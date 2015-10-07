@@ -68,4 +68,6 @@ make(){
   git push origin master:master --force
 }
 
+# make 6
 make 7
+# make 8

@@ -4,7 +4,7 @@
  * at https://www.drupal.org/about-drupalorg/api
  */
 
-require('vendor/rmccue/requests/library/Requests.php');
+require_once('Requests.php');
 
 if (isset($argv[1]) && $argv[1]){
   $cores = array($argv[1]);
