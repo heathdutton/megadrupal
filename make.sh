@@ -20,8 +20,7 @@ datestamp() {
   date +%Y-%m-%d
 }
 
-echo "Ensuring drush requirements"
-composer require drush/drush:dev-master
+composer install
 
 make(){
 
