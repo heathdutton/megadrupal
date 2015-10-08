@@ -27,12 +27,12 @@ make(){
   version="$1"
   echo "Making MegaDrupal $1"
 
-  echo "Building make file"
-  php build-make-files.php $version
+  # echo "Building make file"
+  # php build-make-files.php $version
 
   echo "Running Drush Make process"
   rm -rf "$tmpDir"
-  bash "$BASEDIR/vendor/bin/drush" make "$BASEDIR/drupal-org-$version.make" "$tmpDir" --no-recursion --force-complete --concurrency 1 --prepare-install -y
+  drush make "$BASEDIR/drupal-org-$version.make" "$tmpDir" --no-recursion --force-complete --concurrency 1 --prepare-install -y
 
   # echo "Cloning if needed"
   # rm -rf "$repoDir" >/dev/null 2>&1
