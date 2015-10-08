@@ -20,8 +20,6 @@ datestamp() {
   date +%Y-%m-%d
 }
 
-composer install
-
 make(){
 
   version="$1"
