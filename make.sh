@@ -25,8 +25,8 @@ make(){
   version="$1"
   echo "Making MegaDrupal $1"
 
-  # echo "Building make file"
-  # php build-make-files.php $version
+  echo "Building make file"
+  php build-make-files.php $version
 
   echo "Running Drush Make process"
   rm -rf "$tmpDir"
@@ -46,8 +46,8 @@ make(){
   # git pull
 
   echo "Cleaning out repo files to be replaced with those from make process"
-  cd "$repoDir"
-  rm -R -- */
+  rm -rf "$repoDir"
+  mkdir "$repoDir"
 
   echo "Moving make files into repo"
   cp -r "$tmpDir/*" "$repoDir"
@@ -55,16 +55,16 @@ make(){
   echo "Copying make file into repo"
   cp "$BASEDIR/drupal-org-$version.make" "$repoDir/drupal-org-$version.make"
 
-  echo "Committing all changes."
-  git add .
-  git commit --all --message="$(datestamp)"
+  # echo "Committing all changes."
+  # git add .
+  # git commit --all --message="$(datestamp)"
 
   # echo "Cleaning up Git."
   # git remote prune origin
   # git gc
 
-  echo "Pushing changes."
-  git push origin master:master --force
+  # echo "Pushing changes."
+  # git push origin master:master --force
 }
 
 # make 6
