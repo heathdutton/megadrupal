@@ -36,9 +36,10 @@ make(){
   # rm -rf "$repoDir" >/dev/null 2>&1
   # git clone $repo "$repoDir" >/dev/null 2>&1
 
-  branch="$version.x"
-  echo "Checking out branch: ${branch}"
-  cd "$repoDir"
+  # branch="$version.x"
+  # echo "Checking out branch: ${branch}"
+  # cd "$repoDir"
+
   # Use the following if this is a first time push
   # git branch $branch >/dev/null 2>&1
   # git checkout $branch
