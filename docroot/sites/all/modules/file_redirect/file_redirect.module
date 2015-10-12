@@ -1,0 +1,255 @@
+<?php
+/**
+ * @file
+ * Administrators enter the hostnames of their less-than-production servers
+ * and an .htaccess file is created at the root of the files directory to
+ * temporarily redirect to the production server when files cannot be found,
+ * such as when a database is copied down from production but the files are not.
+ */
+
+define('FILE_REDIRECT_START', '### START FILE REDIRECT ###');
+define('FILE_REDIRECT_END',   '### END FILE REDIRECT ###');
+define('FILE_REDIRECT_PUBLIC_PATH', variable_get('file_public_path'));
+
+/**
+ * Implements hook_menu().
+ */
+function file_redirect_menu() {
+  $items = array();
+
+  $items['admin/config/media/file-system/file-redirect'] = array(
+    'title' => 'File Redirect',
+    'description' => 'Manage file redirection from lower servers.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('file_redirect_admin_form'),
+    'access arguments' => array('administer file system redirects'),
+    'type' => MENU_LOCAL_TASK,
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_permission().
+ */
+function file_redirect_permission() {
+  return array(
+    'administer file system redirects' => array(
+      'title' => t('Manage Redirects for Missing Dev System Files'),
+      'description' => t('Manage the hostnames for other servers in this site\'s family so missing files can be redirected to production.'),
+    ),
+  );
+}
+
+/**
+ * Implements hook_theme().
+ */
+function file_redirect_theme($existing, $type, $theme, $path) {
+  return array(
+    'file_redirect_htaccess_entry' => array(
+      'variables' => array('prod_host' => NULL),
+    ),
+  );
+}
+
+
+/**
+ * System form for administering file system redirects.
+ * FORM
+ *
+ * @param $form
+ * @param $form_state
+ */
+function file_redirect_admin_form($form, &$form_state) {
+  $form['#submit'][] = 'file_redirect_admin_form_submit';
+
+  $form['file_redirect_production_host'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Production Root'),
+    '#description' => t('Enter the protocol, hostname and base path for your production site.') . '<br /><strong>' . t('Ex: https://example.com, http://www.example.com or http://www.example.com/drupal') . '</strong>',
+    '#default_value' => variable_get('file_redirect_production_host', ''),
+    '#element_validate' => array('file_redirect_host_validate'),
+    //'#after_build' => array('file_redirect_check_directory'),
+  );
+
+  /*$form['snippet'] = array(
+    '#type' => 'markup',
+    '#markup' => '<pre>' . theme('file_redirect_htaccess_entry', array('prod_host' => variable_get('file_redirect_production_host', ''))) . '</pre>',
+  );*/
+
+  return system_settings_form($form);
+}
+
+/**
+ * System form for administering file system redirects.
+ * VALIDATE
+ */
+function file_redirect_host_validate($element, &$form_state, $form) {
+  $prod_host = rtrim($element['#value'], '/');
+
+  // Validate the hostname with protocol and optional base path
+  if ($prod_host && !preg_match('#^http(s)?://([a-zA-Z0-9\.\-\:\_]\/?)+$#', $prod_host)) {
+    form_error($element, t('Invalid production root.'));
+  }
+  // Strip extra slashes from the hostname
+  else {
+    form_set_value($element, $prod_host, $form_state);
+  }
+}
+
+/**
+ * System form for administering file system redirects.
+ * SUBMIT
+ */
+function file_redirect_admin_form_submit($form, &$form_state) {
+  // Our submit function will run before the system submit function, so we need
+  // to set the variables manually before we write the htaccess file.
+  variable_set('file_redirect_production_host', rtrim($form_state['values']['file_redirect_production_host'], '/'));
+
+  file_redirect_create_htaccess();
+}
+
+/**
+ * Theme the htaccess file entry for file redirects.
+ *
+ * @param $prod_host
+ *   The production server hostname.
+ */
+function theme_file_redirect_htaccess_entry($vars) {
+  $prod_host = $vars['prod_host'];
+  $output = '';
+
+  //$local = ($_SERVER['HTTP_HOST'] != 'default' ? $SERVER['HTTP_HOST'] : $_SERVER['REMOTE_ADDR']);
+
+  $output .= FILE_REDIRECT_START . "\n";
+  $output .= 'RewriteEngine On' . "\n";
+  $output .= 'RewriteCond "^\/' . str_replace('/', '\/', FILE_REDIRECT_PUBLIC_PATH) . '\/(.*)"' . "\n";
+  $output .= 'RewriteCond %{REQUEST_FILENAME} !-f' . "\n";
+  $output .= 'RewriteRule ^(.*)$ ' . $prod_host . '/' . FILE_REDIRECT_PUBLIC_PATH . '/$1' . "\n";
+  $output .= FILE_REDIRECT_END;
+
+  return $output;
+}
+
+/**
+ * Checks the existence of the directory specified in $form_element.
+ *
+ * @param $form_element
+ *   The form element containing the name of the directory to check.
+ */
+function file_redirect_check_directory($form_element) {
+  $directory = $form_element['#value'];
+  if (strlen($directory) == 0) {
+    return $form_element;
+  }
+
+  if (!is_dir($directory) && !drupal_mkdir($directory, NULL, TRUE)) {
+    // If the directory does not exists and cannot be created.
+    form_set_error($form_element['#parents'][0], t('The directory %directory does not exist and could not be created.', array('%directory' => $directory)));
+    watchdog('file redirect', 'The directory %directory does not exist and could not be created.', array('%directory' => $directory), WATCHDOG_ERROR);
+  }
+
+  if (is_dir($directory) && !is_writable($directory) && !drupal_chmod($directory)) {
+    // If the directory is not writable and cannot be made so.
+    form_set_error($form_element['#parents'][0], t('The directory %directory exists but is not writable and could not be made writable.', array('%directory' => $directory)));
+    watchdog('file redirect', 'The directory %directory exists but is not writable and could not be made writable.', array('%directory' => $directory), WATCHDOG_ERROR);
+  }
+  elseif (is_dir($directory)) {
+    // Create public .htaccess file.
+    file_create_htaccess($directory, FALSE);
+  }
+
+  return $form_element;
+}
+
+/**
+ * Create the htaccess file.
+ *
+ * @param $clear
+ *   Boolean value to forceably remove the redirect.
+ */
+function file_redirect_create_htaccess($clear = FALSE) {
+  // If we're on the production server, don't alter the .htaccess file.
+  if (file_redirect_host_is_production()) {
+    drupal_set_message(t('Redirection is not allowed from the production server.  The .htaccess file will not be altered.'), 'warning');
+    return;
+  }
+
+  $htaccess_path = FILE_REDIRECT_PUBLIC_PATH . '/.htaccess';
+  $prod_host     = variable_get('file_redirect_production_host', '');
+  $content       = theme('file_redirect_htaccess_entry', array('prod_host' => $prod_host));
+  $old_content   = (file_exists($htaccess_path) ? file_get_contents($htaccess_path) : '');
+
+  // Run replacement script
+  $pattern = _file_redirect_pattern_snippet();
+  if (!$prod_host || $clear) {
+    // Replace the snippet with nothing.
+    $new_content = preg_replace($pattern, '', $old_content);
+
+    // Clean up any extra line breaks.
+    $new_content = preg_replace('/(\r?\n)+$/', '', $new_content);
+  }
+  elseif (preg_match($pattern, $old_content)) {
+    $new_content = preg_replace($pattern, str_replace('$1', '{v1}', $content), $old_content);
+    $new_content = str_replace('{v1}', '$1', $new_content);
+  }
+  elseif ($old_content) {
+    $new_content = $old_content . "\n\n" . $content;
+  }
+  else {
+    $new_content = $content;
+  }
+
+  if (@_file_redirect_set_file($htaccess_path, $new_content)) {
+    drupal_set_message(t('Redirect has been set successfully.'));
+  }
+  else {
+    $variables = array('%directory' => $directory, '!htaccess' => '<br />' . nl2br(check_plain($new_content)));
+    drupal_set_message(t("Couldn't write .htaccess file. Please create a .htaccess file in your %directory directory which contains the following lines:<br /><code>!htaccess</code>", $variables), 'warning');
+    watchdog('security', "Security warning: Couldn't write .htaccess file. Please create a .htaccess file in your %directory directory which contains the following lines: <code>!htaccess</code>", $variables, WATCHDOG_ERROR);
+  }
+}
+
+/**
+ * Helper function to create/replace the file.
+ */
+function _file_redirect_set_file($path, $content) {
+  if (!$content) {
+    return FALSE;
+  }
+
+  // Remove old .htaccess file.
+  if (file_exists($path)) {
+    file_unmanaged_delete($path);
+  }
+
+  // Write the .htaccess file.
+  if (file_put_contents($path, $content)) {
+    drupal_chmod($path, 0444);
+    return TRUE;
+  }
+  else {
+    return FALSE;
+  }
+}
+
+/**
+ * Determine whether the current server is the listed production server.
+ */
+function file_redirect_host_is_production() {
+  $host = $_SERVER['HTTP_HOST'];
+  $prod = variable_get('file_redirect_production_host');
+
+  if (preg_match('#^(http(s)?://)?' . $host . '\/#', $prod)) {
+    return TRUE;
+  }
+
+  return FALSE;
+}
+
+/**
+ * The pattern for replacing redirect snippets.
+ */
+function _file_redirect_pattern_snippet() {
+  return '/(' . preg_quote(FILE_REDIRECT_START, '#') . ')(.*\s)*(' . preg_quote(FILE_REDIRECT_END, '#') . ')/';
+}

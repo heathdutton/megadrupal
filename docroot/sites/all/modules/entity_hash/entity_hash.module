@@ -1,0 +1,276 @@
+<?php
+
+/*
+ * To change this license header, choose License Headers in Project Properties.
+ * To change this template file, choose Tools | Templates
+ * and open the template in the editor.
+ */
+
+module_load_include('inc', 'entity_hash');
+
+function entity_hash_menu() {
+
+//config page settings parent object
+  $items['admin/config/entity_hash'] = array(
+    'title' => t('Entity Hash Administration'),
+    'description' => 'Administer Entity Hash.',
+    'position' => 'right',
+    'weight' => -5,
+    'page callback' => 'system_admin_menu_block_page',
+    'access arguments' => array('access administration pages'),
+    'file' => 'system.admin.inc',
+    'file path' => drupal_get_path('module', 'system'),
+  );
+//default item
+  $items['admin/config/entity_hash/settings'] = array(
+    'title' => t('Entity Hash Settings'),
+    'description' => t('Begin Entity Hashing.'),
+    'type' => MENU_NORMAL_ITEM,
+    'weight' => 50,
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('entity_hash_admin_form'),
+    'access arguments' => array('access administration pages'),
+  );
+
+  return $items;
+}
+
+function entity_hash_admin_form($form, &$form_state) {
+
+  $entity_info = array_keys(entity_hash_get_supported_entity_info());
+
+  $all[] = "All Entities";
+  $options = array_merge($all, $entity_info);
+  $options = drupal_map_assoc($options);
+
+  $form['entityselect'] = array(
+    '#type' => 'select',
+    '#title' => 'Entity Select',
+    '#options' => $options,
+  );
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Queue Entities')
+  );
+
+  return $form;
+}
+
+function entity_hash_admin_form_submit($form, &$form_state) {
+
+  if ($form_state['values']['entityselect'] != 'All Entities') {
+    entity_hash_queue_prepare($form_state['values']['entityselect']);
+  }
+  elseif ($form_state['values']['entityselect'] == 'All Entities') {
+    entity_hash_queue_prepare();
+  }
+}
+
+function entity_hash_queue_prepare($entity_restrict = NULL, $hash = 'md5') {
+
+  if ($entity_restrict != NULL) {
+    $entities[] = $entity_restrict;
+  }
+  elseif ($entity_restrict == NULL) {
+    $entities = array_keys(entity_hash_get_supported_entity_info());
+  }
+
+  foreach ($entities as $entity_key => $entity_type) {
+    $entity_info = entity_get_info($entity_type);
+    $idkey = $entity_info['entity keys']['id'];
+    if (!empty($entity_info['entity keys']['revision'])) {
+      $revkey = $entity_info['entity keys']['revision'];
+      $query = db_select($entity_info['revision table'], 'rt')
+        ->fields('rt', array($revkey, $idkey));
+      $results = $query->execute()->fetchAll();
+      foreach ($results as $result) {
+        entity_hash_enqueue($entity_type, $result->$idkey, $result->$revkey);
+      }
+    }
+    else {
+      $query = db_select($entity_info['base table'], 'bt')
+        ->fields('bt', array($idkey));
+      $results = $query->execute()->fetchAll();
+      foreach ($results as $result) {
+        entity_hash_enqueue($entity_type, $result->$idkey);
+      }
+    }
+  }
+}
+
+/*
+ * Implements hook_cron_queue_info()
+ */
+
+function entity_hash_cron_queue_info() {
+  $queues['entity_hash'] = array(
+    'worker callback' => 'entity_hash_queue_process',
+    'time' => 180,
+  );
+  return $queues;
+}
+
+function entity_hash_enqueue($entity_type, $id, $revision = FALSE) {
+  $queue = DrupalQueue::get("entity_hash");
+  $obj = array(
+    'id' => $id,
+    'revision' => $revision,
+    'entity_type' => $entity_type,
+  );
+  $queue->createItem($obj, TRUE);
+}
+
+function entity_hash_queue_process($obj) {
+  $entity_type = $obj['entity_type'];
+  $entity_info = entity_get_info($entity_type);
+  $idkey = $entity_info['entity keys']['id'];
+  $revkey = $entity_info['entity keys']['revision'];
+  $hash_value = '';
+
+  watchdog("obj", print_r($obj, TRUE));
+  watchdog("queue process", "queue process");
+
+  if ($obj['revision'] != FALSE) {
+    watchdog("revision triggered", "true");
+    $revision = entity_revision_load($obj['entity_type'], $obj['revision']);
+
+    $revision_idkey = $revision->{$idkey};
+    $revision_revkey = $revision->{$revkey};
+    if ($revision === FALSE) {
+      watchdog('Revision: @revision did not exist or could not be loaded.', array('@revision' => $obj['revision']), WATCHDOG_NOTICE);
+      return;
+    }
+    $hash_value = entity_hash_hash_item($revision, $entity_type);
+    watchdog("drupal revision hash", print_r($hash_value, TRUE));
+    entity_hash_database_update($entity_info['revision table'], $hash_value, $revkey, $obj['revision']);
+    $query = db_select($entity_info['base table'], 'bt')
+      ->fields('bt', array($revkey, $idkey))
+      ->condition($idkey, $revision_idkey);
+    $results = $query->execute()->fetchAssoc($revkey);
+
+
+    $published = ($results[$revkey] == $revision_revkey);
+    if (!$published) {
+      return;
+    }
+  }
+  else {
+    $entity = entity_load_single($obj['entity_type'], $obj['id']);
+    if ($entity === FALSE) {
+      watchdog('Entity with id @id did not exist or could not be loaded.', array('@id' => $obj['id']), WATCHDOG_NOTICE);
+      return;
+    }
+    $hash_value = entity_hash_hash_item($entity, $entity_type);
+    watchdog("drupal regular hash", print_r($hash_value, TRUE));
+  }
+
+  entity_hash_database_update($entity_info['base table'], $hash_value, $idkey, $obj['id']);
+}
+
+/*
+ * Implements hook_entity_presave()
+ */
+
+function entity_hash_entity_presave($entity, $entity_type) {
+  drupal_register_shutdown_function('entity_hash_shutdown', $entity, $entity_type);
+}
+
+function entity_hash_shutdown($entity, $entity_type) {
+  $info = entity_get_info($entity_type);
+  if (isset($info['hash']) && $info['hash'] == TRUE && !empty($info['entity keys']['hash'])) {
+    $hash_key = $info['entity keys']['hash'];
+    $vid = $entity->vid;
+    $result_revision = db_update('node_revision')
+      ->fields(array('hash' => entity_hash_hash_item($entity, $entity_type)))
+      ->condition('vid', $vid, "=")
+      ->execute();
+    $result_node = db_update('node')
+      ->fields(array('hash' => entity_hash_hash_item($entity, $entity_type)))
+      ->condition('vid', $vid, "=")
+      ->execute();
+  }
+}
+
+function entity_hash_database_update($table, $hash_value, $id, $iddata) {
+  db_update($table)
+    ->fields(array(
+      'hash' => $hash_value,
+    ))
+    ->condition($id, $iddata, '=')
+    ->execute();
+}
+
+function entity_hash_getter($entity_type, $id, $revision = FALSE) {
+  $entity_info = entity_get_info($entity_type);
+  $hash_column = 'hash';
+  if ($revision == FALSE) {
+    $entity_key = $entity_info['entity keys']['id'];
+    $entity_table = $entity_info['base table'];
+    $entity_key_value = $id;
+  }
+  else {
+    $entity_key_value = $revision;
+    $entity_table = $entity_info['revision table'];
+    $entity_key = $entity_info['entity keys']['revision'];
+  }
+  $result = db_select($entity_table, 'table')
+    ->fields('table', array($hash_column))
+    ->condition($entity_key, $entity_key_value)
+    ->execute()
+    ->fetchField();
+
+  return $result;
+}
+
+function entity_hash_hash_item($orig_entity, $entity_type = NULL, $hash = FALSE) {
+//if no hash selected, default to md5
+  if (!$hash) {
+    $hash = 'md5';
+  }
+
+  $hash_algos = hash_algos();
+  if (!in_array($hash, $hash_algos)) {
+    Throw New Exception("Hash type not supported by PHP");
+  }
+  $entity = clone $orig_entity;
+//let modules modify the entity before we hash it
+  drupal_alter('entity_hash', $entity, $entity_type);
+  $serial_entity = serialize($entity);
+  $hash_value = hash($hash, $serial_entity);
+  return $hash_value;
+}
+
+/*
+ * Implements hook entity_hash_alter()
+ */
+
+function entity_hash_entity_hash_alter($entity, $entity_type) {
+  unset($entity->hash);
+}
+
+/*
+ * Check if a particular hash exists
+ * @return: entity_id if an entity that hashes the same as this exists, FALSE otherwise
+ */
+
+function entity_hash_check_hash($entity_type, $hash) {
+  $entity_info = entity_get_info($entity_type);
+  $query = db_select($entity_info['revision table'], 'revision')
+    ->fields('revision', array($entity_info['entity keys']['id']))
+    ->condition('hash', $hash);
+  $result = $query->execute()->fetchField();
+  watchdog("check hash result", print_r($result, TRUE));
+  if ($result) {
+    return $result;
+  }
+  return FALSE;
+}
+
+/**
+ * Implementation of hook_views_api().
+ */
+function entity_hash_views_api() {
+  return array(
+    'api' => 3,
+  );
+}

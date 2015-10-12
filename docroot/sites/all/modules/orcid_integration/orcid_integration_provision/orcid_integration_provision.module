@@ -1,0 +1,186 @@
+<?php
+
+/**
+ * Implements hook_menu().
+ */
+function orcid_integration_provision_menu() {
+  $items = array();
+
+  $items['admin/people/orcid-import'] = array(
+    'title' => 'Import for ORCID',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('orcid_integration_provision_import'),
+    'access arguments' => array('administer users'),
+  );
+
+  return $items;
+}
+
+function orcid_integration_provision_import($form, &$form_state) {
+  $form['filepath'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Path to import file'),
+    '#description' => t('Please provide a path to the import file. It should contain a header with the following columns (in any order): <code>first_name,last_name,username,email</code>'),
+    '#required' => TRUE,
+  );
+
+  return confirm_form($form, t('Do you wish to import ORCID users from CSV'), '<front>');
+}
+
+function orcid_integration_provision_import_submit($form, &$form_state) {
+  $file = file_get_contents($form_state['values']['filepath']);
+  $content = new parseCSV($file);
+  $data = _orcid_integration_provision_sanitize_csv($content->data);
+  $batch = array(
+    'operations' => array(),
+    'finished' => 'orcid_integration_provision_import_finished',
+    'title' => t('Import users for ORCID'),
+    'init_message' => t('Importing users for ORCID'),
+    'progress_message' => t('Batch @current out of @total'),
+    'error_message' => t('An error occurred processing a user.'),
+  );
+  $operations = array();
+  foreach ($data as $data_entry) {
+    $batch['operations'][] = array('orcid_integration_provision_import_user', array($data_entry));
+  }
+  batch_set($batch);
+}
+
+function orcid_integration_provision_import_user($data, &$context) {
+  $account = NULL;
+  $claimed = TRUE;
+  $conflict = FALSE;
+  $conflict_orcids = array();
+  if (!empty($data['username'])) {
+    $account = user_load_by_name($data['username']);
+  }
+  if (empty($account) && !empty($data['email'][0])) {
+    $account = user_load_by_mail($data['email'][0]);
+  }
+  if (empty($account)) {
+    $account = _orcid_integration_provision_create_new_account($data);
+  }
+  $orcid = field_get_items('user', $account, 'field_orcid_id');
+  if (!empty($orcid)) {
+    $orcid = $orcid[0]['safe_value'];
+  }
+  else {
+    $orcid = FALSE;
+    $original_mail = $account->mail;
+    foreach ($data['email'] as $email) {
+      $account->mail = $email;
+      $possible_accounts = orcid_integration_search_account($account);
+      if ($possible_accounts['orcid-search-results']['num-found'] > 0) {
+        foreach ($possible_accounts['orcid-search-results']['orcid-search-result'] as $orcid_account) {
+          foreach ($orcid_account['orcid-profile']['orcid-bio']['contact-details']['email'] as $email) {
+            if ($email['value'] == $account->mail) {
+              if (!empty($orcid)) {
+                if (empty($conflict_orcids)) {
+                  $conflict_orcids[] = $orcid;
+                }
+                $conflict_orcids[] = $orcid_account['orcid-profile']['orcid-identifier']['path'];
+                $conflict = TRUE;
+                break 2;
+              }
+              else {
+                $orcid = $orcid_account['orcid-profile']['orcid-identifier']['path'];
+                break 2;
+              }
+            }
+          }
+        }
+      }
+    }
+    if (!empty($conflict)) {
+      $orcid = NULL;
+    }
+
+    $account->mail = $original_mail;
+    // Claim account if same email exists and there were no conflicts.
+    if (empty($orcid) && !$conflict) {
+      $claimed = FALSE;
+      $orcid = orcid_integration_provision_new_account($account->mail, $data['first_name'], $data['last_name']);
+    }
+
+    if (!empty($orcid)) {
+      $account->field_orcid_id[LANGUAGE_NONE][0] = array(
+        'value' => $orcid,
+      );
+      user_save($account);
+      drupal_set_message(t('User %user claimed ORCID: @orcid', array('%user' => $account->name, '@orcid' => $orcid)));
+    }
+  }
+  if ($orcid && $claimed) {
+    $context['results']['orcid-results']['claimed'][] = array(
+      'username' => $account->name,
+      'orcid' => $orcid,
+    );
+  }
+  else if ($orcid && !$claimed) {
+    $context['results']['orcid-results']['provisioned'][] = array(
+      'username' => $account->name,
+      'orcid' => $orcid,
+    );
+  }
+  else if (!$orcid && $conflict) {
+    $context['results']['orcid-results']['conflict'][] = array(
+      'username' => $account->name,
+      'email' => $account->mail,
+      'conflicts' => '"' . implode(', ', $conflict_orcids) . '"',
+    );
+  }
+}
+
+function orcid_integration_provision_import_finished($success, $results, $operations) {
+  drupal_set_message(t('Users have been imported and ORCIDs claimed.'));
+  drupal_set_message(t('Below list in table format of claiming pre-existing ORCIDs:'));
+  $content = '<table><tr><th>username</th><th>orcid</th></tr>';
+  foreach ($results['orcid-results']['claimed'] as $result) {
+    $content .= "<tr><td>{$result['username']}</td><td>{$result['orcid']}</td></tr>";
+  }
+  $content .= '</table>';
+  drupal_set_message($content);
+  drupal_set_message(t('Below list in table format of provisioned new ORCIDs:'));
+  $content = '<table><tr><th>username</th><th>orcid</th></tr>';
+  foreach ($results['orcid-results']['provisioned'] as $result) {
+    $content .= "<tr><td>{$result['username']}</td><td>{$result['orcid']}</td></tr>";
+  }
+  $content .= '</table>';
+  drupal_set_message($content);
+  drupal_set_message(t('Below list in table format of accounts with conflicts (multiple ORCIDs):'));
+  $content = '<table><tr><th>username</th><th>email</th><th>conflicts</th></tr>';
+  foreach ($results['orcid-results']['conflict'] as $result) {
+    $content .= "<tr><td>{$result['username']}</td><td>{$result['email']}</td><td>{$result['conflicts']}</td></tr>";
+  }
+  $content .= '</table>';
+  drupal_set_message($content);
+}
+
+function _orcid_integration_provision_create_new_account($data) {
+  $user_info = array(
+    'name' => $data['username'],
+    'mail' => $data['email'][0],
+    'pass' => user_password(),
+    'status' => 1,
+  );
+  $account = new stdClass();
+  $account = user_save($account, $user_info);
+  return user_load($account->uid);
+}
+
+function _orcid_integration_provision_sanitize_csv($csv_data) {
+  $data = array();
+  foreach ($csv_data as $data_entry) {
+    if (!isset($data[$data_entry['username']])) {
+      $data[$data_entry['username']] = array(
+        'username' => $data_entry['username'],
+        'first_name' => $data_entry['first_name'],
+        'last_name' => $data_entry['last_name'],
+        'email' => array(),
+      );
+    }
+    $data[$data_entry['username']]['email'][] = $data_entry['email'];
+  }
+  return $data;
+}
+

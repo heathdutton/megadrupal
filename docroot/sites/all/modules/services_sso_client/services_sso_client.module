@@ -1,0 +1,1112 @@
+<?php
+
+require_once dirname(__FILE__) . '/includes/services_sso_client.remote_register.inc';
+require_once dirname(__FILE__) . '/includes/services_sso_client.sessions.inc';
+require_once dirname(__FILE__) . '/includes/services_sso_client.sso_bar.inc';
+
+/**
+ * Implements hook_init().
+ */
+function services_sso_client_init() {
+  global $user;
+  global $cookie_domain;
+  global $base_path;
+  $common_cookie_domain = _services_sso_client_get_common_cookie_domain();
+
+  // Load the generic javascript that came with this module.
+  drupal_add_js(drupal_get_path('module', 'services_sso_client') . '/js/services_sso_client.js', array('cache' => FALSE));
+
+  $account = user_load($user->uid);
+
+  //Handle the server response message
+  if (!empty($_REQUEST['message'])) {
+    if (variable_get('services_sso_client_optional_load_remote_modal', FALSE)) {
+      //If it's a modal window, put the message into a cookie, so that it can be displayed on page reload
+      setcookie('sso_server_last_message', $_REQUEST['message'], time() + 3600, $base_path, $cookie_domain, FALSE, TRUE);
+    }
+    else {
+      //Not modal. Just print out the message.
+      drupal_set_message($_REQUEST['message']);
+    }
+
+  }
+
+  if (isset($_COOKIE['sso_server_last_message']) || isset($_GET['sso_server_last_message'])) {
+    if (isset($_COOKIE['sso_server_last_message'])) {
+      drupal_set_message($_COOKIE['sso_server_last_message']);
+
+      //Delete the cookie
+      setcookie('sso_server_last_message', "", 0, $base_path, $cookie_domain);
+    }
+
+    if (isset($_GET['sso_server_last_message'])) {
+      drupal_set_message($_GET['sso_server_last_message']);
+    }
+  }
+
+  if (!empty($_REQUEST['services_sso_update']) && variable_get('services_sso_client_optional_load_remote_modal', FALSE)) {
+    // Include a JS to close colorbox if necessary and refresh our entire page
+    drupal_add_js(drupal_get_path('module', 'services_sso_client') . '/js/escapeParent.js', array('cache' => FALSE));
+  }
+
+  // Don't need to do anything of the current active user isn't external
+  if (!empty($account->uid) && empty($account->is_external)) {
+    return FALSE;
+  }
+
+  if (!empty($user->uid)) {
+    $now = REQUEST_TIME;
+
+    // Verify the validity of the remote session stored in local session
+    if (empty($_SESSION['services_sso_client']['last_verified'])) {
+      $_SESSION['services_sso_client']['last_verified'] = REQUEST_TIME;
+    }
+    else {
+      if (!empty($_SESSION['services_sso_client']['data']) && ($now - $_SESSION['services_sso_client']['last_verified']) > variable_get('services_sso_client_last_verified_threshold', 300)) {
+
+        if (services_sso_client_update_remote($account)) {
+          // Invoke immediate actions based on successful propagation.
+          module_invoke_all('services_sso_client_update_remote_update', $user->uid);
+          $_SESSION['services_sso_client']['last_verified'] = REQUEST_TIME;
+
+          // If currently on a cookie domain not the
+          if (stripos($cookie_domain, $common_cookie_domain) != 0) {
+            $data = $_SESSION['services_sso_client']['data'];
+            if (empty($_COOKIE[$data->session_name])) {
+              setcookie($data->session_name, $data->sessid, REQUEST_TIME + 3600 * 24 * 30, $base_path, $common_cookie_domain, FALSE, TRUE);
+            }
+          }
+        }
+        else {
+          // Log the local user out if there is no longer a valid session or connection
+          // to the single sign-on server
+          module_load_include('inc', 'user', 'user.pages');
+          user_logout();
+          drupal_set_message(t('You have been logged out because you have signed out of the singal sign-on service elsewhere.'));
+        }
+      }
+    }
+  }
+  else {
+    // If the user is not logged in, let's try to look for a session cookie that is perhaps from the
+    // SSO server, if that's the case then we can authenticate the user
+    // If currently on a cookie domain not the
+    if (stripos($cookie_domain, $common_cookie_domain) !== 0) {
+      foreach ($_COOKIE as $cookie_key => $cookie_value) {
+        if (_services_sso_client_is_session_cookie($cookie_key)) {
+          $data = services_sso_client_session_try_provided_pair($cookie_key, $cookie_value);
+
+          // If we can actually login, good!
+          if (services_sso_client_session_login($data)) {
+            return;
+          }
+          // If we cannot login with this thing, get rid of, it's old
+          else {
+            setcookie($cookie_key, '', REQUEST_TIME - 3600, $base_path, $common_cookie_domain, FALSE, TRUE);
+          }
+        }
+      }
+    }
+  }
+
+  if (!empty($_SESSION['services_sso_client']['data'])) {
+    // Populate SSO remote session data into JS for later consumption every page load.
+    drupal_add_js(array('services_sso_client' => array('data' => $_SESSION['services_sso_client']['data'])), 'setting');
+  }
+}
+
+/**
+ * Implements hook_permission().
+ */
+function services_sso_client_permission() {
+  return array(
+    'administer services sso client' => array(
+      'title' => t('Administer services single sign-on client'),
+      'description' => t('Perform administration tasks for the services single sign-on client module.'),
+    ),
+    'remote profile edit via services sso client' => array(
+      'title' => t('Remotely edit profile'),
+      'description' => t('Edit the user\'s own account profile remotely on the single sign-on server.'),
+    ),
+  );
+}
+
+/**
+ * Implements hook_menu().
+ */
+function services_sso_client_menu() {
+  $items = array();
+
+  // Services single sign-on client settings.
+  $items['admin/config/services/sso-client'] = array(
+    'title' => 'Services single sign-on client settings',
+    'type' => MENU_NORMAL_ITEM,
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('services_sso_client_user_admin_form'),
+    'file' => 'includes/services_sso_client.admin.inc',
+    'access arguments' => array('administer services sso client'),
+    'description' => t('Configuration settings for the SSO client'),
+  );
+  $items['admin/config/services/sso-client/settings'] = array(
+    'title' => 'Settings',
+    'type' => MENU_DEFAULT_LOCAL_TASK,
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('services_sso_client_user_admin_form'),
+    'file' => 'includes/services_sso_client.admin.inc',
+    'access arguments' => array('administer services sso client'),
+    'description' => t('Configuration settings for the SSO client'),
+  );
+
+  // Menu callback for redirecting to remote profile editing.
+  $items['sso/user/%user/edit'] = array(
+    'title' => 'Edit profile',
+    'type' => MENU_CALLBACK,
+    'page callback' => 'services_sso_client_edit_profile',
+    'page arguments' => array(2),
+    'access callback' => 'user_access',
+    'access arguments' => array('remote profile edit via services sso client'),
+  );
+
+  // Menu callback for session redirection page.
+  $items['sso/session/%/%'] = array(
+    'title' => 'Try provided session pair',
+    'type' => MENU_CALLBACK,
+    'page callback' => 'services_sso_client_try_provided_session_pair_page',
+    'page arguments' => array(2, 3),
+    'access callback' => 'user_access',
+    'access arguments' => array('access content'),
+  );
+  return $items;
+}
+
+/**
+ * Menu callback for redirecting to remote profile editing.
+ *
+ * This function will determine and construct a URL with query
+ * parameters and send a 302 Found http flag, and send the browser
+ * to the remote profile editing interface. The query parameters
+ * will contain the session_name and sessid and set the cookie with
+ * them.
+ *
+ * @param $user
+ *  Valid local user object passed through hook_menu(). We expect this object
+ *  to contain the remote_uid member populated by hook_user() implementation.
+ */
+function services_sso_client_edit_profile($user) {
+  if (empty($user)) {
+    return FALSE;
+  }
+
+  // Pull up the SSO server address.
+  $url = variable_get('services_sso_client_server_address', '');
+
+  // Referrer URL
+  if (!empty($_SERVER['HTTP_REFERER'])) {
+    $referer_parts = parse_url($_SERVER['HTTP_REFERER']);
+    if (extract($referer_parts)) {
+      $referer = "$scheme://$host/$path";
+    }
+  }
+
+  // Construct the necessary query parameters.
+  $query = array(
+    'services_sso_destination' => 'user/' . $user->remote_uid . '/edit',
+    'services_sso_session_name' => $_SESSION['services_sso_client']['data']->session_name,
+    'services_sso_sessid' => $_SESSION['services_sso_client']['data']->sessid,
+    'services_sso_client_url' => empty($referer) ? url('user/' . $user->uid . '/edit', array('absolute' => TRUE)) . '/' : $referer,
+    'services_sso_modal' => variable_get('services_sso_client_optional_load_remote_modal', FALSE),
+  );
+
+  // If URL was defined through admin settings, send user to remote site.
+  if (!empty($url)) {
+    drupal_goto($url, array('query' => $query));
+  }
+  else {
+    return drupal_not_found();
+  }
+}
+
+/**
+ * Implements hook_user_logout().
+ */
+function services_sso_client_user_logout($account) {
+  // If the user logs out here. He should be logged out everywhere.
+  services_sso_client_logout($account);
+}
+
+/**
+ * Implements hook_user_load().
+ */
+function services_sso_client_user_load($users) {
+  foreach ($users as $uid => $account) {
+    // Look up the remote user and populate additional members in the local user object accordingly.
+    _services_sso_client_add_external_info($account);
+  }
+}
+
+/**
+ * Look up the remote user and populate additional members in the local user object accordingly.
+ *
+ * @param $account
+ *  A single Drupal user object.
+ */
+function _services_sso_client_add_external_info(&$account) {
+  if ($result = db_query("SELECT * FROM {authmap} su WHERE uid=:uid AND module='services_sso_client' LIMIT 1", array(':uid' => $account->uid))) {
+    foreach ($result as $record) {
+      $account->is_external = TRUE;
+      $account->remote_uid = $record->authname;
+    }
+  }
+}
+
+/**
+ * Implements preprocess_menu_local_tasks().
+ *
+ * - Set classes for remote user login forms
+ */
+function services_sso_client_preprocess_menu_local_tasks(&$vars) {
+
+  if (isset($vars['primary'])) {
+    if (!empty($vars['primary'])) {
+      foreach ($vars['primary'] as $index => $tab) {
+
+        if ($tab['#link']['path'] == 'user/register' || $tab['#link']['path'] == 'user/password') {
+
+          //Add classes for the modal load, if option is set
+          if (variable_get('services_sso_client_optional_load_remote_modal', FALSE)) {
+
+            if (empty($vars['primary'][$index]['#link']['localized_options']['attributes']['class'])) {
+              $vars['primary'][$index]['#link']['localized_options'] = array('attributes' => array('class' => 'load-modal ' . drupal_html_class($tab['#link']['path'])));
+            }
+            else {
+              $vars['primary'][$index]['#link']['localized_options']['attributes']['class'] .= 'load-modal ' . drupal_html_class($tab['#link']['path']);
+            }
+          }
+        }
+      }
+    }
+  }
+
+}
+
+/**
+ * Implements hook_block_info().
+ */
+function services_sso_client_block_info() {
+  $blocks = array();
+  $blocks['sso_bar'] = array(
+    'info' => t('Single sign-on menu bar'),
+    'cache' => DRUPAL_NO_CACHE,
+  );
+  return $blocks;
+}
+
+/**
+ * Implements hook_block_view().
+ */
+function services_sso_client_block_view($delta = '') {
+  $block = array();
+
+  switch ($delta) {
+    case 'sso_bar':
+      $block['subject'] = '';
+      $block['content'] = services_sso_client_sso_bar();
+      break;
+  }
+
+  return $block;
+}
+
+/**
+ * Implements hook_theme().
+ */
+
+/**
+ * Implements hook_form_alter().
+ */
+function services_sso_client_form_alter(&$form, &$form_state, $form_id) {
+  switch ($form_id) {
+    case 'user_login_block':
+    case 'user_login':
+
+      drupal_add_js(drupal_get_path('module', 'services_sso_client') . '/js/services_sso_client.js', array('cache' => FALSE));
+
+      // Store the normal local authentication routines aside.
+      $form['#validate_funcs'] = $form['#validate'];
+
+      // Add the SSO authentication routine as the only routine.
+      $form['#validate'] = array('services_sso_client_authenticate_validate');
+      break;
+
+    case 'user_profile_form':
+      // If the user is actually just a local user, dont do anything
+      if (empty($form['#user']->remote_uid)) {
+        return FALSE;
+      }
+
+      // If we were being directed back from the SSO profile edit interface
+      // Look for a force update flag
+      if (!empty($_REQUEST['services_sso_update'])) {
+        // Include a JS to close colorbox if necessary and refresh our entire page
+        drupal_add_js(drupal_get_path('module', 'services_sso_client') . '/js/escapeParent.js', array('cache' => FALSE));
+
+        // Update cached remote account and update where it is present in $_SESSION
+        services_sso_client_update_remote($form['#user']);
+      }
+
+      // @todo More systematically hide things.
+      // @todo The list of things to hide should come from some sort of UI.
+      // Need to remove some fields and leave them to SSO profile edit interface
+
+      // Making everything in the 'account' group hidden unless if we are not copying roles
+      // then in that case let's show the roles checkboxes at least.
+      foreach ($form['account'] as $key => $account_item) {
+        if (is_array($account_item) && ($key != 'roles' || variable_get('services_sso_client_use_roles_from_sso', FALSE))) {
+          $form['account'][$key]['#access'] = FALSE;
+        }
+      }
+
+      $form['password_policy'] = FALSE;
+      $form['picture']['#access'] = FALSE;
+
+      // Hide picture fields
+      foreach ($form['picture'] as $key => $field) {
+        if (is_array($field) && $key != 'current_picture') {
+          $form['picture'][$key]['#access'] = FALSE;
+        }
+      }
+
+      $form['timezone']['#access'] = FALSE;
+
+      // Insert additional validating options at the beginning of the validating procedures
+      //   to allow the hide fields to be reappended to their default values before
+      //   additional validation fails because they are missing entirely.
+      array_unshift($form['#validate'], 'services_sso_client_user_profile_form_validate');
+
+      // @todo The placement of this remote edit link is highly arbitrary, in fact it probably shouldn't be here
+      // @todo Move the remote edit button into the tabs along the top of the page
+      $form['remote_edit'] = array(
+        '#weight' => -500,
+        '#markup' => l(
+          'Remote edit',
+          'sso/user/'.$form['#user']->uid.'/edit',
+          array(
+            'attributes' => array(
+              'class' => variable_get('services_sso_client_optional_load_remote_modal', FALSE) ? 'load-modal' : '',
+            )
+          )
+        ),
+      );
+      break;
+  }
+}
+
+/**
+ * Validation for the user_profile_form.
+ * Insert form_state values so that subsequent validations will pass.
+ */
+function services_sso_client_user_profile_form_validate($form, &$form_state) {
+  if (isset($form['_account']['#value'])) {
+    $form_state['values']['mail'] = $form['_account']['#value']->mail;
+    $form_state['values']['name'] = $form['_account']['#value']->name;
+  }
+  else if (isset($form['#user']) && is_object($form['#user'])) {
+    $form_state['values']['mail'] = $form['#user']->mail;
+    $form_state['values']['name'] = $form['#user']->name;
+  }
+}
+
+/**
+ * Propagate user accounts from SSO.
+ */
+function services_sso_client_propagate() {
+  // Create an API account session so we can use it.
+  $session_data = services_sso_client_propagate_api_account();
+
+  if (!empty($session_data)) {
+    $users = TRUE;
+    $accounts = array();
+    $offset = 0;
+
+    while ($users = services_sso_client_propagate_get_accounts($session_data, $offset)) {
+      $offset++;
+      $accounts = array_merge($accounts, $users);
+    }
+  }
+
+  if (!empty($accounts)) {
+    $ignore = _services_sso_client_ignore_accounts();
+
+    foreach ($accounts as $account) {
+      if (!($local_account = user_external_load($account->uid))) {
+        if (!in_array($account->name, $ignore) && !empty($account->uid)) {
+          // Copy the account to local.
+          $local_account = services_sso_client_propagate_copy_account($session_data, $account);
+
+          // Break of something went wrong.
+          if (!$local_account) {
+            watchdog('services_sso_client', t('Couldn\'t create account for SSO user: ' . $account->name));
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  // This will destroy the API account session.
+  services_sso_client_propagate_api_account($session_data);
+}
+
+/**
+ * Functions related to initializing and destroying sessions of the API account.
+ *
+ * @param $session_data
+ *  If this is not provided, the function will initialize a session using the API account.
+ *  If this is provided, the function will destroy the session of the API account. (logout)
+ *
+ * @return
+ *  Will return the session_data if initializing API account. Bool for if succeeding at logging out.
+ */
+function services_sso_client_propagate_api_account($session_data = FALSE) {
+  // Construct full endpoint URL from saved settings in admin config.
+  $endpoint_url = variable_get('services_sso_client_server_address', '') . '/' . variable_get('services_sso_client_server_endpoint', '');
+
+  $headers = array(
+    'Content-Type' => 'application/x-www-form-urlencoded',
+  );
+
+  if (!empty($session_data)) {
+    // Logout API user
+    $headers['Cookie'] = $session_data->session_name . '=' . $session_data->sessid;
+    $headers['X-CSRF-Token'] = _services_sso_client_get_csrf_token();
+    $response = drupal_http_request($endpoint_url . '/user/logout.json', array('headers' => $headers, 'method' => 'POST'));
+
+    return json_decode($response->data);
+  }
+  else {
+    // Build the necessary POST http request.
+    $data = array(
+      'username' => 'api',
+      'password' => variable_get('services_sso_client_api_key', ''),
+    );
+    $data = drupal_http_build_query($data, '', '&');
+
+    // Make HTTP request.
+    $response = drupal_http_request($endpoint_url . '/user/login.json', array('headers' => $headers, 'method' => 'POST', 'data' => $data));
+
+    // Parse return data.
+    $session_data = json_decode($response->data);
+
+    return $session_data;
+  }
+}
+
+/**
+ *
+ */
+function services_sso_client_propagate_get_accounts($session_data, $offset = 0, $num = 10) {
+  // Construct full endpoint URL from saved settings in admin config.
+  $endpoint_url = variable_get('services_sso_client_server_address', '') . '/' . variable_get('services_sso_client_server_endpoint', '');
+  $headers = array(
+    'Content-Type' => 'application/x-www-form-urlencoded',
+    'Cookie' => $session_data->session_name . '=' . $session_data->sessid,
+  );
+
+  $params = array(
+    'pagesize' => $num,
+    'page' => $offset,
+  );
+  $params = drupal_http_build_query($params, '', '&');
+
+  $response = drupal_http_request($endpoint_url . '/user?' . $params, array('headers' => $headers));
+
+  return json_decode($response->data);
+}
+
+/**
+ * Duplicate an account on the SSO to local users table.
+ *
+ * @param
+ * @param
+ *
+ * @return
+ */
+function services_sso_client_propagate_copy_account($session_data, $account) {
+  // Construct proper endpoint URL for the services resource
+  $endpoint_url = variable_get('services_sso_client_server_address', '') . '/' . variable_get('services_sso_client_server_endpoint', '');
+
+  // Construct proper cookie using the stored session information.
+  $headers = array(
+    'Content-Type' => 'application/json',
+    'Cookie' => $session_data->session_name . '=' . $session_data->sessid,
+  );
+
+  // Make request to REST services user.retrieve
+  $response = drupal_http_request($endpoint_url . '/user/' . $account->uid . '.json', array('headers' => $headers));
+
+  $remote_account = json_decode($response->data);
+  $local_account = services_sso_client_update_remote_process($remote_account);
+
+  return $local_account;
+}
+
+/**
+ * Update a remote account during propagation.
+ *
+ * @param
+ * @param
+ */
+function services_sso_client_propagate_update_account($session_data, $account) {
+  // Construct proper endpoint URL for the services resource
+  $endpoint_url = variable_get('services_sso_client_server_address', '') . '/' . variable_get('services_sso_client_server_endpoint', '');
+
+  // Construct proper cookie using the stored session information.
+  $headers = array(
+    'Content-Type' => 'application/json',
+    'Cookie' => $session_data->session_name . '=' . $session_data->sessid,
+  );
+
+  // Make request to REST services user.retrieve
+  $response = drupal_http_request($endpoint_url . '/user/' . $account->uid . '.json', array('headers' => $headers));
+
+  $remote_account = json_decode($response->data);
+  $local_account = services_sso_client_update_remote_process($remote_account);
+
+  return $local_account;
+}
+
+/**
+ * Helper function which allow devs to easily print debug info to Drupal log
+ *
+ * This function will determine the best way to log a variable to watchdog.
+ *
+ * @param $data
+ *  An array/object or string.
+ * @param $label
+ *  Optional string to help identify outputted variable.
+ */
+function services_sso_client_watchdog($data = array(), $label = '') {
+  return FALSE;
+  // Throw some square brackets on the label.
+  if (!empty($label)) {
+    $label = '[' . $label . ']';
+  }
+
+  // Check to see if debugging is enabled through settings.
+  if (variable_get('services_sso_client_debug', TRUE)) {
+    if (is_array($data) || is_object($data)) {
+      // If the variable is array or object, add the html <PRE> tag so the formatting comes out readable.
+      //watchdog('services_user', $label . ' <pre>' . print_r($data, 1)) . '</pre>';
+    }
+    else {
+      watchdog('services_user', $label . ' ' . $data);
+    }
+  }
+}
+
+/**
+ * Validation callback to intercept regular user authentication routines.
+ *
+ * This function will see if the user can be logged in through SSO first, if not
+ *  it will go back to trying to login the authentication request as a local Drupal
+ *  user.
+ *
+ * @param $form
+ *  The user_login_form form array.
+ * @param $form_state
+ *  The user_login_form form_state array.
+ */
+function services_sso_client_authenticate_validate($form, &$form_state) {
+  // First, try to authenticate through SSO.
+  if (services_sso_client_authenticate_remote($form_state)) {
+    global $user;
+
+    // Through the uid into the form_state array to indicate success.
+    $form_state['uid'] = $user->uid;
+  }
+  else {
+    // Go through the normal authentication routine locally if SSO authentication failed.
+    foreach ($form['#validate_funcs'] as $func) {
+      call_user_func_array($func, array($form, &$form_state));
+    }
+
+    // Check to see if the user successfully got in locally, if not throw up
+    // that error we got by talking to the SSO server.
+    if (empty($form_state['uid']) && !empty($_SESSION['services_sso_client']['error'])) {
+      form_set_error('name', $_SESSION['services_sso_client']['error']);
+      unset($_SESSION['services_sso_client']['error']);
+    }
+  }
+}
+
+/**
+ * Update the copy of the remote SSO session and user object in $_SESSION.
+ *
+ * @param $user
+ *  The local user object containing a defined remote_id.
+ *
+ * @return bool
+ *  TRUE if remote user object is successfully returned.
+ */
+function services_sso_client_update_remote($user) {
+  // Proceed if the user has an active session resulting from successful SSO authentication.
+  if (!empty($_SESSION['services_sso_client']['data'])) {
+    // Copy the drupal_http_request response data stored from earlier for shorter code.
+    $data = $_SESSION['services_sso_client']['data'];
+
+    // Construct proper endpoint URL for the services resource
+    $endpoint_url = variable_get('services_sso_client_server_address', '') . '/' . variable_get('services_sso_client_server_endpoint', '');
+
+    // Construct proper cookie using the stored session information.
+    $headers = array(
+      'Content-Type' => 'application/json',
+      'Cookie' => $data->session_name . '=' . $data->sessid,
+    );
+
+    // Make request to REST services user.retrieve
+    $response = drupal_http_request($endpoint_url . '/user/' . $user->remote_uid . '', array('headers' => $headers));
+
+    // Decode response and update the local Drupal user in the DB if necessary.
+    if (services_sso_client_verify_response($response)) {
+      // Because the request was  user.retrieve, the user object is in the base of $response->data.
+      $remote_user = json_decode($response->data);
+
+      if (!empty($remote_user)) {
+        // Copy the user object to $_SESSION.
+        $_SESSION['services_sso_client']['data']->user = $remote_user;
+
+        // Copy the user object to Drupal.settings.
+        drupal_add_js(array('services_sso_client' => array('data' => $_SESSION['services_sso_client']['data'])), 'setting');
+
+        // Update local Drupal user in DB.
+        $account = services_sso_client_update_remote_process($remote_user);
+        return TRUE;
+      }
+    }
+  }
+
+  return FALSE;
+}
+
+/**
+ * This function will use media_internet to fetch the picture and save it locally.
+ *
+ * @param $picture
+ *  A file object or array.
+ *
+ * @return $file
+ *  A valid local file object.
+ */
+function _services_sso_client_get_provider($picture) {
+  if (is_array($picture)) {
+    $picture = (object) $picture;
+  }
+
+  if (empty($picture) || empty($picture->uri)) return FALSE;
+
+  $picture_url = ((variable_get('services_sso_client_server_address', '') && !empty($picture->uri)) ? variable_get('services_sso_client_server_address', '') . '/' . str_ireplace('public://', 'sites/default/files/', $picture->uri) : str_ireplace('public://', 'sites/default/files/', $picture->uri));
+  $provider = media_internet_get_provider($picture_url);
+  $provider->validate();
+  $file = $provider->getFileObject();
+  return $provider->save();
+}
+
+/**
+ * Process the grabbed SSO user objective appropriately.
+ *
+ * @param $user
+ *  Remote user object.
+ * @param $skip_login
+ *  Boolean for skipping Drupal login procedures.
+ * @param $form_state
+ *  Content of the user_login_form.
+ *
+ * @return $account
+ *  A valid local user account object or FALSE if not able to load local user account.
+ */
+function services_sso_client_update_remote_process($user, $skip_login = TRUE, &$form_state = array()) {
+  if (empty($user->uid) && empty($user->mail)) {
+    return FALSE;
+  }
+
+  // Selectively choose parts of the user object to save or update db components.
+  $account = array(
+    'uid' => $user->uid,
+    'name' => $user->name,
+    'mail' => $user->mail,
+    'created' => $user->created,
+    'access' => $user->access,
+    'login' => $user->login,
+    'status' => $user->status,
+    'timezone' => $user->timezone,
+    'language' => $user->language,
+    'picture' => _services_sso_client_object_to_array($user->picture),
+    'init' => empty($user->init) ? '' : $user->init,
+  );
+
+  // If we will be needing the roles to be copied locally as well.
+  if (variable_get('services_sso_client_use_roles_from_sso', FALSE)) {
+    $account['roles'] = (array) $user->roles;
+  }
+
+  // If extra settings are specified, grab the settings and copy over some additional fields.
+  if ($extras = variable_get('services_sso_client_optional_profile_fields', '')) {
+    $extras = explode("\n", $extras);
+    $extras = array_filter(array_map('trim', $extras));
+    foreach ($extras as $extra) {
+      $extra = explode("|", $extra);
+      $account[$extra[1]] = _services_sso_client_object_to_array($user->$extra[0]); //Right operand comes from SSO
+    }
+  }
+
+  // Attempt to load the local user account with the processed account info array.
+  $account = services_sso_client_load_local_user($account, $skip_login, $form_state);
+
+  // Post-save hook
+  module_invoke_all('services_sso_client_update_remote_process', $user, $account);
+
+  return $account;
+}
+
+/**
+ * Identify acceptable HTTP response codes.
+ *
+ * @param $response
+ *  Response object returned by drupal_http_request().
+ *
+ * @return bool
+ *  TRUE if response code is acceptable, otherwise FALSE.
+ */
+function services_sso_client_verify_response($response) {
+  switch ($response->code) {
+    case '200':
+      return TRUE;
+  }
+  return FALSE;
+}
+
+/**
+ * Log the user out from the Single sign-on service
+ *
+ * @param $user
+ *  The local user object for which we want to signout of the SSO service.
+ */
+function services_sso_client_logout($user) {
+  if (!empty($_SESSION['services_sso_client']['data'])) {
+    // Copy the drupal_http_request response data stored from earlier for shorter code.
+    $data = $_SESSION['services_sso_client']['data'];
+
+    // Construct proper endpoint URL for the services resource
+    $endpoint_url = variable_get('services_sso_client_server_address', '') . '/' . variable_get('services_sso_client_server_endpoint', '');
+
+    // Construct proper cookie using the stored session information.
+    $headers = array(
+      'Content-Type' => 'application/json',
+      'Cookie' => $data->session_name . '=' . $data->sessid,
+      'X-CSRF-Token' => _services_sso_client_get_csrf_token(),
+    );
+
+    // Make request to REST services user.retrieve
+    $response = drupal_http_request($endpoint_url . '/user/logout', array('headers' => $headers, 'method' => 'POST'));
+  }
+}
+
+/**
+ * Verify authentication for SSO server for user_login_form.
+ *
+ * This function will takeover authentication and attempt to authenticate with the
+ * SSO server first.
+ *
+ * @param $form_state
+ *  The form_state array from user_login_form
+ *
+ * @return bool
+ *  TRUE if authentication succeeded, otherwise
+ */
+function services_sso_client_authenticate_remote(&$form_state) {
+  global $base_path;
+  $common_cookie_domain = _services_sso_client_get_common_cookie_domain();
+
+  $username = $form_state['values']['name'];
+  $password = $form_state['values']['pass'];
+
+  // Construct full endpoint URL from saved settings in admin config.
+  $endpoint_url = variable_get('services_sso_client_server_address', '') . '/' . variable_get('services_sso_client_server_endpoint', '');
+  if (empty($endpoint_url)) {
+    services_sso_client_watchdog('SSO server not responding correctly. Check your settings.');
+    return FALSE;
+  }
+
+  // Build the necessary POST http request.
+  $data = array(
+    'username' => $username,
+    'password' => $password,
+  );
+  $data = drupal_http_build_query($data, '', '&');
+  $headers = array(
+    'Content-Type' => 'application/x-www-form-urlencoded',
+  );
+
+  // Make HTTP request.
+  $response = drupal_http_request($endpoint_url . '/user/login.json', array('headers' => $headers, 'method' => 'POST', 'data' => $data));
+
+  // Parse return data.
+  $data = json_decode($response->data);
+  // Fail if no data.
+  if (empty($data)) {
+    return FALSE;
+  }
+
+  // If account is not enabled, generate the same message as if local Drupal user account is disabled.
+  if (empty($data->user->status) && !empty($data->user->name)) {
+    services_sso_client_watchdog('Account is not enabled on SSO server. Will not continue.');
+    form_set_error('name', t('The username %name has not been activated or is blocked.', array('%name' => $form_state['values']['name'])));
+    return FALSE;
+  }
+
+  if (!empty($response->code)) {
+    switch ($response->code) {
+      case '401':
+        $message = reset($data);
+        $_SESSION['services_sso_client']['error'] = $message;
+        return FALSE;
+        break;
+    }
+  }
+
+  // Logging $data for debugging.
+  services_sso_client_watchdog($data);
+
+  // Remember data in SESSION and in Drupal.settings
+  $_SESSION['services_sso_client']['data'] = $data;
+
+  drupal_add_js(array('services_sso_client' => array('data' => $data)), 'setting');
+
+  // Do all the storing/creating for accounts.
+  $remote_user = $data->user;
+
+  // Copy the user object to $_SESSION.
+  $_SESSION['services_sso_client']['data']->user = $remote_user;
+
+  // Copy the user object to Drupal.settings.
+  drupal_add_js(array('services_sso_client' => array('data' => $_SESSION['services_sso_client']['data'])), 'setting');
+
+  $account = services_sso_client_update_remote_process($remote_user, FALSE, $form_state);
+
+  // Something went wrong with remote auth and local storage of said account.
+  if (empty($account)) {
+    return FALSE;
+  }
+
+  // Finally maybe set that common cookie
+  services_sso_client_session_set_common_cookie($data);
+
+  return TRUE;
+}
+
+/**
+ * Load the local user account.
+ *
+ * This function will create a local account mapped to the remote account if necessary.
+ *
+ * @param $user
+ *  A selectively constructed array contain info for the remote user from the SSO server.
+ * @param $skip_login
+ *  Do not perform the Drupal login routine after successfully loading a local Drupal user object.
+ * @param $views_ui_build_form_state(js, key, &view, display_id, args)
+ *  The form_state array from user_login_form.
+ *
+ * @return $account
+ *  The loaded local user object is returned. FALSE is returned if it doesn't succeed.
+ */
+function services_sso_client_load_local_user($user, $skip_login = TRUE, &$form_state) {
+  // Cherry-pick the remote uid for code readability.
+  $remote_uid = $user['uid'];
+
+  // Debugging info.
+  services_sso_client_watchdog($user);
+  services_sso_client_watchdog('Remote UID: ' . $remote_uid);
+
+  // Attempt to load existing local user for given remote UID.
+  $account = user_external_load($remote_uid);
+
+  // Debugging info.
+  services_sso_client_watchdog($account);
+
+  // Get rid of roles if needed to
+  if (!variable_get('services_sso_client_use_roles_from_sso', FALSE)) {
+    unset($user->roles);
+  }
+
+  // If we actually found a local account for the given remote UID.
+  if (!empty($account)) {
+    // Debugging info.
+    services_sso_client_watchdog('User is already cached locally; updating local account with latest info from SSO.');
+
+    // Don't save the remote password and don't write in the remote uid into the local user record.
+    unset($user['pass']);
+    unset($user['uid']);
+
+    // To compensate for errors being generated by activity_log module
+    $user['activity_log_types_all_values'] = array();
+    $user['activity_log_types'] = array();
+
+    // Check to see if the user picture has changed
+    if (empty($account->picture) || $account->picture->filename != $user['picture']['filename']) {
+      // Turn the remote picture into a local picture
+      $user['picture'] = _services_sso_client_get_provider($user['picture']);
+    }
+    else {
+      unset($user['picture']);
+    }
+
+    $account = user_save($account, $user);
+  }
+  else {
+    // See if this account name exist locally, raise flag and break out
+    if ($local_account_check = user_load_by_name($user['name'])) {
+      services_sso_client_watchdog('User name already exists in system. Cannot copy from SSO.');
+      return FALSE;
+    }
+
+    // Remove the UID
+    unset($user['uid']);
+
+    // Set theh password to something random
+    $user['pass'] = user_password();
+
+    // Turn the remote picture into a local picture
+    $user['picture'] = _services_sso_client_get_provider($user['picture']);
+
+    $account = user_save(drupal_anonymous_user(), $user);
+
+    services_sso_client_watchdog($account);
+
+    if (!empty($account)) {
+      user_set_authmaps($account, array("authname_services_sso_client" => $remote_uid));
+    }
+    else {
+      services_sso_client_watchdog('Creating account failed unexpectedly.');
+    }
+  }
+
+  if (!$skip_login) {
+    // Logged the user in
+    // Log user in.
+    $form_state['uid'] = $account->uid;
+    user_login_submit(array(), $form_state);
+  }
+
+  return $account;
+}
+
+/**
+ * Implements hook_menu_alter().
+ */
+function services_sso_client_menu_alter(&$items) {
+  $items['user/register']['page callback'] = 'services_sso_client_menu_alter_callback';
+  $items['user/register']['page arguments'] = array('user/register');
+
+  $items['user/password']['page callback'] = 'services_sso_client_menu_alter_callback';
+  $items['user/password']['page arguments'] = array('user/password');
+}
+
+/**
+ * Helper function
+ */
+function services_sso_client_menu_alter_callback($path) {
+  global $base_url;
+  $remote_url = variable_get('services_sso_client_server_address', '');
+
+  switch ($path) {
+    case 'user/register':
+      if (variable_get('services_sso_client_remote_registration_client', FALSE)) {
+        return drupal_get_form('user_register_form');
+      }
+      else {
+        drupal_goto($remote_url . '/user/register', array('query' => array(
+            'services_sso_client_url' => $base_url,
+            'services_sso_modal' => variable_get('services_sso_client_optional_load_remote_modal', FALSE),
+          )));
+      }
+      break;
+    case 'user/password':
+      drupal_goto($remote_url . '/user/password', array('query' => array(
+          'services_sso_client_url' => $base_url,
+          'services_sso_modal' => variable_get('services_sso_client_optional_load_remote_modal', FALSE),
+        )));
+      break;
+  }
+}
+
+/**
+ * Return a list of account names from SSO to ignore.
+ */
+function _services_sso_client_ignore_accounts() {
+  return array('admin', 'api');
+}
+
+function _services_sso_client_object_to_array($Class){
+  # Typecast to (array) automatically converts stdClass -> array.
+  $Class = (array)$Class;
+
+  # Iterate through the former properties looking for any stdClass properties.
+  # Recursively apply (array).
+  foreach($Class as $key => $value){
+    if((is_object($value)&&get_class($value)==='stdClass') || is_array($value)){
+      $Class[$key] = _services_sso_client_object_to_array($value);
+    }
+  }
+  return $Class;
+}
+
+/**
+ * Return a base domain for assumed cookie
+ */
+function _services_sso_client_get_common_cookie_domain() {
+  if ($cookie_domain = variable_get('services_sso_client_cookie_domain', '')) {
+    return $cookie_domain;
+  }
+
+  if (!empty($_SERVER['HTTP_HOST'])) {
+    $cookie_domain = $_SERVER['HTTP_HOST'];
+    // Strip leading periods, www., and port numbers from cookie domain.
+    $cookie_domain = ltrim($cookie_domain, '.');
+    if (count(explode('.', $cookie_domain)) > 2) {
+      $parts = explode('.', $cookie_domain);
+      $cookie_domain = $parts[count($parts) - 2] . '.' . $parts[count($parts) - 1];
+    }
+    $cookie_domain = explode(':', $cookie_domain);
+    $cookie_domain = '.' . $cookie_domain[0];
+
+    return $cookie_domain;
+  }
+}
+
+/**
+ * Check to see if a cookie_key is that of a session cookie.
+ */
+function _services_sso_client_is_session_cookie($cookie_key) {
+  return (stripos($cookie_key, 'SESS') === 0 || stripos($cookie_key, 'SSESS') === 0);
+}
+
+/**
+ * Retrieve a X-CSF token.
+ */
+function _services_sso_client_get_csrf_token($session_name = '', $sessid = '') {
+  if ((empty($session_name) || empty($sessid))) {
+    $session_name = $_SESSION['services_sso_client']['data']->session_name;
+    $sessid = $_SESSION['services_sso_client']['data']->sessid;
+  }
+
+  if (!empty($session_name) && !empty($sessid)) {
+    $headers = array(
+      'Cookie' => "{$session_name}={$sessid}",
+    );
+    $remote_url = variable_get('services_sso_client_server_address', '');
+    $response = drupal_http_request("{$remote_url}/services/session/token", array('headers' => $headers));
+    $token = empty($response->data) ? FALSE : $response->data;
+  }
+
+  return empty($token) ? FALSE : $token;
+}

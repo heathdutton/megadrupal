@@ -1,0 +1,12 @@
+<?php
+/**
+ * @file
+ * preview_sync.features.inc
+ */
+
+/**
+ * Implements hook_views_api().
+ */
+function preview_sync_views_api($module = NULL, $api = NULL) {
+  return array("api" => "3.0");
+}

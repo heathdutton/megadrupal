@@ -1,0 +1,327 @@
+<?php
+
+/**
+ * @file
+ *
+ * This module allows admins to set recurrent announcements for nodes to send
+ * to specified email addresses.
+ */
+
+/**
+ *  function medbg($obj) {
+ *  drupal_set_message("<pre>" . check_plain(print_r($obj, TRUE)) . "</pre>");
+ *  }
+ */
+
+/**
+ * Implements hook_permission().
+ */
+function meetup_events_permission() {
+  return array(
+    'administer meetup events' => array(
+      'title' => t('Administer Meetup Events'),
+      'description' => t('Create linkage to meetup events')
+    )
+  );
+}
+
+/**
+ * Implements hook_menu().
+ */
+function meetup_events_menu() {
+  $items['admin/config/system/meetup_events'] = array(
+    'title' => 'Meetup Events',
+    'description' => 'Setup Meetup Event synchronization',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('meetup_events_admin_settings'),
+    'access arguments' => array('administer meetup events'),
+    'type' => MENU_NORMAL_ITEM,
+    'file' => 'meetup_events.admin.inc',
+  );
+  return $items;
+}
+
+/**
+ * This function fetches a numeric field which might be on a node reference
+ */
+function meetup_events_fetch_numeric($node, $vfield) {
+  if (!$vfield or ($vfield == "none")) {
+    return;
+  }
+
+  $parts = explode(":", $vfield);
+
+  // if it's a single name, find and return it
+  if (!array_key_exists(1, $parts)) {
+    $venue = $node->$vfield;
+    if (array_key_exists(0, $venue['und'])) {
+      return $venue['und'][0]["value"];
+    } else {
+      return NULL;
+    }
+  }
+
+  // if it's a referenced field, deconstruct and find it
+  $ref = $parts[0];
+  $field = $parts[1];
+
+  $loc = $node->$ref;
+  $refnode = node_load($loc['und'][0]["nid"]);
+
+  $venue = $refnode->$field;
+  return $venue['und'][0]["value"];
+}
+
+/**
+ * Fetch a date field and convert it to UTC datetime
+ */
+function meetup_events_fetch_date($node, $dfield) {
+  $tz = date_default_timezone_get();
+  date_default_timezone_set('UTC');
+
+  $date = $node->$dfield;
+
+  $dtstart = new DateTime($date['und'][0]["value"]);
+
+  // Make sure to reset the timezone, we really don't want this actually global
+  date_default_timezone_set($tz);
+  return $dtstart;
+}
+
+/**
+ * Fetch the duration of an event
+ */
+function meetup_events_fetch_duration($node, $dfield) {
+  $tz = date_default_timezone_get();
+  date_default_timezone_set('UTC');
+
+  $duration = 0;
+
+  $date = $node->$dfield;
+  $dtstart = new DateTime($date['und'][0]["value"]);
+  $dtend = new DateTime($date['und'][0]["value2"]);
+  if ($dtend) {
+    $duration = $dtend->getTimestamp() - $dtstart->getTimestamp();
+  }
+
+  // Make sure to reset the timezone, we really don't want this actually global
+  date_default_timezone_set($tz);
+  return $duration;
+}
+
+function meetup_events_display_rsvp(&$node) {
+  $api = variable_get('meetup_api', array());
+
+  // if we don't have an oauth key, none of this is going to work
+  $oauth_id = $api["oauth_key"];
+  if (!$oauth_id) {
+    return;
+  }
+
+  // only bother doing anything on nodes that are actually in meetup
+  $meetup_id = meetup_events_get_meetupid($node->nid);
+  if (!$meetup_id) {
+    return;
+  }
+
+  drupal_add_js(
+    array('meetup_events' =>
+      array(
+        'force_to_meetup' => ($api["opts"]["force_to_meetup"]) ? TRUE : FALSE,
+        'oauth_key' => $api["oauth_key"])
+    ),
+    'setting'
+  );
+
+  drupal_add_js(drupal_get_path('module', 'meetup_events') . '/js/rsvp.js');
+
+  $url = '<a href="http://www.meetup.com/' .
+    $api["group_url"] . '/events/' . $meetup_id . '/" data-event="' .
+    $meetup_id . '" class="mu-rsvp-btn">RSVP</a>';
+
+  $node->content['meetup_rsvp'] = array(
+    '#value' => $url,
+    '#weight' => -10,
+  );
+}
+
+/**
+ * Implementation of hook_nodeapi()
+ */
+function meetup_events_node_insert($node) {
+  if (meetup_events_is_type_syncable($node->type)) {
+    meetup_events_sync_event($node);
+  }
+}
+
+function meetup_events_node_update($node) {
+  if (meetup_events_is_type_syncable($node->type)) {
+    meetup_events_sync_event($node);
+  }
+}
+
+function meetup_events_options_for($type) {
+  $values = variable_get("meetup_events", array());
+  $options = array();
+  $options["enabled"] = ($values[$type . "_enabled"][$type]) ? TRUE : FALSE;
+  $options["date_field"] = $values[$type]["date_field"];
+  $options["venue_field"] = $values[$type]["venue_field"];
+  $options["venue_lat"] = $values[$type]["venue_lat"];
+  $options["venue_lon"] = $values[$type]["venue_lon"];
+  $options["body"] = $values[$type]["body"];
+  return $options;
+}
+
+function meetup_events_is_type_syncable($type) {
+  $options = meetup_events_options_for($type);
+  if ($options["enabled"]) {
+    return TRUE;
+  } else {
+    return FALSE;
+  }
+}
+
+function meetup_events_sync_event(&$node) {
+  $meetupid = meetup_events_get_meetupid($node->nid);
+  if ($meetupid) {
+    meetup_events_update_event($meetupid, $node);
+  } else {
+    meetup_events_create_event($node);
+  }
+
+}
+
+function meetup_events_save_meetupid($nid, $id) {
+  $obj = (object)array(
+    "nid" => $nid,
+    "id" => $id,
+    "last_updated" => time(),
+  );
+  drupal_write_record('meetup_events', $obj);
+}
+
+function meetup_events_get_meetupid($nid) {
+  $query = db_select('meetup_events', 'm')
+    ->fields('m', array('id'))
+    ->condition("m.nid", $nid)
+    ->execute();
+  $event = $query->fetchObject();
+
+  if (!$event) {
+    return NULL;
+  } else {
+    return $event->id;
+  }
+}
+
+function meetup_events_node_data($node) {
+  // This is a hack, but it works. There should be a way to do timezone
+  // gymnastics on the DateTime field, but I'm not sure what that is yet.
+  $options = meetup_events_options_for($node->type);
+  $api = variable_get('meetup_api', array());
+
+  if (!$options["date_field"]) {
+    drupal_set_message(t("No date field specified, can't sync event. Please check your settings"));
+    return;
+  }
+
+  // TODO: validate date is in the future or don't submit
+  $date = meetup_events_fetch_date($node, $options["date_field"]);
+
+  // TODO: validate key / group look sane or don't submit
+  // TODO: add duration
+  $data = array(
+    "key" => $api["key"],
+    "group_id" => $api["group"],
+    "name" => $node->title,
+    "description" => token_replace($options["body"], array('node' => $node)),
+    "time" => $date->getTimestamp() * 1000,
+  );
+
+  $duration = meetup_events_fetch_duration($node, $options["date_field"]);
+  if ($duration) {
+    $data["duration"] = $duration * 1000;
+  }
+
+  $venue = meetup_events_fetch_numeric($node, $options["venue_field"]);
+  if ($venue) {
+    $data["venue_id"] = $venue;
+  }
+  // lat / lon fetching, only work if there is valid venue and both are valid
+  $lat = meetup_events_fetch_numeric($node, $options["venue_lat"]);
+  $lon = meetup_events_fetch_numeric($node, $options["venue_lon"]);
+  if ($lat && $lon) {
+    $data["lat"] = $lat;
+    $data["lon"] = $lon;
+  }
+
+  $request_data = http_build_query($data, '', '&');
+
+  return $request_data;
+}
+
+function meetup_events_delete_event($id) {
+  $options = array(
+    'headers' => array(
+      'Content-Type' => 'application/x-www-form-urlencoded',
+      'Accept-Charset' => 'utf-8'),
+    'method' => 'DELETE',
+    'data' => array()
+  );
+
+  $request_url = "https://api.meetup.com/2/event/$id";
+
+  $res = drupal_http_request($request_url, $options);
+  if ($res->data) {
+    drupal_set_message(t("Deleted event from meetup"));
+  } else {
+    drupal_set_message(t("Failed to delete from Meetup, you should try again later"));
+  }
+}
+
+function meetup_events_update_event($id, $node) {
+  $options = array(
+    'headers' => array(
+      'Content-Type' => 'application/x-www-form-urlencoded',
+      'Accept-Charset' => 'utf-8'),
+    'method' => 'POST',
+    'data' => meetup_events_node_data($node)
+  );
+  $request_url = "https://api.meetup.com/2/event/$id";
+
+  $res = drupal_http_request($request_url, $options);
+
+  $data = json_decode($res->data);
+  if ($data->id) {
+    drupal_set_message(t("Updated on <a href=\"@url\">Meetup</a>",
+        array('@url' => $data->event_url)));
+  } else {
+    drupal_set_message(t("Failed to update Meetup, you should try again later"));
+  }
+}
+
+function meetup_events_create_event($node) {
+  $options = array(
+    'headers' => array(
+      'Content-Type' => 'application/x-www-form-urlencoded',
+      'Accept-Charset' => 'utf-8'),
+    'method' => 'POST',
+    'data' => meetup_events_node_data($node)
+  );
+
+  $request_url = "https://api.meetup.com/2/event";
+
+  // TODO: validate data as sane before sending out
+  // TODO: refactor to a seperate upstream call
+
+  $res = drupal_http_request($request_url, $options);
+  $data = json_decode($res->data);
+  if ($data->id) {
+    meetup_events_save_meetupid($node->nid, $data->id);
+    meetup_events_update_event($data->id, $node);
+      //    drupal_set_message(t("Saved to <a href=\"@url\">Meetup</a>",
+      //  array('@url' => $data->event_url)));
+  } else {
+    drupal_set_message("Failed to save to Meetup, you should try again later");
+  }
+}

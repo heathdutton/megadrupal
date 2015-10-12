@@ -1,0 +1,403 @@
+<?php
+/**
+ * @file
+ * Main module code for PA11Y integration module.
+ *
+ * Main module functions.
+ */
+
+define('PA11Y_INTEGRATION_BATCH_SIZE', 50);
+define('PA11Y_INTEGRATION_LIMIT_INCREMENT', 5);
+/**
+ * Implements hook_menu().
+ */
+function pa11y_integration_menu() {
+
+  $admin_path = variable_get('pa11y_integration_admin_path', 'admin/config/content/pa11y_integration');
+  $items[variable_get('pa11y_integration_admin_path', 'admin/config/content/pa11y_integration')] = array(
+    'title' => 'P11YA web service integration',
+    'description' => 'Administration functions for the P11YA web service integration module',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('pa11y_integration_admin_settings_form'),
+    'access arguments' => array('administer P11YA'),
+    'file' => 'pa11y_integration.admin.inc',
+  );
+
+  $items[$admin_path . '/test'] = array(
+    'title'              => 'Start',
+    'page callback'      => 'drupal_get_form',
+    'page arguments'     => array('pa11y_integration_admin_settings_form_test_confirm', 5),
+    'file'               => 'pa11y_integration.admin.inc',
+    'access arguments'   => array('administer P11YA'),
+    'type'               => MENU_VISIBLE_IN_BREADCRUMB,
+  );
+
+  $items[$admin_path . '/delete'] = array(
+    'title'              => 'Delete',
+    'page callback'      => 'drupal_get_form',
+    'page arguments'     => array('pa11y_integration_admin_settings_form_delete_confirm', 5),
+    'file'               => 'pa11y_integration.admin.inc',
+    'access arguments'   => array('administer P11YA'),
+    'type'               => MENU_VISIBLE_IN_BREADCRUMB,
+  );
+
+  $items[$admin_path . '/run/%'] = array(
+    'title'              => 'Run',
+    'page callback'      => 'pa11y_integration_run_task_page',
+    'page arguments' => array(5),
+    'file'               => 'pa11y_integration.admin.inc',
+    'access arguments'   => array('administer P11YA'),
+    'type'               => MENU_VISIBLE_IN_BREADCRUMB,
+  );
+
+  $items['admin/reports/pa11y_integration'] = array(
+    'title' => 'P11YA Status',
+    'description' => 'Status report for the P11YA web service integration module',
+    'page callback' => 'pa11y_integration_get_results_page',
+    'access arguments' => array('administer P11YA'),
+    'access callback' => TRUE,
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_permission().
+ */
+function pa11y_integration_permission() {
+  $perms = array(
+    'administer P11YA' => array(
+      'title' => t('administer P11YA'),
+    ),
+  );
+  return $perms;
+}
+
+/**
+ * Get all the results from the PA11Y server and put them in a table.
+ */
+function pa11y_integration_get_results_page() {
+
+  require_once drupal_get_path('module', 'pa11y_integration') . '/lib/PA11Y/Client/PA11YDrupalClient.class.inc';
+  $pa11y = new lib\PA11Y\Client\PA11YDrupalClient(variable_get('pa11y_integration_url', 'http://localhost:3000'));
+  $output['pa11_results'] = array();
+
+  try{
+    $results = $pa11y->getTasksResults();
+    if ($results) {
+      foreach ($results as $task) {
+        $output[] = pa11y_integration_theme_task($task);
+      }
+    }
+    return $output;
+  }
+  catch (Exception $e) {
+    watchdog('PA11Y get results error', $e->getMessage(), NULL, WATCHDOG_ERROR);
+    return FALSE;
+  }
+
+}
+
+/**
+ * Submit one tasks to the the PA11Y server.
+ */
+function pa11y_integration_submit_task($task) {
+
+  $standard = variable_get('pa11y_integration_test_standard', 'WCAG2AA');
+
+  require_once drupal_get_path('module', 'pa11y_integration') . '/lib/PA11Y/Client/PA11YDrupalClient.class.inc';
+  $pa11y = new lib\PA11Y\Client\PA11YDrupalClient(variable_get('pa11y_integration_url', 'http://localhost:3000'));
+
+  try{
+    $pa11y->createTask($task, $standard);
+
+    // Insert task into registry.
+    db_insert('pa11y_task_registry')->fields(array(
+      'task' => $task->id,
+      'created' => time(),
+      'url' => $task->url,
+      'nid' => $task->nid,
+      ))
+      ->execute();
+
+    if (variable_get('pa11y_integration_test_run', FALSE) && !$pa11y->runTask($task->id)) {
+      throw new Exception('Failed to run task: ' . $task->id);
+    }
+    else {
+      return TRUE;
+    }
+  }
+  catch (Exception $e) {
+    watchdog('PA11Y', $e->getMessage(), NULL, WATCHDOG_ERROR);
+    return FALSE;
+  }
+  return TRUE;
+}
+/**
+ * Delete one task from PA11Y.
+ */
+function pa11y_integration_delete_task($task) {
+
+  require_once drupal_get_path('module', 'pa11y_integration') . '/lib/PA11Y/Client/PA11YDrupalClient.class.inc';
+  $pa11y = new lib\PA11Y\Client\PA11YDrupalClient(variable_get('pa11y_integration_url', 'http://localhost:3000'));
+
+  if ($pa11y->deleteTask($task->id)) {
+    // Delete task from registry.
+    db_delete('pa11y_task_registry')->condition('task', $task->id)->execute();
+  }
+  else {
+    throw new \Exception('PA11Y delete tasks failed for task: ' . $task->id);
+  }
+  return TRUE;
+}
+
+/**
+ * Get all the content to add to the PA11Y server.
+ */
+function pa11y_integration_get_content($offset = 0) {
+
+  $result = db_select('node', 'n')->fields('n', array('nid', 'title'))->condition('status', 1)->range($offset, PA11Y_INTEGRATION_BATCH_SIZE)->execute();
+
+  while ($node = $result->fetchAssoc()) {
+
+    $return[] = pa11y_integration_create_task_from_node($node);
+  }
+
+  return $return;
+
+}
+
+/**
+ * Get content that has been submitted as a task to PA11Y but has not yet run.
+ */
+function pa11y_integration_get_cron_content() {
+
+  $return = array();
+
+  $query = db_select('node', 'n');
+  $query->join('pa11y_task_registry', 'pa', 'pa.nid = n.nid');
+  $query->fields('n', array('nid', 'title'))
+        ->fields('pa', array('task', 'id'))
+        ->condition('status', 1)
+        ->condition('pa.has_run', 0)
+        ->range(0, variable_get('pa11y_integration_run_cron_limit', 10) * PA11Y_INTEGRATION_LIMIT_INCREMENT);
+
+  $result = $query->execute();
+
+  while ($node = $result->fetchAssoc()) {
+
+    $return[] = pa11y_integration_create_task_from_node($node);
+  }
+
+  return $return;
+
+}
+
+/**
+ * Wrapper function for the menu item to run an individual task.
+ */
+function pa11y_integration_run_task_page($task_id = FALSE) {
+
+  $task = new stdClass();
+  $task->task = $task_id;
+  // Call the actual function to run the task.
+  if (pa11y_integration_run_task($task)) {
+    drupal_set_message(t('Task @task_id was submmitted successfully', array('@task_id' => $task_id)));
+    drupal_goto('/admin/reports/pa11y_integration');
+  }
+  else {
+    drupal_set_message(t('Task @task_id could not be submmitted successfully', array('@task_id' => $task_id)), 'error');
+    drupal_goto('/admin/reports/pa11y_integration');
+  }
+
+}
+/**
+ * Run an individual task, already created on the PA11Y webservice.
+ */
+function pa11y_integration_run_task($task_id = FALSE) {
+
+  if (!$task_id) {
+    throw new \Exception('PA11Y run task failed due to lack of task id');
+  }
+
+  require_once drupal_get_path('module', 'pa11y_integration') . '/lib/PA11Y/Client/PA11YDrupalClient.class.inc';
+  $pa11y = new lib\PA11Y\Client\PA11YDrupalClient(variable_get('pa11y_integration_url', 'http://localhost:3000'));
+
+  try {
+    $pa11y->runTask($task_id);
+
+  }
+  catch (\Exception $e) {
+    throw new \Exception('PA11Y run task failed for task: ' . print_r($e, TRUE));
+  }
+
+  return TRUE;
+}
+
+/**
+ * Implements hook_menu_breadcrumb_alter().
+ */
+function pa11y_integration_menu_breadcrumb_alter(&$active_trail, $item) {
+
+  // Ensure the current menu item is in the trail.
+  if (!drupal_is_front_page()) {
+    $end = end($active_trail);
+    if ($item['href'] == $end['href']) {
+      $active_trail[] = $end;
+    }
+  }
+}
+
+/**
+ * Implements hook_help().
+ */
+function pa11y_integration_help($path, $arg) {
+  switch ($path) {
+    case 'admin/help#pa11y_integration':
+      // Return a line-break version of the module README.txt
+      return check_markup(file_get_contents(dirname(__FILE__) . "/README.txt"));
+  }
+}
+
+/**
+ * Format a task for display.
+ */
+function pa11y_integration_theme_task($task) {
+
+  $result_array = array();
+  $output = array(
+    'site-overview' => array(),
+    'header' => array(),
+    'results' => array(),
+    '#prefix' => '<div class="result">',
+    '#suffix' => '</div>',
+    '#attached' => array('css' => array(drupal_get_path('module', 'pa11y_integration') . '/pa11y_integration.admin.css')),
+  );
+
+  // Convert objects in the results array into arrays.
+  if (isset($task->results)) {
+    foreach ($task->results as $result) {
+      $result_array[] = array(
+        'data' => array($result->code, $result->message, $result->type),
+        'class' => array($result->type),
+      );
+    }
+  }
+
+  $output['site-overview'] = array(
+    '#theme' => 'table',
+    '#rows' => array(
+      array('page', l($task->name, $task->url)),
+      array('date', $task->date),
+    ),
+  );
+
+  if ($result_array) {
+    $output['header'] = array(
+      '#theme' => 'table',
+      '#rows' => array(
+        array(
+          'data' => array('total', $task->count->total), 'class' => array('total')),
+        array(
+          'data' => array('error', $task->count->error), 'class' => array('error')),
+        array(
+          'data' => array('warning', $task->count->warning), 'class' => array('warning')),
+        array(
+          'data' => array('notice', $task->count->notice), 'class' => array('notice')),
+      ),
+    );
+
+    drupal_add_library('system', 'drupal.collapse');
+
+    $output['details'] = array(
+      '#type' => 'fieldset',
+      '#title' => t('Results'),
+      'value' => array(
+        '#theme' => 'table',
+        '#header' => array('code', 'message', 'type'),
+        '#rows' => $result_array),
+      '#attributes' => array(
+        'class' => array(
+          'collapsed', 'collapsible'),
+      ),
+    );
+  }
+  else {
+    $output['results'] = array(
+      '#markup' => '<div class="task not run">' . t('Results not ready for task: <strong>!task</strong>.<br/> Please try again later or !link',
+         array(
+           '!task' => $task->name,
+           '!link' => l(t('Run Again'), variable_get('pa11y_integration_admin_path', 'admin/config/content/pa11y_integration') . '/run/' . $task->id),
+         )
+      ) . '</div>',
+    );
+  }
+
+  return $output;
+}
+
+/**
+ * Implements hook_cron_queue_info().
+ */
+function pa11y_integration_cron_queue_info() {
+  $queue['pa11y_integration_queue'] = array('worker callback' => 'pa11y_integration_queue_worker', 'time' => 60);
+  return $queue;
+}
+
+/**
+ * Worker callback function for cron.
+ */
+function pa11y_integration_queue_worker($task) {
+
+  if (pa11y_integration_run_task($task)) {
+
+    db_update('pa11y_task_registry')->fields(array(
+      'has_run' => 1))
+      ->condition('id', $task->id)
+      ->execute();
+  }
+}
+
+/**
+ * Implements hook_cron().
+ */
+function pa11y_integration_cron() {
+  // Create the actual queue.
+  $queue = DrupalQueue::get('pa11y_integration_queue');
+
+  // Get all data for your queue.
+  $data = pa11y_integration_get_cron_content();
+
+  // Fill the queue.
+  foreach ($data as $task) {
+    $queue->createItem($task);
+  }
+}
+
+/**
+ * Convert a node into a task.
+ */
+function pa11y_integration_create_task_from_node($node) {
+  $task = new stdClass();
+
+  // Ensure url is always available.
+  $task->url = url('node/' . $node['nid'], array('absolute' => TRUE));
+
+  foreach ($node as $attribute => $value) {
+    switch ($attribute) {
+      case 'url':
+        $task->url = url('node/' . $node['nid'], array('absolute' => TRUE));
+        break;
+
+      case 'title':
+        $task->name = $value;
+        break;
+
+      default:
+        $task->$attribute = $value;
+
+    }
+  }
+
+  return $task;
+}
