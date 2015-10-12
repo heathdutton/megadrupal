@@ -15,6 +15,8 @@
         var y = -42;
         options.offset = [x, y];
       }
+      options.noHide = false;
+      options.pane = 'popupPane';
       lFeature.bindLabel(feature.label, options);
     }
   });

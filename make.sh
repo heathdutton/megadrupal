@@ -54,16 +54,16 @@ make(){
   echo "Copying make file into repo"
   cp "$BASEDIR/drupal-org-$version.make" "$repoDir/drupal-org-$version.make"
 
-  # echo "Committing all changes."
-  # git add .
-  # git commit --all --message="$(datestamp)"
+  echo "Committing all changes."
+  git add .
+  git commit --all --message="$(datestamp)"
 
-  # echo "Cleaning up Git."
-  # git remote prune origin
-  # git gc
+  echo "Cleaning up Git."
+  git remote prune origin
+  git gc
 
-  # echo "Pushing changes."
-  # git push origin master:master --force
+  echo "Pushing changes."
+  git push origin master:master --force
 }
 
 # make 6

@@ -18,7 +18,7 @@ sure this library is present and enabled on the server.
 Installation
 Install module like usual. No special installation considerations
 
-Configuration
+Configuration 
 No configuration options. After enabling the module, it will perform an
 alternative server side extension validation on every uploaded file of every
 content type file field.

@@ -17,18 +17,17 @@ class EntityCollectionStorageDB extends EntityCollectionStorage {
     if (isset($collection->contexts) && empty($contexts)) {
       $contexts = $collection->contexts;
     }
-    $record = $this->getRecord($collection, $tree, $position, $contexts, $depth);
-    $primary_keys = array();
+    $record = $this->getRecord($collection, $tree, $contexts, $position, $depth);
     if ($record) {
+      $primary_keys = array();
       if ($this->itemExists($collection, $record->eid, $record->entity_type, $contexts)) {
         $primary_keys = $this->getPrimaryKeys();
       }
       drupal_write_record('entity_collection_storage', $record, $primary_keys);
     }
-    $i = 0;
-    foreach ($tree->getChildren() as $node) {
-      $this->save($collection, $node, $contexts, $i, $depth + 1);
-      $i++;
+    $pos = 0;
+    foreach ($tree->getChildren() as $child_entity) {
+      $this->save($collection, $child_entity, $contexts, $pos++, ($depth + 1));
     }
   }
 
@@ -75,7 +74,7 @@ class EntityCollectionStorageDB extends EntityCollectionStorage {
   /**
    * @see EntityCollectionStorageInterface::getRecord().
    */
-  protected function getRecord(EntityCollection $collection, EntityCollectionTreeNode $item, $position = 0, $contexts = array(), $depth = 0) {
+  protected function getRecord(EntityCollection $collection, EntityCollectionTreeNode $item, $contexts = array(), $position = 0, $depth = 0) {
     if (isset($item->content)) {
       $record = new stdClass();
       $record->name = $collection->name;
@@ -84,10 +83,10 @@ class EntityCollectionStorageDB extends EntityCollectionStorage {
       }
       $record->entity_type = $item->type;
       $record->eid = $item->entity_id;
-      $record->depth = isset($item->parent) && isset($item->parent->key) ? $depth : 0;;
+      $record->depth = isset($item->parent) && isset($item->parent->key) ? $depth : 0;
       $record->style = $item->style;
       $record->parent = isset($item->parent) && isset($item->parent->key) ? $item->parent->key : 0;
-      $record->position = $position;
+      $record->position = ($position >= 0) ? $position : 0;
       $record->contexts = $this->serializeContexts($contexts);
       return $record;
     }

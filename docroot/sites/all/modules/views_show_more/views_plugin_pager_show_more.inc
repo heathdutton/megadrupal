@@ -10,16 +10,21 @@ class ViewsShowMorePlugin extends views_plugin_pager_full {
    * Summary title overwrite.
    */
   function summary_title() {
-    $count = !empty($this->options['offset']) ? $this->options['offset'] : $this->options['items_per_page'];
+    $initial = !empty($this->options['initial']) ? $this->options['initial'] : $this->options['items_per_page'];
+
+    $offset = '';
+    if (!empty($this->options['offset'])) {
+      $offset = ', skip ' . $this->options['offset'];
+    }
 
     return format_plural(
-      $count, 'Initial @skip item, ', 'Initial @skip items, ', array('@skip' => $count))
+      $initial, 'Initial @initial item, ', 'Initial @initial items, ', array('@initial' => $initial))
     . format_plural(
       $this->options['items_per_page'], 'Per click @count item', 'Per click @count items',
       array(
         '@count' => $this->options['items_per_page'],
       )
-    );
+    ) . $offset;
   }
 
   /**
@@ -37,6 +42,9 @@ class ViewsShowMorePlugin extends views_plugin_pager_full {
     $options['show_more_empty_text'] = array(
       'default' => '',
       'translatable' => TRUE,
+    );
+    $options['initial'] = array(
+      'default' => 0,
     );
     $options['effects'] = array(
       'contains' => array(
@@ -68,11 +76,6 @@ class ViewsShowMorePlugin extends views_plugin_pager_full {
       $form[$ex]['#attributes'] = array('class' => array('element-invisible'));
     }
 
-    $form['items_per_page']['#description'] = t('The number of items to display per show more click.');
-
-    $form['offset']['#title'] = t('Initial items');
-    $form['offset']['#description'] = t('The number of items to display initially. Enter 0 for use same as items per page (show more click).');
-
     // Result display method.
     $form['result_display_method'] = array(
       '#type' => 'select',
@@ -83,16 +86,18 @@ class ViewsShowMorePlugin extends views_plugin_pager_full {
         'html' => t('Replace'),
       ),
       '#default_value' => $this->options['result_display_method'] ? $this->options['result_display_method'] : 'append',
-      '#weight' => -1,
+      '#weight' => 0,
     );
+
     // Option for users to specify the text used on the 'show more' button.
     $form['show_more_text'] = array(
       '#type' => 'textfield',
       '#title' => t('Show more pager link text'),
       '#description' => t('Text for the button which used to load more items. Like "Show More".'),
       '#default_value' => $this->options['show_more_text'] ? $this->options['show_more_text'] : t('Show more'),
-      '#weight' => -1,
+      '#weight' => 1,
     );
+
     // Option for users to specify the text used on the 'show more' button
     // when no mor result is found.
     $form['show_more_empty_text'] = array(
@@ -100,10 +105,30 @@ class ViewsShowMorePlugin extends views_plugin_pager_full {
       '#title' => t('Show more pager link text when empty'),
       '#description' => t('Empty text when no more items exist to load. Like "No more results".'),
       '#default_value' => $this->options['show_more_empty_text'] ? $this->options['show_more_empty_text'] : '',
-      '#weight' => -1,
+      '#weight' => 2,
     );
 
-    // Affect the way that Views Load More adds new rows.
+    // Initial items count.
+    $form['initial'] = array(
+      '#type' => 'textfield',
+      '#title' => t('Initial items'),
+      '#description' => t('The number of items to display initially. Enter 0 for use same as items per page (show more click).'),
+      '#default_value' => $this->options['initial'] ? $this->options['initial'] : 0,
+      '#weight' => 3,
+      '#element_validate' => array('views_show_more_integer_positive'),
+    );
+
+    // Twick item per page description and weight.
+    $form['items_per_page']['#description'] = t('The number of items to display per show more click.');
+    $form['items_per_page']['#weight'] = 4;
+
+    // Twick offset weight.
+    $form['offset']['#weight'] = 5;
+
+    // Twick pager id weight.
+    $form['id']['#weight'] = 5;
+
+    // Effects for loading adds new rows.
     $form['effects'] = array(
       '#type' => 'fieldset',
       '#collapsible' => TRUE,
@@ -111,6 +136,7 @@ class ViewsShowMorePlugin extends views_plugin_pager_full {
       '#tree' => TRUE,
       '#title' => t('Animation'),
       '#input' => TRUE,
+      '#weight' => 7,
     );
     $form['effects']['type'] = array(
       '#type' => 'select',
@@ -155,6 +181,41 @@ class ViewsShowMorePlugin extends views_plugin_pager_full {
       '#element_validate' => array('element_validate_integer_positive'),
     );
 
+    // Pager style settings.
+    // $form['pager_style'] = array(
+    //   '#type' => 'fieldset',
+    //   '#collapsible' => TRUE,
+    //   '#collapsed' => TRUE,
+    //   '#tree' => TRUE,
+    //   '#title' => t('Pager style settings'),
+    //   '#input' => TRUE,
+    //   '#weight' => 9,
+    // );
+
+    // $element_options = array(
+    //   'div' => 'DIV',
+    //   'span' => 'SPAN',
+    //   'p' => 'P',
+    //   'strong' => 'STRONG',
+    //   'em' => 'EM',
+    // );
+    // $form['pager_style']['html'] = array(
+    //   '#type' => 'checkbox',
+    //   '#title' => t('Customize field HTML'),
+    // );
+    // $form['pager_style']['html_element'] = array(
+    //   '#type' => 'select',
+    //   '#title' => t('HTML element'),
+    //   '#description' => t('Choose the HTML element to wrap around this field, e.g. div, span, etc.'),
+    //   '#options' => $element_options,
+    //   '#attributes' => array('class' => array('dependent-options')),
+    //   '#states' => array(
+    //     'visible' => array(
+    //       '#edit-pager-options-pager-style-html' => array('checked' => TRUE),
+    //     ),
+    //   ),
+    // );
+
     // Advanced options, override default selectors.
     $form['advance'] = array(
       '#type' => 'fieldset',
@@ -163,6 +224,7 @@ class ViewsShowMorePlugin extends views_plugin_pager_full {
       '#tree' => TRUE,
       '#title' => t('Advanced Options'),
       '#input' => TRUE,
+      '#weight' => 9,
     );
     // Option to specify the content_selector, which is the wrapping div for
     // views rows. This allows the JS to both find new rows on next pages and
@@ -209,16 +271,16 @@ class ViewsShowMorePlugin extends views_plugin_pager_full {
     parent::query();
 
     $others_page = $this->options['items_per_page'];
-    $first_page = !empty($this->options['offset']) ? $this->options['offset'] : $others_page;
+    $limit = !empty($this->options['initial']) ? $this->options['initial'] : $others_page;
+    $offset = !empty($this->options['offset']) ? $this->options['offset'] : 0;
 
-    if ($this->current_page == 0) {
-      $this->view->query->limit = $first_page;
-      $this->view->query->offset = 0;
+    if ($this->current_page != 0) {
+      $offset = $limit + (($this->current_page - 1) * $others_page) + $offset;
+      $limit = $others_page;
     }
-    else {
-      $this->view->query->limit = $others_page;
-      $this->view->query->offset = $first_page + (($this->current_page - 1) * $others_page);
-    }
+
+    $this->view->query->set_limit($limit);
+    $this->view->query->set_offset($offset);
   }
 
   /**
@@ -241,7 +303,7 @@ class ViewsShowMorePlugin extends views_plugin_pager_full {
    */
   function get_pager_total() {
     if ($items_per_page = intval($this->get_items_per_page())) {
-      if ($initial_items = intval($this->get_offset())) {
+      if ($initial_items = intval($this->get_initial())) {
         return 1 + ceil(($this->total_items - $initial_items) / $items_per_page);
       }
       else {
@@ -259,8 +321,20 @@ class ViewsShowMorePlugin extends views_plugin_pager_full {
    */
   function execute_count_query(&$count_query) {
     $this->total_items = $count_query->execute()->fetchField();
+    if (!empty($this->options['offset'])) {
+      $this->total_items -= $this->options['offset'];
+    }
+
     $this->update_page_info();
     return $this->total_items;
+  }
+
+  /**
+   * Get the page initial items count.
+   */
+  function get_initial() {
+    $items_per_page = intval($this->get_items_per_page());
+    return isset($this->options['initial']) ? $this->options['initial'] : $items_per_page;
   }
 
 }

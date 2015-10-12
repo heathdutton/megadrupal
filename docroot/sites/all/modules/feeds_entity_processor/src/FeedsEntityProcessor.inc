@@ -272,12 +272,36 @@ class FeedsEntityProcessor extends FeedsProcessor {
     $targets[$entity_info['entity keys']['id']]['optional_unique'] = TRUE;
 
     // Let other modules expose mapping targets.
-    self::loadMappers();
-    $type = $this->entityType();
-    $bundle = $this->bundle();
-    drupal_alter('feeds_processor_targets', $targets, $type, $bundle);
+    $this->getHookTargets($targets);
 
     return $targets;
+  }
+
+  /**
+   * Overrides FeedsProcessor::existingEntityId().
+   *
+   * Tries to retrieve entity by ID if marked as unique target.
+   */
+  protected function existingEntityId(FeedsSource $source, FeedsParserResult $result) {
+    $targets = $this->uniqueTargets($source, $result);
+
+    $entity_info = $this->entityInfo();
+    $entity_type = $this->entityType();
+    if (!empty($entity_info['entity keys']['id']) && isset($targets[$entity_info['entity keys']['id']])) {
+      $entity_id = $targets[$entity_info['entity keys']['id']];
+      // Check if entity ID exists.
+      $query = new EntityFieldQuery();
+      $query->entityCondition('entity_type', $entity_type)
+        ->entityCondition('entity_id', $entity_id);
+
+      $query_result = $query->execute();
+      if (!empty($query_result[$entity_type])) {
+        return $entity_id;
+      }
+    }
+
+    // If no entity was found by now, try parent.
+    return parent::existingEntityId($source, $result);
   }
 
 }
