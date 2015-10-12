@@ -47,10 +47,9 @@ make(){
 
   echo "Cleaning out repo files to be replaced with those from make process"
   rm -rf "$repoDir"
-  mkdir "$repoDir"
 
   echo "Moving make files into repo"
-  cp -r "$tmpDir/*" "$repoDir"
+  mv "$tmpDir" "$repoDir"
 
   echo "Copying make file into repo"
   cp "$BASEDIR/drupal-org-$version.make" "$repoDir/drupal-org-$version.make"
