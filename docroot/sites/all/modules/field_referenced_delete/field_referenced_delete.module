@@ -1,0 +1,207 @@
+<?php
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function field_referenced_delete_form_field_ui_field_edit_form_alter(&$form, &$form_state) {
+  _field_referenced_delete_add_field_settings($form['#field'], $form['field']['settings']);
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function field_referenced_delete_form_field_ui_field_settings_form_alter(&$form, &$form_state) {
+  $field = field_info_field($form['field']['field_name']['#value']);
+  _field_referenced_delete_add_field_settings($field, $form['field']['settings']);
+
+  // Remove the 'field has no settings' if we added our fields to this form.
+  if (!empty($form['field']['settings']['#markup']) && element_children($form['field']['settings'])) {
+    unset($form['field']['settings']['#markup']);
+  }
+}
+
+/**
+ * Helper to add our option to field UI forms.
+ */
+function _field_referenced_delete_add_field_settings($field, &$field_settings) {
+  if (!empty($field['locked'])) {
+    // Do not add UI elements to locked fields.
+    return;
+  }
+
+  // Check that this is reference field.
+  $info = field_referenced_delete_get_reference_fields($field['field_name']);
+  if (empty($info)) {
+    return;
+  }
+
+  $field['settings'] += array('delete_on_parent_delete' => '');
+  $field_settings['delete_on_parent_delete'] = array(
+    '#type' => 'radios',
+    '#title' => t('Should entities from this field be deleted if their parent is deleted?'),
+    '#options' => array(
+      '' => t('Never delete'),
+      'if-unused' => t('Only delete if not referenced by any other entity aside from the parent'),
+      'always' => t('Always delete'),
+    ),
+    '#default_value' => $field['settings']['delete_on_parent_delete'],
+  );
+}
+
+/**
+ * Implements hook_entity_delete().
+ */
+function field_referenced_delete_entity_delete($entity, $entity_type) {
+  $results = field_referenced_delete_get_deletable_entities($entity_type, $entity);
+  foreach ($results as $type => $ids) {
+    if (module_exists('entity_bulk_delete')) {
+      entity_bulk_delete($type, $ids, TRUE);
+    }
+    else {
+      entity_delete_multiple($type, $ids);
+    }
+  }
+}
+
+function field_referenced_delete_extract_field_items_column($items, $column) {
+  $return = array();
+  foreach ($items as $item) {
+    if (!empty($item[$column])) {
+      $return[] = $item[$column];
+    }
+  }
+  return $return;
+}
+
+function field_referenced_delete_get_deletable_entities($entity_type, $entity) {
+  list($entity_id, , $bundle) = entity_extract_ids($entity_type, $entity);
+
+  $results = array();
+
+  $reference_fields = field_referenced_delete_get_reference_fields();
+  $fields = array_intersect_key($reference_fields, field_info_instances($entity_type, $bundle));
+  foreach ($fields as $field_name => $columns) {
+    $field = field_info_field($field_name);
+
+    if (empty($field['settings']['delete_on_parent_delete'])) {
+      continue;
+    }
+
+    foreach ($columns as $column => $column_entity_type) {
+      if ($items = field_get_items($entity_type, $entity, $field_name)) {
+        if ($ids = field_referenced_delete_extract_field_items_column($items, $column)) {
+          $ids = array_map('intval', $ids);
+          foreach ($ids as $id) {
+            switch ($field['settings']['delete_on_parent_delete']) {
+              case 'always':
+                $results[$column_entity_type][$id] = $id;
+                break;
+              case 'if-unused':
+                $references = field_referenced_delete_get_references($column_entity_type, $id);
+                // Make sure to exclude this currently-deleted entity.
+                unset($references[$entity_type][$entity_id]);
+                if (!array_filter($references)) {
+                  $results[$column_entity_type][$id] = $id;
+                }
+                break;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  drupal_alter('field_referenced_delete_deletable_entities', $results, $entity_type, $entity);
+
+  return $results;
+}
+
+function field_referenced_delete_get_reference_fields($field_name = NULL) {
+  $results = &drupal_static(__FUNCTION__);
+
+  if (!isset($results)) {
+    if ($cache = cache_get('field_referenced_delete_fields', 'cache_field')) {
+      $results = $cache->data;
+    }
+    else {
+      $entity_info = entity_get_info();
+      $base_tables = array();
+      foreach ($entity_info as $type => $type_info) {
+        if (!empty($type_info['base table']) && !empty($type_info['entity keys']['id'])) {
+          $base_tables[$type_info['base table']] = array('type' => $type, 'column' => $type_info['entity keys']['id']);
+        }
+      }
+
+      $results = array();
+      $fields = field_info_fields();
+      foreach ($fields as $field) {
+        // Cannot rely on entityreference fields having correct foreign key info.
+        // @todo Remove when http://drupal.org/node/1969018 is fixed.
+        if ($field['type'] != 'entityreference') {
+          foreach ($field['foreign keys'] as $foreign_key) {
+            if (isset($base_tables[$foreign_key['table']])) {
+              $base_table = $base_tables[$foreign_key['table']];
+              if ($column = array_search($base_table['column'], $foreign_key['columns'])) {
+                $results[$field['field_name']][$column] = $base_table['type'];
+              }
+            }
+          }
+        }
+        else {
+          // Special handling for entity reference fields.
+          $type = $field['settings']['target_type'];
+          if (!empty($entity_info[$type]['base table']) && !empty($entity_info[$type]['entity keys']['id'])) {
+            $results[$field['field_name']]['target_id'] = $type;
+          }
+        }
+      }
+
+      drupal_alter('field_referenced_delete_fields', $results);
+      cache_set('field_referenced_delete_fields', $results, 'cache_field');
+    }
+  }
+
+  if (isset($field_name)) {
+    return !empty($results[$field_name]) ? $results[$field_name] : array();
+  }
+  else {
+    return $results;
+  }
+}
+
+function field_referenced_delete_get_references($entity_type, $entity_id) {
+  $references = array();
+
+  $fields = field_referenced_delete_get_reference_fields();
+  foreach ($fields as $field_name => $columns) {
+    foreach ($columns as $column => $column_entity_type) {
+      if ($column_entity_type == $entity_type) {
+        $query = new EntityFieldQuery();
+        $query->fieldCondition($field_name, $column, $entity_id);
+        $references = drupal_array_merge_deep($references, $query->execute());
+
+        // Check this field's instances' default values for this entity.
+        $field = field_info_field($field_name);
+        foreach ($field['bundles'] as $type => $bundles) {
+          foreach ($bundles as $bundle) {
+            $instance = field_info_instance($type, $field_name, $bundle);
+            if ($default_value = field_get_default_value($type, NULL, $field, $instance)) {
+              if ($ids = field_referenced_delete_extract_field_items_column($default_value, $column)) {
+                if (in_array($entity_id, $ids)) {
+                  $references['_field_default_value'][$field_name] = $field_name;
+                  // We found the entity in a default value, so stop bothering
+                  // inspecting the rest of the instance default values.
+                  break 3;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  drupal_alter('field_referenced_delete_references', $references);
+
+  return $references;
+}

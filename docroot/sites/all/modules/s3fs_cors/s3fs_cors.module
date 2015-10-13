@@ -1,0 +1,611 @@
+<?php
+/**
+ * @file
+ * Allow uploading of files directly to AmazonS3 via the browser using CORS.
+ */
+
+/**
+ * Implements hook_menu().
+ */
+function s3fs_cors_menu() {
+  $items = array();
+  $items['ajax/s3fs_cors'] = array(
+    'title' => 'S3 Request Signature Callback',
+    'page callback' => 's3fs_cors_sign_request',
+    // TODO: Add a permission for this? Or at least restrict to logged-in users.
+    'access callback' => TRUE,
+    'type' => MENU_CALLBACK,
+  );
+  $items['admin/config/media/s3fs/cors'] = array(
+    'title' => 'CORS Upload',
+    'description' => 'Configure S3 File System CORS Upload.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('s3fs_cors_admin_form'),
+    'access arguments' => array('administer s3fs CORS'),
+    'file' => 's3fs_cors.admin.inc',
+    'type' => MENU_LOCAL_TASK,
+    'weight' => 20,
+  );
+  return $items;
+}
+
+/**
+ * Implements hook_permission().
+ */
+function s3fs_cors_permission() {
+  return array(
+    'administer s3fs CORS' => array(
+      'title' => t('Administer S3 File System CORS Upload'),
+    ),
+    'generate s3fs CORS upload parameters' => array(
+      'title' => t('Generate CORS Upload Parameters'),
+    ),
+  );
+}
+
+/**
+ * Implements hook_help().
+ */
+function s3fs_cors_help($path, $arg) {
+  if ($path == 'admin/config/media/s3fs/cors') {
+    $msg = t('Configure your S3 Bucket\'s CORS configuration from this page.
+      Please be aware that submitting this form will <b>overwrite</b> your bucket\'s current CORS config.<br>
+      So if you intend to configure your bucket\'s CORS policy manually, <b>never submit this form</b>.'
+    );
+    return "<p>$msg</p>";
+  }
+}
+
+/**
+ * Implements hook_element_info().
+ */
+function s3fs_cors_element_info() {
+  $config = _s3fs_get_config();
+  $file_path = drupal_get_path('module', 's3fs_cors');
+  $types['s3fs_cors_upload'] = array(
+    '#input' => TRUE,
+    '#process' => array('s3fs_cors_upload_process'),
+    '#value_callback' => 's3fs_cors_upload_value',
+    '#element_validate' => array('s3fs_cors_upload_validate'),
+    '#pre_render' => array('file_managed_file_pre_render'),
+    '#theme' => 's3fs_cors_upload',
+    '#theme_wrappers' => array('form_element'),
+    '#upload_validators' => array(),
+    // The default directory for uploaded files. This will be overidden later,
+    // but we must set it here to satisfy an internal Drupalism.
+    '#upload_location' => 's3://',
+    '#size' => 22,
+    '#extended' => FALSE,
+    '#attached' => array(
+      'js' => array(
+        $file_path . '/s3fs_cors.js',
+        // The File module's JS does things like client side validation for us.
+        drupal_get_path('module', 'file') . '/file.js',
+      ),
+      'library' => array(array('system', 'ui.progressbar')),
+    ),
+  );
+  return $types;
+}
+
+/**
+ * Implements hook_field_widget_info().
+ */
+function s3fs_cors_field_widget_info() {
+  return array(
+    's3fs_cors' => array(
+      'label' => t('S3 CORS File Upload'),
+      'field types' => array('file', 'image'),
+      'behaviors' => array(
+        'multiple values' => FIELD_BEHAVIOR_CUSTOM,
+        'default value' => FIELD_BEHAVIOR_NONE,
+      ),
+      // Make sure our widget doesn't take over the File widget as the default.
+      'weight' => 999,
+    ),
+  );
+}
+
+/**
+ * Implements hook_field_widget_form().
+ */
+function s3fs_cors_field_widget_form(&$form, &$form_state, $field, $instance, $langcode, $items, $delta, $element) {
+  // A lot of this is borrowed from file_field_widget_form().
+  $defaults = array(
+    'fid' => 0,
+    'display' => !empty($field['settings']['display_default']),
+    'description' => '',
+  );
+
+  // Load the items for form rebuilds from the field state as they might not be
+  // in $form_state['values'] because of validation limitations. Also, they are
+  // only passed in as $items when editing existing entities.
+  $field_state = field_form_get_state($element['#field_parents'], $field['field_name'], $langcode, $form_state);
+  if (isset($field_state['items'])) {
+    $items = $field_state['items'];
+  }
+
+  // Since the upload isn't going through PHP, it is limited only by S3's max
+  // filesize for single-part uploads, which is 5GB.
+  $validators = file_field_widget_upload_validators($field, $instance);
+  $max_filesize = parse_size('5G');
+  // If the user is on IE8 or 9, they can't do CORS uploads, so PHP's upload
+  // size limit matters.
+  if (isset($_SERVER['HTTP_USER_AGENT']) && preg_match('/MSIE [8-9]\.0/', $_SERVER['HTTP_USER_AGENT'])) {
+    $max_filesize = parse_size(file_upload_max_size());
+  }
+  // If the admin has specified a smaller max size, use that.
+  if (!empty($instance['settings']['max_filesize']) && parse_size($instance['settings']['max_filesize']) < $max_filesize) {
+    $max_filesize = parse_size($instance['settings']['max_filesize']);
+  }
+  $validators['file_validate_size'] = array($max_filesize);
+
+  // We use the s3fs_cors_upload type, which is based of of the managed_file type,
+  // extended with some enhancements for CORS.
+  $element_info = element_info('s3fs_cors_upload');
+  $element += array(
+    '#type' => 's3fs_cors_upload',
+    '#upload_location' => file_field_widget_uri($field, $instance),
+    // TODO: See https://www.drupal.org/node/2185925 for ideas on how to
+    // deal with file_field_widget_upload_validators() being too restrictive on file size.
+    '#upload_validators' => $validators,
+    '#value_callback' => 's3fs_cors_field_widget_value',
+    '#process' => array_merge($element_info['#process'], array('file_field_widget_process')),
+    // Allows this field to return an array instead of a single value.
+    '#extended' => TRUE,
+  );
+
+  if ($field['cardinality'] == 1) {
+    // Set the default value.
+    $element['#default_value'] = !empty($items) ? $items[0] : $defaults;
+    // If there's only one field, return it as delta 0.
+    if (empty($element['#default_value']['fid'])) {
+      $element['#description'] = theme('file_upload_help', array('description' => $element['#description'], 'upload_validators' => $element['#upload_validators']));
+    }
+    $elements = array($element);
+  }
+  else {
+    // If there are multiple values, add an element for each existing one.
+    foreach ($items as $item) {
+      $elements[$delta] = $element;
+      $elements[$delta]['#default_value'] = $item;
+      $elements[$delta]['#weight'] = $delta;
+      $delta++;
+    }
+    // And then add one more empty row for new uploads except when this is a
+    // programmed form as it is not necessary.
+    if (($field['cardinality'] == FIELD_CARDINALITY_UNLIMITED || $delta < $field['cardinality']) && empty($form_state['programmed'])) {
+      $elements[$delta] = $element;
+      $elements[$delta]['#default_value'] = $defaults;
+      $elements[$delta]['#weight'] = $delta;
+      $elements[$delta]['#required'] = ($element['#required'] && $delta == 0);
+    }
+    // The group of elements all-together need some extra functionality
+    // after building up the full list (like draggable table rows).
+    $elements['#file_upload_delta'] = $delta;
+    $elements['#theme'] = 'file_widget_multiple';
+    $elements['#theme_wrappers'] = array('fieldset');
+    $elements['#process'] = array('file_field_widget_process_multiple');
+    $elements['#title'] = $element['#title'];
+    $elements['#description'] = $element['#description'];
+    $elements['#field_name'] = $element['#field_name'];
+    $elements['#language'] = $element['#language'];
+    $elements['#display_field'] = $field['settings']['display_field'];
+
+    // Add some properties that will eventually be added to the file upload
+    // field. These are added here so that they may be referenced easily through
+    // a hook_form_alter().
+    $elements['#file_upload_title'] = t('Add a new file');
+    $elements['#file_upload_description'] = theme('file_upload_help', array('description' => '', 'upload_validators' => $elements[0]['#upload_validators']));
+  }
+
+  return $elements;
+}
+
+/**
+ * Element process function for s3fs_cors_upload element.
+ *
+ * Expands the element to include Upload and Remove buttons, as well as support
+ * for a default value.
+ *
+ * In order to take advantage of the work that file.module is already doing for
+ * elements of type #managed_file, we stick to the same naming convention here.
+ */
+function s3fs_cors_upload_process($element, &$form_state, &$form) {
+  $fid = isset($element['#value']['fid']) ? $element['#value']['fid'] : 0;
+  $element['#file'] = $fid ? file_load($fid) : FALSE;
+  $element['#tree'] = TRUE;
+  $parents_id = implode('_', $element['#parents']);
+
+  // AJAX settings used for upload and remove buttons.
+  $ajax_settings = array(
+    'callback' => 's3fs_cors_upload_js',
+    'wrapper' => "{$element['#id']}-ajax-wrapper",
+    'method' => 'replace',
+    'effect' => 'fade',
+  );
+
+  // The "Upload" button.
+  $element['upload_button'] = array(
+    '#name' => "{$parents_id}_upload_button",
+    '#type' => 'submit',
+    '#value' => t('Upload'),
+    '#validate' => array(),
+    '#limit_validation_errors' => array($element['#parents']),
+    '#attributes' => array('class' => array('cors-form-submit')),
+    '#weight' => -5,
+    '#submit' => array('s3fs_cors_upload_submit'),
+    '#ajax' => $ajax_settings,
+  );
+
+  // The "Remove" button.
+  $element['remove_button'] = array(
+    '#name' => "{$parents_id}_remove_button",
+    '#type' => 'submit',
+    '#value' => t('Remove'),
+    '#validate' => array(),
+    '#limit_validation_errors' => array($element['#parents']),
+    '#attributes' => array('class' => array('cors-form-remove')),
+    '#weight' => -5,
+    '#submit' => array('s3fs_cors_remove_submit'),
+    '#ajax' => $ajax_settings,
+  );
+
+  // The file upload field itself.
+  $element['upload'] = array(
+    '#name' => "files[$parents_id]",
+    '#type' => 'file',
+    '#title' => t('Choose a file.'),
+    '#title_display' => 'invisible',
+    '#size' => $element['#size'],
+    '#theme_wrappers' => array(),
+    '#weight' => -10,
+    '#attributes' => array('class' => array('s3fs-cors-upload-file')),
+  );
+
+  if ($fid && $element['#file']) {
+    $element['filelink'] = array(
+      '#type' => 'markup',
+      '#markup' => theme('file_link', array('file' => $element['#file'])) . ' ',
+      '#weight' => -10,
+    );
+  }
+
+  // Add the extension list to the page as JavaScript settings.
+  if (isset($element['#upload_validators']['file_validate_extensions'][0])) {
+    $extension_list = implode(',', array_filter(explode(' ', $element['#upload_validators']['file_validate_extensions'][0])));
+    $element['upload']['#attached']['js'] = array(
+      array(
+        'type' => 'setting',
+        'data' => array('file' => array('elements' => array("#{$element['#id']}-upload" => $extension_list))),
+      ),
+    );
+  }
+
+  // These hidden elements get populated by javascript after uploading the file
+  // to S3. They are then used by the value callback to save the new file record
+  // to the DB.
+  $element['fid'] = array(
+    '#type' => 'hidden',
+    '#value' => $fid,
+    '#attributes' => array('class' => array('fid')),
+  );
+  $element['filename'] = array(
+    '#type' => 'hidden',
+    '#default_value' => isset($element['#file']->filename) ? $element['#file']->filename : '',
+    '#attributes' => array('class' => array('filename')),
+    // This keeps theme_file_widget() happy.
+    '#markup' => '',
+  );
+  $element['filemime'] = array(
+    '#type' => 'hidden',
+    '#attributes' => array('class' => array('filemime')),
+    '#default_value' => isset($element['#file']->filemime) ? $element['#file']->filemime : '',
+  );
+  $element['filesize'] = array(
+    '#type' => 'hidden',
+    '#attributes' => array('class' => array('filesize')),
+    '#default_value' => isset($element['#file']->filesize) ? $element['#file']->filesize : '',
+  );
+
+  // Add a class to the <form> element so we can find it with JS later.
+  $form['#attributes'] = array('class' => array('s3fs-cors-upload-form'));
+
+  $element['#prefix'] = "<div id=\"{$element['#id']}-ajax-wrapper\">";
+  $element['#suffix'] = '</div>';
+
+  return $element;
+}
+
+/**
+ * Value callback for s3fs_cors_upload element type.
+ */
+function s3fs_cors_upload_value(&$element, $input = FALSE, $form_state = NULL) {
+  global $user;
+  $fid = 0;
+  $return = array();
+  $parents = $element['#parents'];
+  $parents_id = implode('_', $parents);
+
+  if (!empty($input['fid'])) {
+    // The input will have a non-zero fid only when saving the full node form.
+    // We don't want to do anything when that happens, because everything has
+    // already been done in the AJAX workflow.
+    return $input;
+  }
+
+  $remove_button_clicked = (isset($form_state['input']['_triggering_element_name'])
+    && $form_state['input']['_triggering_element_name'] == "{$parents_id}_remove_button");
+
+  // TODO: I'm relatively sure this is useless, because of how we deal with the files.
+  // But just in case, I'm going to leave it around for now.
+  // Find the current value of this field from the form state, if it's there.
+  $form_state_fid = $form_state['values'];
+  foreach ($parents as $parent) {
+    $form_state_fid = isset($form_state_fid[$parent]) ? $form_state_fid[$parent] : 0;
+  }
+  if ($element['#extended'] && isset($form_state_fid['fid'])) {
+    $fid = $form_state_fid['fid'];
+  }
+  elseif (is_numeric($form_state_fid)) {
+    $fid = $form_state_fid;
+  }
+
+  // If there's valid input, save the new upload.
+  if ($input !== FALSE && $fid == 0 && !empty($input['filename']) && !$remove_button_clicked) {
+    $return = $input;
+
+    $base_dir = '';
+    if (isset($element['#upload_location']) && file_uri_target($element['#upload_location']) != '') {
+      $base_dir = file_uri_target($element['#upload_location']) . '/';
+    }
+    // Construct a Drupal file object.
+    $file = new stdClass();
+    $file->uid = $user->uid;
+    $file->filename = $input['filename'];
+    $file->filesize = $input['filesize'];
+    $file->filemime = $input['filemime'];
+    $file->uri = "s3://$base_dir{$input['filename']}";
+    $file->status = 0;
+    $file->timestamp = REQUEST_TIME;
+
+    // Save the uploaded file to the file_managed table.
+    $file = _s3fs_cors_file_save($file);
+    $return['fid'] = $file->fid;
+
+    // Store the file's metadata into s3fs's metadata cache.
+    $wrapper = new S3fsStreamWrapper();
+    $wrapper->writeUriToCache($file->uri);
+  }
+
+  if ($input === FALSE || $remove_button_clicked) {
+    // If there is no input, or the remove button was just clicked, set the
+    // default value.
+    if ($element['#extended']) {
+      $default_fid = isset($element['#default_value']['fid']) ? $element['#default_value']['fid'] : 0;
+      $return = isset($element['#default_value']) ? $element['#default_value'] : array('fid' => 0);
+    }
+    else {
+      $default_fid = isset($element['#default_value']) ? $element['#default_value'] : 0;
+      $return = array('fid' => 0);
+    }
+
+    // Confirm that the file exists when used as a default value.
+    if ($default_fid && $file = file_load($default_fid)) {
+      $return['fid'] = $file->fid;
+    }
+    else {
+      $return['fid'] = $fid;
+    }
+  }
+
+  return $return;
+}
+
+/**
+ * The #value_callback for the s3fs_cors field element.
+ *
+ * This is pretty much a copy of file_field_widget_value(), but modified to use
+ * the s3fs_cors_upload_value() function instead of the file.module one.
+ */
+function s3fs_cors_field_widget_value($element, $input = FALSE, $form_state) {
+  if ($input) {
+    // Checkboxes lose their value when empty.
+    // If the display field is present make sure its unchecked value is saved.
+    $field = field_widget_field($element, $form_state);
+    if (empty($input['display'])) {
+      $input['display'] = $field['settings']['display_field'] ? 0 : 1;
+    }
+  }
+
+  // Handle uploads and the like.
+  $return = s3fs_cors_upload_value($element, $input, $form_state);
+
+  // Ensure that all the required properties are returned, even if empty.
+  $return += array(
+    'fid' => 0,
+    'display' => 1,
+    'description' => '',
+  );
+
+  return $return;
+}
+
+/**
+ * Validation callback for s3fs_cors element type.
+ */
+function s3fs_cors_upload_validate(&$element, &$form_state) {
+  // Consolidate the array value of this field to a single FID.
+  if (!$element['#extended']) {
+    form_set_value($element, $element['fid']['#value'], $form_state);
+  }
+}
+
+function s3fs_cors_upload_js($form, &$form_state) {
+  // Find the element that triggered the AJAX callback and return it so that it
+  // can be replaced.
+  $parents = $form_state['triggering_element']['#array_parents'];
+  $button_key = array_pop($parents);
+  $element = drupal_array_get_nested_value($form, $parents);
+  return $element;
+}
+
+/**
+ * Submit callback for the remove button on s3fs_cors elements.
+ */
+function s3fs_cors_remove_submit($form, &$form_state) {
+  $parents = $form_state['triggering_element']['#array_parents'];
+  // Drop the button_key value off the end of the parents array, since we don't need it.
+  array_pop($parents);
+  $element = drupal_array_get_nested_value($form, $parents);
+
+  // If it's a temporary file we can safely remove it immediately, otherwise
+  // it's up to the implementing module to clean up files that are in use.
+  if ($element['#file'] && $element['#file']->status == 0) {
+    file_delete($element['#file']);
+  }
+  // Update both $form_state['values'] and $form_state['input'] to reflect
+  // that the file has been removed, so that the form is rebuilt correctly.
+  // $form_state['values'] must be updated in case additional submit handlers
+  // run, and for form building functions that run during the rebuild, such as
+  // when the s3fs_cors_upload element is part of a field widget.
+  // $form_state['input'] must be updated so that s3fs_cors_upload_value()
+  // has correct information during the rebuild.
+  $values_element = $element['#extended'] ? $element['fid'] : $element;
+  form_set_value($values_element, NULL, $form_state);
+  drupal_array_set_nested_value($form_state['input'], $values_element['#parents'], NULL);
+
+  // Set the form to rebuild so that $form is correctly updated in response to
+  // processing the file removal.
+  $form_state['rebuild'] = TRUE;
+}
+
+/**
+ * Submit callback for the upload button on s3fs_cors elements.
+ */
+function s3fs_cors_upload_submit($form, &$form_state) {
+  // No action is needed here because all file uploads on the form are
+  // processed by s3fs_cors_upload_value().
+  // Since this function did not change $form_state, a rebuild isn't
+  // necessary; setting $form_state['redirect'] to FALSE would suffice.
+  // However, we choose to always rebuild, to keep the form processing
+  // workflow consistent between the two buttons.
+  $form_state['rebuild'] = TRUE;
+}
+
+/**
+ * AJAX callback to create paramaters necessary for submitting a CORS request.
+ *
+ * Use the filename, filesize, and filemime properies in $_POST in conjunction
+ * with the AWS key/secret in order to create the required parameters for
+ * sending a file to S3 via a CORS request.
+ *
+ * The heavy lifting here is handled by the AWSSDK.
+ *
+ * @see s3fs_cors.js
+ */
+function s3fs_cors_sign_request() {
+  // Be careful with these, as they are user input.
+  $filename = $_POST['filename'];
+  $filemime = $_POST['filemime'];
+  $form_build_id = $_POST['form_build_id'];
+  $field_name = $_POST['field_name'];
+
+  $library = _s3fs_load_awssdk2_library();
+  if (!$library['loaded']) {
+    $error = t('Unable to load the AWS SDK for PHP. Please check you have the library installed correctly and have your S3 credentials configured.');
+    header('HTTP/1.1 500 Internal Server Error');
+    drupal_add_http_header('Content-Type', 'application/json; charset=utf-8');
+    print json_encode(array('error' => $error));
+    drupal_exit();
+  }
+
+  $config = _s3fs_get_config();
+  $client = _s3fs_get_amazons3_client($config);
+
+  // Retrieve the form from which this request is being made, so we can get some much-needed context.
+  $form_state = form_state_defaults();
+  $form = form_get_cache($form_build_id, $form_state);
+  if (!$form) {
+    // If $form cannot be loaded from the cache, the form_build_id in $_POST
+    // must be invalid, which means that someone performed a POST request onto
+    // system/ajax without actually viewing the concerned form in the browser.
+    // This is likely a hacking attempt as it never happens under normal
+    // circumstances, so we just do nothing.
+    watchdog('ajax', 'Invalid form POST data.', array(), WATCHDOG_WARNING);
+    drupal_exit();
+  }
+
+  // Get the "File directory" setting for this field, as a URI.
+  $instance_info = field_info_instance($form['#entity_type'], $field_name, $form['#bundle']);
+  $field_info = field_info_field($field_name);
+  $file_directory_uri = "{$field_info['settings']['uri_scheme']}://{$instance_info['settings']['file_directory']}";
+
+  // Use file_create_filename() to avoid overwriting an existing file.
+  $uri = file_create_filename($filename, $file_directory_uri);
+  $s3_key = file_uri_target($uri);
+
+  $options = array(
+    'acl' => (strpos($uri, 'private://') === FALSE) ? 'public-read' : 'private',
+    // Use a "starts-with" comparison instead of "equals" for Content-Type.
+    // Not sure this is actually needed, but the old code did it.
+    'Content-Type' => "^$filemime",
+    // The root folder is not part of a file's URI, so we don't add it until
+    // we're setting up the final s3 parameters.
+    'key' => !empty($config['root_folder']) ? "{$config['root_folder']}/$s3_key" : $s3_key,
+    'ttd' => '+5 minutes',
+  );
+
+  if (!empty($config['cache_control_header'])) {
+    $options['Cache-Control'] = $config['cache_control_header'];
+  }
+
+  $post_object = new Aws\S3\Model\PostObject($client, $config['bucket'], $options);
+  $post_object->prepareData();
+
+  $data = array(
+    'inputs' => $post_object->getFormInputs(),
+    'form' => $post_object->getFormAttributes(),
+    // Tell our javascript the filename that Drupal ended up giving us.
+    'file_real' => drupal_basename($s3_key),
+  );
+
+  // Prepare to send JSON text to the browser.
+  if (ob_get_level()) {
+    ob_end_clean();
+  }
+  drupal_add_http_header('Content-Type', 'application/json; charset=utf-8');
+  print json_encode($data);
+  drupal_exit();
+}
+
+/**
+ * Custom version of drupal's file_save() function.
+ *
+ * This function exists because we need to call file_save() before saving the
+ * file's s3 metadata to the cache. Which means that the filesize() function
+ * will fail. So we skip it in this version, since we already know the size.
+ *
+ * @param $file
+ *   A file object returned by file_load().
+ *
+ * @return
+ *   The updated file object.
+ *
+ * @see hook_file_insert()
+ * @see hook_file_update()
+ */
+function _s3fs_cors_file_save(stdClass $file) {
+  module_invoke_all('file_presave', $file);
+  module_invoke_all('entity_presave', $file, 'file');
+
+  drupal_write_record('file_managed', $file);
+  // Inform modules about the newly added file.
+  module_invoke_all('file_insert', $file);
+  module_invoke_all('entity_insert', $file, 'file');
+
+  // Clear the static loading cache.
+  entity_get_controller('file')->resetCache(array($file->fid));
+
+  return $file;
+}

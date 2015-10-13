@@ -1,0 +1,405 @@
+<?php
+
+/**
+ * hook_menu implementation
+ */
+function vr_list_menu() {
+  $items['admin/config/vr/default-map'] = array(
+    'title' => t('Default Field Map'),
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('vr_list_member_map'),
+    'access arguments' => array('administer VerticalResponse'),
+    'description' => t('Create a default field map that will be used for all
+      mailing lists that do not otherwise have a field map specified.'),
+    'file' => 'vr_list.admin.inc',
+  );
+  return $items;
+}
+
+/**
+ * Return a VerticalResponse list object using a list id.
+ *
+ * @param string
+ *  VerticalResponse list id.
+ * @return object
+ *  VerticalResponse mailing list object
+ */
+function vr_list_load($list_ids) {
+  foreach ($list_ids as $nid => &$list_id) {
+    $node_additions = (empty($list_id)) ? FALSE : vr_get_list_by_id($list_id);
+    foreach ($node_additions as $property => &$value) {
+      $list_id->$property = $value;
+    }
+  }
+}
+
+/**
+ * Change bulk operation to action
+ */
+function vr_list_action_info() {
+  return array(
+    'vr_list_user_subscribe' => array(
+      'label' => t('Select recipient(s)'),
+      'type' => 'user',
+      'configurable' => TRUE,
+    ),
+    'vr_list_user_unsubscribe' => array(
+      'label' => t('Remove recipient(s)'),
+      'type' => 'user',
+      'configurable' => TRUE,
+    ),
+  );
+}
+
+/**
+ * Configure bulk operation.
+ */
+function vr_list_user_subscribe_form($data, $context) {
+  if (empty($data['view'])) {
+    drupal_set_message(t('This action should only be used with Views Bulk Operations.'), 'error');
+    return array();
+  }
+  else {
+    $arguments = $data['view']->argument;
+  }
+  foreach ($arguments as $argument) {
+    if ($argument->definition['handler'] == 'vr_campaign_argument_campaign_id') {
+      $nid = $argument->argument;
+      break;
+    }
+  }
+  if (empty($nid)) {
+    drupal_set_message('VR Campaign ID argument not found. Please check your Contextual Filters.');
+    return array();
+  }
+  $node = node_load($nid);
+  $campaign = vr_campaign_retrieve_campaign($node);
+  // Get current list members
+  $result = db_query('SELECT COUNT(uid) as list_length FROM {vr_campaign_recipients} WHERE vrid = :vrid', array(':vrid' => $campaign->id));
+  $length = $result->fetchField();
+  if ($length > 0) {
+    $singular = 'This campaign has 1 recipient. <a href="@url">Reset recipients</a>.';
+    $plural = 'This campaign has @count recipients. <a href="@url">Reset recipients</a>.';
+    $args = array(
+      '@count' => $length,
+      '@url' => 'FIXME',
+    );
+    $message = format_plural($length, $singular, $plural, $args);
+    drupal_set_message($message);
+  }
+  $form['campaign'] = array(
+    '#type' => 'hidden',
+    '#value' => $campaign->id,
+  );
+  return $form;
+}
+
+/**
+ * Add campaign to context variable.
+ */
+function vr_list_user_subscribe_submit($form, &$form_state) {
+  return $form_state['values'];
+}
+
+/**
+ * List in database.
+ */
+function vr_list_user_subscribe(&$user, $context = array()) {
+  static $list;
+  if (empty($list)) {
+    $result = db_query('SELECT uid FROM {vr_campaign_recipients} WHERE vrid = :vrid', array(':vrid' => $context['campaign']));
+    $list = array();
+    while ($uid = $result->fetchField()) {
+      $list[$uid] = $uid;
+    }
+  }
+  if (!in_array($user->uid, $list)) {
+    $record = (object) NULL;
+    $record->uid = $user->uid;
+    $record->vrid = $context['campaign'];
+    drupal_write_record('vr_campaign_recipients', $record);
+  }
+}
+
+/**
+ * vr_list_user_subscribe and unsubscribe use the exact same configuration.
+ */
+function vr_list_user_unsubscribe_form($context) {
+  return vr_list_user_subscribe_form($context);
+}
+
+/**
+ * @todo Please document this function.
+ * @see http://drupal.org/node/1354
+ */
+function vr_list_user_unsubscribe_submit($form, &$form_state) {
+  return $form_state['values'];
+}
+
+/**
+ * @todo Please document this function.
+ * @see http://drupal.org/node/1354
+ */
+function vr_list_user_unsubscribe(&$user, $context = array()) {
+  db_delete('vr_campaign_recipients')
+    ->condition('vrid', $context['campaign'])
+    ->condition('uid', $user->uid)
+    ->execute();
+}
+
+/**
+ * Create a batch operation to update list information in VerticalResponse
+ * based on field mappings in drupal.
+ *
+ * @param array
+ *  An array of mailing list ids.
+ * @param int
+ *  campaign id from VerticalResponse
+ */
+function vr_list_update_batch($lists, $campaign = NULL) {
+  foreach ($lists as $list_id) {
+    $operations[] = array(
+      '_vr_list_update',
+      array($list_id, $campaign),
+    );
+  }
+  $batch = array(
+    'operations' => $operations,
+    'finished' => t('vr_list_update_finish'),
+    'title' => t('Updating Mailing List information in VerticalResponse'),
+    'progress_message' => t('Processed @current out of @total.'),
+  );
+  batch_set($batch);
+  // Campaign will be empty if the administrator is simply pushing
+  // local data to VerticalResponse and NOT launching a campaign.
+  // In that case batch_process needs to be invoked with a redirect destination.
+  if (empty($campaign)) {
+    $list_id = reset($lists);
+    batch_process('admin/structure/vr/list/' . $list_id . '/edit');
+  }
+}
+
+/**
+ * Update VerticalRepsone Mailing List before launching a campaign.  This
+ * is the actual callback that is used to loop through all the users that
+ * are found in a VerticalResponse list, and then search for and apply any
+ * field maps in drupal.
+ *
+ * @see http://drupal.org/node/180528
+ *
+ * @param int
+ *  VerticalResponse list id.
+ * @param array
+ *  context array from batch api
+ */
+function _vr_list_update($list_id, $campaign, &$context) {
+  // Get list information
+  if (empty($context['sandbox'])) {
+    $list = vr_get_list_by_id($list_id);
+    $context['sandbox']['total'] = $list->size;
+    $default_throttle = variable_get('vr_list_throttle_default', 10);
+    $context['sandbox']['max'] = variable_get('vr_list_throttle_' . $list->id, $default_throttle);
+    $context['sandbox']['progress'] = 0;
+    $context['results']['campaign'] = $campaign;
+  }
+  // Load and Save list members
+  $params = array(
+    'list_id' => $list_id,
+    'max_records' => $context['sandbox']['max'],
+    'offset' => $context['sandbox']['progress'],
+  );
+  $members = vr_api('getListMembers', $params);
+  vr_list_member_init();
+  foreach ($members as $member) {
+    $member = new vr_list_member($list_id, $member);
+    // Only update records with a local field map.
+    if ($member->map_fields()) {
+      $member->save();
+    }
+    $context['sandbox']['progress']++;
+  }
+  if ($context['sandbox']['total'] == 0) {
+
+  }
+  elseif ($context['sandbox']['progress'] != $context['sandbox']['total']) {
+    $context['finished'] = $context['sandbox']['progress'] / $context['sandbox']['total'];
+  }
+}
+
+/**
+ * "Finished" callback for batch list update.
+ */
+function vr_list_update_finish($success, $results, $operations) {
+  if ($success AND !empty($results['campaign'])) {
+    drupal_set_message('Drupal has updated the selected VerticalResponse mailing lists
+      according to defined field maps.');
+    $param['campaign_id'] = $results['campaign']->id;
+    $campaign_name = $results['campaign']->name;
+    vr_api('launchEmailCampaign', $param);
+    $message = t('@name has been launched!', array('@name' => $campaign_name));
+    drupal_set_message($message);
+    watchdog('VerticalResponse', $message, array(), WATCHDOG_INFO);
+  }
+  elseif ($success AND empty($results['campaign'])) {
+    drupal_set_message('Local list information has been pushed to VerticalResponse.');
+  }
+  else {
+    $error_operation = reset($operations);
+    $message = t('An error occurred while processing %error_operation with arguments: @arguments', array('%error_operation' => $error_operation[0], '@arguments' => print_r($error_operation[1], TRUE)));
+    drupal_set_message($message);
+  }
+}
+
+
+
+/**
+ * Bulk operation for adding and removing users from a list.
+ *
+ * @param array
+ *  an array of uids keyed on uid.
+ * @param int
+ *  VerticalResponse list id
+ * @param string
+ *  The desired action (subscribe || unsubscribe)
+ * @param array
+ *  context array for batch operation.
+ */
+function _vr_list_subscribe($users, $list_id, $method, $campaign, &$context) {
+  vr_list_member_init();
+  // Setup the operation.
+  if (empty($context['sandbox'])) {
+    // Get list from VerticalRepsonse and create a member template array.
+    $list = vr_get_list_by_id($list_id, TRUE);
+    $context['results']['list'] = $list;
+    $context['results']['method'] = $method;
+    $context['results']['campaign'] = $campaign;
+    foreach ($list->fields as $key) {
+      $context['sandbox']['template'][$key] = NULL;
+    }
+    // Basic counter fields for tracking progress
+    $context['sandbox']['total'] = count($users);
+    $context['sandbox']['progress'] = 0;
+    $context['sandbox']['users'] = array_values($users);
+
+    if ($method == 'unsubscribe') {
+      // Create a list member object to track current list membership.  This is
+      // only important when list members are being removed.
+      $list_member = new vr_list_member($list->id);
+      $members = vr_api('getListMembers', array('list_id' => $list_id, 'max_records' => $list->size));
+      foreach ($members as $member) {
+        $member = $list_member->make_array($member);
+        $list_members[$member['email_address']] = $member['hash'];
+      }
+      $context['sandbox']['members'] = $list_members;
+    }
+  }
+
+  $i = $context['sandbox']['progress'];
+  if ($method == 'subscribe') {
+    $max = $i + variable_get('vr_list_subscribe_throttle_' . $list->id, 100);
+  }
+  elseif ($method == 'unsubscribe') {
+    $max = $i + variable_get('vr_list_throttle_' . $list_id, 10);
+  }
+  $max = ($max < $context['sandbox']['total']) ? $max : $context['sandbox']['total'];
+  for ($i; $i < $max; $i++) {
+    $uid = $context['sandbox']['users'][$i];
+    $mail = db_query('SELECT mail FROM {users} WHERE uid = :uid', array(':uid' => $uid))->fetchField();
+    $param['list_member']['list_id'] = $list_id;
+    // Generate the "file" that should be appended to the list.
+    if ($method == 'subscribe') {
+      $template = $context['sandbox']['template'];
+      $template['email_address'] = $mail;
+      $subscriber = new vr_list_member($list_id, $template);
+      $subscriber->map_fields();
+      $context['results']['subscribers'][] = vr_list_subscribe_filter_fields($subscriber->member_array);
+    }
+    // Remove users only if they are subscribed.
+    if ($method == 'unsubscribe' AND !empty($context['sandbox']['members'][$mail])) {
+      $param['list_member']['member_data'] = array(
+        array(
+          'name' => 'hash',
+          'value' => $context['sandbox']['members'][$mail],
+        ),
+      );
+      vr_api('deleteListMember', $param);
+    }
+  }
+  $context['sandbox']['progress'] = $i;
+  $context['finished'] = ($i > 0) ? $i / $context['sandbox']['total'] : 1;
+}
+
+/**
+ * Finished callback for _vr_list_subscribe
+ */
+function _vr_list_subscribe_finish($success, $results, $operations) {
+  if ($success) {
+    $list = $results['list'];
+
+    if ($results['method'] == 'subscribe') {
+      // Prepare to "upload" file to VerticalResponse
+      $subscribers = $results['subscribers'];
+      $param['list_id'] = $list->id;
+      $param['file'] = array(
+        'filename' => t('import_@time.csv', array('@time' => REQUEST_TIME)),
+        'delimiter' => 'csv',
+        'contents' => base64_encode(_vr_list_create_file($subscribers)),
+      );
+      $param['fields'] = array_keys($subscribers[0]);
+      $result = vr_api('appendFileToList', $param);
+      // Notify administrator if some records do not make it to VerticalResponse
+      if ($result->records_rejected > 0) {
+        $url = $result->rejected_records_file->location;
+        $message = t('One or more records were not added to the list.  <a href="@url">Click here</a>
+                    to learn why.', array('@url' => $url));
+        drupal_set_message($message, 'error');
+        watchdog('VerticalResponse', $message, array(), WATCHDOG_ERROR);
+      }
+    }
+    $message = t('@list has been updated.', $list->name);
+    drupal_set_message($message);
+  }
+  else {
+    $message = t('An error occured during this operation. Please try again.');
+    drupal_set_message($message);
+  }
+}
+
+/**
+ * vr_list_subscribe_filter_fields
+ *
+ * Some fields should not be passed to VerticalResponse when a user is
+ * subscribed.  Use this to filter them out.
+ *
+ * @param array
+ *  member_array property from vr_list_member object
+ * @return array
+ *  filtered array
+ */
+function vr_list_subscribe_filter_fields($member) {
+  foreach ($member as $key => $value) {
+    if (empty($member[$key])) {
+      unset($member[$key]);
+    }
+  }
+  return $member;
+}
+
+/**
+ * _vr_list_create_file
+ *
+ * Convert an array of member arrays (keyed on field) to csv format, suitable
+ * for use with the appendFileToList method provided by VerticalResponse.
+ *
+ * @param array
+ *  An array of member arrays. Each element shall be keyed on field.
+ * @return string
+ *  The content of a csv file.
+ */
+function _vr_list_create_file($members) {
+  $csv = '';
+  foreach ($members as $member) {
+    $csv .= '"' . implode('","', $member) . "\"\n";
+  }
+  return $csv;
+}
