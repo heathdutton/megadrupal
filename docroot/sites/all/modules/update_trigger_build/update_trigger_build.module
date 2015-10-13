@@ -1,0 +1,239 @@
+<?php
+
+/**
+ * @file
+ *  Hooks for the Update trigger build module.
+ */
+
+/**
+ * Implements hook_menu().
+ */
+function update_trigger_build_menu() {
+
+  $items = array();  
+
+  // The configuration page for this module.
+  $items['admin/config/development/update_trigger_build'] = array(
+    'title' => 'Update Trigger Build ' . t('Configuration'),
+    'description' => t('Trigger builds on a continuous integration server when Drupal updates are available.'),
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('update_trigger_build_config_form'),
+    'type' => MENU_NORMAL_ITEM,
+    'file' => 'src/Admin/Admin.php',
+    'access arguments' => array('Administer site configuration'),
+  );
+
+  // The page for viewing the details of a single CI Build Schedule.
+  $items['ci_build_schedule/%'] = array(
+    'title' => 'CI Build Schedule',
+    'page callback' => 'update_trigger_build_view_ci_build_schedule',
+    'page arguments' => array(1),
+    'type' => MENU_NORMAL_ITEM,
+    'file' => 'src/Admin/Admin.php',
+    'access arguments' => array('Administer site configuration'),
+  );
+
+  // The page for viewing the details of a single CI Server.
+  $items['ci_server/%'] = array(
+    'title' => 'CI Server',
+    'page callback' => 'update_trigger_build_view_ci_server',
+    'page arguments' => array(1),
+    'type' => MENU_NORMAL_ITEM,
+    'file' => 'src/Admin/Admin.php',
+    'access arguments' => array('Administer site configuration'),
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_entity_info().
+ */
+function update_trigger_build_entity_info() {
+  $info = array();
+
+  // CI Build Schedule entity is used to hold the details of a single build 
+  // along with the triggers that determine when it should run.
+  $info['ci_build_schedule'] = array(
+    'label' => t('CI Build Schedule'),
+    'base table' => 'update_trigger_build_ci_build_schedule',
+    'entity keys' => array(
+      'id' => 'id',
+      'name' => 'name',
+      'label' => 'label',
+    ),
+    'exportable' => TRUE,
+    'module' => 'update_trigger_build',
+    'entity class' => 'CIBuildScheduleEntity',
+    'controller class' => 'CIBuildScheduleEntityController',
+    'access callback' => 'update_trigger_build_ci_build_schedule_access_callback',
+    'uri callback' => 'entity_class_uri',
+    'admin ui' => array(
+      'path' => 'admin/config/development/update_trigger_build/ci_build_schedule',
+      'file' => 'src/Admin/Admin.php',
+      'controller class' => 'EntityDefaultUIController',
+    ),
+    'entity cache' => module_exists('entitycache'),
+  );
+
+  // CI Server is the base entity for CI Server instances.  Each CI server instance
+  // is an entity of a CI Server bundle, such as ci_server_jenkins.
+  $info['ci_server'] = array(
+    'label' => t('CI Server'),
+    'base table' => 'update_trigger_build_ci_server',
+    'entity keys' => array(
+      'id' => 'id',
+      'name' => 'name',
+      'label' => 'label',
+    ),
+    'bundle keys' => array(
+      'bundle' => 'name',
+    ),
+    'module' => 'update_trigger_build',
+    'entity class' => 'CIServerEntity',
+    'controller class' => 'CIServerEntityController',
+    'access callback' => 'update_trigger_build_ci_server_access_callback',
+    'uri callback' => 'entity_class_uri',
+    'entity cache' => module_exists('entitycache'),
+  );
+
+  return $info;
+}
+
+/**
+ * Implements hook_cron().
+ *
+ * Check which projects have updates and then trigger a build for
+ * the build schedules that meet the triggers. 
+ */
+function update_trigger_build_cron() {
+
+  // Track whether the update module is enabled.  If it is disabled then 
+  // we will temporarily re-enable in order to check the available updates.
+  $update_originally_enabled = TRUE;
+
+  // Ensure that the update module is enabled.
+  if(!module_exists('update')) {
+    $update_originally_enabled = FALSE;
+    module_enable(array('update'));
+  }
+
+  // If there have been updates.
+  if($update_data = update_trigger_build_get_update_data()) {
+    update_trigger_build_run_build_schedules($update_data);
+  }
+  else {
+    watchdog('Update Trigger Build', t("No update data found during cron run."));
+  }
+
+  // If the update module was originally disabled then disable it again.
+  if(!$update_originally_enabled) {
+    module_disable(array('update'));
+  }
+}
+
+/**
+ * Retrieve the update data using functions defined by the update module.
+ *
+ * @return array $update_data
+ *  A list of modules and their update status.  
+ */
+function update_trigger_build_get_update_data() {
+
+  $update_data = FALSE;
+
+  // If there are available updates then retrieve them.
+  if ($available = update_get_available(TRUE)) {
+    module_load_include('inc', 'update', 'update.compare');
+    $update_data = update_calculate_project_data($available);
+  }
+
+  return $update_data;
+}
+
+/**
+ * Loads all build schedule entity objects, checks whether the conditions have been
+ * met for running the build and initiates the build.
+ *
+ * @param array $update_data
+ *  The data from the update module, which lists the update status of each project.
+ */
+function update_trigger_build_run_build_schedules($update_data) {
+
+  // Grab a list of CI build schedules.
+  $ci_build_schedules = entity_load('ci_build_schedule');
+  
+  foreach($ci_build_schedules as $build_schedule) {
+
+    // Assume that the build will be ran.  If the build triggers aren't met or 
+    // the duration since the last build hasn't passed then we'll set this to false.
+    $run_build = TRUE;
+
+    // If the build schedule frequency duration hasn't passed then 
+    // skip running this build.
+    if(!$build_schedule->checkFrequency()) {
+      watchdog('Update Trigger Build', t("Skipping build schedule '@name'. Frequency criteria has not been met.",
+        array('@name' => $build_schedule->label))
+      );
+      $run_build = FALSE;
+    }
+
+    // Check if any project statuses meet the build triggers.
+    $projects = $build_schedule->checkTriggers($update_data);
+
+    // If no projects were returned then no need to run a build since
+    // the build triggers haven't been met.
+    if(empty($projects)) {
+      watchdog('Update Trigger Build', t("No project meets build triggers for build schedule: @name.  Skipping this build.",
+        array('@name' => $build_schedule->label))
+      );
+      $run_build = FALSE;
+    }
+
+    if($run_build) {
+      $build_schedule->initiateBuild($projects);
+    }
+  }
+}
+
+/**
+ * Access callback.  Define access restrictions for CI Build Schedule entities.
+ */
+function update_trigger_build_ci_build_schedule_access_callback($op, $project = NULL, $account = NULL) {
+
+  /**
+   * @todo define individual permissions for 'view CI Build Schedule', 'create CI Build Schedul' etc in hook_permission.
+   * Not a priority.
+   */
+  switch($op) {
+    case 'view':
+    case 'update':
+    case 'create':
+    case 'delete': {
+      return user_access('Administer site configuration', $account);
+    }
+    break;
+  }
+  return FALSE;
+}
+
+/**
+ * Access callback.  Define access restrictions for CI Server entities.
+ */
+function update_trigger_build_ci_server_access_callback($op, $project = NULL, $account = NULL) {
+
+  /**
+   * @todo define individual permissions for 'view CI Server', 'create CI Server' etc in hook_permission.
+   * Not a priority.
+   */
+  switch($op) {
+    case 'view':
+    case 'update':
+    case 'create':
+    case 'delete': {
+      return user_access('Administer site configuration', $account);
+    }
+    break;
+  }
+  return FALSE;
+}

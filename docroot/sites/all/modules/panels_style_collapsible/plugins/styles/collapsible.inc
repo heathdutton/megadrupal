@@ -6,7 +6,6 @@
  * Definition of the collapsible panel style.
  */
 
-// Plugin definition
 $plugin = array(
   'title' => t('Collapsible'),
   'description' => t('Allows the panel pane to be collapsed.'),
@@ -26,12 +25,12 @@ function panels_style_collapsible_region_settings_form($style_settings) {
     '#title' => t('Title'),
     '#description' => t('Title used as clickable text to open / close collapsed region.'),
     '#required' => TRUE,
-    '#default_value' => (isset($style_settings['region_title'])) ? $style_settings['region_title'] : ''
-  );  
+    '#default_value' => isset($style_settings['region_title']) ? $style_settings['region_title'] : ''
+  );
   $form['region_collapsed'] = array(
     '#type' => 'checkbox',
     '#title' => t('Collapsed by default'),
-    '#default_value' => (isset($style_settings['region_collapsed'])) ? $style_settings['region_collapsed'] : FALSE
+    '#default_value' => isset($style_settings['region_collapsed']) ? $style_settings['region_collapsed'] : FALSE
   );
   return $form;
 }
@@ -44,14 +43,14 @@ function panels_style_collapsible_pane_settings_form($style_settings) {
   $form['pane_title'] = array(
     '#type' => 'textfield',
     '#title' => t('Title'),
-    '#description' => t('Title used as clickable text to open / close collapsed region.'),
+    '#description' => t('Title used as clickable text to open / close collapsed region. Use %title for the original pane title.'),
     '#required' => TRUE,
-    '#default_value' => (isset($style_settings['pane_title'])) ? $style_settings['pane_title'] : ''
-  ); 
+    '#default_value' => isset($style_settings['pane_title']) ? $style_settings['pane_title'] : '%title'
+  );
   $form['pane_collapsed'] = array(
     '#type' => 'checkbox',
     '#title' => t('Collapsed by default'),
-    '#default_value' => (isset($style_settings['pane_collapsed'])) ? $style_settings['pane_collapsed'] : FALSE
+    '#default_value' => isset($style_settings['pane_collapsed']) ? $style_settings['pane_collapsed'] : FALSE
   );
   return $form;
 }
@@ -63,11 +62,11 @@ function panels_style_collapsible_pane_settings_form($style_settings) {
  */
 function theme_panels_style_collapsible_render_region($vars) {
   $settings = $vars['settings'];
-  
+
   $content = implode('<div class="panel-separator"></div>', $vars['panes']);
 
   ctools_include('collapsible.theme');
-  
+
   if (empty($settings['region_title'])) {
     $settings['region_title'] = '<empty>';
   }
@@ -75,8 +74,12 @@ function theme_panels_style_collapsible_render_region($vars) {
     $settings['region_collapsed'] = FALSE;
   }
   $title = ctools_context_keyword_substitute($settings['region_title'], array(), $vars['display']->context);
-  $output = theme('panels_style_collapsible', array('handle' => $title, 'content' => $content, 'collapsed' => $settings['region_collapsed']));
-  return $output;
+
+  return theme('panels_style_collapsible', array(
+    'handle' => $title,
+    'content' => $content,
+    'collapsed' => $settings['region_collapsed']
+  ));
 }
 
 /**
@@ -84,7 +87,7 @@ function theme_panels_style_collapsible_render_region($vars) {
  *
  * @ingroup themeable
  */
-function theme_panels_style_collapsible_render_pane($vars) { 
+function theme_panels_style_collapsible_render_pane($vars) {
   $content = $vars['content'];
   $pane = $vars['pane'];
   $display = $vars['display'];
@@ -93,7 +96,7 @@ function theme_panels_style_collapsible_render_pane($vars) {
   if (empty($content->content)) {
     return;
   }
-  
+
   if (!empty($settings['pane_title'])) {
     ctools_include('collapsible.theme');
 
@@ -103,37 +106,41 @@ function theme_panels_style_collapsible_render_pane($vars) {
     if (is_array($content->content)) {
       $content->content = drupal_render($content->content);
     }
-    $title = ctools_context_keyword_substitute($settings['pane_title'], array(), $vars['display']->context);
-    $output = theme('panels_style_collapsible', array('handle' => $title, 'content' => $content->content, 'collapsed' => $settings['pane_collapsed'], 'pane' => $pane));
+    $pane_title = !empty($content->title) ? $content->title : '';
+    $substitutions = array('%title' => $pane_title);
+    $title = ctools_context_keyword_substitute($settings['pane_title'], $substitutions, $vars['display']->context);
+
+    return theme('panels_style_collapsible', array(
+      'handle' => $title,
+      'content' => $content->content,
+      'collapsed' => $settings['pane_collapsed'],
+      'pane' => $pane
+    ));
   }
-  else {
-    $output = theme('panels_pane', array('content' => $content, 'pane' => $pane, 'display' => $display));
-  }
-  return $output;
+
+  return theme('panels_pane', array(
+    'content' => $content,
+    'pane' => $pane,
+    'display' => $display
+  ));
 }
 
 /**
  * Render a collapsible div.
  *
- * @param $handle
- *   Text to put in the handle/title area of the div.
- * @param $content
- *   Text to put in the content area of the div, this is what will get
- *   collapsed
- * @param $collapsed = FALSE
- *   If true, this div will start out collapsed.
+ * @ingroup themeable
  */
 function theme_panels_style_collapsible($vars) {
   ctools_add_js('collapsible-div');
   ctools_add_css('collapsible-div');
-  
+
   $pane_css = $pane_id = '';
   if (isset($vars['pane']) && is_object($vars['pane'])) {
     $pane_css = $vars['pane']->css;
     $pane_id = !empty($pane_css['css_id']) ? ' id="' . $pane_css['css_id'] . '"' : '';
     $pane_css = !empty($pane_css['css_class']) ? ' ' . $pane_css['css_class'] : '';
   }
-    
+
   $class = $vars['collapsed'] ? ' ctools-collapsed' : '';
   $output = '<div' . $pane_id . ' class="ctools-collapsible-container' . $class . $pane_css . '">';
   $output .= '<h2 class="pane-title ctools-collapsible-handle">' . $vars['handle'] . '</h2>';

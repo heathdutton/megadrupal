@@ -1,0 +1,341 @@
+<?php
+/**
+ * @file
+ * Defines a Vine provider for Scald.
+ */
+
+define('SCALD_VINE_WEB', 'https://vine.co/v/');
+define('SCALD_VINE_ID_REGEXP', '/^[a-zA-Z0-9]+$/');
+define('SCALD_VINE_WEB_REGEXP', '#https://vine\.co/v/([a-zA-Z0-9]+)#');
+define('SCALD_VINE_TAGS_REGEXP', '/#([a-zA-Z0-9]+)/');
+
+/**
+ * Implements hook_scald_atom_providers().
+ *
+ * Tell Scald that we'll be providing some video atoms.
+ */
+function scald_vine_scald_atom_providers() {
+  return array(
+    'video' => 'Video hosted on Vine',
+  );
+
+  // This code will never be hit, but is necessary to mark the string
+  // for translation on localize.drupal.org.
+  t('Video hosted on Vine');
+}
+
+/**
+ * Implements hook_scald_add_form().
+ */
+function scald_vine_scald_add_form(&$form, &$form_state) {
+  $form['identifier'] = array(
+    '#default_value' => '',
+    '#description' => t('Vine video identifier or URL'),
+    '#element_validate' => array('scald_vine_validate_id'),
+    '#title' => t('Vine video identifier or URL'),
+    '#type' => 'textfield',
+  );
+}
+
+/**
+ * Form element validation handler for Vine identifier.
+ */
+function scald_vine_validate_id($element, &$form_state) {
+  $vine_id = scald_vine_parse_id($form_state['values']['identifier']);
+  $form_state['values']['vine_id'] = $vine_id;
+
+  if (!$vine_id) {
+    form_error($element, t('Invalid Vine video identifier.'));
+  }
+  elseif (scald_vine_already_imported($vine_id)) {
+    form_error($element, t('Vine video already imported.'));
+  }
+}
+
+/**
+ * Implements hook_scald_add_form_fill().
+ */
+function scald_vine_scald_add_form_fill(&$atom, $form, $form_state) {
+  // Get video info.
+  $infos = scald_vine_feed($form_state['values']['vine_id']);
+
+  $atom->base_id = $form_state['values']['vine_id'];
+  $atom->title = $infos->title;
+
+  // Prefill the author.
+  $langcode = field_language('scald_atom', $atom, 'scald_authors');
+  $atom->scald_authors[$langcode][0] = array(
+    'tid' => 0,
+    'taxonomy_term' => (object) array('name' => $infos->author),
+  );
+
+  // Prefill tags.
+  $langcode = field_language('scald_atom', $atom, 'scald_tags');
+  if (isset($infos->tags)) {
+    foreach ($infos->tags as $index => $tag) {
+      $atom->scald_tags[$langcode][$index] = array(
+        // Beware, this is not a real tid, it's just an index.
+        'tid' => $index,
+        'taxonomy_term' => (object) array('name' => $tag),
+      );
+    }
+  }
+
+  // Save video width and height.
+  if (!isset($atom->data)) {
+    $atom->data = array();
+  }
+  $atom->data['video_width'] = $infos->width;
+  $atom->data['video_height'] = $infos->height;
+
+  // Download a copy of the video thumbnail. This makes it possible
+  // to do interesting manipulation with image styles presets.
+  $thumb = drupal_http_request($infos->thumbnail['src']);
+  if ('200' === $thumb->code && $directory = ScaldAtomController::getThumbnailPath('video')) {
+    $dest = $directory . '/vine-' . $infos->id . '.jpg';
+    $file = file_save_data($thumb->data, $dest);
+
+    if ($file) {
+      // Set the file status to temporary.
+      db_update('file_managed')
+        ->condition('fid', $file->fid)
+        ->fields(array('status' => 0))
+        ->execute();
+      $langcode = field_language('scald_atom', $atom, 'scald_thumbnail');
+      $atom->scald_thumbnail[$langcode][0] = (array) $file;
+    }
+  }
+}
+
+/**
+ * Parse a Vine ID and check validity.
+ *
+ * @param string $string
+ *   Identifier or URL of the video.
+ *
+ * @return string
+ *   The video identifier.
+ */
+function scald_vine_parse_id($string) {
+  $vine_id = NULL;
+  $string = trim($string);
+
+  // This string is a URL, most likely a shortened one.
+  // (http://dai.ly, http://bit.ly, etc...).
+  if (preg_match("/^http:/", $string)) {
+    $response = drupal_http_request($string);
+
+    if ('200' === $response->code && isset($response->redirect_code) && ('301' === $response->redirect_code || '302' === $response->redirect_code)) {
+      $string = $response->redirect_url;
+    }
+  }
+
+  // This string is a full Vine URL.
+  if (preg_match(SCALD_VINE_WEB_REGEXP, $string, $matches)) {
+    $vine_id = $matches[1];
+  }
+  // This string is an ID.
+  elseif (preg_match(SCALD_VINE_ID_REGEXP, $string)) {
+    $vine_id = $string;
+  }
+
+  if ($vine_id) {
+    $response = drupal_http_request(SCALD_VINE_WEB . $vine_id);
+
+    if (200 <= $response->code && 400 > $response->code && !empty($response->data)) {
+      return $vine_id;
+    }
+  }
+}
+
+/**
+ * Analyze a Vine page to extract videos information.
+ *
+ * @param string $vine_id
+ *   The video identifier.
+ *
+ * @return object
+ *   An object containing an analyzed video.
+ */
+function scald_vine_feed($vine_id) {
+  $response = drupal_http_request(SCALD_VINE_WEB . $vine_id);
+
+  if (200 <= $response->code && 400 > $response->code && !empty($response->data)) {
+    $dom = new DOMDocument();
+    $search_page = mb_convert_encoding($response->data, 'HTML-ENTITIES', 'UTF-8');
+
+    if (@$dom->loadHTML($search_page)) {
+      foreach ($dom->getElementsByTagName('html') as $item) {
+        $items[] = scald_vine_parse_item($item);
+      }
+
+      return $items[0];
+    }
+  }
+}
+
+/**
+ * Analyze a XML DOMElement item to extract interesting info.
+ *
+ * @param object $item
+ *   An object of class DOMElement corresponding to an element of the feed.
+ *
+ * @return object
+ *   An object containing various videos information:
+ *     - author:    the Vine username of the user who uploaded the video
+ *     - height:    height of the video
+ *     - id:        the Vine video id
+ *     - tags:      an associative array, containing Twitter tags
+ *     - thumbnail: an associative array, containing the source ('src')
+ *     - title:     the video title
+ *     - width:     width of the video
+ */
+function scald_vine_parse_item($item) {
+  $info = new stdClass();
+  $metas = $item->getElementsByTagName('meta');
+
+  for ($i = 0; $i < $metas->length; $i++) {
+    $meta = $metas->item($i);
+    $property = $meta->getAttribute('property');
+    $content = $meta->getAttribute('content');
+
+    // Fetch the video identifier.
+    if ('twitter:player' === $property) {
+      $api_url_full = $content;
+      $api_url_parts = explode('/', $api_url_full);
+      $info->id = $api_url_parts[4];
+    }
+
+    // Author.
+    if ('twitter:description' === $property) {
+      $info->author = str_replace('Vine by ', '', $content);
+    }
+
+    // Width.
+    if ('twitter:player:width' === $property) {
+      $info->width = $content;
+    }
+
+    // Height.
+    if ('twitter:player:height' === $property) {
+      $info->height = $content;
+    }
+
+    // Thumbnail.
+    if ('twitter:image:src' === $property) {
+      $info->thumbnail['src'] = $content;
+    }
+
+    // Title.
+    if ('twitter:title' === $property) {
+      $info->title = $content;
+
+      // Tags.
+      if (preg_match_all(SCALD_VINE_TAGS_REGEXP, $content, $matches)) {
+        $info->tags = $matches[1];
+      }
+    }
+  }
+
+  return $info;
+}
+
+/**
+ * Checks if a video has already been imported, based on its video id.
+ *
+ * @param string $vine_id
+ *   The video identifier.
+ *
+ * @return mixed
+ *   FALSE if the video was never imported, the scald identifier of
+ *   the video otherwise.
+ */
+function scald_vine_already_imported($vine_id) {
+  $query = array('provider' => 'scald_vine', 'base_id' => $vine_id);
+
+  return scald_search($query, FALSE, TRUE);
+}
+
+/**
+ * Implements hook_scald_fetch().
+ */
+function scald_vine_scald_fetch($atom, $type) {
+  $items = field_get_items('scald_atom', $atom, 'scald_thumbnail');
+
+  if ($items && file_exists($items[0]['uri'])) {
+    $atom->file_source = $atom->thumbnail_source = $items[0]['uri'];
+  }
+}
+
+/**
+ * Implements hook_scald_prerender().
+ */
+function scald_vine_scald_prerender($atom, $context, $options, $mode) {
+  if ('atom' === $mode) {
+    drupal_add_js(
+      '//platform.vine.co/static/scripts/embed.js',
+      array(
+        'type' => 'external',
+        'scope' => 'footer',
+      )
+    );
+
+    $atom->rendered->player = theme(
+      'scald_vine_player',
+      array(
+        'id' => $atom->base_id,
+        'height' => $atom->data['video_height'] ? $atom->data['video_height'] : 480,
+        'title' => check_plain($atom->title),
+        'width' => $atom->data['video_width'] ? $atom->data['video_width'] : 480,
+      )
+    );
+  }
+}
+
+/**
+ * Implements hook_theme().
+ */
+function scald_vine_theme() {
+  return array(
+    'scald_vine_player' => array(
+      'variables' => array(
+        // Autoplay audio: 1 or 0.
+        'audio' => 1,
+        'class' => 'vine-embed',
+        // Two styles: simple or postcard.
+        'embed' => 'simple',
+        'frameborder' => 0,
+        'height' => NULL,
+        'id' => NULL,
+        'title' => NULL,
+        'width' => NULL,
+      ),
+    ),
+  );
+}
+
+/**
+ * Display player (iframe).
+ *
+ * @param array $variables
+ *   An associative array containing dimensions and identifier of video.
+ *
+ * @return string
+ *   Iframe HTMl code.
+ */
+function theme_scald_vine_player($variables) {
+  $iframe['element'] = array(
+    '#attributes' => array(
+      'class' => $variables['class'],
+      'frameborder' => $variables['frameborder'],
+      'height' => $variables['height'],
+      'src' => "https://vine.co/v/{$variables['id']}/embed/{$variables['embed']}?audio={$variables['audio']}",
+      'title' => $variables['title'],
+      'width' => $variables['width'],
+    ),
+    '#tag' => 'iframe',
+    '#value' => '',
+  );
+
+  return theme('html_tag', $iframe);
+}

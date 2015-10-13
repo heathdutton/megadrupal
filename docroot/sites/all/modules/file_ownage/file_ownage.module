@@ -1,0 +1,896 @@
+<?php
+
+/**
+ * @file
+ * Repairs markup and bad image references.
+ *
+ * A utility module to import (in bulk or individually), images that have been
+ * placed inline with the HTML content, and transform them into
+ * local attachments that can be more reliably be managed as thumbnails and
+ * findable items.
+ *
+ * This uses the watchdog as its own feedback mechanism.
+ * By default anything at severity WATCHDOG_NOTICE or higher
+ * gets echoed to the screen.
+ * That indicates actual write-back changes that are being made to your content.
+ * Turn the volume down on the settings page at /admin/settings/file_ownage.
+ *
+ * @author Dan Morrison dan@coders.co.nz http://coders.co.nz
+ *
+ * @version #1 file_ownage.module,v 1.2 2007/10/31 14:11:34 coders
+ */
+
+/**
+ * Image width to ignore.
+ *
+ * When importing as a feature attachment, don't bother unless the original is
+ * at least this big.
+ */
+define('FILE_OWNAGE_MIN_WIDTH', 300);
+
+/**
+ * Constants representing the status and location of found files.
+ */
+
+/**
+ * Is at least readable on this server.
+ */
+define('FILE_OWNAGE_IS_ON_FILESYSTEM', 1);
+/**
+ * File is not where it's expected to be.
+ *
+ * Complementing ~FILE_STATUS_PERMANENT and FILE_STATUS_PERMANENT.
+ * This may get inserted into the files table in the status row.
+ *
+ * @see file_checker.module FILE_STATUS_MISSING
+ */
+define('FILE_OWNAGE_IS_INVALID', 2);
+/**
+ * Looks like an URL.
+ */
+define('FILE_OWNAGE_IS_REMOTE', 4);
+/**
+ * Is within the server files dir. Probably correct.
+ */
+define('FILE_OWNAGE_IS_LOCAL', 8);
+/**
+ * Is within the server root, but not in the files dir.
+ */
+define('FILE_OWNAGE_IS_NEARBY', 16);
+/**
+ * Has an entry in the files table and exists. Almost definately correct.
+ */
+define('FILE_OWNAGE_IS_REGISTERED', 32);
+
+/**
+ * Publish the settings form.
+ *
+ * Add a contextual local task to assist re-scanning pages.
+ *
+ * Implements hook_menu().
+ */
+function file_ownage_menu() {
+  $items = array();
+  $items['admin/config/media/file_ownage'] = array(
+    'title' => 'File Ownage',
+    'description' => 'Configure what happens when an inline file is found in text, and what to do about lost files',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('file_ownage_admin_settings'),
+    'access arguments' => array('administer site configuration'),
+    'file' => 'file_ownage.admin.inc',
+    'type' => MENU_NORMAL_ITEM,
+  );
+
+  $settings = variable_get('file_ownage_settings', file_ownage_default_settings());
+  if (!empty($settings['show_tab'])) {
+    $items['node/%node/scan_files'] = array(
+      'title' => 'File Ownage',
+      'description' => 'Scan for embedded files in the source of this page, and repair any links.',
+      'page callback' => 'file_ownage_scan_embeds_tab',
+      'page arguments' => array(1),
+      'access arguments' => array('show file ownage tab'),
+      'type' => MENU_LOCAL_TASK,
+    );
+  }
+
+  if (!empty($settings['show_repair_file_tab'])) {
+    $items['file/%file/repair'] = array(
+      'title' => 'Repair',
+      'description' => 'Scan for other places this file may be found.',
+      'page callback' => 'file_ownage_repair_file_tab',
+      'page arguments' => array(1),
+      'access arguments' => array('show file ownage tab'),
+      'type' => MENU_LOCAL_TASK,
+    );
+  }
+
+  if (!empty($settings['show_check_file_tab'])) {
+    $items['file/%file/check'] = array(
+      'title' => 'Check',
+      'description' => 'Check the status of this file. (debug only)',
+      'page callback' => 'file_ownage_check_file_tab',
+      'page arguments' => array(1),
+      'access arguments' => array('show file check tab'),
+      'type' => MENU_LOCAL_TASK,
+    );
+  }
+
+  return $items;
+}
+
+/**
+ * Implements hook_permission().
+ */
+function file_ownage_permission() {
+  return array(
+    'show file ownage tab' => array(
+      'title' => t('Show file ownage tab'),
+      'description' => t('Whether the user sees the "file ownage" utility tab when editing nodes'),
+    ),
+  );
+}
+
+/**
+ * Returns help text from the help directory.
+ *
+ * Implements hook_help().
+ */
+function file_ownage_help($path, $arg) {
+  $strings = array(
+    '!help' => l(t('Help'), 'admin/help/file_ownage'),
+    '!settings' => l(t('Settings'), 'admin/help/file_ownage'),
+  );
+  switch ($path) {
+    case 'admin/config/content/formats/file_ownage':
+      return t('For more info on how File Ownage works, see the !help', $strings);
+
+    case 'admin/config/media/file_ownage':
+      return t('For more info on how File Ownage works, see the !help', $strings);
+
+    case 'node/%node/scan_images':
+      return t('For more info on how File Ownage works, see the !help. Settings can be found at !settings', $strings);
+
+    case 'admin/help#file_ownage':
+      $help_dir = drupal_get_path('module', 'file_ownage') . '/help';
+      $output = file_get_contents("$help_dir/index.html");
+      drupal_add_css("$help_dir/docs.css");
+      $output = preg_replace('|<h1>[^<]*</h1>|', '', $output);
+      $output = preg_replace('|href="base_url:([^"]+)"|', 'href="' . strtr(url('$1'), array('%24' => '$')) . '"', $output);
+      $output = preg_replace('/(src|href)="([^\\/][^"]+)"/', '$1="' . url($help_dir) . '/$2"', $output);
+      return $output;
+
+  }
+  return NULL;
+}
+
+/**
+ * Pushes log notices generated by this module to the screen.
+ *
+ * Configure this loglevel on the settings page.
+ *
+ * Implements hook_watchdog().
+ */
+function file_ownage_watchdog($log_message) {
+  if ($log_message['type'] != 'file_ownage') {
+    return;
+  }
+  $settings = variable_get('file_ownage_settings', file_ownage_default_settings());
+  global $_file_ownage_log_to_screen;
+  if ($log_message['severity'] <= $settings['loglevel'] || $_file_ownage_log_to_screen) {
+    drupal_set_message(format_string($log_message['message'], $log_message['variables']));
+  }
+}
+
+/**
+ * The default config settings.
+ *
+ * Provide some valid values so we don't trigger strict warnings.
+ *
+ * @return array
+ *   Settings that get stored in variable : file_ownage_settings
+ */
+function file_ownage_default_settings() {
+  return array(
+    'path' => 'images',
+    'show_tab' => FALSE,
+    'show_repair_file_tab' => FALSE,
+    'show_check_file_tab' => FALSE,
+    'import_remote' => TRUE,
+    'import_nearby' => TRUE,
+    'node_save' => FALSE,
+    'remove_original' => FALSE,
+    'image_ownage' => array(
+      'attach_method' => 'file_ownage_attach_none',
+      'feature_filefield_name' => 'field_image',
+      'filefield_name' => 'field_image',
+      'import_files' => FALSE,
+    ),
+    'file_ownage' => array(
+      'attach_method' => 'file_ownage_attach_none',
+      'filefield_name' => 'field_file',
+      'import_files' => FALSE,
+      'suffix_list' => 'pdf,doc',
+    ),
+    'storage_path' => '',
+    'prettyfiles' => FALSE,
+    // A list of parts of filesystem paths
+    // that we want to throw away - redundant folders.
+    'strip_paths' => array(),
+    // Whitelisted or blacklisted remote hosts for importing from.
+    'domains' => array(
+      'domain_handler' => 'ownage',
+      'domain_list' => array(),
+    ),
+    'seek_paths' => array(
+      'public://',
+    ),
+    'do_directory_scan' => FALSE,
+    'relink_behaviour' => 'move_file',
+    'loglevel' => WATCHDOG_NOTICE,
+  );
+}
+
+
+/**
+ * Return a list of available attachment methods.
+ *
+ * These can be extended by other modules
+ * using hook_file_ownage_image_attachment_methods()
+ *
+ * @see file_ownage_file_ownage_image_attachment_methods
+ */
+function file_ownage_image_attachment_methods() {
+  static $methods;
+  if (empty($methods)) {
+    $methods = module_invoke_all('file_ownage_image_attachment_methods');
+  }
+  return $methods;
+}
+
+/**
+ * Declare the methods available for attaching with.
+ *
+ * A response to my own hook invocation.
+ *
+ * Implements HOOK_file_ownage_image_attachment_methods().
+ */
+function file_ownage_file_ownage_image_attachment_methods() {
+  $attachment_methods = array(
+    'file_ownage_attach_none' => array(
+      'label' => 'Do not attach, just leave in the imported directory',
+      'description' => 'The URL in the body text will be updated. No additional database options.',
+    ),
+    'file_ownage_attach_filefield' => array(
+      'label' => 'Attach as a filefield',
+      'description' => 'This option will just ensure that all found images are appropriately associated with the node. Your content type must have an appropriate file field available already.',
+      'subform' => 'file_ownage_attach_filefield_subform',
+    ),
+    'file_ownage_attach_feature_filefield' => array(
+      'label' => 'Attach as a feature filefield',
+      'description' => 'This special option will attach only one image, and remove the img from the text. To qualify as a feature image, the picture must be at least a certain size. Other found images will be attached as supplimentary files. Your content type must have an appropriate field set up already.',
+      'subform' => 'file_ownage_attach_feature_filefield_subform',
+    ),
+    'file_ownage_attach_fileholder_nodereference' => array(
+      'label' => 'Attach as a separate node, using filefield and nodereference',
+      'description' => 'A new container node will be created to hold the found image, and it will be attached via nodereference. This is an advanced architecture.',
+      'subform' => 'file_ownage_attach_fileholder_nodereference_subform',
+    ),
+  );
+  return $attachment_methods;
+}
+
+
+/**
+ * Return a list of available FILE attachment methods.
+ *
+ * As compared to IMAGE attachment methods.
+ * These can be extended by other modules using
+ * hook_file_ownage_file_attachment_methods().
+ *
+ * @see file_ownage_image_attachment_methods()
+ * @see file_ownage_file_ownage_file_attachment_methods()
+ */
+function file_ownage_file_attachment_methods() {
+  static $methods;
+  if (empty($methods)) {
+    $methods = module_invoke_all('file_ownage_file_attachment_methods');
+  }
+  return $methods;
+}
+
+
+/**
+ * Declare the methods available for attaching linked files with.
+ *
+ * As opposed to those supporting embedded images with...
+ * Largely the same as the file_ownage_file_ownage_image_attachment_methods.
+ *
+ * Implements hook_file_ownage_file_attachment_methods().
+ */
+function file_ownage_file_ownage_file_attachment_methods() {
+  $attachment_methods = array(
+    'file_ownage_attach_none' => array(
+      'label' => 'Do not attach, just leave in directory',
+      'description' => 'The URL in the body text will be updated. No additional database options.',
+    ),
+    'file_ownage_attach_filefield' => array(
+      'label' => 'Attach as a filefield',
+      'description' => 'This option will just ensure that all found images are appropriately associated with the node. Requires a file field to be available on the content type.',
+      'subform' => 'file_ownage_attach_filefield_subform',
+    ),
+  );
+  return $attachment_methods;
+}
+
+
+/**
+ * Run the scan action and return the node view.
+ *
+ * Menu action callback.
+ *
+ * @param object $entity
+ *   Entity to work on.
+ * @param array $settings
+ *   Context configs, if any.
+ *
+ * @return array
+ *   Renderable result.
+ */
+function file_ownage_scan_embeds_tab($entity, $settings = array()) {
+  $modified = file_ownage_scan_embeds_action($entity, $settings);
+  $message = $modified ? 'Found some embedded resources and re-saved page' : 'No new embedded images or resources processed on this page (or maybe an error, see logs)';
+  drupal_set_message($message);
+  return node_show($entity, NULL);
+}
+
+/**
+ * Run the repair (seek_file) action and bounces to an updated file view.
+ *
+ * Menu action callback.
+ *
+ * @param object $entity
+ *   Entity to work on.
+ * @param array $settings
+ *   Context configs, if any.
+ */
+function file_ownage_repair_file_tab($entity, $settings = array()) {
+  $settings = variable_get('file_ownage_settings', file_ownage_default_settings());
+  global $_file_ownage_log_to_screen;
+  $_file_ownage_log_to_screen = TRUE;
+  drupal_set_message("Running integrity check on file...");
+
+  $modified = file_ownage_seek_file_action($entity, $settings);
+  $message = $modified ? 'Repaired file' : 'No repairs were possible';
+  drupal_set_message($message);
+  $file_page_url = entity_uri('file', $entity);
+  drupal_goto($file_page_url['path']);
+}
+
+
+/**
+ * Run the 'check' action and return an updated file view.
+ *
+ * Checking a file will update its status and verify the usage count.
+ *
+ * This is only here for diagnostics, probably not useful most of the time.
+ *
+ * Menu action callback.
+ *
+ * @param object $entity
+ *   Entity to work on.
+ * @param array $settings
+ *   Context configs, if any.
+ */
+function file_ownage_check_file_tab($entity, $settings = array()) {
+  $settings = variable_get('file_ownage_settings', file_ownage_default_settings());
+  global $_file_ownage_log_to_screen;
+  $_file_ownage_log_to_screen = TRUE;
+  drupal_set_message("Checking file status...");
+
+  $status = file_ownage_check_file_action($entity, $settings);
+  drupal_set_message(t('File status is %status', array('%status' => $status)));
+  $file_page_url = entity_uri('file', $entity);
+  drupal_goto($file_page_url['path']);
+}
+
+
+/**
+ * Advertise the processes that can be done from the content management screen.
+ *
+ * At admin/content. This is mostly redundant and surpassed by
+ * hook_action_info() but added fo immediate gratification if you are not using
+ * VBO yet.
+ *
+ * Implements hook_node_operations().
+ */
+function file_ownage_node_operations() {
+  $operations = array(
+    'file_ownage_scan_embeds' => array(
+      'label' => t('Scan content for embedded files and own them'),
+      'callback' => 'file_ownage_scan_embeds_operation',
+    ),
+  );
+  return $operations;
+}
+
+/**
+ * Advertise the actions we may perform on a file.
+ *
+ * This is most often accessed via VBO, though Rules could also find this.
+ *
+ * Implements hook_action_info()
+ */
+function file_ownage_action_info() {
+  return array(
+    'file_ownage_scan_embeds' => array(
+      'type' => 'entity',
+      'label' => t('Check textfields for embeds'),
+      'configurable' => TRUE,
+      'triggers' => array(
+        'entity_update',
+      ),
+      'behavior' => array('changes_property'),
+    ),
+    'file_ownage_check_file_action' => array(
+      'type' => 'file',
+      'label' => t('Check file status and usage'),
+      'configurable' => FALSE,
+      'behavior' => array('changes_property'),
+    ),
+    'file_ownage_seek_file_action' => array(
+      'type' => 'file',
+      'label' => t('Search for file'),
+      'configurable' => TRUE,
+      'behavior' => array('changes_property'),
+    ),
+  );
+}
+
+/**
+ * Optionally run the scan process on every node save.
+ *
+ * Implements hook_node_presave().
+ */
+function file_ownage_node_presave($node) {
+  $settings = variable_get('file_ownage_settings', file_ownage_default_settings());
+  if ($settings['node_save']) {
+    module_load_include('inc', 'file_ownage', 'file_ownage.process');
+    // Update the content, but don't actually save.
+    file_ownage_scan_embeds_process_node($node, $settings);
+  }
+}
+
+
+/**
+ * Scan a list of nodes and own their images.
+ *
+ * A hook_node_operations callback.
+ */
+function file_ownage_scan_embeds_operation($nids = array(), $show_message = TRUE) {
+  foreach ($nids as $nid) {
+    watchdog('file_ownage', "Running %function on %nid", array('%function' => __FUNCTION__, '%nid' => $nid), WATCHDOG_INFO);
+    $node = node_load($nid);
+    file_ownage_scan_embeds_action($node);
+  }
+}
+
+
+/**
+ * Action that runs the scan process and saves the result.
+ *
+ * If you don't want to save yet, use
+ * file_ownage_scan_embeds_process_node()
+ *
+ * This may be:
+ * - Invoked directly by pressing file_ownage_scan_embeds_tab()
+ * - Called from VBO (advertised by way of file_ownage_action_info())
+ * - Or invoked from file_ownage_scan_embeds_operation()
+ *   from the content management page.
+ * - Or even as a 'Rules' event.
+ *
+ * Implements hook_ACTION_ID_action().
+ */
+function file_ownage_scan_embeds_action(&$node, $settings = array()) {
+  $strings = array('!node' => l($node->title, 'node/' . $node->nid));
+  watchdog('file_ownage', "Running %function on %nid", array('%function' => __FUNCTION__, '%nid' => $node->nid), WATCHDOG_INFO);
+  module_load_include('inc', 'file_ownage', 'file_ownage.process');
+
+  $modified = file_ownage_scan_embeds_process_node($node, $settings);
+
+  if ($modified) {
+    // // Remember to rebuild the teaser or strange double-ups occur
+    // unset($node->teaser);
+    $node->log = "file_ownage rewrote some links to attached files";
+    $node->revision = TRUE;
+    node_submit($node);
+    node_save($node);
+  }
+  else {
+    watchdog('file_ownage', 'No relevant changes made to the node !node', $strings, WATCHDOG_INFO);
+  }
+  return $modified;
+}
+
+/**
+ * Updates the status of a single file.
+ *
+ * Checks if a registered file is where it's expected to be.
+ *
+ * hook_action() defines no return type, but we return the status anyway
+ * in case someone cares.
+ * Duplicates file_checker_verify()
+ *
+ * This makes minor database status updates - to reflect reality,
+ * not to enact change.
+ *
+ * Implements hook_action().
+ */
+function file_ownage_check_file_action(&$entity, $context = array()) {
+
+  $path = file_stream_wrapper_uri_normalize($entity->uri);
+  $entity_uri = entity_uri('file', $entity);
+  $strings = array(
+    '%fid' => $entity->fid,
+    '!file' => l($entity->filename, $entity_uri['path']),
+  );
+
+  // Check if file can be accessed.
+  if (!file_exists($path) || !is_readable($path)) {
+    $entity->status = FILE_OWNAGE_IS_INVALID;
+    drupal_write_record('file_managed', $entity, 'fid');
+    watchdog('file_ownage', 'File %fid !file seems to be missing.', $strings, WATCHDOG_WARNING);
+  }
+  // If files are falsely marked as missing, revert the status back.
+  elseif (($entity->status & FILE_OWNAGE_IS_INVALID) == FILE_OWNAGE_IS_INVALID) {
+    $entity->status = FILE_STATUS_PERMANENT;
+    drupal_write_record('file_managed', $entity, 'fid');
+    watchdog('file_ownage', 'File %fid !file once was lost but now is found.', $strings, WATCHDOG_NOTICE);
+  }
+
+  // While here, clean up the file usage table - it can also get dirty.
+  file_ownage_check_file_usage_action($entity);
+
+  return $entity->status;
+}
+
+
+/**
+ * Sweep remnants out of the file_usage table.
+ *
+ * This makes minor database status updates - to reflect reality,
+ * not to enact change.
+ *
+ * Implements hook_action().
+ */
+function file_ownage_check_file_usage_action(&$entity) {
+  $entity_uri = entity_uri('file', $entity);
+  $strings = array(
+    '%fid' => $entity->fid,
+    '!file' => l($entity->filename, $entity_uri['path']),
+  );
+
+  $usages = file_usage_list($entity);
+  // Note what type of node is using it.
+  $bundles = array();
+  foreach ($usages as $module => $usage_by_module) {
+    foreach ($usage_by_module as $type => $usage_list) {
+      if ($type == 'node') {
+        foreach ($usage_list as $id => $count) {
+          $check_owner = node_load($id);
+          if (empty($check_owner)) {
+            $strings['%nid'] = $id;
+            watchdog('file_ownage', 'File %fid !file said it was owned by a node "%nid" that is no longer available. removing usage record.', $strings, WATCHDOG_NOTICE);
+            file_usage_delete($entity, 'file', 'node', $id, 0);
+          }
+          else {
+            $bundles[$check_owner->type][] = $id;
+          }
+        }
+      }
+    }
+  }
+
+}
+
+
+/**
+ * Attempts to find a misplaced file.
+ *
+ * Checks if a given file is where it should be, and if not, searches other
+ * possible locations and updates the record appropriately.
+ *
+ * Search for the expected file,
+ *   In each of the given seek_paths.
+ *   First with the long filepath,
+ *   Then incrementally shortening it.
+ *
+ * The directories ABOVE the filename are often useful clues to pinpoint the
+ * exact lost file. So scan variations of those while searching.
+ *
+ * To search for 'news/2013/DSC3001.JPG'
+ * in paths 'public://' and '/var/backups/websitefiles/'
+ *
+ * Candidates will be, in order:
+ *
+ * public://news/2013/DSC3001.JPG
+ * public://2013/DSC3001.JPG
+ * public://DSC3001.JPG
+ * /var/backups/websitefiles/news/2013/DSC3001.JPG'
+ * /var/backups/websitefiles/2013/DSC3001.JPG'
+ * /var/backups/websitefiles/DSC3001.JPG'
+ * Where '*' expands to *any* folder found under websitefiles.
+ *
+ *
+ * Implements hook_action().
+ */
+function file_ownage_seek_file_action($entity, $context) {
+  module_load_include('inc', 'file_ownage', 'file_ownage.process');
+
+  // Strings mostly for diagnostics.
+  $entity_uri = entity_uri('file', $entity);
+  $strings = array(
+    '%original_uri' => $entity->uri,
+    '!file_link' => l($entity->filename, $entity_uri['path']),
+  );
+
+  // If file already exists, do nothing.
+  if (file_exists($entity->uri)) {
+    watchdog('file_ownage', 'File !file_link %original_uri is where it should be already. Making no change.', $strings, WATCHDOG_NOTICE);
+    return NULL;
+  }
+  $modified = FALSE;
+
+  $seek_paths = array_filter($context['seek_paths']);
+  // Devolve the file URI into useful bits.
+  // I need the rel_path - the bit after the scheme,
+  $original_filepath = file_uri_target($entity->uri);
+
+  $candidates = array();
+  // List the simple suspected places this file may be found.
+  foreach ($seek_paths as $seek_path) {
+    $path_parts = explode('/', $original_filepath);
+    while ($path_parts) {
+      $partial_path = implode('/', $path_parts);
+      // Can't find an api for file_create_uri() to glue these two together.
+      // I suspect we should need one here.
+      $candidates[] = implode('', array($seek_path, $partial_path));
+      array_shift($path_parts);
+    }
+  }
+
+  // I've enumerated the places to look, now check them.
+  $found_uri = NULL;
+  foreach ($candidates as $possible_path) {
+    $strings['%possible_path'] = $possible_path;
+    watchdog('file_ownage', 'Seeking lost file %original_uri in %possible_path', $strings, WATCHDOG_INFO);
+    if (file_ownage_file_exists($possible_path)) {
+      $found_uri = $possible_path;
+      // The first one found (bottom up scan) is the winner.
+      break;
+    }
+  }
+
+  if ($found_uri) {
+    $strings['%found_uri'] = $found_uri;
+    watchdog('file_ownage', 'Found lost file %original_uri in location %found_uri during path recursion - Hooray! Can repair this!', $strings, WATCHDOG_INFO);
+    $modified = file_ownage_repair_lost_file_reference($entity, $found_uri, $context);
+  }
+
+  // ONLY if the simple scans failed, do we try the expensive
+  // file_scan_directory method.
+  // For this one, we *cannot* use the parent directories to narrow any
+  // precision, so any filename match will do.
+  if ($context['do_directory_scan'] && !$found_uri) {
+    // Repeat a scan, this time with recursion.
+    foreach ($seek_paths as $seek_path) {
+      $safe_path = preg_quote($entity->filename);
+      $matches = file_scan_directory($seek_path, "|$safe_path\$|");
+      if (!empty($matches)) {
+        $found = reset($matches);
+        $found_uri = $found->uri;
+        $strings['%found_uri'] = $found_uri;
+        watchdog('file_ownage', 'Found lost file %original_uri in location %found_uri during folder scans - Hooray! Can repair this!', $strings, WATCHDOG_INFO);
+        $modified = file_ownage_repair_lost_file_reference($entity, $found_uri, $context);
+        break;
+      }
+    }
+  }
+
+  if (!$found_uri) {
+    watchdog('file_ownage', 'Failed to find any valid candidate to replace !file_link that was expected at %original_uri .', $strings, WATCHDOG_WARNING);
+  }
+
+  if ($modified) {
+    watchdog('file_ownage', 'The file !file_link should be good now!', $strings, WATCHDOG_INFO);
+    // Update its status in the files table.
+    file_ownage_check_file_action($entity);
+  }
+  return $modified;
+}
+
+
+/**
+ * Settings for the 'seek_file' action.
+ *
+ * Implements hook_action_form()
+ */
+function file_ownage_seek_file_action_form($context) {
+  $settings = variable_get('file_ownage_settings', file_ownage_default_settings());
+
+  // Remember these configs semi-permanently.
+  $seek_paths = $settings['seek_paths'];
+  // Eliminate blank values and add one blank at the end.
+  $seek_paths = array_filter($seek_paths, 'trim');
+  $seek_paths[] = '';
+
+  $form['seek_paths'] = array(
+    '#tree' => TRUE,
+    '#description' => t('
+      Paths to scan for this file, by filename and parentage.
+      Can be a local filestream identifier (eg public://oldfiles)
+      or a system path (eg /var/www/backup/assets)
+      or even an URL (http://example.com/images/).
+
+      Remote URL retrieval requires the <a href="https://www.drupal.org/project/remote_stream_wrapper">remote stream wrapper module</a>.
+
+      For local filestreams, you can add a wildcard at the end also,
+      eg public://imported/* .
+      Without a wildcard, only reasonably precise matches will be checked.
+
+      Include trailing slash.
+    '),
+  );
+  foreach ($seek_paths as $delta => $path) {
+    $form['seek_paths'][] = array(
+      '#title' => t('Path'),
+      '#type' => 'textfield',
+      '#default_value' => isset($seek_paths[$delta]) ? $seek_paths[$delta] : '',
+    );
+  }
+
+  $form['relink_behaviour'] = array(
+    '#title' => t('When found:'),
+    '#type' => 'radios',
+    '#options' => array(
+      'update_db' => 'Change reference in the database',
+      'move_file' => 'Move file to expected location',
+      'copy_file' => 'Copy file to expected location',
+    ),
+    '#required' => TRUE,
+    '#default_value' => $settings['relink_behaviour'],
+  );
+
+  $form['loglevel'] = array(
+    '#title' => t('Log level'),
+    '#description' => t('
+      For debugging, messages at this level or higher
+      will be echoed to the screen.
+      "Notice" is probably the most informative as it describes changes
+      that get made during the process.
+    '),
+    '#type' => 'select',
+    '#options' => watchdog_severity_levels(),
+    '#default_value' => $settings['loglevel'],
+  );
+
+  return $form;
+}
+
+/**
+ * Ensure that the paths to scan are valid.
+ *
+ * @see file_ownage_seek_file_action_form()
+ *
+ * Implements hook_action_validate().
+ */
+function file_ownage_seek_file_action_validate($form, $form_state) {
+  $seek_paths = array_filter($form_state['values']['seek_paths']);
+  foreach ($seek_paths as $delta => $seek_path) {
+    if (!preg_match('|/$|', $seek_path)) {
+      form_set_error('seek_paths][' . $delta, t('Path must end with /'));
+    }
+  }
+}
+
+/**
+ * Remember the paths to scan for next time.
+ *
+ * Implements hook_action_submit().
+ */
+function file_ownage_seek_file_action_submit($form, $form_state) {
+  // Remember this preference for next time. It'll usually be the same.
+  $settings = variable_get('file_ownage_settings', file_ownage_default_settings());
+  $seek_paths = array_filter($form_state['values']['seek_paths']);
+  $settings['seek_paths'] = $seek_paths;
+  $settings['relink_behaviour'] = $form_state['values']['relink_behaviour'];
+  $settings['loglevel'] = $form_state['values']['loglevel'];
+  variable_set('file_ownage_settings', $settings);
+  return $settings;
+}
+
+/**
+ * Fix a broken file reference.
+ *
+ * Do this by changing our data record, or by changing reality.
+ */
+function file_ownage_repair_lost_file_reference($entity, $found_uri, $context) {
+
+  // For diagnostics.
+  $entity_uri = entity_uri('file', $entity);
+  $strings = array(
+    '%found_uri' => $found_uri,
+    '!found_uri' => l($found_uri, file_create_url($found_uri)),
+    '%original_uri' => $entity->uri,
+    '!original_uri' => l($entity->uri, file_create_url($entity->uri)),
+    '%method' => $context['relink_behaviour'],
+    '!file_link' => l($entity->filename, $entity_uri['path']),
+  );
+
+  // If the new URL is NOT in the same file scheme as the old one,
+  // we are going to have to import it from where it was found.
+  $old_scheme = file_uri_scheme($entity->uri);
+  $new_scheme = file_uri_scheme($found_uri);
+  if ($old_scheme != $new_scheme) {
+    $context['relink_behaviour'] = 'move_file';
+  }
+
+  // If we can't remove the old one (eg, remote or protected),
+  // we'd better just copy.
+  if ($context['relink_behaviour'] == 'move_file' && !is_writable($found_uri)) {
+    $context['relink_behaviour'] = 'copy_file';
+  }
+
+  if ($context['relink_behaviour'] == 'move_file' || $context['relink_behaviour'] == 'move_file') {
+    // TODO - sanity check that this isn't already a registered file.
+    // If this file is already registered on the system, then we should merge
+    // the database rows, and force relink_behaviour to be rewrite reference.
+  }
+
+  $modified = FALSE;
+  switch ($context['relink_behaviour']) {
+    case 'move_file':
+      file_unmanaged_move($found_uri, $entity->uri);
+      drupal_set_message(t("Moved found file !file_link from %found_uri to !original_uri where it's expected to be.", $strings));
+      $modified = TRUE;
+      break;
+
+    case 'copy_file':
+      $success = file_ownage_file_copy($found_uri, $entity->uri);
+      if ($success) {
+        drupal_set_message(t("Copied found file !file_link  from %found_uri to !original_uri where it's expected to be.", $strings));
+        $modified = TRUE;
+      }
+      else {
+        drupal_set_message(t("Failed to copy file !file_link from %found_uri to !original_uri where it's expected to be.", $strings));
+      }
+      break;
+
+    case 'update_db':
+
+      // Look-ahead in db to see if there is an existing dupe
+      // for this path - which would imply the records need *merging* .
+      // select count(*), fid, uri, filename from file_managed GROUP BY uri having COUNT(*) > 1 ORDER BY COUNT(*);
+      $existing = file_ownage_get_file_by_uri($found_uri);
+      if (!empty($existing)) {
+        $existing_uri = entity_uri('file', $existing);
+        $strings['!existing'] = l($existing->filename, $existing_uri['path']);
+        drupal_set_message(t("We already have a file entry for the expected URI! !existing . This should probably be MERGED instead of replaced. Not updating", $strings));
+        // Set modified to something to prevent further searches.
+        $modified = 2;
+      }
+      else {
+        $entity->uri = $found_uri;
+        entity_save('file', $entity);
+        drupal_set_message(t("Changed the database for !file_link to become !found_uri instead of %original_uri .", $strings));
+        $modified = TRUE;
+      }
+      break;
+
+    default:
+      drupal_set_message(t("Invalid repair method '%method'!", $strings), 'error');
+      break;
+
+  }
+
+  return $modified;
+}

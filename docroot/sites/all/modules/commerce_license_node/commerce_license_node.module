@@ -1,0 +1,415 @@
+<?php
+
+/**
+ * @file
+ * Provides a license type for selling nodes.
+ */
+
+/**
+ * Implements hook_ctools_plugin_directory().
+ */
+function commerce_license_node_ctools_plugin_directory($owner, $plugin_type) {
+  if ($owner == 'commerce_license') {
+    return "plugins/$plugin_type";
+  }
+}
+
+/**
+ * Implements hook_menu().
+ */
+function commerce_license_node_menu() {
+  $items['admin/commerce/config/license/node'] = array(
+    'title' => 'Node',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('commerce_license_node_settings_form'),
+    'access arguments' => array('administer licenses'),
+    'type' => MENU_LOCAL_TASK,
+    'file' => 'includes/commerce_license_node.admin.inc',
+  );
+
+  return $items;
+}
+
+/**
+ * Return a list of product types used for node licensing.
+ *
+ * @return
+ *   An array of product type machine names.
+ */
+function commerce_license_node_product_types() {
+  $node_product_types = variable_get('commerce_license_node_product_types', array());
+  $node_product_types = array_filter($node_product_types);
+  // Return only those $node_product_types that are still licensable.
+  $license_product_types = commerce_license_product_types();
+  return array_intersect($node_product_types, $license_product_types);
+}
+
+/**
+ * Implements hook_commerce_license_types_list_alter().
+ *
+ * Removes the role_node license type option from those product types that don't
+ * have it configured.
+ */
+function commerce_license_node_commerce_license_types_list_alter(&$types, $product) {
+  if (!empty($product) && !in_array($product->type, commerce_license_node_product_types())) {
+    // @todo Support license types that inherit role_node.
+    unset($types['role_node']);
+  }
+}
+
+/**
+ * Implements hook_flush_caches().
+ *
+ * Ensures that products have the required commerce_license_node field.
+ */
+function commerce_license_node_flush_caches() {
+  $node_product_types = commerce_license_node_product_types();
+  commerce_license_node_configure_node_product_types($node_product_types);
+
+  $role_product_types = commerce_license_role_product_types();
+  $role_node_product_types = array_intersect($node_product_types, $role_product_types);
+  commerce_license_node_configure_role_node_product_types($role_node_product_types);
+}
+
+/**
+ * Returns a list of licensable node types.
+ */
+function commerce_license_node_get_licensable_node_types() {
+  $product_types = commerce_license_node_product_types();
+  $node_types = array();
+  if (count($product_types) != 0) {
+    $query = new EntityFieldQuery();
+    $query
+      ->entityCondition('entity_type', 'commerce_product')
+      ->entityCondition('bundle', $product_types)
+      ->propertyCondition('status', 1);
+    $result = $query->execute();
+    if ($result) {
+      $product_ids = array_keys($result['commerce_product']);
+      $products = commerce_product_load_multiple($product_ids);
+      foreach ($products as $product) {
+        $product_wrapper = entity_metadata_wrapper('commerce_product', $product);
+        // @todo Support license types that inherit role_node.
+        if ($product_wrapper->commerce_license_type->value() == 'role_node') {
+          $node_types[] = $product_wrapper->cl_node_type->value();
+        }
+      }
+    }
+  }
+  return $node_types;
+}
+
+/**
+ * Returns the main license for the provided uid.
+ *
+ * @param $uid
+ *   The user id.
+ *
+ * @return
+ *   A commerce_license entity, or FALSE if none found.
+ */
+function commerce_license_node_get_master_license($uid) {
+  $license = FALSE;
+  $query = new EntityFieldQuery();
+  $query
+    ->entityCondition('entity_type', 'commerce_license')
+    // @todo Support license types that inherit role_node.
+    ->entityCondition('bundle', 'role_node')
+    ->propertyCondition('uid', $uid)
+    ->propertyCondition('status', COMMERCE_LICENSE_ACTIVE);
+  $result = $query->execute();
+  if ($result) {
+    $license_id = key($result['commerce_license']);
+    $license = entity_load_single('commerce_license', $license_id);
+  }
+
+  return $license;
+}
+
+/**
+ * Returns the node license for the provided nid and uid.
+ *
+ * @param $nid
+ *   The node id.
+ * @param $uid
+ *   The user id.
+ *
+ * @return
+ *   A commerce_license entity, or FALSE if none found.
+ */
+function commerce_license_node_get_node_license($nid, $uid) {
+  $license = FALSE;
+  $query = new EntityFieldQuery();
+  $query
+    ->entityCondition('entity_type', 'commerce_license')
+    ->entityCondition('bundle', 'node')
+    ->propertyCondition('uid', $uid)
+    ->fieldCondition('cl_created_node', 'target_id', $nid);
+  $result = $query->execute();
+  if ($result) {
+    $license_id = key($result['commerce_license']);
+    $license = entity_load_single('commerce_license', $license_id);
+  }
+
+  return $license;
+}
+
+/**
+ * Implements hook_node_insert().
+ */
+function commerce_license_node_node_insert($node) {
+  if (!in_array($node->type, commerce_license_node_get_licensable_node_types())) {
+    // Only react for licensable node types.
+    return;
+  }
+
+  if ($node->status = NODE_PUBLISHED) {
+    // If no license was found, create one.
+    $master_license = commerce_license_node_get_master_license($node->uid);
+    $license_product_id = $master_license->wrapper->product->raw();
+    $usage_product_id = $master_license->wrapper->product->cl_node_usage_product->raw();
+
+    $node_license = entity_create('commerce_license', array(
+      'type' => 'node',
+      'product_id' => $usage_product_id,
+      'uid' => $node->uid,
+      'status' => COMMERCE_LICENSE_ACTIVE,
+    ));
+
+    $node_license_wrapper = entity_metadata_wrapper('commerce_license', $node_license);
+    $node_license_wrapper->cl_licensed_node = $node->nid;
+    $node_license_wrapper->save();
+    $increment_usage = TRUE;
+  }
+
+  // Increment usage if a sublicense was activated.
+  if ($increment_usage) {
+    $usage_group = commerce_license_billing_usage_group($master_license, 'nodes');
+    $current_usage = $usage_group->currentUsage();
+    $usage_group->addUsage($master_license->revision_id, $current_usage + 1, REQUEST_TIME);
+  }
+}
+
+/**
+ * Implements hook_node_update().
+ */
+function commerce_license_node_node_update($node) {
+  if (!in_array($node->type, commerce_license_node_get_licensable_node_types())) {
+    // Only react for licensable node types.
+    return;
+  }
+
+  // The node was just published. Register usage and create a sublicense.
+  if ($node->status = NODE_PUBLISHED && $node->original->status == NODE_NOT_PUBLISHED) {
+    $master_license = commerce_license_node_get_master_license($node->uid);
+    $node_license = commerce_license_node_get_node_license($node->nid, $node->uid);
+    $increment_usage = FALSE;
+    // If there is an expired license for this node, reactivate it.
+    if ($node_license && $node_license->status == COMMERCE_LICENSE_EXPIRED) {
+      $node_license->status = COMMERCE_LICENSE_ACTIVE;
+      $node_license->save();
+      $increment_usage = TRUE;
+    }
+    elseif (!$node_license) {
+      // If no license was found, create one.
+      $license_product_id = $master_license->wrapper->product->raw();
+      $usage_product_id = $master_license->wrapper->product->cl_node_usage_product->raw();
+
+      $node_license = entity_create('commerce_license', array(
+        'type' => 'node',
+        'product_id' => $usage_product_id,
+        'uid' => $node->uid,
+        'status' => COMMERCE_LICENSE_ACTIVE,
+      ));
+
+      $node_license_wrapper = entity_metadata_wrapper('commerce_license', $node_license);
+      $node_license_wrapper->cl_licensed_node = $node->nid;
+      $node_license_wrapper->save();
+      $increment_usage = TRUE;
+    }
+
+    // Increment usage if a sublicense was activated.
+    if ($increment_usage) {
+      $usage_group = commerce_license_billing_usage_group($master_license, 'nodes');
+      $current_usage = $usage_group->currentUsage();
+      $usage_group->addUsage($master_license->revision_id, $current_usage + 1, REQUEST_TIME);
+    }
+  }
+  // The node was just unpublished.
+  elseif ($node->status == NODE_NOT_PUBLISHED && $node->original->status == NODE_PUBLISHED) {
+    $master_license = commerce_license_node_get_master_license($node->uid);
+    $node_license = commerce_license_node_get_node_license($node->nid, $node->uid);
+    // If there is an active license for this node, expire it.
+    if ($node_license && $node_license->status == COMMERCE_LICENSE_ACTIVE) {
+      $node_license->status = COMMERCE_LICENSE_EXPIRED;
+      $node_license->save();
+
+      // Decrement usage.
+      $usage_group = commerce_license_billing_usage_group($master_license, 'nodes');
+      $current_usage = $usage_group->currentUsage();
+      $usage_group->addUsage($master_license->revision_id, $current_usage - 1, REQUEST_TIME);
+    }
+  }
+}
+
+/**
+ * Ensures that the provided product types have the required fields.
+ *
+ * Note that fields are prefixed with cl_ and not commerce_license to get
+ * around the 32 character field name length limitation.
+ *
+ * Fields:
+ * - cl_node_type: a list(text) field pointing to a node type.
+ *
+ * @param $types
+ *   An array of product type machine names.
+ */
+function commerce_license_node_configure_node_product_types($types) {
+  $field = field_info_field('cl_node_type');
+  if (!$field) {
+    $field = array(
+      'field_name' => 'cl_node_type',
+      'cardinality' => 1,
+      'type' => 'list_text',
+      'locked' => TRUE,
+      'settings' => array(
+        'allowed_values_function' => 'commerce_license_node_allowed_values',
+      ),
+    );
+    field_create_field($field);
+  }
+
+  $existing = array();
+  if (!empty($field['bundles']['commerce_product'])) {
+    $existing = $field['bundles']['commerce_product'];
+  }
+  // Create instances on newly configured product types.
+  foreach (array_diff($types, $existing) as $new_bundle) {
+    $instance = array(
+      'field_name' => 'cl_node_type',
+      'entity_type' => 'commerce_product',
+      'bundle' => $new_bundle,
+      'label' => t('Node Type'),
+      'required' => TRUE,
+      'widget' => array(
+        'type' => 'options_select',
+        'weight' => 9,
+      ),
+    );
+    field_create_instance($instance);
+  }
+
+  // Remove instances from product types that can no longer have role licenses.
+  foreach (array_diff($existing, $types) as $removed_bundle) {
+    $instance = field_info_instance('commerce_product', 'cl_node_type', $removed_bundle);
+    field_delete_instance($instance, TRUE);
+  }
+}
+
+/**
+ * Ensures that the provided product types have the required fields.
+ *
+ * Fields:
+ * - cl_node_quota: a quantity field.
+ *
+ * @param $types
+ *   An array of product type machine names.
+ */
+function commerce_license_node_configure_role_node_product_types($types) {
+  $field = field_info_field('cl_node_quota');
+  if (!$field) {
+    $field = array(
+      'field_name' => 'cl_node_quota',
+      'cardinality' => 1,
+      'type' => 'number_integer',
+      'locked' => TRUE,
+      'settings' => array(),
+    );
+    field_create_field($field);
+  }
+
+  $existing = array();
+  if (!empty($field['bundles']['commerce_product'])) {
+    $existing = $field['bundles']['commerce_product'];
+  }
+  // Create instances on newly configured product types.
+  foreach (array_diff($types, $existing) as $new_bundle) {
+    $instance = array(
+      'field_name' => 'cl_node_quota',
+      'entity_type' => 'commerce_product',
+      'description' => t('The number of nodes included in the license.'),
+      'bundle' => $new_bundle,
+      'label' => t('Quota'),
+      'required' => TRUE,
+      'settings' => array(
+        'max' => '',
+        'min' => 0,
+        'prefix' => '',
+        'suffix' => '',
+        'user_register_form' => FALSE,
+      ),
+      'widget' => array(
+        'active' => 0,
+        'module' => 'number',
+        'settings' => array(),
+        'type' => 'number',
+        'weight' => 3,
+      ),
+    );
+    field_create_instance($instance);
+  }
+
+  $field = field_info_field('cl_node_usage_product');
+  if (!$field) {
+    $field = array(
+      'field_name' => 'cl_node_usage_product',
+      'cardinality' => 1,
+      'type' => 'entityreference',
+      'locked' => TRUE,
+      'settings' => array(
+        'target_type' => 'commerce_product'
+      ),
+    );
+    field_create_field($field);
+  }
+
+  $existing = array();
+  if (!empty($field['bundles']['commerce_product'])) {
+    $existing = $field['bundles']['commerce_product'];
+  }
+  // Create instances on newly configured product types.
+  foreach (array_diff($types, $existing) as $new_bundle) {
+    $instance = array(
+      'field_name' => 'cl_node_usage_product',
+      'entity_type' => 'commerce_product',
+      'description' => t('Used to charge nodes over the included quota.'),
+      'bundle' => $new_bundle,
+      'label' => t('Usage product'),
+      'required' => TRUE,
+      'settings' => array(),
+      'widget' => array(
+        'active' => 1,
+        'module' => 'options',
+        'settings' => array(),
+        'type' => 'options_select',
+        'weight' => 4,
+      ),
+    );
+    field_create_instance($instance);
+  }
+
+  // Remove instances from product types that can no longer have role licenses.
+  foreach (array_diff($existing, $types) as $removed_bundle) {
+    $instance = field_info_instance('commerce_product', 'cl_node_quota', $removed_bundle);
+    field_delete_instance($instance, TRUE);
+    $instance = field_info_instance('commerce_product', 'cl_node_usage_product', $removed_bundle);
+    field_delete_instance($instance, TRUE);
+  }
+}
+
+/**
+ * Allowed values callback for roles.
+ */
+function commerce_license_node_allowed_values($field, $instance, $entity_type, $entity) {
+  return node_type_get_names();
+}

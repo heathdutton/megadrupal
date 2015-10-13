@@ -1,0 +1,536 @@
+<?php
+/**
+ * @file
+ * Main module for the Webform ExactTarget SOAP API integration.
+ *
+ * This file implements hooks used to tie the ExactTarget SOAP API module into the
+ * Webforms module to allow forms to add rows to ExactTarget Data Extensions.
+ */
+
+/**
+ * Implements hook_menu().
+ */
+function webform_exacttarget_soap_menu() {
+  $items = array();
+
+  $items['node/%webform_menu/webform/exacttarget_soap'] = array(
+    'title' => 'ExactTarget SOAP API settings',
+    'page callback' => 'webform_exacttarget_soap_configure_page',
+    'page arguments' => array(1),
+    'access callback' => 'node_access',
+    'access arguments' => array('update', 1),
+    'file' => 'webform_exacttarget_soap.admin.inc',
+    'weight' => 3,
+    'type' => MENU_LOCAL_TASK,
+  );
+    $items['admin/config/services/exact_target_soap/webform'] = array(
+    'title' => 'Webform config',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('webform_exacttarget_soap_config'),
+    'access arguments' => array('administer exact target soap'),
+    'file' => 'webform_exacttarget_soap.admin.inc',
+    'type' => MENU_LOCAL_TASK,
+    'weight' => 3,
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_theme().
+ */
+function webform_exacttarget_soap_theme($existing, $type, $theme, $path) {
+  return array(
+    'webform_exacttarget_soap_configure_form' => array(
+      'render element' => 'form',
+    ),
+  );
+}
+
+
+/**
+ * Implements hook_nodeapi_delete().
+ */
+function webform_exacttarget_soap_nodeapi_delete($node) {
+  // We're only interested in webform enabled content types
+  if (in_array($node->type, webform_variable_get('webform_node_types'))) {
+    // Delete all mappings related to this node
+    _webform_exacttarget_soap_delete_mappings($node, TRUE);
+  }
+}
+
+
+/**
+ * Implements hook_nodeapi_revision_delete().
+ */
+function webform_exacttarget_soap_nodeapi_revision_delete($node) {
+  // We're only interested in webform enabled content types
+  if (in_array($node->type, webform_variable_get('webform_node_types'))) {
+    // Delete a single revision's mappings
+    _webform_exacttarget_soap_delete_mappings($node);
+  }
+}
+
+/**
+ * Implements hook_node_load().
+ * @param array $nodes
+ * @param type $types
+ */
+function webform_exacttarget_soap_node_load($nodes, $types) {
+  // @todo deal with revisions
+  $query = db_select('webform_exacttarget_soap', 'wfets');
+  $query->groupBy('wfets.nid');
+  $query->fields('wfets', array('nid', 'vid', 'de_key', 'component', 'primary_key'))
+      ->condition('nid', array_keys($nodes), 'IN');
+
+  $result = $query->execute();
+    if ($result) {
+      while ($row = $result->fetchAssoc()) {
+        $nodes[$row['nid']]->uses_exacttarget_soap = FALSE;
+        if ($row['de_key']) {
+          $cfg[] = $row;
+          $nodes[$row['nid']]->uses_exacttarget_soap = TRUE;
+          $nodes[$row['nid']]->exacttarget_soap_map = $row;
+        }
+      }
+    }
+}
+
+/**
+ * Start of Drupal Webform 3.x hook implementations
+ */
+
+/**
+ * Implements hook_webform_submission_insert().
+ */
+function webform_exacttarget_soap_webform_submission_insert($node, $submission) {
+  $form_cfg = webform_exacttarget_soap_get_map($node);
+  // Make sure we have the mappings and SF object type
+  if (!empty($form_cfg)) {
+    // Group mapping by Customer Key
+    $cfg_mapping = array();
+    foreach ($form_cfg as $cfg) {
+      $cfg_mapping[$cfg['de_key']][] = $cfg;
+    }
+
+    // Build xref for Webform components keyed to the field name
+    $wf_fields = array();
+    foreach ($node->webform['components'] as $idx => $field) {
+      $wf_fields[$field['form_key']] = $idx;
+    }
+
+    // Map submission to Data Extension(s) and call create method for each
+    // @see http://help.exacttarget.com/en/technical_library/web_service_guide/methods/create/
+    foreach ($cfg_mapping as $de => $de_map) {
+      $sub_fields = array();
+      $de_primary_keys = array();
+      foreach ($de_map as $de_field) {
+        $webform_component = $de_field['component'];
+        $de_property = $de_field['de_property'];
+        // Determine the primary keys for the Data Extension
+        if (!empty($de_field['primary_key']) ) {
+          $de_primary_keys[] = $de_property;
+        }
+
+        if (isset($wf_fields[$webform_component])) {
+          $submission_field = $wf_fields[$webform_component];
+          if (isset($submission->data[$submission_field]['value']) && isset($submission->data[$submission_field]['value'][0])) {
+            $sub_fields[$de_property] = implode(';', $submission->data[$submission_field]['value']);
+          }
+        }
+      }
+      // Call the ExactTarget API to make the submission but let other modules alter
+      // the data or intercept submission beforehand.
+      // Assume that other modules won't handle the submission to ExactTarget
+      $is_handled = FALSE;
+      // Allow other modules to handle the submit to Salesforce
+      // @note $sub_fields is passed by reference
+      foreach (module_implements('webform_exacttarget_soap_api_submit') as $module) {
+        if ($is_handled == FALSE) {
+          $function = $module . '_webform_exacttarget_soap_api_submit';
+          $new_id = $function($de, $sub_fields, $de_primary_keys, $submission);
+          if (!empty($new_id)) {
+            $is_handled = TRUE;
+          }
+        }
+      }
+
+      // If it wasn't handled by another module, then submit it to ExactTarget
+      if ($is_handled == FALSE) {
+        $result = webform_exacttarget_soap_api_call_updateadd($de, $sub_fields, $de_primary_keys, $submission);
+      }
+      // Allow other modules to act after the submission
+      foreach (module_implements('webform_exacttarget_soap_api_post_submit') as $module) {
+        $function = $module . '_webform_exacttarget_soap_api_post_submit';
+        $function($node, $submission, $sub_fields);
+      }
+    }
+  }
+}
+
+
+/**
+ * Helper functions
+ */
+
+/**
+ * Submits a webform submission as a new data extension object in ExactTarget
+ * as Update with UpdateAdd.
+ * @see http://help.exacttarget.com/en/technical_library/web_service_guide/methods/update/
+ * @param string $data_extension Data Extension external key/unique identifier
+ * @param array $fields Key/value pairs of Properties
+ * @param array $primary_keys array of primary keys (property names in ET)
+ * @params array $submission Webform submission data
+ */
+function webform_exacttarget_soap_api_call_updateadd($data_extension, $fields, $primary_keys, $submission = array()) {
+  // Create data extension object
+  $de = new ExactTarget_DataExtensionObject();
+  $de->CustomerKey = $data_extension; // unique identifier to the data extension
+
+  // Update can happen only if you have PrimaryKey column in the Data Extension
+  // ExactTarget UI allows to set more than one PrimaryKey
+  foreach ($primary_keys as $primary_key) {
+    $api_property_key = new ExactTarget_APIProperty();
+    $api_property_key->Value = $fields[$primary_key]; // value of the primary key for the row we want to add/update
+    _webform_exacttarget_soap_customer_key_simplified($primary_key);
+    $api_property_key->Name = $primary_key; // primary key of the data extension
+    $de->Keys[] = $api_property_key; // add primary key field to the data exension
+  }
+
+  foreach ($fields as $name => $value) {
+    // Only submit properties that have a value.
+    if (!empty($value)) {
+      _webform_exacttarget_soap_customer_key_simplified($name);
+      $property = new ExactTarget_APIProperty();
+      $property->Name = $name; // name of DE field
+      $property->Value = $value; // value for DE field
+      $de->Properties[] = $property;
+    }
+  }
+
+  $object = new SoapVar($de, SOAP_ENC_OBJECT, 'DataExtensionObject', "http://exacttarget.com/wsdl/partnerAPI");
+
+  // Create the ExactTarget_SaveOption Object
+  $save_option = new ExactTarget_SaveOption();
+  $save_option->PropertyName = "DataExtensionObject";
+  $save_option->SaveAction = ExactTarget_SaveAction::UpdateAdd; // set the SaveAction to add/update
+
+  // Apply options and object to request and perform update of data extension
+  $update_options = new ExactTarget_UpdateOptions();
+  $update_options->SaveOptions[] = new SoapVar($save_option, SOAP_ENC_OBJECT, 'SaveOption', "http://exacttarget.com/wsdl/partnerAPI");
+
+  $request->Options = new SoapVar($update_options, SOAP_ENC_OBJECT, 'UpdateOptions', "http://exacttarget.com/wsdl/partnerAPI");
+  $request = new ExactTarget_CreateRequest();
+  $request->Options = $update_options;
+  $request->Objects = array($object);
+
+  try {
+    $results = @ExactTarget::instance()->Update($request);
+    if ($results->OverallStatus == 'OK' || $results->OverallStatus == 'queued') {
+      $return = TRUE;
+    }
+    else {
+      // Construct the error message
+      if (isset($results->Results->ValueErrors->ValueError)) {
+        $msg = $results->Results->ValueErrors->ValueError->Name;
+        $msg .= ': '. $results->Results->ValueErrors->ValueError->ErrorMessage;
+      }
+      else {
+        $msg = $results->Results->StatusMessage;
+      }
+      watchdog('webform_exacttarget_soap', 'An error occurred during @de Update request.<br>Details:<br>@error', array('@de' => $data_extension, '@error' => print_r($results->Results, TRUE)), WATCHDOG_WARNING);
+      $return = FALSE;
+    }
+  } catch (Exception $e) {
+    $return = FALSE;
+    watchdog('webform_exacttarget_soap', 'ExactTarget SOAP API Update with UpdateAdd action returned the following error: @error', array('@error' => $e), WATCHDOG_ERROR);
+  }
+
+  return $return;
+}
+
+/**
+ * Submits a webform submission as a new data extension object in ExactTarget.
+ * @see http://help.exacttarget.com/en/technical_library/web_service_guide/methods/create/
+ * @param string $data_extension Data Extension external key/unique identifier
+ * @param array $fields Key/value pairs of Properties
+ * @params array $submission Webform submission data
+ */
+function webform_exacttarget_soap_api_call_create($data_extension, $fields, $primary_keys = array(), $submission = array()) {
+  $de = new ExactTarget_DataExtensionObject();
+  $de->CustomerKey = $data_extension; //external key/unique identifier for the data extension
+  foreach ($fields as $name => $value) {
+    $property = new ExactTarget_APIProperty();
+    _webform_exacttarget_soap_customer_key_simplified($name);
+    $property->Name = $name; // name of DE field
+    $property->Value = $value; // value for DE field
+    $de->Properties[] = $property;
+  }
+  $object = new SoapVar($de, SOAP_ENC_OBJECT, 'DataExtensionObject', "http://exacttarget.com/wsdl/partnerAPI");
+
+  // create the row of the data extension
+  $request = new ExactTarget_CreateRequest();
+  $request->Options = NULL;
+  $request->Objects = array($object);
+  try {
+    $results = @ExactTarget::instance()->Create($request);
+    if ($results->OverallStatus == 'OK' || $results->OverallStatus == 'queued') {
+      $return = TRUE;
+    }
+    else {
+      // Construct the error message
+      if (isset($results->Results->ValueErrors->ValueError)) {
+        $msg = $results->Results->ValueErrors->ValueError->Name;
+        $msg .= ': '. $results->Results->ValueErrors->ValueError->ErrorMessage;
+      }
+      else {
+        $msg = $results->Results->StatusMessage;
+      }
+      watchdog('webform_exacttarget_soap', 'An error occurred during @de Create request.<br>Details:<br>@error', array('@de' => $data_extension, '@error' => $msg), WATCHDOG_WARNING);
+      $return = FALSE;
+    }
+  } catch (Exception $e) {
+    $return = FALSE;
+    watchdog('webform_exacttarget_soap', 'ExactTarget SOAP API Create method returned the following error: @error', array('@error' => $e), WATCHDOG_ERROR);
+  }
+
+  return $return;
+}
+
+/**
+ * Retrieves field mappings for a webform node.
+ * May be called by other modules implementing module hooks.
+ */
+function webform_exacttarget_soap_get_map($node) {
+  static $cfg = array();
+  if (!is_object($node)) {
+    $node = node_load($node);
+  }
+  if (!$node || empty($node->nid)) {
+    return;
+  }
+  $nid = $node->nid;
+  $vid = (!empty($node->vid)) ? $node->vid : 0;
+
+  if (empty($cfg[$nid][$vid])) {
+    $cfg[$nid][$vid] = array();
+    $result = db_select('webform_exacttarget_soap', 'wfets')
+      ->fields('wfets')
+      ->condition('nid', $nid)
+      ->condition('vid', $vid)
+      ->execute();
+    if ($result) {
+      while ($row = $result->fetchAssoc()) {
+        if ($row['de_key']) {
+          $cfg[$nid][$vid][] = $row;
+        }
+      }
+    }
+  }
+  return isset($cfg[$nid][$vid]) ? $cfg[$nid][$vid] : array();
+}
+
+/**
+ * Retrieves all enabled Data Extensions on the site
+ * @return array
+ */
+function webform_salesforce_soap_describe_enabled_de() {
+  $options = variable_get('webform_exacttarget_soap_enabled_data_extensions', array());
+  $enabled = array();
+  foreach ($options as $key => $val) {
+    if (!empty($val)) {
+      $enabled[$key] = $val;
+    }
+  }
+  return $enabled;
+}
+
+/**
+ * Retrieves all enabled Data Extensions for the ExactTarget account
+ * @return array
+ */
+function webform_salesforce_soap_describe_all_de() {
+  $options = array();
+  $rr = new ExactTarget_RetrieveRequest();
+  $rr->ObjectType = "DataExtension";
+  // Set the properties to return
+  // @see http://help.exacttarget.com/en/technical_library/web_service_guide/objects/dataextension/
+  $props = array("ObjectID", "CustomerKey");
+  $rr->Properties = $props;
+  // Return all MIDs
+  $rr->Filter = NULL;
+
+  $rrm = new ExactTarget_RetrieveRequestMsg();
+  $rrm->RetrieveRequest = $rr;
+  try {
+    $results = @ExactTarget::instance()->Retrieve($rrm);
+  } catch (Exception $e) {
+    $results = FALSE;
+  }
+
+  if (!empty($results)) {
+    if ($results->OverallStatus == 'OK') {
+      foreach ($results->Results as $de) {
+        $options[$de->CustomerKey] = $de->CustomerKey;
+      }
+    }
+  }
+  return $options;
+}
+
+/**
+ * Retrieves all fields associated with ExactTarget data extension
+ * @see http://help.exacttarget.com/en/technical_library/web_service_guide/objects/dataextensionfield/
+ * @param string $de
+ * @return array data extension field properties
+ */
+function webform_exacttarget_soap_get_data_extension_fields($de) {
+  $rr = new ExactTarget_RetrieveRequest();
+  $rr->ObjectType = "DataExtensionField";
+  // Set the properties to return
+  $props = array("Name", "CustomerKey", "FieldType", "IsRequired", "IsPrimaryKey", "DataExtension.CustomerKey");
+  $rr->Properties = $props;
+
+  // Create the filter to filter out the data extension we want
+  $filter1 = new ExactTarget_SimpleFilterPart() ;
+  $filter1->Property = "DataExtension.CustomerKey";
+  $filter1->SimpleOperator = ExactTarget_SimpleOperators::equals;
+  $filter1->Value = array($de);
+
+  // Attach the filter to the request
+  $rr->Filter = new SoapVar($filter1, SOAP_ENC_OBJECT, 'SimpleFilterPart', "http://exacttarget.com/wsdl/partnerAPI");
+
+  $rrm = new ExactTarget_RetrieveRequestMsg();
+  $rrm->RetrieveRequest = $rr;
+  try {
+    $results = @ExactTarget::instance()->Retrieve($rrm);
+  } catch (Exception $e) {
+    $results = FALSE;
+  }
+
+  $fields = array();
+  if (!empty($results) && $results->OverallStatus == 'OK') {
+    foreach ($results->Results as $field) {
+      _webform_exacttarget_soap_customer_key_simplified($field->CustomerKey);
+      _webform_exacttarget_soap_customer_key_simplified($field->DataExtension->CustomerKey);
+      $fields[] = array(
+       'label' => $field->Name,
+       'key' => $field->CustomerKey,
+       'required' => $field->IsRequired,
+       'primary_key' => $field->IsPrimaryKey,
+       'type' => $field->FieldType,
+       'parent' => $field->DataExtension->CustomerKey,
+      );
+    }
+  }
+  return $fields;
+}
+
+
+/**
+ * Start of "private" utility functions for this module
+ */
+
+/**
+ * Helper function to delete field mappings for this form (node) when it is deleted
+ */
+function _webform_exacttarget_soap_delete_map($node, $all_revs = FALSE) {
+  if (!is_object($node)) {
+    $node = node_load($node);
+  }
+  if (!$node || empty($node->nid)) {
+    return;
+  }
+  $nid = $node->nid;
+  $vid = (!empty($node->vid)) ? $node->vid : 0;
+
+  $query = db_delete('webform_exacttarget_soap')
+  ->condition('nid', $nid);
+  if (!$all_revs) {
+    $query->condition('vid', $vid);
+  }
+  $result = $query->execute();
+  return $result;
+}
+
+/**
+ * Stores the mapping of ExactTarget fields and Webform components.
+ * @param array $node
+ * @param array $values
+ */
+function _webform_exacttarget_soap_set_map($node, $values) {
+  if (!is_object($node)) {
+    $node = node_load($node);
+  }
+  if (!$node || empty($node->nid)) {
+    return;
+  }
+
+  $nid = $node->nid;
+  $vid = (!empty($node->vid)) ? $node->vid : 0;
+
+  // Using delete then insert approach
+  db_delete('webform_exacttarget_soap')
+  ->condition('nid', $nid)
+  ->condition('vid', $vid)
+  ->execute();
+
+  foreach ($values['de'] as $ext => $val) {
+    // Only process enabled extensions
+      if (!empty($val)) {
+        // Extension is enabled, find any field mappings
+        if (isset($values['map'])) {
+          foreach ($values['map']  as $field => $component) {
+            if (!empty($component)) {
+              db_insert('webform_exacttarget_soap')
+              ->fields(array(
+                'nid' => $nid,
+                'vid' => $vid,
+                'de_key' => $ext,
+                'de_property' => $field,
+                'component' => $component,
+                'primary_key' => in_array($field, $values['primary_keys']) ? 1 : 0,
+              ))->execute();
+            }
+          }
+        }
+          else {
+            db_insert('webform_exacttarget_soap')
+              ->fields(array(
+                'nid' => $nid,
+                'vid' => $vid,
+                'de_key' => $ext,
+                'de_property' => '',
+                'component' => '',
+                'primary_key' => 0,
+              ))->execute();
+          }
+      }
+    }
+}
+
+
+/**
+ * Formats Customer Key into a format Drupal FAPI can deal with
+ * @param string $key
+ * @param boolean $encode
+ */
+function _webform_exacttarget_soap_customer_key_format(&$key, $encode = TRUE) {
+  if ($encode === TRUE) {
+    $key = str_replace('[', '*', str_replace(']', '#', $key));
+  }
+  else {
+    $key = str_replace('*', '[', str_replace('#', ']', $key));
+  }
+}
+
+/**
+ * Formats ExactTarget CustomKey to the format it expects for create/update/delete.
+ * Retrieve for DataExtensionField returns them inthe format of [Data Extension].[Customer Key]
+ */
+function _webform_exacttarget_soap_customer_key_simplified(&$key) {
+  $pieces = explode('].[', $key);
+  if (count($pieces) > 1) {
+    $key = str_replace(']', '', $pieces[1]);
+  }
+}

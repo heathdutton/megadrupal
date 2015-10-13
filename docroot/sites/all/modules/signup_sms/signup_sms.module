@@ -1,0 +1,853 @@
+<?php
+
+/**
+ * @file signup_sms.module
+ * Main module file.
+ *
+ * You'll need a 2-way SMS gateway properly configured to use this.
+ *
+ * An idea born during DrupalCon 2011 - to integrate SMS framework with Signup.
+ * I should give some credit to the people who sponsored my trip -
+ * DLC Solutions, LLC. (http://www.dlc-solutions.com)
+ *
+ * Here's a use case for signup_sms:
+ *
+ *  1. Admin creates a signup-enabled event, can see SMS code
+ *  2. User either signs up for a live event, or goes directly to a live event
+ *     without signing up.
+ *  3. User receives code from admin, sends text message to number with code
+ *     in between the allowed times.
+ *    - If user's account already has mobile number, mark user attended.
+ *    - If user does not have an account, put number and node in limbo.
+ *       - Then, user will create an account on the website. When user confirms
+ *         the mobile number within sms_user, attendance is recorded.
+ *
+ * @todo option whether or not to enable SMS signups per event
+ * @todo ability to have X amount of codes for a single event (like coupons)
+ */
+
+/**
+ * Implements hook_views_api()
+ */
+function signup_sms_views_api() {
+  return array(
+    'api' => 3,
+  );
+}
+
+/**
+ * Return an sms code that isn't used.
+ */
+function _signup_sms_word() {
+  // Distinguishable characters.
+  $accepted_cons_start = "BCDFGHJKLMNPQRSTVWYZ";
+  $accepted_cons_end = "BCDFGHKLMNPQRSTVWXYZ";
+  $accepted_vowels = "AEUO";
+
+  // Gen word, then check
+  do {
+    $word = '';
+    for ($i = 1; $i <= 6; $i++) {
+      switch ($i) {
+        case 1:
+        case 4:
+          $word .= $accepted_cons_start[rand(0, strlen($accepted_cons_start) - 1)];
+          break;
+        case 3:
+        case 6:
+          $word .= $accepted_cons_end[rand(0, strlen($accepted_cons_end) - 1)];
+          break;
+        case 2:
+        case 5:
+          $word .= $accepted_vowels[rand(0, strlen($accepted_vowels) - 1)];
+          break;
+      }
+    }
+    drupal_alter('signup_sms_word', $word);
+  } while (db_select('signup_sms_codes')->fields('signup_sms_codes')->condition('code', $word)->execute()->fetchField());
+  return $word;
+}
+
+/**
+ * Implements hook_permission().
+ *
+ * Permissions to view all SMS codes, or only the SMS codes of nodes the user
+ * has created.
+ */
+function signup_sms_permission() {
+  return array(
+    'view any sms code' => array(
+      'title' => t('view any sms code'),
+      'description' => t('User can view any sms code on any node'),
+    ),
+    'view own sms code' => array(
+      'title' => t('view own sms code'),
+      'description' => t('User can view sms code on owned node only'),
+    ),
+  );
+}
+
+/**
+ * Find an nid from a code.
+ */
+function _signup_check_code($code) {
+  if (!$code) {
+    return FALSE;
+  }
+  return db_select('signup_sms_codes')->fields('signup_sms_codes', array('nid'))->condition('code', $code)->execute()->fetchObject()->nid;
+}
+
+/**
+ * ...find code for a node.
+ */
+function _signup_code_for_node($nid) {
+  return db_select('signup_sms_codes')->fields('signup_sms_codes', array('code'))->condition('nid', $nid)->execute()->fetchObject()->code;
+}
+
+/**
+ * Implements hook_node_insert().
+ */
+function signup_sms_node_insert($node) {
+  if ((isset($node->signup_enabled) && $node->signup_enabled == 1) || (!isset($node->signup_enabled) && variable_get('signup_node_default_state_' . $node->type, 'disabled') == 'enabled_on')) {
+    if (empty($node->signup_sms)) {
+      // Set defaults if none provided.
+      $node->signup_sms = new stdClass;
+      $node->signup_sms->open = variable_get('signup_sms_default_open', 0);
+      $node->signup_sms->close = variable_get('signup_sms_default_close', 0);
+    }
+
+    // Always set node ID and generate a new code if this is a new node (support
+    // for cloning).
+    $node->signup_sms->code = _signup_sms_word();
+    $node->signup_sms->nid = $node->nid;
+    drupal_write_record('signup_sms_codes', $node->signup_sms);
+  }
+}
+
+/**
+ * Implements hook_node_load().
+ */
+function signup_sms_node_load($nodes, $types) {
+  $nids = array_keys($nodes);
+
+  $settings = db_select('signup_sms_codes')->fields('signup_sms_codes')->condition('nid', $nids)->execute()->fetchAllAssoc('nid');
+
+  foreach ($nodes as $node) {
+    if (isset($node->signup) && $node->signup) {
+      unset($settings[$node->nid]->nid);
+      $nodes[$node->nid]->signup_sms = (isset($settings[$node->nid])) ? $settings[$node->nid] : NULL;
+    }
+  }
+}
+
+/**
+ * Implements hook_node_view().
+ */
+function signup_sms_node_view($node, $view_mode = 'full') {
+  if (user_access('view any sms code') || (user_access('view own sms code') && $node->uid == $user->uid)) {
+    if (in_array($node->type, signup_content_types())) {
+      $code = _signup_code_for_node($node->nid);
+      $field = array(
+        '#title' => t('SMS Code'),
+        '#type' => 'item',
+        '#id' => 'sms-code',
+        '#markup' => $code,
+      );
+      $node->content['signup_sms'] = $field;
+    }
+  }
+}
+
+/**
+ * Find a signup ID by nid, number, and possibly uid.
+ *
+ * @param int $nid
+ *   Node ID.
+ * @param string $number
+ *   Mobile phone.
+ * @param int $uid
+ *   User ID.
+ *
+ * @return int
+ */
+function _signup_sms_get_sid($nid, $number, $uid = 0) {
+  // Try to find a signup ID in the holding table (maybe user submitted twice).
+  $sql = "select * from {signup_sms} ss
+    left join {signup_log} sl on (ss.sid = sl.sid)
+    where nid = :nid and (number = :number or (ss.uid > 0 AND ss.uid = :uid))";
+  $result = db_query($sql, array(':nid' => $nid, ':number' => $number, ':uid' => $uid,))->fetchField();
+
+  if ($result->sid) {
+    // Found it in the holding table.
+    return $result->sid;
+  }
+
+  // Maybe user isn't in holding table?
+  $sql = "select * from {signup_log} sl where nid = :uid and (uid > 0 AND uid = :uid)";
+  $result = db_query($sql, array(':nid' => $nid, ':uid' => $uid,))->fetchField();
+  if ($result->sid) {
+    return $result->sid;
+  }
+
+  return FALSE;
+}
+
+/**
+ * Implements hook_sms_incoming().
+ *
+ * Receive an incoming SMS message and try to mark the user attended.
+ */
+function signup_sms_sms_incoming($op, $number, $message) {
+  switch ($op) {
+    case 'post process':
+      $message = trim($message);
+
+      // @kludge this needs to be int'l somehow, but sms_user stores the prefix in a serialized array
+      // serialized arrays are not good for lookups
+      $number = str_replace('+1', '', $number);
+      if (strlen($number) == 11) {
+        $number = preg_replace('/^1/', '', $number);
+      }
+
+      // Prep tokens for messages.
+      $tokens = array();
+
+      // Try to find user by mobile number.
+      $uid = sms_user_get_uid($number);
+      if (!$uid && strlen($number) == 10) {
+        // Try prefixing a 1.
+        $uid = sms_user_get_uid('1' . $number);
+      }
+
+      if ($nid = _signup_check_code($message)) {
+        $node = node_load($nid);
+        $tokens['node'] = $node;
+
+        module_load_include('inc', 'signup', 'scheduler');
+
+        $start_date = signup_sms_get_unix_start($node);
+        $open = $start_date + ($node->signup_sms->open);
+        $close = $start_date + ($node->signup_sms->close);
+
+        if (REQUEST_TIME > $close) {
+          sms_send($number, _signup_sms_get_message('closed', $tokens));
+          break;
+        }
+
+        if (REQUEST_TIME < $open) {
+          sms_send($number, _signup_sms_get_message('not_open', $tokens));
+          break;
+        }
+
+        // Message matched a valid attendance code.
+        // Step 1 - find or make a signup SID and mark attended
+        $sid = _signup_sms_get_sid($nid, $number, $uid);
+        if (!$sid) {
+          // Nope, this is the first time. Couldn't find a signup.
+          $signup = new stdClass();
+          $signup->uid = $uid;
+          $signup->nid = $nid;
+          $signup->signup_time = REQUEST_TIME;
+          $signup->form_data = array();
+          $signup->count_towards_limit = 1;
+          if (!$uid) {
+            $signup->anon_mail = 'placeholder-sms-' . $number . '@example.com';
+          }
+          signup_save_signup($signup);
+          $sid = $signup->sid;
+        }
+
+        // There is a signup but we have to mark it attended.
+        $signup = signup_load_signup($sid);
+        signup_mark_attended_action($signup);
+        $node = node_load($signup->nid);
+        if ($node->signup_send_confirmation) {
+          signup_send_confirmation_mail($signup, $node);
+        }
+
+        // Step 2 - record into signup_sms that we received this submission.
+        if (!db_query('SELECT * FROM {signup_sms} WHERE sid = :sid AND (uid = :uid OR number = :number)', array(':sid' => $sid, ':uid' => $uid, ':number' => $number))->fetchField()) {
+          $signup_sms = new stdClass;
+          $signup_sms->uid = $uid;
+          $signup_sms->number = $number;
+          $signup_sms->sid = $sid;
+          $signup_sms->created = REQUEST_TIME;
+          // Store the submission.
+          drupal_write_record('signup_sms', $signup_sms);
+        }
+
+        if (!$uid) {
+          // User is attended but doesn't have an account.
+          sms_send($number, _signup_sms_get_message('confirmation_anonymous', $tokens));
+        }
+        if ($uid) {
+          // User attended and has UID.
+          sms_send($number, _signup_sms_get_message('confirmation_registered', $tokens));
+        }
+      }
+      else if (valid_email_address($message)) {
+        // User passed their email.
+        // Update all the existing anonymous signups with emails.
+        $sql = "UPDATE {signup_log} AS sl
+          INNER JOIN {signup_sms} ss ON (sl.sid = ss.sid)
+          SET sl.anon_mail = :message
+          WHERE ss.number = :number AND ss.uid = 0";
+        db_query($sql, array(':message' => $message, ':number' => $number));
+
+        // Check if we found the user but they entered a different number.
+        $sql = "SELECT u.uid FROM {users} u
+          LEFT JOIN {sms_user} su ON (u.uid = su.uid AND su.number NOT LIKE :number)
+          WHERE mail LIKE :message";
+        $result = db_query($sql, array(':number' => '%' . $number, ':message' => $message))->fetchField();
+        if ($result) {
+          // User found by email but number did not match account. Ask to
+          // verify.
+          sms_send($number, _signup_sms_get_message('new_number'));
+          drupal_mail('signup_sms', 'new_number', $message, null, array());
+        }
+        else {
+          // Send the user an SMS and an email. When they login and confirm their
+          // number or email, their anonymous signups will be converted.
+          sms_send($number, _signup_sms_get_message('email_confirmation'));
+          drupal_mail('signup_sms', 'email_confirmation', $message, null, array('number' => $number));
+        }
+      }
+      else {
+        sms_send($number, _signup_sms_get_message('bad_code'));
+      }
+      break;
+  }
+}
+
+/**
+ * Get the unix timestamp from the signup start date.
+ */
+function signup_sms_get_unix_start($node) {
+  module_load_include('inc', 'signup', 'includes/date');
+  $field = signup_date_field($node->type);
+  if (!$field || $field == 'none') {
+    return FALSE;
+  }
+  else {
+    if (!empty($node->{$field['field_name']})) {
+      $string = $node->{$field['field_name']}[LANGUAGE_NONE][0]['value'];
+      $date = new DateTime($string, new DateTimeZone('UTC'));
+      $unixtime = $date->getTimestamp();
+      if ($unixtime) {
+        return $unixtime;
+      }
+    }
+
+    return FALSE;
+  }
+}
+
+/**
+ * Implements hook_field_extra_fields().
+ */
+function signup_sms_field_extra_fields() {
+  $extra = array();
+  foreach (entity_get_info() as $entity_type => $entity_info) {
+    foreach (array_keys($entity_info['bundles']) as $bundle) {
+      if (in_array($bundle, signup_content_types())) {
+        $extra[$entity_type][$bundle]['display']['signup_sms'] = array(
+          'label' => t('Signup SMS code'),
+          'description' => 'SMS code if user is allowed to see it.',
+          'weight' => 0,
+        );
+      }
+    }
+  }
+  return $extra;
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function signup_sms_form_signup_node_settings_form_alter(&$form, &$form_state) {
+  $node = $form['#node'];
+
+  $form['signup_sms'] = array(
+    '#weight' => 0,
+    '#type' => 'fieldset',
+    '#title' => 'SMS',
+    '#tree' => TRUE,
+    '#collapsible' => TRUE,
+  );
+
+  $form['signup_sms']['open']['#prefix'] = '<div class="container-inline">';
+  $form['signup_sms']['open']['#suffix'] = ' start date</div>';
+  $form['signup_sms']['open']['duration'] = array(
+    '#title' => t('Open attendance'),
+    '#type' => 'timeperiod_select',
+    '#units' => array(
+      3600 => array('max' => 23, 'step size' => 1), // Hours 1 minute intervals
+      60 => array('max' => 55, 'step size' => 5), // Minutes 5 minute intervals
+    ),
+    '#default_value' => abs($node->signup_sms->open),
+  );
+
+  $form['signup_sms']['open']['direction'] = array(
+    '#title' => t(''),
+    '#type' => 'select',
+    '#options' => array(
+      1 => 'after',
+      -1 => 'before',
+    ),
+    '#default_value' => $node->signup_sms->open > 1 ? 1 : -1,
+  );
+
+  $form['signup_sms']['close']['#prefix'] = '<div class="container-inline">';
+  $form['signup_sms']['close']['#suffix'] = ' start date</div>';
+  $form['signup_sms']['close']['duration'] = array(
+    '#title' => t('Close attendance'),
+    '#type' => 'timeperiod_select',
+    '#units' => array(
+      3600 => array('max' => 23, 'step size' => 1), // Hours 1 minute intervals
+      60 => array('max' => 55, 'step size' => 5), // Minutes 5 minute intervals
+    ),
+    '#default_value' => abs($node->signup_sms->close),
+  );
+  $form['signup_sms']['close']['direction'] = array(
+    '#title' => t(''),
+    '#type' => 'select',
+    '#options' => array(
+      1 => 'after',
+      -1 => 'before',
+    ),
+    '#default_value' => $node->signup_sms->close > 1 ? 1 : -1,
+  );
+
+  $form['signup_sms']['code'] = array(
+    '#title' => 'SMS code',
+    '#type' => 'textfield',
+    '#size' => 16,
+    '#default_value' => $node->signup_sms->code,
+    '#description' => t('Randomly generated when this signup is created, but you can change it here.'),
+  );
+
+  $form['signup_sms']['reset'] = array(
+    '#title' => 'Reset code',
+    '#description' => t('Check this to randomly generate a new code.'),
+    '#type' => 'checkbox',
+  );
+
+  $form['#validate'][] = 'signup_sms_validate';
+  $form['#submit'][] = 'signup_sms_submit';
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function signup_sms_form_sms_user_settings_confirm_form_alter(&$form, &$form_state) {
+  $form['#submit'][] = 'signup_sms_convert_sms_signups';
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function signup_sms_form_signup_settings_form_alter(&$form, &$form_state) {
+  $form['signup_sms'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('SMS integration'),
+    '#collapsible' => TRUE,
+    '#collapsed' => TRUE,
+  );
+
+  $form['signup_sms']['open']['signup_sms_default_open'] = array(
+    '#title' => t('Default time from start date to take attendance'),
+    '#type' => 'timeperiod_select',
+    '#units' => array(
+      3600 => array('max' => 23, 'step size' => 1), // Hours 1 minute intervals
+      60 => array('max' => 55, 'step size' => 5), // Minutes 5 minute intervals
+    ),
+    '#default_value' => abs(variable_get('signup_sms_default_open')),
+  );
+
+  $form['signup_sms']['open']['#prefix'] = '<div class="container-inline">';
+  $form['signup_sms']['open']['#suffix'] = ' start date</div>';
+  $form['signup_sms']['close']['#prefix'] = '<div class="container-inline">';
+  $form['signup_sms']['close']['#suffix'] = ' start date</div>';
+
+  $form['signup_sms']['open']['signup_sms_open_direction'] = array(
+    '#title' => t(''),
+    '#type' => 'select',
+    '#options' => array(1 => 'after', -1 => 'before'),
+    '#default_value' => variable_get('signup_sms_default_open', '') > 0 ? 1 : -1,
+  );
+
+  $form['signup_sms']['close']['signup_sms_default_close'] = array(
+    '#title' => t('Default time from start date to stop attendance'),
+    '#type' => 'timeperiod_select',
+    '#units' => array(
+      3600 => array('max' => 23, 'step size' => 1), // Hours 1 minute intervals
+      60 => array('max' => 55, 'step size' => 5), // Minutes 5 minute intervals
+    ),
+    '#default_value' => abs(variable_get('signup_sms_default_close')),
+  );
+
+  $form['signup_sms']['close']['signup_sms_close_direction'] = array(
+    '#title' => t(''),
+    '#type' => 'select',
+    '#options' => array(1 => 'after', -1 => 'before'),
+    '#default_value' => variable_get('signup_sms_default_close', '') > 0 ? 1 : -1,
+  );
+
+  $form['signup_sms']['signup_sms_reminder_time'] = array(
+    '#title' => t('Time after an abandoned attendance record to send a reminder'),
+    '#description' => t('Users who sent a valid SMS code but did not create an account yet will be reminded after this time. Set to 0 to disable.'),
+    '#type' => 'timeperiod_select',
+    '#units' => array(
+      3600 => array('max' => 23, 'step size' => 1), // Hours 1 minute intervals
+      60 => array('max' => 55, 'step size' => 5), // Minutes 5 minute intervals
+    ),
+    '#default_value' => variable_get('signup_sms_reminder_time'),
+  );
+
+  // Messages
+  $form['signup_sms']['signup_sms_bad_code_message'] = array(
+    '#title' => t('Bad code message'),
+    '#type' => 'textarea',
+    '#default_value' => _signup_sms_get_message('bad_code'),
+    '#description' => t('This is the message given to users to send a bad attendance code.'),
+  );
+
+  $form['signup_sms']['signup_sms_confirmation_anonymous'] = array(
+    '#title' => t('Anonymous registered confirmation'),
+    '#type' => 'textarea',
+    '#default_value' => _signup_sms_get_message('confirmation_anonymous'),
+    '#description' => t('This is the message given to users who submitted a good code but need to provide an email address.'),
+  );
+
+  $form['signup_sms']['signup_sms_confirmation_registered_message'] = array(
+    '#title' => t('Registered confirmation'),
+    '#type' => 'textarea',
+    '#default_value' => _signup_sms_get_message('confirmation_registered'),
+    '#description' => t('This is the message given to users whose mobile number matched an existing account'),
+  );
+
+  $form['signup_sms']['signup_sms_confirmation_anonymous_message'] = array(
+    '#title' => t('Anonymous confirmation'),
+    '#type' => 'textarea',
+    '#default_value' => _signup_sms_get_message('confirmation_anonymous'),
+    '#description' => t('This is the email sent to users to remind them to sign up for an account on the main site.'),
+  );
+
+  $form['signup_sms']['signup_sms_not_open_message'] = array(
+    '#title' => t('Attendance not open'),
+    '#type' => 'textarea',
+    '#default_value' => _signup_sms_get_message('not_open'),
+    '#description' => t('Sent to users who try to mark themselves attended for a course not yet open'),
+  );
+
+  $form['signup_sms']['signup_sms_closed_message'] = array(
+    '#title' => t('Attendance closed'),
+    '#type' => 'textarea',
+    '#default_value' => _signup_sms_get_message('closed'),
+    '#description' => t('Sent to users who try to mark themselves attended for a closed course.'),
+  );
+
+  array_unshift($form['#submit'], 'signup_sms_duration_submit');
+}
+
+/**
+ * Change polarity of timestamp.
+ */
+function signup_sms_duration_submit(&$form, &$form_state) {
+  $form_state['values']['signup_sms_default_close'] = $form_state['values']['signup_sms_default_close'] * $form_state['values']['signup_sms_close_direction'];
+  $form_state['values']['signup_sms_default_open'] = $form_state['values']['signup_sms_default_open'] * $form_state['values']['signup_sms_open_direction'];
+}
+
+/**
+ * Check if a code has been created previously
+ */
+function signup_sms_validate(&$form, &$form_state) {
+  $record = $form_state['values']['signup_sms'];
+  $record['nid'] = $form['#node']->nid;
+  $sql = "select 1 from {signup_sms_codes} where code = :code and nid != :nid";
+  //db_select('signup_sms_codes')->fields('signup_sms_codes')->condition('nid', $record['nid'])->execute()->fetchAll();
+  if (db_query($sql, array(':code' => $record['code'], ':nid' => $record['nid']))->fetchField()) {
+    form_error($form['signup_sms']['code'], t('That code is already in use. Please pick a different code.'));
+  }
+}
+
+/**
+ * Submit the request and update the sms code for the node
+ */
+function signup_sms_submit(&$form, &$form_state) {
+  $record = $form_state['values']['signup_sms'];
+  $record['nid'] = $form['#node']->nid;
+  if (!$record['code'] || $record['reset']) {
+    $record['code'] = _signup_sms_word();
+  }
+  $sql = "select * from {signup_sms_codes} where nid = :nid";
+  $keys = db_query($sql, array(':nid' => $record['nid']))->fetchField() ? array('nid') : array();
+  //db_select('signup_sms_codes')->fields('signup_sms_codes')->condition('nid', $record['nid'])->execute()->fetchAll();
+  $record['open'] = $record['open']['duration'] * $record['open']['direction'];
+  $record['close'] = $record['close']['duration'] * $record['close']['direction'];
+  drupal_write_record('signup_sms_codes', $record, $keys);
+}
+
+/**
+ * Wrapper for variable_get() for all the configurable messages.
+ *
+ * @param $var
+ *   Variable name.
+ * @param $types
+ *   Token context.
+ */
+function _signup_sms_get_message($var, $types = array()) {
+  $defaults = array(
+    'bad_code' => 'Sorry, that code is incorrect. Please try again.',
+    'confirmation_registered' => 'Your attendance has been recorded for "[node:title]"',
+    'confirmation_anonymous' => 'No account on file - your attendance has been recorded for "[node:title]" using this mobile number. Please send your full email address to confirm.',
+    'not_open' => 'Sorry, attendance for "[node:title]" opens at [node:signup-sms:open-time] on [node:signup-sms:open-date]',
+    'closed' => 'Sorry, attendance for "[node:title]" closed at [node:signup-sms:close-time] on [node:signup-sms:close-date]',
+    'email_confirmation' => 'Check your inbox for an email with instructions on how to confirm your attendance.',
+    'new_number' => 'Account on file, but different mobile number. Please login to your account to confirm the changes.',
+  );
+
+  $text = variable_get('signup_sms_' . $var, '');
+
+  if (!$text) {
+    $text = $defaults[$var];
+  }
+
+  $out = token_replace($text, $types);
+  return $out;
+}
+
+/**
+ * Convert limbo signups to signups.
+ *
+ * This happens after a mobile number is confirmed thru sms_signup - so we know
+ * that any event that had limbo attendance should be converted to an actual
+ * signup.
+ */
+function signup_sms_convert_sms_signups() {
+  global $user;
+
+  // Global $user has been changed by sms_user, need to reload.
+  $account = user_load($user->uid);
+
+  // Get all pending signups. Prefix a 1 in the case that sms_user needed it.
+  $result = db_query("SELECT sl.*, n.title FROM {sms_user} su
+  INNER JOIN {signup_sms} ss ON (su.number = ss.number OR su.number = concat('1', ss.number))
+  INNER JOIN {signup_log} sl ON (sl.sid = ss.sid)
+  INNER JOIN {node} n ON (sl.nid = n.nid)
+  WHERE su.uid = :su_uid AND su.status = :su_status AND ss.uid = :ss_uid AND sl.uid = 0", array(':su_uid' => $account->uid, ':su_status' => 2, ':ss_uid' => 0));
+  while ($row = $result->fetch()) {
+    // We are going to update a record, but make sure that one doesn't already
+    // exist. In that case we will have to delete this incoming one and mark the
+    // existing one attended then re-join the new SMS submission to the existing
+    // signup record.
+    $sql = "SELECT * FROM {signup_log} sl WHERE sl.nid = :nid and sl.uid = :uid";
+    if ($existing_row = db_query($sql, array(':nid' => $row->nid, ':uid' => $account->uid))->fetch()) {
+      // Found existing record. We need to delete our current one. We can't use
+      // signup_cancel_record() because that will kill more stuff.
+      db_query('DELETE FROM {signup_log} WHERE sid = :sid', array(':sid' => $row->sid));
+
+      // Update the new SMS record with the existing signup log ID.
+      db_query('UPDATE {signup_sms} SET sid = :to_sid WHERE sid = :from_sid', array(':to_sid' => $existing_row->sid, ':from_sid' => $row->sid));
+
+      // Operate on the old signup.
+      $row = $existing_row;
+    }
+
+    $row->attended = 1;
+    $row->anon_mail = '';
+    $row->uid = $account->uid;
+    signup_save_signup($row);
+    $row->mail = $account->mail;
+    $node = node_load($row->nid);
+    if ($node->signup_send_confirmation) {
+      signup_send_confirmation_mail($row, $node);
+    }
+    if ($row->attended == 1) {
+      // Re-mark the attendance so that signup_course_watchdog() completes
+      // fulfillment.
+      signup_mark_attended_action($row);
+      drupal_set_message(t('Confirmed attendance for %title.', array('%title' => $row->title)));
+    }
+  }
+
+  db_update('signup_sms')
+    ->fields(array('uid' => $account->uid,))
+    ->condition('number', $account->sms_user[0]['number'])
+    ->execute();
+}
+
+/**
+ * Implements hook_mail().
+ *
+ * Send message to users who provided an email address thru SMS.
+ */
+function signup_sms_mail($key, &$message, &$params) {
+  $replace = array(
+    '!register' => url('user/register', array('absolute' => TRUE)),
+    '!login' => url('user/login', array('absolute' => TRUE)),
+  );
+
+  if ($key == 'email_confirmation') {
+    $subject = '[site-name]: Attendance confirmation';
+    $message['subject'] = token_replace($subject);
+    $message['body'][] = t('You were marked attended for an event on our website without an account.  Please create one at !register', $replace);
+    $message['body'][] = t('In order to bypass this step for future events, you must verify your mobile number in your profile.');
+    $message['body'][] = t('If you already have an account, please login at !login', $replace);
+    $message['body'][] = t('When verifying your mobile number, please make sure to use the same mobile number used to mark yourself attended.');
+  }
+
+  if ($key == 'reminder') {
+    $subject = '[site-name]: Attendance reminder';
+    $message['subject'] = token_replace($subject);
+    $message['body'][] = t('You were marked attended for an event on our website without an account.  Please create one at !register', $replace);
+    $message['body'][] = t('In order to bypass this step for future events, you must verify your mobile number in your profile.');
+    $message['body'][] = t('When setting your mobile number, please make sure to use the same mobile number used to mark yourself attended.');
+  }
+
+  if ($key == 'new_number') {
+    $subject = '[site-name]: Confirm your mobile number';
+    $message['subject'] = token_replace($subject);
+    $message['body'][] = t('You were marked attended for an event on our website using a new mobile number.');
+    $message['body'][] = t('In order to confirm this attendance, you must verify your mobile number in your profile.');
+    $message['body'][] = t('Please login to your account at !login', $replace);
+    $message['body'][] = t('When verifying your mobile number, make sure to use the same mobile number used to mark yourself attended.');
+  }
+}
+
+/**
+ * Implements hook_token_info().
+ */
+function signup_sms_token_info() {
+
+  $type['signup-sms'] = array(
+    'name' => t('Signup SMS'),
+    'description' => t('Tokens related to Signup SMS'),
+    'needs-data' => 'node',
+  );
+
+  $tokens['node']['signup-sms'] = array(
+    'name' => t('Signup SMS'),
+    'description' => t('Tokens related to Signup SMS'),
+    'type' => 'signup-sms',
+  );
+  $tokens['signup-sms']['code'] = array(
+    'name' => t("SMS Code"),
+    'description' => t("The auto generated sign up code"),
+  );
+  $tokens['signup-sms']['open-date'] = array(
+    'name' => t("SMS Open Date"),
+    'description' => t("Start of attendance date"),
+  );
+  $tokens['signup-sms']['open-time'] = array(
+    'name' => t("SMS Open Time"),
+    'description' => t("Start of attendance time"),
+  );
+  $tokens['signup-sms']['close-date'] = array(
+    'name' => t("SMS Close Date"),
+    'description' => t("End of attendance date"),
+  );
+  $tokens['signup-sms']['close-time'] = array(
+    'name' => t("SMS Close Time"),
+    'description' => t("End of attendance time"),
+  );
+
+  return array(
+    'types' => $type,
+    'tokens' => $tokens,
+  );
+}
+
+/**
+ * Implements hook_tokens().
+ */
+function signup_sms_tokens($type, $tokens, array $data = array(), array $options = array()) {
+  $replacements = array();
+  if ($type == 'node' && !empty($data['node']) && isset($data['node']->signup_sms)) {
+    module_load_include('inc', 'signup', 'scheduler');
+    $node = $data['node'];
+    $start_date = signup_sms_get_unix_start($node);
+    $open = $start_date + ($node->signup_sms->open);
+    $close = $start_date + ($node->signup_sms->close);
+    $time_format = 'g:ia';
+    $date_format = 'm/d/Y';
+    // Replace values
+    foreach ($tokens as $name => $original) {
+      switch ($name) {
+        case 'signup-sms:code':
+          $replacements[$original] = $node->signup_sms->code;
+          break;
+        case 'signup-sms:open-date':
+          $replacements[$original] = date($date_format, $open);
+          break;
+        case 'signup-sms:open-time':
+          $replacements[$original] = date($time_format, $open);
+          break;
+        case 'signup-sms:close-date':
+          $replacements[$original] = date($date_format, $close);
+          break;
+        case 'signup-sms:close-time':
+          $replacements[$original] = date($time_format, $close);
+          break;
+      }
+    }
+  }
+  return $replacements;
+}
+
+/**
+ * Implements hook_cron().
+ *
+ * Remind temporary registrants about their pending attendance.
+ */
+function signup_sms_cron() {
+  $reminder_time = variable_get('signup_sms_reminder_time', 0);
+  if ($reminder_time > 0) {
+    $result = db_query("SELECT ss.*, sl.anon_mail FROM {signup_sms} ss
+    INNER JOIN {signup_log} sl ON (ss.sid = sl.sid)
+    WHERE ss.uid = :ss_uid AND created < :created AND !reminded", array(':ss_uid' => 0, ':created' => (REQUEST_TIME - $reminder_time),));
+    while ($row = $result->fetch()) {
+      drupal_mail('signup_sms', 'reminder', $row->anon_mail, null, array());
+      $row->reminded = REQUEST_TIME;
+      drupal_write_record('signup_sms', $row, array('ssid'));
+    }
+  }
+}
+
+/**
+ * Implements hook_user_login().
+ *
+ * Check for attendance under a different number and prompt the user to confirm
+ * them.
+ */
+function signup_sms_user_login(&$edit, $account) {
+  if ($account->sms_user[0]['status'] == 2) {
+    // User logging in with an already confirmed (somehow) number.
+    signup_sms_convert_sms_signups();
+  }
+}
+
+/**
+ * Implements hook_user_view().
+ */
+function signup_sms_user_view($account, $view_mode) {
+  if (isset($account->sms_user)) {
+    $result = db_query("SELECT * FROM {signup_log} sl
+      INNER JOIN {signup_sms} ss ON (sl.sid = ss.sid)
+      WHERE anon_mail LIKE :anon_mail AND ss.number != :ss_number", array(':anon_mail' => $account->mail, ':ss_number' => $account->sms_user[0]['number']));
+    if ($row = $result->fetchField()) {
+      drupal_set_message(t('You have pending attendance from mobile number %number. Please !confirm to confirm your attendance.', array('!confirm' => l('change your mobile number', "user/$account->uid/edit/mobile"), '%number' => $row->number)), 'warning', FALSE);
+    }
+  }
+}
+
+/**
+ * Implements hook_user().
+ *
+ * Delete the registrations when a signup is deleted.
+ */
+function signup_sms_signup_cancel($signup, $node) {
+  db_delete('signup_sms')
+    ->condition('sid', $signup->sid)
+    ->execute();
+}

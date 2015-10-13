@@ -35,19 +35,3 @@ function restaurant_blog_add_blog_category_admin() {
   // Return content for admin/structure/taxonomy/blog_categories/add path.
   return menu_execute_active_handler('admin/structure/taxonomy/blog_categories/add');
 }
-
-/**
- * Page callback for admin/blog_posts/tags.
- */
-function restaurant_blog_blog_tags_admin() {
-  // Return content for admin/structure/taxonomy/blog_tags.
-  return menu_execute_active_handler('admin/structure/taxonomy/blog_tags');
-}
-
-/**
- * Page callback for admin/blog_posts/tags/add.
- */
-function restaurant_blog_add_blog_tag_admin() {
-  // Return content for admin/structure/taxonomy/blog_tags/add path.
-  return menu_execute_active_handler('admin/structure/taxonomy/blog_tags/add');
-}

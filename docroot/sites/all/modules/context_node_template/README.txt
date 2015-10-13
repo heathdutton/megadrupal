@@ -1,5 +1,0 @@
-
-Contributors
-------------
-
-- zhiqiang (Chengdu China)

@@ -8,6 +8,9 @@
  * Implements hook_ctools_plugin_api().
  */
 function restaurant_blog_ctools_plugin_api($module = NULL, $api = NULL) {
+  if ($module == "field_group" && $api == "field_group") {
+    return array("version" => "1");
+  }
   if ($module == "page_manager" && $api == "pages_default") {
     return array("version" => "1");
   }
@@ -41,6 +44,36 @@ function restaurant_blog_image_default_styles() {
         'data' => array(
           'width' => 165,
           'height' => 125,
+        ),
+        'weight' => 1,
+      ),
+    ),
+  );
+
+  // Exported image style: blog_post_image__full.
+  $styles['blog_post_image__full'] = array(
+    'label' => 'Blog post image (full)',
+    'effects' => array(
+      26 => array(
+        'name' => 'image_scale_and_crop',
+        'data' => array(
+          'width' => 375,
+          'height' => 250,
+        ),
+        'weight' => 1,
+      ),
+    ),
+  );
+
+  // Exported image style: blog_post_image__teaser.
+  $styles['blog_post_image__teaser'] = array(
+    'label' => 'Blog post image (teaser)',
+    'effects' => array(
+      22 => array(
+        'name' => 'image_scale_and_crop',
+        'data' => array(
+          'width' => 375,
+          'height' => 250,
         ),
         'weight' => 1,
       ),

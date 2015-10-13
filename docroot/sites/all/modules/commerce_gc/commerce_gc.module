@@ -1,0 +1,1225 @@
+<?php
+
+/**
+ * @file
+ * Provides Giftcard coupon bundle, Giftcard Transaction entity and basic user
+ * interface elements.
+ */
+
+/*
+ * Complete status: for successful, paid-in-full purchases or standalone
+ * transactions against a giftcard
+ */
+define('COMMERCE_GC_TRANSACTION_COMPLETE_STATUS', 'complete');
+
+/*
+ * Pending status: for reserving an amount to be completed later
+ */
+define('COMMERCE_GC_TRANSACTION_PENDING_STATUS', 'pending');
+
+/*
+ * Void status: for transactions that are cancelled and should not be counted as
+ * part of the balance
+ */
+define('COMMERCE_GC_TRANSACTION_VOID_STATUS', 'void');
+
+/*
+ * For payments that completed checkout but where some amount on the order
+ * remains to be paid.
+ */
+define('COMMERCE_GC_TRANSACTION_AUTHORIZED_STATUS', 'authorized');
+
+/*
+ * Implements hook_entity_info().
+ */
+function commerce_gc_entity_info() {
+  $entity_info['commerce_gc_transaction'] = array(
+    'label' => t('Commerce giftcard transaction'),
+    'plural label' => t('Commerce giftcard transactions'),
+    'views controller class' => 'CommerceGCTransactionViewsController',
+    'controller class' => 'CommerceGCTransactionEntityController',
+    'base table' => 'commerce_gc_transaction',
+    'fieldable' => FALSE,
+    'locking mode' => 'pessimistic',
+    'entity keys' => array(
+      'id' => 'transaction_id',
+      'label' => 'transaction_id',
+    ),
+    'access callback' => 'commerce_entity_access',
+    'access arguments' => array(
+      'access tag' => 'commerce_gc_transaction_access',
+    ),
+    'bundles' => array(
+      'commerce_gc_transaction' => array(
+        'label' => t('Commerce giftcard transaction')
+      )
+    ),
+    'module' => 'commerce_gc',
+    'permission labels' => array(
+      'singular' => t('Giftcard transaction'),
+      'plural' => t('Giftcard Transactions'),
+    ),
+  );
+
+  return $entity_info;
+}
+
+/*
+ * Implements hook_commerce_gc_transaction_status_info().
+ */
+function commerce_gc_commerce_gc_transaction_status_info() {
+  return array(
+    COMMERCE_GC_TRANSACTION_COMPLETE_STATUS => array(
+      'label' => t('Complete'),
+      'total' => TRUE
+    ),
+    COMMERCE_GC_TRANSACTION_PENDING_STATUS => array(
+      'label' => t('Pending'),
+      'total' => TRUE
+    ),
+    COMMERCE_GC_TRANSACTION_VOID_STATUS => array(
+      'label' => t('Void'),
+      'total' => FALSE
+    ),
+    COMMERCE_GC_TRANSACTION_AUTHORIZED_STATUS => array(
+      'label' => t('Authorized'),
+      'total' => TRUE
+    )
+  );
+}
+
+/**
+ * Get a list of all transaction status info or info about a particular status.
+ */
+function commerce_gc_transaction_statuses($name = FALSE) {
+  $cache = &drupal_static(__FUNCTION__);
+
+  if (!$cache) {
+    $statuses = module_invoke_all('commerce_gc_transaction_status_info');
+    foreach ($statuses as $machine_name => $status) {
+      $cache[$machine_name] = $status + array(
+        'machine_name' => $machine_name
+      );
+    }
+  }
+
+  return isset($cache[$name]) ? $cache[$name] : $cache;
+}
+
+/**
+ * Get a list of statuses, by name, that are eligible to be counted as part of
+ * a giftcard's transaction balance.
+ *
+ * @return array
+ *  List of status names
+ */
+function commerce_gc_balance_total_status_names() {
+  return array_keys(commerce_gc_balance_total_statuses());
+}
+
+/**
+ * Get all statuses in a particular state
+ *
+ * @param type $states
+ * @return type
+ */
+function commerce_gc_balance_total_statuses() {
+  $names = array();
+  foreach (commerce_gc_transaction_statuses() as $name => $status) {
+    if (!empty($status['total'])) {
+      $names[] = $name;
+    }
+  }
+  return $names;
+}
+
+/**
+ * Get a list of transaction status options
+ *
+ * @return array
+ *  Option list
+ */
+function commerce_gc_transaction_status_option_list() {
+  $options = array();
+  foreach (commerce_gc_transaction_statuses() as $name => $status) {
+    $options[$name] = $status['label'];
+  }
+  return $options;
+}
+
+/*
+ * Implements hook_commerce_cart_order_refresh().
+ */
+function commerce_gc_commerce_cart_order_refresh($order_wrapper) {
+  $order = $order_wrapper->value();
+  $line_item_data = array();
+  $delete_line_item_ids = array();
+  $remove_coupon_ids = array();
+
+  // Create a list of line items in the order keyed by coupon id so that if
+  // necessary we can reference/delete them later if they no longer are valid.
+  foreach ($order_wrapper->commerce_line_items as $delta => $line_item_wrapper) {
+    if ($line_item_wrapper->type->value() == 'giftcard_use') {
+      $coupon_id = $line_item_wrapper->commerce_giftcard->coupon_id->value();
+      $line_item_data[$coupon_id] = array(
+        'line_item' => clone($line_item_wrapper),
+        'delta' => $delta,
+      );
+
+      // Set giftcard line item prices to zero. We always have to recalculate the price, similar to how commerce
+      // discount works.
+      commerce_gc_remove_giftcard_components($line_item_wrapper->commerce_unit_price);
+      commerce_gc_remove_giftcard_components($line_item_wrapper->commerce_total);
+    }
+  }
+
+  // Strip out giftcard components from order total.
+  commerce_gc_remove_giftcard_components($order_wrapper->commerce_order_total);
+
+  // Add giftcard use line items if necessary.
+  foreach ($order_wrapper->commerce_coupons as $delta => $coupon_wrapper) {
+    if ($coupon_wrapper->value() && $coupon_wrapper->type->value() == 'giftcard_coupon') {
+      $coupon = $coupon_wrapper->value();
+      $coupon_id = $coupon->coupon_id;
+
+      commerce_order_calculate_total($order);
+
+      // Evaluate conditions.
+      if (commerce_coupon_evaluate_conditions($coupon_wrapper, $order_wrapper)) {
+        // We know the balance is positive, but we need to know exactly how much
+        // of the giftcard can be applied based on the order total minus the
+        // amount of any line item tied to the use of this particular giftcard.
+        $amount = commerce_gc_order_giftcard_amount($order_wrapper, $coupon_wrapper);
+
+        $price = array(
+          'amount' => -$amount,
+          'currency_code' => commerce_default_currency()
+        );
+
+        // Add a new line item if one does not already exist.
+        if (!isset($line_item_data[$coupon_wrapper->coupon_id->value()])) {
+          $new_line_item = commerce_gc_add_line_item($order_wrapper, $coupon_wrapper, $price);
+          $new_line_item_wrapper = entity_metadata_wrapper('commerce_line_item', $new_line_item);
+
+          $new_delta = $order_wrapper->commerce_line_items->count();
+
+          // Track this line item because we might have to delete it later.
+          $line_item_data[$coupon_wrapper->coupon_id->value()] = array(
+            'line_item' => $new_line_item_wrapper,
+            'delta' => $new_delta,
+          );
+        }
+        // Otherwise we set the price and save.
+        else {
+          $line_item_wrapper = $line_item_data[$coupon_id]['line_item'];
+          commerce_gc_line_item_set_price($price, $line_item_wrapper, $coupon_wrapper);
+          $line_item_wrapper->save();
+        }
+
+        // Make sure this line item doesn't get deleted later, as long as its amount is not zero.
+        if ($price['amount'] < 0) {
+          unset($line_item_data[$coupon_id]);
+        }
+        else {
+          $remove_coupon_ids[] = $coupon_id;
+        }
+      }
+      else {
+        $remove_coupon_ids[] = $coupon_id;
+      }
+    }
+  }
+
+  // Remove coupons and line items that no longer apply.
+  foreach ($line_item_data as $coupon_id => $data) {
+    // It is not safe to use the offsetUnset pattern because this is not
+    // compatible with other modules that have already made changes to the
+    // line item list in this fashion - namely Commerce Discount.
+    $lang = field_language('commerce_order', $order, 'commerce_line_items');
+    $delta = $line_item_data[$coupon_id]['delta'];
+    unset($order->commerce_line_items[$lang][$delta]);
+
+    if ($line_item_data[$coupon_id]['line_item']->value()) {
+      $delete_line_item_ids[] = $line_item_data[$coupon_id]['line_item']->line_item_id->value();
+    }
+  }
+
+  // Finally get rid of all line items that need to be removed.
+  commerce_line_item_delete_multiple(array_values($delete_line_item_ids));
+
+  // Get rid of orphaned coupon references.
+  foreach ($remove_coupon_ids as $coupon_id) {
+    $coupon = commerce_coupon_load($coupon_id);
+    // Remove coupons from the order.
+    commerce_coupon_remove_coupon_from_order($order, $coupon, FALSE);
+  }
+}
+
+/*
+ * Implements hook_commerce_discount_remove_price_component_alter().
+ */
+function commerce_gc_commerce_discount_remove_price_component_alter($component, &$remove) {
+  if ($component['name'] == 'giftcard') {
+    $remove = TRUE;
+  }
+}
+
+/**
+ * Remove giftcard components from a given price and recalculate the total.
+ *
+ * @param $price_wrapper
+ *   Wrapped commerce price.
+ */
+function commerce_gc_remove_giftcard_components($price_wrapper) {
+  $data = $price_wrapper->data->value();
+  $component_removed = FALSE;
+  // Remove price components belonging to giftcards.
+  foreach ($data['components'] as $key => $component) {
+    if ($component['name'] == 'giftcard') {
+      unset($data['components'][$key]);
+      $component_removed = TRUE;
+    }
+  }
+  // Don't alter the price components if no components were removed.
+  if (!$component_removed) {
+    return;
+  }
+
+  // Re-save the price without the giftcards (if existed).
+  $price_wrapper->data->set($data);
+
+  // Re-set the total price.
+  $total = commerce_price_component_total($price_wrapper->value());
+  $price_wrapper->amount->set($total['amount']);
+}
+
+/**
+ * Determine the amount of a particular giftcard that is eligible to apply to
+ * apply against an order. Uses a static cache.
+ *
+ * @param EntityDrupalWrapper $order_wrapper
+ * @param EntityDrupalWrapper $coupon_wrapper
+ * @param type $exclude_amount
+ * @param type $reset
+ * @return type
+ */
+function commerce_gc_order_giftcard_amount(EntityDrupalWrapper $order_wrapper, EntityDrupalWrapper $coupon_wrapper, $reset = FALSE) {
+  $cache = &drupal_static(__FUNCTION__);
+  $coupon_id = $coupon_wrapper->coupon_id->value();
+  if ($reset || !isset($cache[$coupon_id])) {
+    $order_amount = $order_wrapper->commerce_order_total->amount->value();
+
+    // Calculate the amount of the giftcard that may be applied.
+    $balance_amount = commerce_gc_giftcard_balance($coupon_id);
+    $cache[$coupon_id] = $order_amount < $balance_amount ? $order_amount : $balance_amount;
+  }
+
+  return $cache[$coupon_id];
+}
+
+/**
+ * Implements hook_query_TAG_alter().
+ *
+ * Derived from
+ * commerce_payment_query_commerce_payment_transaction_access_alter().
+ */
+function commerce_gc_query_commerce_gc_transaction_access_alter(QueryAlterableInterface $query) {
+  // Read the meta-data from the query.
+  if (!$account = $query->getMetaData('account')) {
+    global $user;
+    $account = $user;
+  }
+
+  // If the user is allowed to administrate giftcards, stop here.
+  if (user_access('administer giftcard transactions')) {
+    return;
+  }
+
+  // If the user is not administrative-level, he/she must own the coupon related
+  // to a given transaction record.
+  if (user_access('view own giftcard transactions')) {
+    $tables = &$query->getTables();
+
+    // Look for an existing commerce_coupon table as well as the transaction
+    // table.
+    foreach ($tables as $table) {
+      if ($table['table'] == 'commerce_coupon') {
+        $coupon_alias = $table['alias'];
+      }
+      else if ($table['table'] == 'commerce_gc_transaction') {
+        $transaction_alias = $table['alias'];
+      }
+    }
+
+    // If not found, join to the coupon table and check access on the coupon.
+    // Otherwise, we know that Commerce Coupon has already added its access
+    // checks.
+    if (!isset($coupon_alias) && isset($transaction_alias)) {
+      $coupon_alias = $query->innerJoin('commerce_coupon', 'cc', '%alias.coupon_id = ' . $transaction_alias . '.coupon_id');
+
+      // Look up access on the coupon.
+      commerce_coupon_apply_access_query_substitute($query, $coupon_alias, $account);
+    }
+  }
+  else {
+    // The user may not view the results of this query.
+    $query->condition('1=0');
+  }
+}
+
+/*
+ * Implements hook_menu().
+ */
+function commerce_gc_menu() {
+  $items['giftcards/%commerce_coupon/transactions/%commerce_gc_transaction/delete'] = array(
+    'title' => 'Delete giftcard transaction',
+    'access arguments' => array('delete giftcard transactions'),
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('commerce_gc_delete_transaction_form', 1, 3)
+  );
+
+  return $items;
+}
+
+/*
+ * Delete transaction confirm form
+ */
+function commerce_gc_delete_transaction_form($form, &$form_state, $coupon, $transaction) {
+  $form_state['commerce_gc_transaction'] = $transaction;
+  $form_state['commerce_coupon'] = $coupon;
+  $form['#submit'][] = 'commerce_gc_delete_transaction_form_submit';
+
+  $form = confirm_form($form, t('Are you sure you want to delete this transaction?'), 'giftcards/' . $coupon->coupon_id . '/transactions/' . $transaction->transaction_id);
+
+  return $form;
+}
+
+/*
+ * Delete transaction form submit
+ */
+function commerce_gc_delete_transaction_form_submit(&$form, &$form_state) {
+  commerce_gc_transaction_delete($form_state['commerce_gc_transaction']->transaction_id);
+  drupal_set_message(t('Giftcard transaction successfully deleted.'));
+
+  $form_state['redirect'] = 'giftcards/' . $form_state['commerce_coupon']->coupon_id . '/transactions/';
+}
+
+/*
+ * Implements hook_permission().
+ */
+function commerce_gc_permission() {
+  return array(
+    'administer giftcard transactions' => array(
+      'title' => t('Administer giftcard transactions')
+    ),
+    'administer giftcards' => array(
+      'title' => t('Administer giftcards')
+    ),
+    'view own giftcard transactions' => array(
+      'title' => t('View own giftcard transactions')
+    ),
+    'create new giftcard transactions' => array(
+      'title' => t('Create new giftcard transactions')
+    ),
+    'delete giftcard transactions' => array(
+      'title' => t('Delete giftcard transactions')
+    ),
+  );
+}
+
+/*
+ * Implements hook_commerce_coupon_type_info().
+ */
+function commerce_gc_commerce_coupon_type_info() {
+  $types['giftcard_coupon'] = array(
+    'label' => t('Giftcard'),
+    'type' => 'giftcard_coupon'
+  );
+
+  return $types;
+}
+
+/*
+ * Implements hook_commerce_price_component_type_info().
+ */
+function commerce_gc_commerce_price_component_type_info() {
+  $types['giftcard'] = array(
+    'title' => t('Giftcard')
+  );
+
+  return $types;
+}
+
+/*
+ * Implements hook_commerce_line_item_type_info().
+ */
+function commerce_gc_commerce_line_item_type_info() {
+  $types['giftcard_use'] = array(
+    'type' => 'giftcard_use',
+    'name' => t('Giftcard use'),
+    'description' => t('Line item for giftcard usage.'),
+    'add_form_submit_value' => t('Add giftcard'),
+    'base' => 'commerce_gc_line_item',
+  );
+
+  return $types;
+}
+
+/*
+ * Line item type callback: giftcard use configuration
+ */
+function commerce_gc_line_item_configuration() {
+  field_info_cache_clear();
+
+  $fields = field_info_fields();
+  $instances = field_info_instances();
+
+  /*
+   * Line item: giftcard reference
+   */
+  if (empty($fields['commerce_giftcard'])) {
+    // Create giftcard reference field
+    $field = array(
+      'settings' => array(
+        'target_type' => 'commerce_coupon',
+        'handler' => 'base',
+        'handler_settings' => array(
+          'target_bundles' => array(
+            'product_display' => 'giftcard_coupon',
+          ),
+        ),
+      ),
+      'field_name' => 'commerce_giftcard',
+      'type' => 'entityreference',
+      'locked' => TRUE,
+      'cardinality' => '1',
+    );
+    field_create_field($field);
+  }
+  if (empty($instances['commerce_line_item']['giftcard_use']['commerce_giftcard'])) {
+    $instance = array(
+      'label' => t('Giftcard'),
+      'widget' => array(
+        'type' => 'entityreference_autocomplete',
+        'weight' => '9',
+        'settings' => array(
+          'match_operator' => 'CONTAINS',
+          'size' => 60,
+          'path' => '',
+        ),
+      ),
+      'field_name' => 'commerce_giftcard',
+      'entity_type' => 'commerce_line_item',
+      'bundle' => 'giftcard_use',
+      'default_value' => NULL,
+    );
+    field_create_instance($instance);
+  }
+}
+
+/*
+ * Line item callback: title
+ */
+function commerce_gc_line_item_title() {
+  return t('Giftcard use');
+}
+
+/*
+ * Line item type callback: giftcard use add form
+ */
+function commerce_gc_line_item_add_form($element, &$form_state) {
+  $form['code'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Giftcard code'),
+    '#description' => t('Enter a giftcard code to redeem.'),
+    '#required' => TRUE,
+  );
+
+  $form['amount'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Amount') . ' (' . commerce_default_currency() . ')',
+    '#description' => t('Enter an amount to charge this giftcard.'),
+  );
+
+
+  // We do not allow the line item terminal to trigger transaction inserts if
+  // the order is in the shopping cart state because orders are not supposed to
+  // record transactions until checkout is complete.
+  if (commerce_cart_order_is_cart($form_state['commerce_order'])) {
+    $form['no_transaction'] = array(
+      '#type' => 'markup',
+      '#prefix' => '<div>',
+      '#markup' => t('Since the order is in the shopping cart state, adding this giftcard line item will not generate a transaction.
+        !link', array('!link' => l('Manage giftcard transactions directly', 'admin/commerce/coupons/giftcards'))),
+      '#suffix' => '</div>'
+    );
+  }
+
+  return $form;
+}
+
+/*
+ * Line item type callback: giftcard use add form
+ */
+function commerce_gc_line_item_add_form_submit($line_item, $element, &$form_state, $form) {
+  // No need to go further if there are errors.
+  if (form_get_errors()) {
+    return;
+  }
+
+  // Make sure amount is either empty or a number greater than zero.
+  $decimal_amount = $element['actions']['amount']['#value'];
+  if ($decimal_amount && (!is_numeric($decimal_amount) || $decimal_amount < 0)) {
+    return t('You have entered an invalid amount.');
+  }
+
+  $amount = commerce_currency_decimal_to_amount($decimal_amount, commerce_default_currency());
+
+  // Make sure the giftcard exists.
+  $code = $element['actions']['code']['#value'];
+  $coupon = commerce_coupon_load_by_code($code);
+  if (!$coupon || $coupon->type != 'giftcard_coupon') {
+    return t('This giftcard does not exist.');
+  }
+
+  // Make sure there is not already a giftcard use line item referencing this
+  // code.
+  $order = $form_state['commerce_order'];
+  $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+  foreach ($order_wrapper->commerce_line_items as $order_line_item_wrapper) {
+    if ($order_line_item_wrapper->type->value() == 'giftcard_use' && $order_line_item_wrapper->commerce_giftcard->coupon_id->value() == $coupon->coupon_id) {
+      return t('You may not add the same giftcard code more than once per order.');
+    }
+  }
+
+  // Make sure it has a positive balance.
+  $balance = commerce_gc_giftcard_balance($coupon->coupon_id);
+  if ($balance <= 0) {
+    return t('This balance on this giftcard is not greater than zero.');
+  }
+
+  // Make sure that the amount entered does not exceed the balance
+  if ($amount && $amount > $balance) {
+    $balance_display = commerce_currency_format($balance, commerce_default_currency());
+    return t('You have entered an amount greater than the balance on this card. Card balance is @balance', array('@balance' => $balance_display));
+  }
+
+  commerce_order_calculate_total($order);
+  $order_total = $order_wrapper->commerce_order_total->amount->value();
+
+  $ceiling_amount = $order_total < $balance ? $order_total : $balance;
+  $line_item_amount = $amount ? $amount : $ceiling_amount;
+
+  // This can happen if the order total is zero.
+  if (!$line_item_amount) {
+    return t('You cannot add a zero amount giftcard use line item.');
+  }
+
+  $line_item_wrapper = entity_metadata_wrapper('commerce_line_item', $line_item);
+
+  // Set the giftcard reference
+  $line_item_wrapper->commerce_giftcard = $coupon;
+
+  // Set the price
+  $price = array(
+    'amount' => -$line_item_amount,
+    'currency_code' => commerce_default_currency(),
+    'data' => array()
+  );
+  $line_item_wrapper->commerce_unit_price->amount = -$line_item_amount;
+  $line_item_wrapper->commerce_unit_price->currency_code = commerce_default_currency();
+  $base_price = array(
+    'amount' => 0,
+    'currency_code' => commerce_default_currency(),
+    'data' => array(),
+  );
+  $line_item_wrapper->commerce_unit_price->data = commerce_price_component_add($base_price, $component_title, $price, TRUE);
+}
+
+/**
+ * Write a new commerce giftcard transaction record. Uses a database transaction
+ * to ensure balance integrity.
+ *
+ * @see CommerceGCTransactionEntityController::save().
+ *
+ * @param type $coupon_id
+ * @param type $amount
+ * @return type
+ */
+function commerce_gc_transaction_write($coupon_id, $amount, $status = 'complete') {
+  $values = array(
+    'coupon_id' => $coupon_id,
+    'amount' => $amount,
+    'status' => $status
+  );
+
+  $transaction = commerce_gc_transaction_new($values);
+
+  // Insert record
+  commerce_gc_transaction_save($transaction);
+  return !empty($transaction->transaction_id) ? $transaction->transaction_id : NULL;
+}
+
+/**
+ * Create a stub giftcard transaction entity.
+ *
+ * @return type
+ */
+function commerce_gc_transaction_new($values) {
+  return entity_get_controller('commerce_gc_transaction')->create($values);
+}
+
+/**
+ * Save a giftcard transaction entity.
+ *
+ * @return type
+ */
+function commerce_gc_transaction_save($transaction) {
+  return entity_get_controller('commerce_gc_transaction')->save($transaction);
+}
+
+/**
+ * Load a giftcard transaction entity
+ *
+ * @param type $transaction_id
+ * @param type $reset
+ * @return type
+ */
+function commerce_gc_transaction_load($transaction_id, $reset = FALSE) {
+  $transactions = commerce_gc_transaction_load_multiple(array($transaction_id), array(), $reset);
+  return reset($transactions);
+}
+
+/**
+ * Load multiple giftcard transaction entities based on certain conditions.
+ *
+ * @param $commerce_coupon_ids
+ *   An array of coupon IDs.
+ * @param $conditions
+ *   An array of conditions to match against the {commerce_coupon} table.
+ * @param $reset
+ *   A boolean indicating that the internal cache should be reset.
+ * @return
+ *   An array of coupon objects, indexed by coupon id.
+ *
+ * @see entity_load()
+ */
+function commerce_gc_transaction_load_multiple($transaction_ids = array(), $conditions = array(), $reset = FALSE) {
+  if (empty($transaction_ids) && empty($conditions)) {
+    return array();
+  }
+
+  return entity_load('commerce_gc_transaction', $transaction_ids, $conditions, $reset);
+}
+
+/**
+ * Deletes a giftcard transaction by ID.
+ *
+ * @param $product_id
+ *   The ID of the product to delete.
+ *
+ * @return
+ *   TRUE on success, FALSE otherwise.
+ */
+function commerce_gc_transaction_delete($transaction_id) {
+  return commerce_gc_transaction_delete_multiple(array($transaction_id));
+}
+
+/**
+ * Deletes giftcard transaction by ID.
+ *
+ * @param $transaction_ids
+ *   An array of product IDs to delete.
+ *
+ * @return
+ *   TRUE on success, FALSE otherwise.
+ */
+function commerce_gc_transaction_delete_multiple($transaction_ids) {
+  return entity_get_controller('commerce_gc_transaction')->delete($transaction_ids);
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function commerce_gc_form_commerce_coupon_type_settings_form_alter(&$form, &$form_state) {
+  $form['commerce_gc_disable_empty_cards'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Use cron to disable giftcards with no value remaining.'),
+    '#default_value' => variable_get('commerce_gc_disable_empty_cards', FALSE),
+  );
+}
+
+/*
+ * Implements hook_form_FORM_ID_alter().
+ */
+function commerce_gc_form_commerce_order_ui_order_form_alter(&$form, &$form_state) {
+  // Store the original total of each line item so that we can compute a delta
+  // when we write the transaction. Only do this once to capture just the line
+  // items that were previously saved in the db and thus have transactions
+  // written already.
+  $order = $form_state['commerce_order'];
+  $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+  if (!isset($form_state['original_gc_line_items'])) {
+    $form_state['original_gc_line_items'] = array();
+
+    foreach ($order_wrapper->commerce_line_items as $line_item_wrapper) {
+      if ($line_item_wrapper->value() && $line_item_wrapper->type->value() == 'giftcard_use') {
+        $coupon_id = $line_item_wrapper->commerce_giftcard->coupon_id->value();
+
+        if ($line_item_wrapper->type->value() == 'giftcard_use') {
+          $form_state['original_gc_line_items'][$coupon_id]['amount'] = $line_item_wrapper->commerce_unit_price->amount->value();
+        }
+      }
+    }
+  }
+
+  // Add custom submit/validate handlers for recording transactions.
+  $form['actions']['submit']['#validate'][] = 'commerce_gc_validate_order_form_giftcard_transactions';
+  $form['actions']['submit']['#submit'][] = 'commerce_gc_submit_order_form_giftcard_transactions';
+}
+
+/*
+ * Implements hook_form_alter().
+ */
+function commerce_gc_form_alter(&$form, &$form_state, $form_id) {
+  if (strpos($form_id, 'commerce_checkout_form') === 0 && !empty($form['commerce_coupon'])) {
+    // Change labels for coupon input pane.
+    $form['commerce_coupon']['#title'] = t('Coupons and giftcards');
+    $form['commerce_coupon']['coupon_code']['#description'] = t('Enter a coupon or giftcard code here.');
+    $form['commerce_coupon']['coupon_code']['#title'] = t('Code');
+    $form['commerce_coupon']['coupon_add']['#value'] = t('Add');
+  }
+}
+
+/*
+ * Implements hook_commerce_coupon_final_checkout_transaction_rollback().
+ */
+function commerce_gc_commerce_coupon_final_checkout_transaction_rollback($transaction_id) {
+  commerce_gc_transaction_change_status(array($transaction_id), array(COMMERCE_GC_TRANSACTION_PENDING_STATUS), COMMERCE_GC_TRANSACTION_VOID_STATUS);
+}
+
+/*
+ * Implements hook_commerce_coupon_final_checkout_validate().
+ */
+function commerce_gc_commerce_coupon_final_checkout_validate($form, $form_state, EntityDrupalWrapper $order_wrapper) {
+  $transaction_ids = array();
+
+  // If the form was submitted via the continue button and there are no errors.
+  foreach ($order_wrapper->commerce_line_items as $line_item_wrapper) {
+    if ($line_item_wrapper->value() && $line_item_wrapper->type->value() == 'giftcard_use') {
+      $coupon = $line_item_wrapper->commerce_giftcard->value();
+
+      // Do not save transactions for giftcards with zero amount.
+      if ($coupon) {
+        // Attempt to write a pending transaction. This will be set to
+        // complete when checkout is complete. This will fail if the balance is
+        // too low.
+        $transaction_id = commerce_gc_transaction_write($coupon->coupon_id, $line_item_wrapper->commerce_unit_price->amount->value(), COMMERCE_GC_TRANSACTION_PENDING_STATUS);
+        if (!$transaction_id) {
+          form_set_error('', t('Invalid coupon amount, please try again.'));
+        }
+        else {
+          // Remember which transactions we created so that we can roll them back
+          // if the form returns with errors. This is separate from the order
+          // data record below because we do not want to cancel pending
+          // transactions unless the form is actually being rebuilt from this
+          // submission.
+          $transaction_ids[] = $transaction_id;
+        }
+      }
+    }
+  }
+
+  if (!empty($transaction_ids)) {
+    // Also store the transaction ids in the order data so the checkout
+    // complete hook knows what to update.
+    $order = $order_wrapper->value();
+    $order->data['giftcard_transaction_ids'] = $transaction_ids;
+    $order_wrapper->save();
+  }
+
+  return $transaction_ids;
+}
+
+/**
+ * Given a set of transaction ids, set any that match a certain status to a
+ * target status.
+ *
+ * @param type $order
+ * @param type $status
+ */
+function commerce_gc_transaction_change_status($transaction_ids, $statuses, $target_status) {
+  $transactions = commerce_gc_transaction_load_multiple($transaction_ids);
+  // Save each individually so that the entity save controllers are triggered
+  // in case we implement more advanced logging later. There should always be
+  // a very small number of items here so performance is not an issue.
+  foreach ($transactions as $transaction) {
+    if (in_array($transaction->status, $statuses)) {
+      $transaction->status = $target_status;
+      commerce_gc_transaction_save($transaction);
+    }
+  }
+}
+
+/*
+ * Form validate callback: validate giftcard use line item unit prices before
+ * recording transactions
+ */
+function commerce_gc_validate_order_form_giftcard_transactions(&$form, &$form_state) {
+  $order = $form_state['commerce_order'];
+  $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+
+  // Make sure that any giftcard line items do not exceed the current balance on
+  // their respective coupon entities.
+  foreach ($order_wrapper->commerce_line_items as $line_item_wrapper) {
+    if ($line_item_wrapper->value() && $line_item_wrapper->type->value() == 'giftcard_use') {
+      $unit_amount = $line_item_wrapper->commerce_unit_price->amount->value();
+      $coupon = $line_item_wrapper->commerce_giftcard->value();
+
+      // Giftcard use unit prices must be negative.
+      if ($unit_amount === 0) {
+        form_set_error('', t('The line item amount for giftcard @code cannot be zero. Try removing it instead.', array('@code' => $coupon->code)));
+        return;
+      }
+
+      if ($unit_amount > 0) {
+        form_set_error('', t('The line item amount for giftcard @code must be negative.', array('@code' => $coupon->code)));
+        return;
+      }
+    }
+  }
+}
+
+/*
+ * Form submit callback: record giftcard transactions
+ */
+function commerce_gc_submit_order_form_giftcard_transactions(&$form, &$form_state) {
+  $order = $form_state['commerce_order'];
+  $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+  $save = FALSE;
+
+  foreach ($order_wrapper->commerce_line_items as $line_item_wrapper) {
+    if ($line_item_wrapper->type->value() == 'giftcard_use') {
+      // Remember which giftcards are still present.
+      $coupon_id = $line_item_wrapper->commerce_giftcard->coupon_id->value();
+      $existing_coupon_ids[$coupon_id] = TRUE;
+
+      // Compute the amount that should be written for this transaction by using
+      // the original value as an offset.
+      $unit_price_amount = $line_item_wrapper->commerce_unit_price->amount->value();
+
+      if (isset($form_state['original_gc_line_items'][$coupon_id]['amount'])) {
+        $offset_amount = $form_state['original_gc_line_items'][$coupon_id]['amount'];
+        $transaction_amount = -($offset_amount - $unit_price_amount);
+      }
+      else {
+        $transaction_amount = $unit_price_amount;
+      }
+
+      // As long as the order is not a shopping cart, record a transaction.
+      // Shopping cart orders go through a separate refresh process and do not
+      // create transactions for their giftcard use line items until checkout is
+      // complete.
+      if ($transaction_amount && !commerce_cart_order_is_cart($order)) {
+        commerce_gc_transaction_write($coupon_id, $transaction_amount);
+      }
+
+      // Add the coupon to the order if it is not there already.
+      if (!in_array($coupon_id, $order_wrapper->commerce_coupons->raw())) {
+        $order_wrapper->commerce_coupons[] = $coupon_id;
+        $save = TRUE;
+      }
+    }
+  }
+
+  $remove_coupon_ids = array();
+  // Handle giftcard line items that have been removed.
+  foreach ($form_state['original_gc_line_items'] as $coupon_id => $original_line_item_data) {
+    if (!isset($existing_coupon_ids[$coupon_id])) {
+      // Create a transaction to reverse the missing line item's total, unless
+      // the line item was never associated with a transaction.
+      if (!commerce_cart_order_is_cart($order)) {
+        commerce_gc_transaction_write($coupon_id, -$original_line_item_data['amount']);
+      }
+      $remove_coupon_ids[] = $coupon_id;
+    }
+  }
+
+  // Remove giftcard coupon from order if giftcard's related line item was
+  // removed.
+  foreach ($order_wrapper->commerce_coupons->raw() as $delta => $coupon_id) {
+    if (in_array($coupon_id, $remove_coupon_ids)) {
+      $order_wrapper->commerce_coupons->offsetUnset($delta);
+      $save = TRUE;
+    }
+  }
+
+  if ($save) {
+    commerce_order_save($order);
+  }
+}
+
+/**
+ * Load giftcard that belong to a certain user.
+ *
+ * @param type $uid
+ * @param type $active
+ * @return type
+ */
+function commerce_gc_load_user_giftcards($uid, $active = TRUE) {
+  $coupons = array();
+
+  $query = new EntityFieldQuery;
+  $results = $query
+    ->entityCondition('entity_type', 'commerce_coupon')
+    ->propertyCondition('type', 'giftcard')
+    ->fieldCondition('commerce_coupon_recipient', 'value', $uid)
+    ->propertyCondition('status', $active)
+    ->execute();
+
+  if (!empty($results['commerce_coupon'])) {
+    $coupons = commerce_coupon_load_multiple(array_keys($results['commerce_coupon']));
+  }
+
+  return $coupons;
+}
+
+/*
+ * Implements hook_commerce_coupon_value_display_alter().
+ */
+function commerce_gc_commerce_coupon_value_display_alter(&$text, $coupon, $order) {
+  if ($coupon->type == 'giftcard_coupon') {
+    $coupon_wrapper = entity_metadata_wrapper('commerce_coupon', $coupon);
+    $name = $coupon_wrapper->commerce_gc_name->value();
+    $text = $name ? $name : t('Giftcard');
+  }
+}
+
+/**
+ * Creates a giftcard use line item on the provided order.
+ *
+ * @param EntityDrupalWrapper $order_wrapper
+ *   The wrapped order entity.
+ * @param string $discount_name
+ *   The name of the discount being applied.
+ * @param array $amount
+ *   The discount amount price array (amount, currency_code).
+ */
+function commerce_gc_add_line_item(EntityDrupalWrapper $order_wrapper, EntityDrupalWrapper $coupon_wrapper, $price) {
+  // Create a new line item.
+  $line_item = entity_create('commerce_line_item', array(
+    'type' => 'giftcard_use',
+    'order_id' => $order_wrapper->order_id->value(),
+    'quantity' => 1,
+  ));
+  $line_item_wrapper = entity_metadata_wrapper('commerce_line_item', $line_item);
+
+  // Set a reference to the coupon
+  $line_item_wrapper->commerce_giftcard = $coupon_wrapper->value();
+
+  // Set the giftcard line item price.
+  commerce_gc_line_item_set_price($price, $line_item_wrapper, $coupon_wrapper);
+
+  // Save the line item and add it to the order.
+  $line_item_wrapper->save();
+
+  // The wrapper "set" pattern breaks down because of the way Discount module
+  // rebases line items during order refresh, so we manipulate the entity
+  // directly. See commerce_gc_commerce_cart_order_refresh() for a similar
+  // pattern.
+  $order = $order_wrapper->value();
+  $lang = field_language('commerce_order', $order, 'commerce_line_items');
+  $order->commerce_line_items[$lang][] = array('line_item_id' => $line_item->line_item_id);
+
+  return $line_item;
+}
+
+/**
+ * Set the price of a giftcard line item.
+ *
+ * @param array $price
+ * @param EntityDrupalWrapper $line_item_wrapper
+ * @param EntityDrupalWrapper $coupon_wrapper
+ */
+function commerce_gc_line_item_set_price($price, EntityDrupalWrapper $line_item_wrapper, EntityDrupalWrapper $coupon_wrapper) {
+  // Initialize the line item unit price.
+  $line_item_wrapper->commerce_unit_price->amount = $price['amount'];
+  $line_item_wrapper->commerce_unit_price->currency_code = $price['currency_code'];
+
+  // Reset the data array of the line item total field to only include a
+  // base price component, set the currency code from the order.
+  $base_price = array(
+    'amount' => 0,
+    'currency_code' => $price['currency_code'],
+    'data' => array(),
+  );
+  $component_title = $coupon_wrapper->commerce_gc_name->value() ? $coupon_wrapper->commerce_gc_name->value() : 'giftcard';
+  // Add some data elements to the price
+  $price['data'] = array(
+    'giftcard_component_title' => $component_title
+  );
+
+  // Set components and save.
+  $line_item_wrapper->commerce_unit_price->data = commerce_price_component_add($base_price, 'giftcard', $price, TRUE);
+}
+
+/*
+ * Implements hook_commerce_price_formatted_components_alter().
+ */
+function commerce_gc_commerce_price_formatted_components_alter(&$components, $price, $entity) {
+  // Similar to the implementation in Commerce Discount.
+  if (isset($price['data']['components'])) {
+    // Loop into price components and alter the component title if the giftcard
+    // component label is found.
+    foreach ($price['data']['components'] as $component) {
+      if (!isset($component['price']['data']['giftcard_component_title'])) {
+        continue;
+      }
+      $components[$component['name']]['title'] = $component['price']['data']['giftcard_component_title'];
+    }
+  }
+}
+
+/**
+ * Compute the balance for a particular giftcard coupon.
+ *
+ * @param type $coupon_id
+ * @return type
+ */
+function commerce_gc_giftcard_balance($coupon_id, $for_update = FALSE) {
+  $coupon = commerce_coupon_load($coupon_id);
+
+  if ($coupon) {
+    $query = db_select('commerce_gc_transaction', 'c');
+    $query->addExpression('SUM(c.amount)', 'balance');
+
+    $query
+      ->condition('c.coupon_id', $coupon_id)
+      ->condition('status', commerce_gc_balance_total_statuses());
+
+    if ($for_update) {
+      $query->forUpdate();
+    }
+
+    $balance = $query
+      ->execute()
+      ->fetchCol();
+
+    return $balance ? reset($balance) : 0;
+  }
+}
+
+/*
+ * Implements hook_commerce_coupon_insert().
+ */
+function commerce_gc_commerce_coupon_insert($coupon) {
+  if ($coupon->type == 'giftcard_coupon') {
+    $coupon_wrapper = entity_metadata_wrapper('commerce_coupon', $coupon);
+    // Write a new transaction record for the coupon
+    commerce_gc_transaction_write($coupon->coupon_id, $coupon_wrapper->commerce_gc_value->amount->value());
+  }
+}
+
+/*
+ * Implements hook_views_api().
+ */
+function commerce_gc_views_api() {
+  return array(
+    'api' => 3,
+    'path' => drupal_get_path('module', 'commerce_gc') . '/includes/views',
+  );
+}
+
+/*
+ * Entity metadata property getter: coupons
+ */
+function commerce_gc_coupon_properties($coupon, $options, $name) {
+  switch ($name) {
+    case 'giftcard_balance':
+      $amount = commerce_gc_giftcard_balance($coupon->coupon_id);
+      return array(
+        'amount' => $amount,
+        'currency_code' => commerce_default_currency(),
+        'data' => array()
+      );
+  }
+}
+
+/*
+ * Simple add transaction form
+ */
+function commerce_gc_add_transaction_action_form_simple($form, &$form_state, $coupon_id) {
+  $form['add_transaction'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Add transaction'),
+    '#collapsible' => TRUE,
+    '#collapsed' => TRUE
+  );
+
+  $form['add_transaction']['amount'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Amount (@currency)', array('@currency' => commerce_default_currency())),
+    '#description' => t('Provide a negative number for a debit and positive for credit.'),
+    '#element_validate' => array('element_validate_number'),
+    '#size' => 5
+  );
+
+  $form['add_transaction']['status'] = array(
+    '#type' => 'select',
+    '#title' => t('Status'),
+    '#description' => t('Select the transaction status'),
+    '#default_value' => 'complete',
+    '#options' => commerce_gc_transaction_status_option_list(),
+  );
+
+  $form['add_transaction']['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Submit'),
+  );
+
+  $form_state['coupon_id'] = (int)$coupon_id;
+
+  return $form;
+}
+
+/*
+ * Simple add transaction form submit
+ */
+function commerce_gc_add_transaction_action_form_simple_submit(&$form, &$form_state) {
+  if (!empty($form_state['values']['amount'])) {
+    $amount = commerce_currency_decimal_to_amount($form_state['values']['amount'], commerce_default_currency());
+    commerce_gc_transaction_write($form_state['coupon_id'], $amount, $form_state['values']['status']);
+    drupal_set_message(t('Transaction saved.'));
+  }
+}
+
+/*
+ * Implements hook_commerce_coupon_condition_component_alter().
+ */
+function commerce_gc_commerce_coupon_condition_component_alter($rule, $coupon_type) {
+  if ($coupon_type == 'giftcard_coupon') {
+    // Add a balance check condition to the coupon rules.
+    $rule->condition('commerce_gc_giftcard_minimum_balance', array(
+      'commerce_coupon:select' => 'commerce_coupon',
+    ));
+  }
+}
+
+/**
+ * Implements hook_cron().
+ */
+function commerce_gc_cron() {
+  if (variable_get('commerce_gc_disable_empty_cards', FALSE)) {
+    // Despite using a sum and subselect this query is extremely fast.
+    $query = db_update('commerce_coupon');
+    $query->fields(array('status' => 0));
+    $query->where('(SELECT SUM(amount) AS balance FROM {commerce_gc_transaction} t WHERE t.coupon_id = commerce_coupon.coupon_id AND status IN (:status)) = 0', array(':status' => commerce_gc_balance_total_statuses()));
+    $query->condition('type', 'giftcard_coupon');
+    $query->condition('status', 1);
+    $num_updated = $query->execute();
+
+    if ($num_updated) {
+      watchdog('commerce_gc', 'Disabled @num giftcards with no remaining balance.', array('@num' => $num_updated));
+    }
+  }
+}
