@@ -1,1 +1,0 @@
-We all agree that spammers don't use spaces in their usernames, right? This module forces users to use spaces in their usernames in an attempt that spammers can't register (until they figure out a way to).

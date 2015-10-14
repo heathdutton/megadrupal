@@ -1,1 +1,0 @@
-More information can be found in the Advanced Help topics.
