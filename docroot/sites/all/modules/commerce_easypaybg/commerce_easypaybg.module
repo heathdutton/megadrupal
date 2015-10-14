@@ -1,0 +1,485 @@
+<?php
+/**
+ * @file
+ * Implements EasyPay payment method.
+ */
+ 
+/**
+ * Implements hook_help().
+ */
+function commerce_easypaybg_help($path, $arg) {
+  /* INFO:
+   * The help hook is for displaying helpful messages at the top of pages indicated
+   * by $section to further explain how they work. Adding certain "keywords" to the end of 
+   * a given path (like admin/modules#description) will cause this text to display elsewhere
+   * in the page as well (in this case, in the description section for the given module).
+   */
+  switch ($path) {
+    case 'admin/help#commerce_easypaybg':
+      return t("For test purpose get account in https://devep2.datamax.bg/ep2/epay2_demo/. For production site - http://epay.bg.");
+    // OPTIONAL: Add additional cases for other paths that should display help text.
+  }
+}
+
+function commerce_easypaybg_init() {
+  if (!module_exists('commerce_epaybg')) {
+    module_load_include('inc', 'commerce_easypaybg', 'commerce_easypaybg.hmac');
+  }
+}
+
+/**
+ * Implements hook_menu().
+ */
+function commerce_easypaybg_menu() {
+  $items['payments/easypay/response'] = array(
+    'title' => 'Payments - EasyPay response',
+    'page callback' => 'register_payment_response',
+    'access callback' => TRUE,
+    'type' => MENU_CALLBACK,
+  );
+  $items['easypay/simulate-payment'] = array(
+    'title' => 'EasyPay Simulate Payment',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('easypay_simulate_payment'),
+    'access callback' => 'user_is_administrator_role',
+    //'access arguments' => array('access checkout'),
+    'type' => MENU_NORMAL_ITEM,
+  );
+  
+  return $items;
+}
+
+/**
+ * Implements hook_rules_event_info().
+ */
+function commerce_easypaybg_rules_event_info() {
+  $items = array(
+    'commerce_easypay_payment_receive' => array(
+      'label' => t('EasyPay payment receive'),
+      'module' => 'commerce_easypaybg',
+      'group' => t('Commerce Payment'),
+      'variables' => entity_rules_events_variables('commerce_order', t('Order', array(), array('context' => 'a drupal commerce order'))),
+      'access callback' => 'commerce_order_rules_access',
+    ),
+  );
+  return $items;
+}
+
+/**
+ * EasyPay register payment response
+ */
+function register_payment_response($post = NULL) {
+  if ($post) {
+    $_POST = $post;
+  }
+
+  if (!empty($_POST)) {
+    
+    $encoded = filter_xss($_POST['encoded'], $allowed_tags = array());
+    $checksum = filter_xss($_POST['checksum'], $allowed_tags = array());
+    $status_resp = 'NO';
+    
+    $payment = commerce_payment_method_instance_load('commerce_easypaybg|commerce_payment_commerce_easypaybg');
+    $hmac = hmac('sha1', $encoded, $payment['settings']['easypay_secret']);
+    
+    if ($checksum = $hmac) {
+      $data = base64_decode($encoded);
+      $lines_arr = explode("\n", $data);
+      
+      foreach ($lines_arr as $line) {
+        if (preg_match("/^INVOICE=(\d+):STATUS=(PAID|DENIED|EXPIRED)(:PAY_TIME=(\d+):STAN=(\d+):BCODE=([0-9a-zA-Z]+))?$/", $line, $regs)) {
+          $invoice = $regs[1];
+          $status = $regs[2];
+          // XXX if PAID
+          $pay_date = $regs[4];
+          // XXX if PAID
+          $stan = $regs[5];
+          // XXX if PAID
+          $bcode = $regs[6]; 
+        }
+      }
+      
+      $order = commerce_order_load($invoice);
+      
+      if (isset($order -> order_id) && $order -> order_id) {
+      
+        $transaction_id = db_select('commerce_payment_transaction', 't')
+          -> fields('t', array('transaction_id'))
+          -> condition('order_id', $invoice, '=')
+          -> execute()
+          -> fetchField();
+      
+        //change order status from pending to complited
+        $transaction = commerce_payment_transaction_load($transaction_id);
+    
+        if ($status == 'PAID') {
+          $transaction -> status = COMMERCE_PAYMENT_STATUS_SUCCESS;
+
+          //rules event invoke
+          rules_invoke_event('commerce_easypay_payment_receive', $order);
+        
+          //20120801170838
+          $year = substr($pay_date, 0, 4);
+          $month = substr($pay_date, 4, 2);
+          $day = substr($pay_date, 6, 2);
+          $hour = substr($pay_date, 8, 2);
+          $min = substr($pay_date, 10, 2);
+          $sec = substr($pay_date, 12, 2);
+          $pay_date = $day . '.' . $month . '.' . $year . ' ' . $hour . ':' . $min . ':' . $sec;
+        }
+        elseif ($status == 'DENIED') {
+          //order canceled from customer
+          $transaction -> status = COMMERCE_PAYMENT_STATUS_FAILURE;
+        }
+        elseif ($status == 'EXPIRED') {
+          //order paymet time expired
+          $transaction -> status = COMMERCE_PAYMENT_STATUS_FAILURE;
+        }
+        
+        watchdog('commerce_easypay', 'EasyPay invoice @invoice, status @status, time @time', array('@invoice' => $invoice, '@status' => $status, '@time' => $pay_date), WATCHDOG_NOTICE);
+        $status_resp = 'OK';
+      
+        //update easypay payment status
+        commerce_payment_transaction_save($transaction);
+      
+        db_merge('commerce_easypaybg')
+          ->key(array('order_id' => $invoice))
+          ->fields(array(
+            'status' => $status,
+            'pay_time' => $pay_date,
+          ))
+         ->execute();
+      }
+      
+      //return answer about this invoice
+      echo "INVOICE=$invoice:STATUS=$status_resp";
+    }
+    else {
+      watchdog('commerce_easypay', 'EasyPay unknown invoice.', array(), WATCHDOG_NOTICE);
+    }
+  }
+}
+
+/**
+ * Implements hook_commerce_payment_method_info().
+ */
+function commerce_easypaybg_commerce_payment_method_info() {
+  $payment_methods['commerce_easypaybg'] = array(
+    'title' => t('EasyPay'),
+    'description' => t('EasyPay Payment'),
+    'active' => TRUE,
+  );
+  return $payment_methods;
+}
+
+/**
+ * Payment method callback: submit form.
+ */
+function commerce_easypaybg_submit_form($payment_method, $pane_values, $checkout_pane, $order) {
+  $form = array();
+
+  // Merge in values from the order.
+  if (!empty($order->data['commerce_easypaybg'])) {
+    $pane_values += $order->data['commerce_easypaybg'];
+  }
+
+  // Merge in default values.
+  $pane_values += array(
+    'name' => '',
+  );
+
+  $form['received_easypay_num'] = array(
+    '#markup' => t('Completing the order you will receive a number for payment on nearest to you Easy Pay office.'),
+  );
+
+  return $form;
+}
+
+/**
+ * Payment method callback: settings form.
+ */
+function commerce_easypaybg_settings_form($settings = NULL) {
+  $settings = (array) $settings + array(
+    'easypay_min' => '',
+    'easypay_secret' => '',
+    'site_mode' => 'DEMO_MODE',
+    'easypay_deadline' => '3',
+  );
+  
+  $form = array();
+  
+  $form['site_mode'] = array(
+    '#type' => 'select',
+    '#title' => t('Site mode'),
+    '#description' => t('For Demo mode get profile on https://devep2.datamax.bg/ep2/epay2_demo/, for Live mode - http://epay.bg'),
+    '#options' => array('DEMO_MODE' => t('Demo mode'), 'LIVE_MODE' => t('Live mode')),
+    '#default_value' => $settings['site_mode'],
+  );
+  $form['easypay_deadline'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Order payment deadline'),
+    '#description' => t('Deadline for payment - set between 1 and 30 days.'),
+    '#default_value' => $settings['easypay_deadline'],
+  );
+  $form['information'] = array(
+    '#type' => 'markup',
+    '#markup' => t('Get next data from your appropriate (Demo or Live) EasyPay profile.'),
+  );
+  $form['easypay_min'] = array(
+    '#type' => 'textfield',
+    '#title' => t('MID'),
+    '#description' => t('Customer number'),
+    '#default_value' => $settings['easypay_min'],
+  );
+  $form['easypay_secret'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Secret key'),
+    '#default_value' => $settings['easypay_secret'],
+  );
+  
+  return $form;
+}
+
+/**
+ * Payment method callback: checkout form submission.
+ */
+function commerce_easypaybg_submit_form_submit($payment_method, $pane_form, $pane_values, $order, $charge) {
+  $order->data['commerce_easypaybg'] = $pane_values;
+
+  commerce_easypaybg_transaction($payment_method, $order, $charge);
+}
+
+/**
+ * Creates a cheque payment transaction for the specified charge amount.
+ *
+ * @param $payment_method
+ *   The payment method instance object used to charge this payment.
+ * @param $order
+ *   The order object the payment applies to.
+ * @param $charge
+ *   An array indicating the amount and currency code to charge.
+ */
+function commerce_easypaybg_transaction($payment_method, $order, $charge) {
+  
+  $easypay_code = get_easypay_payment_code($payment_method, $order);
+  
+  $transaction = commerce_payment_transaction_new('commerce_easypaybg', $order -> order_id);
+  $transaction -> instance_id = $payment_method['instance_id'];
+  $transaction -> amount = $charge['amount'];
+  $transaction -> currency_code = $charge['currency_code'];
+  $transaction -> status = COMMERCE_PAYMENT_STATUS_PENDING;
+  $transaction -> message = t('EasyPay code: @easypay_code.', array('@easypay_code' => $easypay_code));
+
+  commerce_payment_transaction_save($transaction);
+}
+
+/**
+ * Get EasyPay code for this order
+ */
+function get_easypay_payment_code($payment_method, $order) {
+  $easypay_code = 'NULL';
+  $time = time();
+  //merchant ID (secret)
+  $secret = $payment_method['settings']['easypay_secret'];
+  //merchant ID (KIN)
+  $min = $payment_method['settings']['easypay_min'];
+  $order_total = $order -> commerce_order_total['und'][0]['amount'] / 100;
+  $invoice = $order -> order_id;
+  $exp_date = $time + (60*60*24*$payment_method['settings']['easypay_deadline']);
+  $exp_date = date('d.m.Y h:i:s', $exp_date);
+  $description = _extract_order_description($order);
+  
+  $data = 'MIN=' . $min . "\n" .
+    'INVOICE=' . $invoice . "\n" .
+    'AMOUNT=' . $order_total . "\n" .
+    'EXP_TIME=' . $exp_date . "\n" .
+    'DESCR=' . $description;
+  
+  
+  $encoded_data = base64_encode($data);
+  $checksum = hmac('sha1', $encoded_data, $secret);
+  
+  $ep_urls = unserialize(variable_get('commerce_easypay_urls', ''));
+  $url_get = $ep_urls[$payment_method['settings']['site_mode']] . '?ENCODED=' . $encoded_data . '&CHECKSUM=' . $checksum;
+  
+  $response = file_get_contents($url_get);
+
+  watchdog('commerce_easypay', 'Pay order @order_id until @exp_time, @idn', array('@order_id' => $invoice, '@exp_time' => $exp_date, '@idn' => $response), WATCHDOG_NOTICE);
+
+  /*
+  $ch = curl_init($url_get);
+  curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, FALSE);
+  curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
+  $response = curl_exec($ch);
+  $info = curl_getinfo($ch);
+  $curl_error = curl_error($ch);
+  curl_close($ch);*/
+  
+  //drupal_set_message(check_plain(correct_encoding($response)));
+/*
+  if ($curl_error) {
+    watchdog('commerce_easypay', 'err: @err', array('@err' => correct_encoding($curl_error)), WATCHDOG_NOTICE);
+  }
+*/
+  //if ($info['http_code'] == 200) {
+    //extract EasyPay payments code only
+    if (strpos($response, 'IDN=') == 0) {
+      $message = substr($response, 4, strlen($response));
+      $easypay_code = $message;
+    }
+    elseif (strstr($response, 'error')) {
+      $message = $response . ' Try again later.';
+    }
+
+    drupal_set_message(t('EasyPay response: @ep_num', array('@order_id' => $order -> order_id, '@ep_num' => correct_encoding($response))));
+
+    watchdog('commerce_easypay', 'EasypayBG rsp.: @resp', array('@resp' => correct_encoding($response)), WATCHDOG_NOTICE);
+    
+    //insert order payment data
+    db_insert('commerce_easypaybg') // Table name no longer needs {}
+      ->fields(array(
+        'order_id' => $order -> order_id,
+        'easypay_code' => $easypay_code,
+        'pay_time' => $time,
+      ))
+      ->execute();
+  //}
+  //else {
+  //  watchdog('commerce_easypay', 'EasyPay site is unreachable or return error. Try again later, or choose another payment method.', array(), WATCHDOG_NOTICE);
+  //}
+
+  return $easypay_code;
+}
+
+/**
+ * Prepare EasyPay order description
+ */
+function _extract_order_description($order) {
+  $str_description = '';
+  $line_item_ids = array();
+  $line_items = array();
+  $descriptions = array();
+  
+  //load order line items
+  foreach ($order -> commerce_line_items['und'] AS $or_line_item) {
+    $line_item_ids[] = $or_line_item['line_item_id'];
+  }
+  $line_items = commerce_line_item_load_multiple($line_item_ids);
+  
+  //extract order product titles and quantity
+  foreach ($line_items AS $line_item) {
+    //get SKU and quantity per line_item
+    $descriptions[] = $line_item -> line_item_label . ' x ' . $line_item -> quantity;
+  }
+  
+  if (count($descriptions) > 1) {
+    $str_description = implode(', ', $descriptions);
+  }
+  else {
+    $str_description = $descriptions[0];
+  }
+  
+  return $str_description;
+}
+
+/**
+ * For TEST purpose only
+ * Form to make EasyPay payment by code number
+ */
+function easypay_simulate_payment() {
+  $form = array();
+  
+  $form['action'] = array(
+    '#type' => 'hidden',
+    '#title' => t('Action'),
+    '#value' => 'PAY',
+  );
+  $form['idn'] = array(
+    '#type' => 'textfield',
+    '#title' => t('EasyPay payment code'),
+  );
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Submit'),
+  );
+  
+  return $form;
+}
+
+/**
+ * Form make payment submit handler
+ */
+function easypay_simulate_payment_submit(&$form, &$form_state) {
+  //
+  $url_get = 'https://devep2.datamax.bg/ep2/epay2_demo/ezp/pay_bill.cgi?ACTION=' . $form_state['values']['action'] . '&IDN=' . $form_state['values']['idn'];
+
+  //$url_get = 'https://devep2.datamax.bg/ep2/epay2_demo/ezp/pay_bill.cgi?ACTION=' . $form_state['values']['action'] . '&IDN=' . $form_state['values']['idn'];
+  
+  $response = file_get_contents($url_get);
+  /*
+  $ch = curl_init($url_get);
+  curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, FALSE);
+  curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
+  $response = curl_exec($ch);
+  $info = curl_getinfo($ch);
+  $curl_error = curl_error($ch);
+  curl_close($ch);
+  */
+  //if ($info['http_code'] == 200) {
+    watchdog('commerce_easypay', 'Simulate EasyPay payment Response: @resp', array('@resp' => correct_encoding($response)), WATCHDOG_NOTICE);
+  //}
+  
+  drupal_set_message(check_plain(correct_encoding($response)));
+}
+
+/**
+ * Change string encoding
+ */
+function correct_encoding($text) {
+  $text = iconv('windows-1251', 'utf-8', $text);
+  return $text;
+}
+
+function user_is_administrator_role() {
+  global $user;
+  $access = FALSE;
+  
+  foreach ($user -> roles AS $uid => $role_id) {
+    if ($role_id == 'administrator') {
+      $access = TRUE;
+      continue;
+    }
+  }
+  
+  return $access;
+}
+
+/**
+ * Implements hook_form_alter()
+ */
+function commerce_easypaybg_form_alter(&$form, &$form_state, $form_id) {
+  if ($form_id == 'rules_ui_edit_element') {
+    if (!empty($form_state['element_settings']['payment_method']['method_id']) && $form_state['element_settings']['payment_method']['method_id'] == 'commerce_easypaybg') {
+      $form['#validate'][] = 'commerce_easypaybg_settings_validate';
+    }
+  }
+}
+
+function commerce_easypaybg_settings_validate(&$form, &$form_state) {  
+  $deadline = (int) $form_state['values']['parameter']['payment_method']['settings']['payment_method']['settings']['easypay_deadline'];
+  
+  if ($deadline < 1 || $deadline > 30) {
+    form_set_error('', t('Enter only digit positive value between 1 -30 (days) in Order payment deadline. @val', array('@val' => $deadline)));
+  }
+}
+
+/**
+ * Implementation of hook_views_api().
+ */
+function commerce_easypaybg_views_api() {
+  return array(
+    'api' => '3.0',
+  );
+}
+
+

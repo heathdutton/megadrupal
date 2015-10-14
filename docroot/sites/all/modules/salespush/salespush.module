@@ -1,0 +1,290 @@
+<?php
+
+/**
+ * @file
+ * SalesForce push data module routines.
+ */
+
+define('NON_DRUPAL_USERS', TRUE);
+define('ENTITIES_QUERY_LIMIT', 10);
+
+define('SALESFORCE_PUSH_EVENT_TYPE', 'HP MATTER event');
+define('SALESPUSH_WEBFORM_MARKED_AS_NEW', 'new');
+
+require_once 'inc/salesforce.inc';
+
+/**
+ * Get all emails from system.
+ *
+ * @param string $environment
+ *   String name for the current environment.
+ *
+ * @return array
+ *   Array of all emails from the system: users, webform_submissions.
+ */
+function salespush_get_user_emails($environment = 'sandbox') {
+  $allemails = & drupal_static(__FUNCTION__ . $environment);
+  if (isset($allemails)) {
+    return array_keys($allemails);
+  }
+  $mapped_mails = db_select('salespush_mapper', 'sm')
+    ->fields('sm', array('getter'))
+    ->condition('type', 'mail')
+    ->condition('environment', $environment);
+
+  $drupal_users = db_select('users', 'u')
+    ->fields('u', array('mail'))
+    ->condition('data', '%basic_profile%', 'LIKE')
+    ->condition('mail', $mapped_mails, 'NOT IN')
+    ->condition('mail', '', '!=')
+    ->isNotNull('mail')
+    ->execute();
+  // List of registered users emails.
+  $allemails = $drupal_users->fetchAllAssoc('mail');
+  // List of all webform users.
+  $webform_users = salespush_get_webform_users(TRUE, FALSE, $environment);
+  foreach ($webform_users as $key => $user) {
+    $allemails[$user->Email] = $user;
+  }
+
+  return array_keys($allemails);
+}
+
+/**
+ * Get all users for push into SalesForce.
+ *
+ * @param string $environment
+ *   String name for the current environment.
+ *
+ * @return string
+ *   Return string representation of CSV file.
+ */
+function salespush_get_users($environment = 'sandbox') {
+
+  /* Field for pushing to SalesForce
+  Name -> FirstName + LastName
+  photo -> no field!!!
+  headline -> Title
+  current positions -> no field!!!
+  Emails -> Email
+  */
+  // SELECT * FROM `users` WHERE `mail` LIKE '%@%' AND `data` LIKE '%a:%' LIMIT 50000.
+  $users_query = db_select('users', 'u');
+  $users_query = $users_query->fields('u', array('mail', 'data', 'created'));
+  $users_query = $users_query->condition('mail', '%@%', 'LIKE');
+  $users_query = $users_query->condition('data', 'a:%', 'LIKE');
+  // SalesForce limit 50000 records at once.
+  $users_query = $users_query->range(0, 50000);
+  $users_query = $users_query->execute();
+
+  $csvcontent = "\"FirstName\",\"LastName\",\"Email\",\"Title\",\"Created_Date__c\",\"IP_Address__c\",\"Linkedin_ID__c\"\n";
+  foreach ($users_query as $user) {
+    if (!isset($user->data)) {
+      continue;
+    }
+    $userdata = unserialize($user->data);
+    // Do not process if there is no basic_profile in data array.
+    if (!isset($userdata['basic_profile'])) {
+      continue;
+    }
+    // Create a line for csv.
+    $firstname = isset($userdata['basic_profile']['first-name']) ? $userdata['basic_profile']['first-name'] : '#N/A';
+    $lastname = isset($userdata['basic_profile']['last-name']) ? $userdata['basic_profile']['last-name'] : '#N/A';
+    $email = $user->mail;
+    $title = isset($userdata['basic_profile']['headline']) ? $userdata['basic_profile']['headline'] : '#N/A';
+    $created = format_date($user->created, 'custom', 'Y-m-d\TH:i:s');
+
+    $linkedin_id = isset($userdata['basic_profile']['id']) ? $userdata['basic_profile']['id'] : '';
+
+    // Escaping strings to be ready for CSV export.
+    $firstname = str_replace('"', '""', $firstname);
+    $lastname = str_replace('"', '""', $lastname);
+    $title = str_replace('"', '""', $title);
+
+    $csvcontent .= "\"$firstname\",\"$lastname\",\"$email\",\"$title\",\"$created\",\"127.0.0.1\",\"$linkedin_id\"\n";
+  }
+
+  // Filling the file with webform submissions for users.
+  $non_drupal_users = salespush_get_webform_users(NON_DRUPAL_USERS, FALSE, $environment);
+  if (!empty($non_drupal_users)) {
+    foreach ($non_drupal_users as $key => $userclass) {
+      // Create a line for csv.
+      list($name_from_email) = explode('@', $userclass->Email);
+      $lastname = ($userclass->SecondName != '') ? $userclass->SecondName : $name_from_email;
+      // @todo fix FirstName not saved in webforms.
+      $firstname = (isset($userclass->FirstName)) ? $userclass->FirstName : $name_from_email;
+      $email = $userclass->Email;
+      $title = ($userclass->Title != '') ? $userclass->Title : '#N/A';
+      $created = format_date($userclass->created, 'custom', 'Y-m-d\TH:i:s');;
+      $ip = $userclass->ip;
+
+      // Escaping strings to be ready for CSV export.
+      $firstname = str_replace('"', '""', $firstname);
+      $lastname = str_replace('"', '""', $lastname);
+      $title = str_replace('"', '""', $title);
+      // Duplicates handled by SaleForce itself.
+      $csvcontent .= "\"$firstname\",\"$lastname\",\"$email\",\"$title\",\"$created\",\"$ip\",\"\"\n";
+    }
+  }
+
+  return $csvcontent;
+}
+
+/**
+ * Get array of users, registered via webform's submissions.
+ *
+ * @param bool $nondrupal_users
+ *   TRUE if function has to return only non Drupal users.
+ * @param bool $synced_users
+ *   TRUE if function should return only already synced users.
+ * @param string $environment
+ *   String name for the current SalesForce environment.
+ *
+ * @return array
+ *   Array of stdClass objects with nid, sid, Email, CompanyName, Title, SecondName.
+ */
+function salespush_get_webform_users(
+  $nondrupal_users = FALSE,
+  $synced_users = FALSE,
+  $environment = 'sandbox'
+) {
+
+  // @todo get rid of $nondrupal_users, $synced_users
+  $users = salespush_parse_webform_submissions($nondrupal_users, $synced_users, $environment);
+
+  return $users;
+}
+
+/**
+ * Implements get all users from all webforms.
+ */
+function salespush_parse_webform_submissions(
+  $nondrupal_users = FALSE,
+  $synced_users = FALSE,
+  $environment = 'sandbox'
+) {
+
+  // Obtaining list of webform enabled nodes. See webform_admin_content().
+  $query = db_select('webform', 'w');
+  $query->join('node', 'n', 'w.nid = n.nid');
+  $query->fields('n', array('nid', 'type'));
+  $webform_nids = $query->execute()->fetchAllAssoc('nid');
+
+  module_load_include('inc', 'webform', 'includes/webform.report');
+  module_load_include('inc', 'webform', 'includes/webform.submissions');
+
+  $allusers = array();
+  $mapper = salespush_webform_get_mappings();
+  foreach ($webform_nids as $nid => $data) {
+    if ($data->type == 'event') {
+      // Adding all events to default mapper.
+      $mapper->adddefault($nid);
+    }
+
+    $submissions = webform_get_submissions($nid, '', 0);
+    foreach ($submissions as $sid => $submission) {
+      if (!$mapper->ismapped($nid)) {
+        continue;
+      }
+      $userrs[$sid] = new stdClass();
+      $userrs[$sid]->nid = $nid;
+      $userrs[$sid]->sid = $sid;
+      $userrs[$sid]->Email = $submission->data[$mapper->getemail($nid)]['value'][0];
+      $userrs[$sid]->Title = $submission->data[$mapper->gettitle($nid)]['value'][0];
+      $userrs[$sid]->SecondName = $submission->data[$mapper->getlastname($nid)]['value'][0];
+      $userrs[$sid]->FirstName = isset($submission->data[$mapper->getfirstname(
+        $nid
+      )]) ? $submission->data[$mapper->getfirstname($nid)]['value'][0] : NULL;
+      $userrs[$sid]->created = $submission->submitted;
+      $userrs[$sid]->ip = $submission->remote_addr;
+    }
+  }
+
+  return $userrs;
+}
+
+/**
+ * Get campaigns for push into SalesForce.
+ *
+ * @param string $environment
+ *   String name for the current environment.
+ *
+ * @return array
+ *   Return SObject array representation of campaign.
+ */
+function salespush_get_campaigns($environment = 'sandbox') {
+
+  // If something goes wrong.
+  $return = array('campaigns', 'mapper');
+
+  $upcoming_webforms_query = db_select('salespush_mapper', 's')
+    ->fields('s', array('getter'))
+    ->condition('destination', SALESPUSH_WEBFORM_MARKED_AS_NEW)
+    ->condition('environment', $environment)
+    ->execute()->fetchAllAssoc('getter');
+  $nodes = node_load_multiple(array_keys($upcoming_webforms_query));
+
+  // Array for salesforce->upsert command.
+  $campaigns = array();
+  // Mapping array for ability to get sObject->Id tied to node->nid.
+  $mapper = array();
+  $i = 0;
+  foreach ($nodes as $node) {
+    $campaigns[$i] = new stdClass();
+    $campaigns[$i]->Name = $node->title;
+    $campaigns[$i]->Type = SALESFORCE_PUSH_EVENT_TYPE;
+    $mapper[$i] = array();
+    $mapper[$i]['nid'] = $node->nid;
+    $mapper[$i]['type'] = $node->type;
+    $campaigns[$i]->IsActive = TRUE;
+    $i++;
+  }
+  $upsert = array(
+    'campaigns' => $campaigns,
+    'mapper' => $mapper
+  );
+
+  return $upsert;
+}
+
+/**
+ * Get users for push into SalesForce.
+ *
+ * @param string $environment
+ *   String name for the current environment.
+ *
+ * @return array
+ *   Return SObject array representation of submission.
+ */
+function salespush_get_submissions($environment = 'sandbox') {
+
+  // If something goes wrong.
+  $return = array('submissions' => array(), 'mapper' => array());
+
+  require_once 'salespush.admin.inc';
+  $synced_users = salespush_get_webform_users(FALSE, TRUE, $environment);
+  // watchdog(__FUNCTION__ . __LINE__ . ' synced_users ', print_r($synced_users, TRUE));
+  // Mapping array for ability to get sObject->Id tied to webform sid.
+  $mapper = array();
+  $submissions = array();
+
+  foreach ($synced_users as $key => $data) {
+    // watchdog(__FUNCTION__ . __LINE__, print_r($data, TRUE));
+    $campaignid = salespush_mapper_getter_destination($data->nid, $environment);
+    $contactid = salespush_mapper_getter_destination($data->Email, $environment);
+    if (!$campaignid || !$contactid) {
+      continue;
+    }
+    $submissions[$key] = new stdClass();
+    $submissions[$key]->CampaignId = $campaignid;
+    $submissions[$key]->ContactId = $contactid;
+    $mapper[$key] = $data->sid;
+  }
+
+  $upsert = array(
+    'submissions' => array_values($submissions),
+    'mapper' => array_values($mapper)
+  );
+
+  return $upsert;
+}

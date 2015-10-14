@@ -1,0 +1,1 @@
+nohup sh multicore.sh &

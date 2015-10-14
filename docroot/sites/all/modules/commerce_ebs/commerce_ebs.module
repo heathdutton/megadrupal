@@ -1,0 +1,543 @@
+<?php
+
+define('COMMERCE_FIRSTDATA_BILLING_PHONE_FIELD', 'commerce_firstdata_billing_phone');
+/**
+ * @file
+ * Provides an ebs payment method for Drupal Commerce for testing and
+ *   development.
+ */
+
+/**
+ * Implements hook_commerce_payment_method_info().
+ */
+function commerce_ebs_commerce_payment_method_info() {
+  $payment_methods = array();
+
+  $display_title = t('EBS Payment Gateway - India');
+
+  $payment_methods['commerce_ebs'] = array(
+    'base' => 'commerce_ebs',
+    'title' => t('EBS'),
+    'short_title' => t('EBS'),
+    'display_title' => $display_title,
+    'description' => t('EBS Payment Gateway'),
+    'terminal' => FALSE,
+    'offsite' => TRUE,
+    'offsite_autoredirect' => TRUE,
+  );
+
+  return $payment_methods;
+}
+
+
+/**
+ * Payment method callback: settings form.
+ */
+function commerce_ebs_settings_form($settings = NULL) {
+  $form = array();
+
+  // Merge default settings into the stored settings array.
+  $default_currency = variable_get('commerce_default_currency', 'INR');
+
+  $settings = (array) $settings + array(
+    'account_id' => '',
+    'secret_key' => '',
+    'payment_mode' => 'TEST',
+  );
+
+  $form['account_id'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Account ID'),
+    '#description' => t('Your EBS client ID.'),
+    '#default_value' => $settings['account_id'],
+    '#size' => 12,
+    '#required' => TRUE,
+  );
+  $form['secret_key'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Account secret key'),
+    '#description' => t('Your EBS account secret key.'),
+    '#default_value' => $settings['secret_key'],
+    '#size' => 12,
+    '#required' => TRUE,
+  );
+  $form['payment_mode'] = array(
+    '#type' => 'select',
+    '#title' => t('Payment mode'),
+    '#description' => t('The mode for capturing payment.'),
+    '#options' => array(
+      'LIVE' => t('Live transactions'),
+      'TEST' => t('Test transactions only'),
+    ),
+    '#default_value' => $settings['payment_mode'],
+  );
+  $form['exchange_rate'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Exchange rate'),
+    '#description' => t("The rate of exchange between your site's default currency and INR. If left blank, currency_api is used."),
+    '#size' => 5,
+    '#default_value' => $settings['exchange_rate'],
+  );
+  return $form;
+}
+
+/**
+ * Payment method callback: redirect form, a wrapper around the module's general
+ *   use function for building a WPS form.
+ */
+function commerce_ebs_redirect_form($form, &$form_state, $order, $payment_method) {
+
+  // Return an error if the enabling action's settings haven't been configured.
+  if (empty($payment_method['settings']['account_id']) || empty($payment_method['settings']['secret_key'])) {
+    drupal_set_message(t('EBS is not configured for use. Please check the EBS account details.'), 'error');
+    return array();
+  }
+
+  $settings = array(
+    // Return to the previous page when payment is canceled
+    'cancel_return' => url('checkout/' . $order->order_id . '/payment/back/' . $order->data['payment_redirect_key'], array('absolute' => TRUE)),
+
+    // Return to the payment redirect page for processing successful payments
+    'return' => url('checkout/' . $order->order_id . '/payment/return/' . $order->data['payment_redirect_key'], array('absolute' => TRUE, 'query' => array('DR' => '{DR}'))),
+
+    // Specify the current payment method instance ID in the notify_url
+    'pay_method' => $payment_method['instance_id'],
+  );
+
+  return commerce_ebs_order_form($form, $form_state, $order, $payment_method['settings'] + $settings);
+}
+
+/**
+ * Payment method callback: redirect form return validation.
+ */
+function commerce_ebs_redirect_form_validate($order, $payment_method) {
+
+  if (isset($_GET['DR'])) {
+    $DR = preg_replace("/\s/", "+", $_GET['DR']);
+    $rc4 = new Crypt_RC4($payment_method['settings']['secret_key']);
+    $QueryString = base64_decode($DR);
+    $rc4->decrypt($QueryString);
+    $QueryString = split('&', $QueryString);
+
+    $response = array();
+    foreach ($QueryString as $param) {
+      $param = split('=', $param);
+      $response[$param[0]] = urldecode($param[1]);
+    }
+    $order_id = check_plain($response['MerchantRefNo']);
+    $payment_id = check_plain($response['PaymentID']);
+    $amount = check_plain($response['Amount']);
+    $transaction_id = check_plain($response['TransactionID']);
+    $response_code = check_plain($response['ResponseCode']);
+    $description = check_plain($response['Description']);
+    $flagged = check_plain($response['IsFlagged']);
+    $mode = check_plain($response['Mode']);
+    $response_reason_text = check_plain($response['ResponseMessage']);
+    watchdog('commerce_ebs', 'Receiving payment response for order !order_id from Authorize.Net', array('!order_id' => $order_id));
+
+    $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+    //check the currency and convert it back to the amount
+    $currency_code = $order_wrapper->commerce_order_total->currency_code->value();
+
+    if ($currency_code != 'INR') {
+      if ($payment_method['settings']['exchange_rate']) {
+        $inr_total = $amount / $payment_method['settings']['exchange_rate'];
+      }
+      else {
+        $from = 'INR';
+        $to = $currency_code;
+        $ret  = currency_api_convert($from, $to, $amount);
+        if ($ret['status'] == FALSE) {
+          drupal_set_message(t('An error occured: ') . $ret['message']);
+          return array();
+        }
+        else {
+          $inr_total = $ret['value'];
+        }
+      }
+    }
+    else {
+      $inr_total = $amount;
+    }
+    if ($order->order_id != $order_id) {
+      $auth_successful = FALSE;
+    }
+    else {
+      $auth_successful = TRUE;
+    }
+    if (!$auth_successful || !$order) { // invalid response
+      $message = t("We're sorry, but due to a technical problem, your order could not be processed. Please try placing the order again later.");
+      watchdog('commerce_ebs', 'An unauthenticated response from EBS made it to checkout, Order id didn\'t match! Response: !Response :.', array('!Response' => print_r($response, TRUE)), WATCHDOG_ERROR);
+    }
+    else {
+      $quantity = commerce_line_items_quantity($order_wrapper->commerce_line_items, commerce_product_line_item_types());
+      if ($quantity > 0) {
+
+        // Prepare a transaction object to log the API response.
+        $transaction = commerce_payment_transaction_new('commerce_ebs', $order->order_id);
+        $transaction->instance_id = $payment_method['instance_id'];
+        $transaction->remote_id = $transaction_id;
+        $transaction->remote_status = $mode;
+        $transaction->amount = commerce_currency_decimal_to_amount($amount, $currency_code);
+        $transaction->currency_code = $currency_code;
+        $transaction->payload[REQUEST_TIME] = $response;
+
+        if ($response_code == '0') { // order APPROVED (1)
+          $gateway_method = $payment_method['settings']['payment_mode'];
+          $message = t('Authorized by !method order with Transaction id: !transaction_id. (payment id : !payment_id, description: !description) !reason_text',
+            array(
+              '!method' => $gateway_method,
+              '!transaction_id' => $transaction_id,
+              '!payment_id' => $payment_id,
+              '!description' => $description,
+              '!reason_text' => $response_reason_text,
+            ));
+          $transaction->message = $message;
+          $message = '';
+          $transaction->status = COMMERCE_PAYMENT_STATUS_SUCCESS;
+          commerce_payment_transaction_save($transaction);
+          commerce_payment_redirect_pane_next_page($order);
+//  }
+        }
+        else {
+          $message = t('The transaction was declined by the credit card company. Reason provided: !reason_text', array('!reason_text' => $response_reason_text));
+          $transaction->status = COMMERCE_PAYMENT_STATUS_FAILURE;
+          $transaction->message = t('There was a problem with your order: !response_code  !reason_text', array('!response_code' => check_plain($response_code), '!reason_text' => $response_reason_text));
+          commerce_payment_transaction_save($transaction);
+          commerce_payment_redirect_pane_previous_page($order);
+        }
+      }
+      else { // order is invalid or empty
+        watchdog('commerce_ebs', 'An invalid or empty order made it to checkout.  Order ID: !order_id', array('!order_id' => $order_id), WATCHDOG_ERROR);
+      }
+    }
+  }
+}
+
+
+/**
+ * Builds a EBS Paymentform from an order object.
+ *
+ * @param $order
+ *   The fully loaded order being paid for.
+ * @param $settings
+ *   An array of settings used to build out the form, including:
+ *   - server: which server to use, either sandbox or live
+ *   - business: the PayPal e-mail address the payment submits to
+ *   - cancel_return: the URL PayPal should send the user to on cancellation
+ *   - return: the URL PayPal should send the user to on successful payment
+ *   - currency_code: the PayPal currency code to use for this payment if the
+ *     total for the order is in a non-PayPal supported currency
+ *   - language: the PayPal language code to use on the payment form
+ *   - payment_action: the PayPal payment action to use: sale, authorization,
+ *     or order
+ *   - payment_method: optionally the name of the Commerce payment method to
+ *     include in the IPN notify_url
+ *
+ * @return
+ *   A renderable form array.
+ */
+function commerce_ebs_order_form($form, &$form_state, $order, $settings) {
+  $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+
+  $currency_code = $order_wrapper->commerce_order_total->currency_code->value();
+
+
+  // Ensure a default value for the payment_method setting.
+  $settings += array('payment_method' => '');
+
+  // Get the order total in the default currency.
+  $order_total = $order_wrapper->commerce_order_total->amount->value();
+  $amount = commerce_currency_amount_to_decimal($order_total, $currency_code);
+
+  // Convert any monetary value from the store's currency to Indian Rupees.
+  if ($currency_code != 'INR') {
+    if ($settings['exchange_rate']) {
+      $inr_total = $amount * $settings['exchange_rate'];
+    }
+    else {
+      $from = $currency_code;
+      $to = 'INR';
+      $ret  = currency_api_convert($from, $to, $amount);
+      if ($ret['status'] == FALSE) {
+        drupal_set_message(t('An error occured: ') . $ret['message']);
+        return array();
+      }
+      else {
+        $inr_total = $ret['value'];
+      }
+    }
+  }
+  else {
+    $inr_total = $amount;
+  }
+
+  // Build a description for the order.
+  $description = array();
+
+  foreach ($order_wrapper->commerce_line_items as $delta => $line_item_wrapper) {
+    if (in_array($line_item_wrapper->type->value(), commerce_product_line_item_types())) {
+      $description[] = round($line_item_wrapper->quantity->value(), 2) . 'x ' . $line_item_wrapper->line_item_label->value();
+    }
+  }
+
+  // Prepare the billing address for use in the request.
+  $billing_address = $order_wrapper->commerce_customer_billing->commerce_customer_address->value();
+
+
+  $return_url = urldecode(url('checkout/' . $order->order_id . '/payment/return/' . $order->data['payment_redirect_key'], array('query' => array('DR' => '{DR}'), 'absolute' => TRUE)));
+  // Build the data array that will be translated into hidden form values.
+
+  //secure hash validation
+  $string =  $settings['secret_key'] . '|' . $settings['account_id'] . '|' . $inr_total . '|' .   $order->order_id . '|' . $return_url . '|' .  $settings['payment_mode'];
+
+  $secure_hash = md5($string);
+  $data = array(
+    'secure_hash' => $secure_hash,
+    'account_id' => $settings['account_id'],
+    'reference_no' => $order->order_id,
+    'amount' => $inr_total,
+    'return_url' => $return_url,
+    'mode' => $settings['payment_mode'],
+    'name' => !empty($billing_address['name_line']) ? drupal_substr($billing_address['name_line'], 0, 128) : drupal_substr($billing_address['first_name'], 0, 128),
+    'address' => drupal_substr($billing_address['thoroughfare'], 0, 255),
+    'city' => drupal_substr($billing_address['locality'], 0, 32),
+    'state' => drupal_substr($billing_address['administrative_area'], 0, 32),
+    'postal_code' => drupal_substr($billing_address['postal_code'], 0, 10),
+    'country' => $billing_address['country'],
+    'phone' => $order_wrapper->commerce_customer_billing->commerce_firstdata_billing_phone->value(),
+    'description' => drupal_substr(implode(', ', $description), 0, 255),
+    'email' => drupal_substr($order->mail, 0, 100),
+    'ship_name' => drupal_substr($billing_address['name_line'], 0, 128),
+    'ship_address' => drupal_substr($billing_address['thoroughfare'], 0, 255),
+    'ship_city' => drupal_substr($billing_address['locality'], 0, 32),
+    'ship_state' => drupal_substr($billing_address['administrative_area'], 0, 32),
+    'ship_postal_code' => drupal_substr($billing_address['postal_code'], 0, 10),
+    'ship_country' => $billing_address['country'],
+    'ship_phone' => $order_wrapper->commerce_customer_billing->commerce_firstdata_billing_phone->value(),
+  );
+
+  // Put the data on a form.
+  foreach ($data as $name => $value) {
+    $form[$name] = array('#type' => 'hidden', '#value' => $value);
+  }
+
+  $form['#action'] = 'https://secure.ebs.in/pg/ma/sale/pay';
+  return $form;
+}
+
+/**
+ * Implementation of hook_enable()
+ **/
+function commerce_ebs_enable() {
+  // add phone number field to billing profile type
+  commerce_ebs_add_phone_field();
+
+  // tell user a new field has been added
+  $message_text = 'Commerce EBS added a new field to your "billing" customer profile for a phone number. ' .
+                  'If you already have one enabled, you must !disablelink now to avoid customer ' .
+                  'confusion during checkout.';
+  $message = t($message_text, array('!disablelink' => l('disable one', 'admin/commerce/customer-profiles/types/billing/fields')));
+  drupal_set_message($message, 'warning');
+}
+
+/**
+ * commerce_customer module creates a customer profile type called "billing".
+ * This profile type only has the field "addressfield", which does not include
+ * a phone number. First Data requires a phone number for transactions, so we
+ * create our own.
+ **/
+function commerce_ebs_add_phone_field() {
+  // Look for or add a billing phone number field to add to billing customer profile
+  $field = field_info_field(COMMERCE_FIRSTDATA_BILLING_PHONE_FIELD);
+  $instance = field_info_instance('commerce_customer_profile', COMMERCE_FIRSTDATA_BILLING_PHONE_FIELD, 'billing');
+
+  if (empty($field)) {
+    $field = array(
+      'field_name' => COMMERCE_FIRSTDATA_BILLING_PHONE_FIELD,
+      'type' => 'text',
+      'cardinality' => 1,
+      'entity_types' => array('commerce_customer_profile'),
+      'translatable' => FALSE,
+      'locked' => FALSE,
+    );
+
+    $field = field_create_field($field);
+  }
+
+  if (empty($instance)) {
+    $instance = array(
+      'field_name' => COMMERCE_FIRSTDATA_BILLING_PHONE_FIELD,
+      'entity_type' => 'commerce_customer_profile',
+      'bundle' => 'billing',
+      'label' => t('Phone Number'),
+      'required' => TRUE,
+      'widget' => array(
+        'type' => 'text_textfield',
+      ),
+      'settings' => array(),
+      'display' => array(),
+    );
+
+    // Set the default display formatters for various view modes.
+    foreach (array('default', 'customer', 'administrator') as $view_mode) {
+      $instance['display'][$view_mode] = array(
+        'label' => 'hidden',
+        'type' => 'text_default',
+        'weight' => -10,
+      );
+    }
+
+    field_create_instance($instance);
+  }
+}
+/* vim: set expandtab tabstop=4 shiftwidth=4: */
+// +----------------------------------------------------------------------+
+// | PHP Version 4                                                        |
+// +----------------------------------------------------------------------+
+// | Copyright (c) 1997-2003 The PHP Group                                |
+// +----------------------------------------------------------------------+
+// | This source file is subject to version 2.0 of the PHP license,       |
+// | that is bundled with this package in the file LICENSE, and is        |
+// | available at through the world-wide-web at                           |
+// | http://www.php.net/license/2_02.txt.                                 |
+// | If you did not receive a copy of the PHP license and are unable to   |
+// | obtain it through the world-wide-web, please send a note to          |
+// | license@php.net so we can mail you a copy immediately.               |
+// +----------------------------------------------------------------------+
+// | Authors: Dave Mertens <dmertens@zyprexia.com>                        |
+// +----------------------------------------------------------------------+
+//
+// $Id: Rc4.php,v 1.6 2003/10/04 16:39:32 zyprexia Exp $
+
+
+/**
+ * RC4 stream cipher routines implementation
+ *
+ * in PHP4 based on code written by Damien Miller <djm@mindrot.org>
+ *
+ * Usage:
+ * $key = "pear";
+ * $message = "PEAR rulez!";
+ *
+ * $rc4 = new Crypt_RC4;
+ * $rc4->key($key);
+ * echo "Original message: $message <br>\n";
+ * $rc4->crypt($message);
+ * echo "Encrypted message: $message <br>\n";
+ * $rc4->decrypt($message);
+ * echo "Decrypted message: $message <br>\n";
+ *
+ * @version $Revision: 1.6 $
+ * @access public
+ * @package Crypt
+ * @author Dave Mertens <dmertens@zyprexia.com>
+ */
+class Crypt_RC4 {
+
+  /**
+   * Real programmers...
+   * @var array
+   */
+  var $s = array();
+  /**
+   * Real programmers...
+   * @var array
+   */
+  var $i = 0;
+  /**
+   * Real programmers...
+   * @var array
+   */
+  var $j = 0;
+
+  /**
+   * Key holder
+   * @var string
+   */
+  var $_key;
+
+  /**
+   * Constructor
+   * Pass encryption key to key()
+   *
+   * @see    key()
+   * @param  string key    - Key which will be used for encryption
+   * @return void
+   * @access public
+   */
+  function Crypt_RC4($key = null) {
+    if ($key != null) {
+      $this->setKey($key);
+    }
+  }
+
+  function setKey($key) {
+    if (strlen($key) > 0) {
+      $this->_key = $key;
+    }
+  }
+
+  /**
+   * Assign encryption key to class
+   *
+   * @param  string key	- Key which will be used for encryption
+   * @return void
+   * @access public
+   */
+  function key(&$key) {
+    $len = strlen($key);
+    for ($this->i = 0; $this->i < 256; $this->i++) {
+      $this->s[$this->i] = $this->i;
+    }
+
+    $this->j = 0;
+    for ($this->i = 0; $this->i < 256; $this->i++) {
+      $this->j = ($this->j + $this->s[$this->i] + ord($key[$this->i % $len])) % 256;
+      $t = $this->s[$this->i];
+      $this->s[$this->i] = $this->s[$this->j];
+      $this->s[$this->j] = $t;
+    }
+    $this->i = $this->j = 0;
+  }
+
+  /**
+   * Encrypt function
+   *
+   * @param  string paramstr 	- string that will encrypted
+   * @return void
+   * @access public
+   */
+  function crypt(&$paramstr) {
+
+    //Init key for every call, Bugfix 22316
+    $this->key($this->_key);
+
+    $len = strlen($paramstr);
+    for ($c = 0; $c < $len; $c++) {
+      $this->i = ($this->i + 1) % 256;
+      $this->j = ($this->j + $this->s[$this->i]) % 256;
+      $t = $this->s[$this->i];
+      $this->s[$this->i] = $this->s[$this->j];
+      $this->s[$this->j] = $t;
+
+      $t = ($this->s[$this->i] + $this->s[$this->j]) % 256;
+
+      $paramstr[$c] = chr(ord($paramstr[$c]) ^ $this->s[$t]);
+    }
+  }
+
+  /**
+   * Decrypt function
+   *
+   * @param  string paramstr 	- string that will decrypted
+   * @return void
+   * @access public
+   */
+  function decrypt(&$paramstr) {
+    //Decrypt is exactly the same as encrypting the string. Reuse (en)crypt code
+    $this->crypt($paramstr);
+  }
+
+
+} //end of RC4 class

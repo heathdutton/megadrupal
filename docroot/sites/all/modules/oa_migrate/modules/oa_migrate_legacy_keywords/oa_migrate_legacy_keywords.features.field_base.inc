@@ -1,0 +1,48 @@
+<?php
+/**
+ * @file
+ * oa_migrate_legacy_keywords.features.field_base.inc
+ */
+
+/**
+ * Implements hook_field_default_field_bases().
+ */
+function oa_migrate_legacy_keywords_field_default_field_bases() {
+  $field_bases = array();
+
+  // Exported field_base: 'field_oa_migrate_legacy_keywords'
+  $field_bases['field_oa_migrate_legacy_keywords'] = array(
+    'active' => 1,
+    'cardinality' => -1,
+    'deleted' => 0,
+    'entity_types' => array(),
+    'field_name' => 'field_oa_migrate_legacy_keywords',
+    'foreign keys' => array(
+      'tid' => array(
+        'columns' => array(
+          'tid' => 'tid',
+        ),
+        'table' => 'taxonomy_term_data',
+      ),
+    ),
+    'indexes' => array(
+      'tid' => array(
+        0 => 'tid',
+      ),
+    ),
+    'locked' => 0,
+    'module' => 'taxonomy',
+    'settings' => array(
+      'allowed_values' => array(
+        0 => array(
+          'vocabulary' => 'oa_migrate_legacy_keywords',
+          'parent' => 0,
+        ),
+      ),
+    ),
+    'translatable' => 0,
+    'type' => 'taxonomy_term_reference',
+  );
+
+  return $field_bases;
+}

@@ -1,0 +1,354 @@
+<?php
+
+/**
+ * Implements hook_menu().
+ */
+function filesondemand_menu() {
+  $items = array();
+
+  $public_directory_path = file_stream_wrapper_get_instance_by_scheme('public')->getDirectoryPath();
+  foreach (filesondemand_get_handler() as $name => $info) {
+    // public files callback
+    $items[$public_directory_path . '/' . $name] = array(
+      'title' => 'Generate file on demand',
+      'page callback' => 'filesondemand_generate',
+      'page arguments' => array($name, 'public'),
+      'access callback' => TRUE,
+      'type' => MENU_CALLBACK,
+    );
+
+    // private files callback
+    $items['system/files/' . $name] = array(
+      'title' => 'Generate file on demand',
+      'page callback' => 'filesondemand_generate',
+      'page arguments' => array($name, 'private'),
+      'access callback' => TRUE,
+      'type' => MENU_CALLBACK,
+    );
+  }
+
+  return $items;
+}
+
+/**
+ * Implements hook_cron().
+ */
+function filesondemand_cron() {
+  foreach (filesondemand_get_handler() as $handler => $info) {
+    // take the suggestion from the module OR use the default (1 week)
+    $expires_after = isset($info['expires after']) ? (int) $info['expires after'] : 604800;
+
+    // allow the user to override the value used
+    if (($override = variable_get('filesondemand_override_expires_after_' . $handler, -1)) != -1) {
+      $expires_after = (int) $override;
+    }
+
+    // if it's 0 or FALSE, then we don't ever expire the files
+    if ($expires_after > 0) {
+      $limit = variable_get('filesondemand_expire_limit_per_handler', 100);
+
+      $res = db_query_range("SELECT * FROM {filesondemand} WHERE timestamp < :timestamp AND handler = :handler", 0, $limit,
+        array(':timestamp' => REQUEST_TIME - $expires_after, ':handler' => $handler));
+      foreach ($res as $obj) {
+        _filesondemand_remove_cache_object($obj, $info);
+      }
+    }
+  }
+}
+
+/**
+ * Deletes the cached files for a specific handler.
+ *
+ * @param string $handler
+ *   The name of the handler.
+ *
+ * @param string $path
+ *   (optional) The path to the specific file to delete.
+ *
+ */
+function filesondemand_clear_cache($handler, $path = NULL) {
+  $info = NULL;
+
+  $query = db_select('filesondemand', 'fod')
+    ->fields('fod', array('handler', 'path', 'scheme', 'uri', 'timestamp'));
+
+  if ($handler) {
+    $info = filesondemand_get_handler($handler);
+    $query->condition('fod.handler', $handler);
+  }
+
+  if ($uri) {
+    $query->condition('fod.path', $path);
+  }
+
+  $res = $query->execute();
+  foreach ($res as $obj) {
+    _filesondemand_remove_cache_object($obj, $info);
+  }
+}
+
+function _filesondemand_remove_cache_object($obj, $info = NULL) {
+  if (is_null($info)) {
+    $info = filesondemand_get_handler($obj->handler);
+  }
+
+  // call a callback for this handler
+  if ($callback = $info['expire callback']) {
+    $callback($obj->path, $obj->uri);
+  }
+
+  // remove from disk
+  @unlink($obj->uri);
+
+  // remove from db
+  db_delete('filesondemand')
+    ->condition('uri', $obj->uri)
+    ->execute();
+
+  if ($callback = $info['after expire callback']) {
+    $callback($obj->path, $obj->uri);
+  }
+}
+
+/**
+ * Get information about a handler or all handlers.
+ *
+ * @param string $name
+ *   (optional) The name of the handler to lookup.
+ * @return array
+ *   Information about the specific handler (if $name is given)
+ *   or information about all handlers, keyed by handler name.
+ */
+function filesondemand_get_handler($name = NULL) {
+  static $handlers = NULL;
+
+  if (is_null($handlers)) {
+    $handlers = (array) module_invoke_all('filesondemand');
+    drupal_alter('filesondemand', $handlers);
+  }
+  if (is_null($name)) {
+    return $handlers;
+  }
+
+  return $handlers[$name];
+}
+
+/**
+ * Gets the file URI from the handler, path and scheme.
+ *
+ * @param string $handler
+ *   The handler name.
+ * @param string $path
+ *   The path according to the handler.
+ * @param string $scheme
+ *   The file storage scheme.
+ * @return string
+ *   The URI to the file on storage.
+ */
+function filesondemand_create_uri($handler, $path, $scheme) {
+  return $scheme . '://' . $handler . '/' . $path;
+}
+
+/**
+ * Helper function to transfer files from cache.
+ *
+ * Determines MIME type and sets a last modified header.
+ *
+ * @param $uri
+ *   String containing the URI to file to be transferred.
+ * @return
+ *   This function does not return. It calls exit().
+ */
+function filesondemand_transfer($uri) {
+  $headers = array('Content-Type: ' . mime_content_type($uri));
+
+  if ($fileinfo = stat($uri)) {
+    _filesondemand_set_cache_headers($fileinfo, $headers);
+    $headers['Content-Length'] = $fileinfo[7];
+    $headers['Expires'] = gmdate('D, d M Y H:i:s', REQUEST_TIME + 1209600) . ' GMT';
+    $headers['Cache-Control'] = 'max-age=1209600, private, must-revalidate';
+  }
+
+  file_transfer($uri, $headers);
+}
+
+/**
+ * Set file headers that handle "If-Modified-Since" correctly for the
+ * given fileinfo.
+ *
+ * Note that this function may return or may call drupal_exit().
+ *
+ * @param $fileinfo
+ *   Array returned by stat().
+ * @param
+ *   Array of existing headers.
+ * @return
+ *   Nothing but beware that this function may not return.
+ */
+function _filesondemand_set_cache_headers($fileinfo, &$headers) {
+  // Set default values:
+  $last_modified = gmdate('D, d M Y H:i:s', $fileinfo[9]) . ' GMT';
+  $etag = '"' . md5($last_modified) . '"';
+
+  // See if the client has provided the required HTTP headers:
+  $if_modified_since = isset($_SERVER['HTTP_IF_MODIFIED_SINCE'])
+                        ? stripslashes($_SERVER['HTTP_IF_MODIFIED_SINCE'])
+                        : FALSE;
+  $if_none_match = isset($_SERVER['HTTP_IF_NONE_MATCH'])
+                    ? stripslashes($_SERVER['HTTP_IF_NONE_MATCH'])
+                    : FALSE;
+
+  if ($if_modified_since && $if_none_match
+       && $if_none_match == $etag // etag must match
+       && $if_modified_since == $last_modified) { // if-modified-since must match
+    drupal_add_http_header('Status', 'HTTP/1.1 304 Not Modified');
+    // All 304 responses must send an etag if the 200 response
+    // for the same object contained an etag
+    drupal_add_http_header('Etag', $etag);
+    // We must also set Last-Modified again, so that we overwrite Drupal's
+    // default Last-Modified header with the right one
+    drupal_add_http_header('Last-Modified', $last_modified);
+
+    drupal_exit();
+  }
+
+  // Send appropriate response:
+  $headers['Last-Modified'] = $last_modified;
+  $headers['ETag'] = $etag;
+}
+
+/**
+ * Page callback: Generates the file on demand.
+ *
+ * After generating the file, transfer it to the requesting agent.
+ *
+ * @param string $handler
+ *   The name of the handler.
+ * @param string $scheme
+ *   The file scheme (for example, 'public' or 'private').
+ */
+function filesondemand_generate($handler, $scheme) {
+  $args = func_get_args();
+  array_shift($args);
+  array_shift($args);
+  $path = implode('/', $args);
+
+  // Send a 404 if we don't know of a handler.
+  if (empty($handler) || (!$info = filesondemand_get_handler($handler))) {
+    return MENU_NOT_FOUND;
+  }
+
+  // Send a 404 if the scheme is invalid.
+  if (!file_stream_wrapper_valid_scheme($scheme)) {
+    return MENU_NOT_FOUND;
+  }
+
+  $uri = filesondemand_create_uri($handler, $path, $scheme);
+
+  if ($scheme == 'private') {
+    if (file_exists($uri)) {
+      // If using the private scheme, let other modules provide headers and
+      // control access to the file.
+      file_download($scheme, file_uri_target($uri));
+    }
+    else {
+      $headers = module_invoke_all('file_download', $uri);
+      if (in_array(-1, $headers) || empty($headers)) {
+        return MENU_ACCESS_DENIED;
+      }
+      if (count($headers)) {
+        foreach ($headers as $name => $value) {
+          drupal_add_http_header($name, $value);
+        }
+      }
+    }
+  }
+
+  if ($callback = $info['validate path callback']) {
+    if (!$callback($path, $uri, $scheme)) {
+      return MENU_NOT_FOUND;
+    }
+  }
+
+  // Don't start generating the file if it already exists or if
+  // generation is in progress in another thread.
+  $lock_name = 'filesondemand:' . $handler . ':' . drupal_hash_base64($uri);
+  if (!file_exists($uri)) {
+    $lock_acquired = lock_acquire($lock_name);
+    if (!$lock_acquired) {
+      // Tell client to retry again in 3 seconds. Currently no browsers are
+      // known to support Retry-After.
+      drupal_add_http_header('Status', '503 Service Unavailable');
+      drupal_add_http_header('Retry-After', 3);
+      print t('File generation in progress. Try again shortly.');
+      drupal_exit();
+    }
+  }
+
+  $success = file_exists($uri) || _filesondemand_generate($path, $scheme, $uri, $handler, $info);
+
+  if (!empty($lock_acquired)) {
+    lock_release($lock_name);
+  }
+
+  if ($success && file_exists($uri)) {
+    filesondemand_transfer($uri);
+  }
+  else {
+    watchdog('filesondemand', 'Failed generating file: %path.', array('%path' => $path), WATCHDOG_ERROR);
+    drupal_add_http_header('Status', '500 Internal Server Error');
+    print t('Error generating file.');
+    drupal_exit();
+  }
+}
+
+function _filesondemand_generate($path, $scheme, $uri, $handler, $info) {
+  // create the destination directory
+  $dir = dirname($uri);
+  if (!is_dir($dir) && !mkdir($dir, 0775, TRUE)) {
+    watchdog('filesondemand', 'Failed to create directory for %handler: %dir', array('%handler' => $handler, '%dir' => $dir), WATCHDOG_ERROR);
+    return FALSE;
+  }
+
+  // call the underlying callback
+  $res = FALSE;
+  if ($callback = $info['generate callback']) {
+    $res = $callback($path, $uri);
+  }
+
+  // record the file creation time in the database
+  if ($res) {
+    filesondemand_touch_cache($handler, $path, $scheme, $uri);
+  }
+
+  return $res;
+}
+
+/**
+ * Writes information about the generate file to our cache record so that the
+ * file will get removed correctly later.
+ *
+ * @param string $handler
+ *   The name of the handler.
+ * @param string $path
+ *   The path to the file.
+ * @param string $uri
+ *   The destination uri where the file should be written.
+ */
+function filesondemand_touch_cache($handler, $path, $scheme, $uri = NULL) {
+  if (is_null($uri)) {
+    $uri = filesondemand_create_uri($handler, $path, $scheme);
+  }
+
+  db_merge('filesondemand')
+    ->key(array('uri' => $uri))
+    ->fields(array(
+        'handler'   => $handler,
+        'scheme'    => $scheme,
+        'path'      => $path,
+        'uri'       => $uri,
+        'timestamp' => REQUEST_TIME,
+      ))
+    ->execute();
+}
+

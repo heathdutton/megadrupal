@@ -1,0 +1,724 @@
+<?php
+/**
+ * @file
+ * Base functionalilty for adding Assetic support to Drupal.
+ */
+
+use Assetic\AssetManager;
+use Assetic\AssetWriter;
+use Assetic\Asset\AssetCache;
+use Assetic\Asset\AssetInterface;
+use Assetic\Cache\FilesystemCache;
+use Assetic\Factory\AssetFactory;
+use Assetic\Factory\LazyAssetManager;
+use Assetic\Factory\Worker\EnsureFilterWorker;
+use Assetic\FilterManager;
+use Assetic\Filter\FilterInterface;
+
+/**
+ * A constant containing the public accesible asset directory.
+ */
+define('ASSETIC_DIR', 'public://assetic');
+
+/**
+ * A constant containing the needed version of the Assetic library.
+ */
+define('ASSETIC_VERSION', '1.1.0');
+
+/**
+ * A constant containing the needed version of the Symfony/Process dependency.
+ */
+define('ASSETIC_SYMFONY_PROCESS_VERSION', '2.2.0');
+
+/**
+ * Implements hook_assetic_filters_info().
+ */
+function assetic_assetic_filters_info() {
+  return array(
+    'cssrewrite' => array(
+      'title' => 'CSS Rewrite',
+      'class' => 'Assetic\\Filter\\CssRewriteFilter',
+    ),
+  );
+}
+
+/**
+ * Implements hook_cron_queue_info().
+ *
+ * This hook runs before cache flush during cron.
+ * Reliably lets us know if it's cron or not.
+ */
+function assetic_cron_queue_info() {
+  drupal_static('assetic_cron', TRUE);
+}
+
+function assetic_dump_asset(AssetInterface $asset) {
+  // @TODO What are variables?
+  $variables = array();
+
+  $dir = ASSETIC_DIR;
+  if (!file_prepare_directory($dir, FILE_CREATE_DIRECTORY | FILE_MODIFY_PERMISSIONS)) {
+    watchdog('assetic', 'Error occurred when creating directory @dir', array(
+      '@dir' => drupal_realpath($dir),
+    ), WATCHDOG_ERROR);
+    return NULL;
+  }
+
+  $dir .= '/cache';
+  if (!file_prepare_directory($dir, FILE_CREATE_DIRECTORY | FILE_MODIFY_PERMISSIONS)) {
+    watchdog('assetic', 'Error occurred when creating directory @dir', array(
+      '@dir' => drupal_realpath($dir),
+    ), WATCHDOG_ERROR);
+    return NULL;
+  }
+
+  $asset_writer = assetic_get_writer();
+
+  try {
+    $asset_writer->writeAsset($asset);
+  }
+  catch (Exception $exception) {
+    watchdog_exception('assetic', $exception);
+    return NULL;
+  }
+
+  // Return the relative path of the created file for further usage.
+  return $asset->getTargetPath();
+}
+
+/**
+ * Implements hook_element_info_alter().
+ */
+function assetic_element_info_alter(&$type) {
+  // Prepend to the list of #pre_render functions so that it runs first.
+  array_unshift($type['styles']['#pre_render'], 'assetic_pre_render_styles');
+}
+
+/**
+ * Implements hook_features_api().
+ */
+function assetic_features_api() {
+  return array(
+    'assetic' => array(
+      'name' => t('Assetic'),
+      'default_hook' => 'assetic_features_default_filters',
+      'default_file' => FEATURES_DEFAULTS_INCLUDED,
+      'feature_source' => TRUE,
+      'file' => drupal_get_path('module', 'assetic') . '/assetic.features.inc',
+    ),
+  );
+}
+
+/**
+ * Implements hook_flush_caches().
+ */
+function assetic_flush_caches() {
+  if (!drupal_static('assetic_cron')) {
+    // Remove the cached files directory.
+    // @TODO log watchdog if failing to delete.
+    file_unmanaged_delete_recursive(ASSETIC_DIR);
+  }
+
+  return array();
+}
+
+function assetic_filter_load($alias) {
+  $filters = assetic_get_filter_info();
+  return isset($filters[$alias]) ? $filters[$alias] : FALSE;
+}
+
+function assetic_filter_save($filter) {
+  $filter_info = assetic_get_filter_info($filter['alias']);
+
+  $fields = array();
+  // If the filter does not specify an explicit weight, assign a default
+  // weight, either defined in hook_assetic_filters_info(), or the
+  // default of 0 by assetic_get_filter_info().
+  $fields['weight'] = isset($filter['weight']) ? $filter['weight'] : $filter_info['weight'];
+
+  $fields['status'] = isset($filter['status']) ? $filter['status'] : 0;
+  $fields['module'] = $filter['module'];
+  $fields['settings'] = $filter['settings'] ? serialize($filter['settings']) : FALSE;
+
+  db_merge('assetic_filter')
+    ->key(array(
+      'alias' => $filter['alias'],
+    ))
+    ->fields($fields)
+    ->execute();
+
+  assetic_filters_reset();
+}
+
+function assetic_filter_settings_form(array $form) {
+  $form = system_settings_form($form);
+  $form['#submit'] = array('assetic_filter_settings_form_submit');
+
+  return $form;
+}
+
+function assetic_filter_settings_form_submit(&$form, &$form_state) {
+  // Exclude unnecessary elements.
+  form_state_values_clean($form_state);
+
+  $filter = assetic_filter_load($form_state['filter']);
+  $filter['settings'] = drupal_array_merge_deep($filter['settings'], $form_state['values']);
+
+  assetic_filter_save($filter);
+
+  drupal_set_message(t('The filter !filter has been updated.', array(
+    '!filter' => $filter['title'],
+  )));
+}
+
+/**
+ * Clears all data that's cached by this module.
+ */
+function assetic_filters_reset() {
+  cache_clear_all('assetic_filter_enabled', 'cache', TRUE);
+  cache_clear_all('assetic_filter_info', 'cache', TRUE);
+  cache_clear_all('assetic_filter_list', 'cache', TRUE);
+
+  drupal_static_reset('assetic_get_filter_enabled');
+  drupal_static_reset('assetic_get_filter_info');
+  drupal_static_reset('assetic_get_filter_list');
+}
+
+/**
+ * Get an asset instance for the given file.
+ *
+ * @param string|array $file
+ *   A single filepath or an array containing filepaths
+ *   relative to the Drupal root.
+ * @param string $type
+ *   The type of the asset.
+ *
+ * @return Assetic\Asset\AssetInterface
+ *   An AssetInterface instance.
+ */
+function assetic_get_asset_from_file($file, $type) {
+  // Get all enabled filters from the database.
+  $filters = array();
+  foreach (assetic_get_filter_enabled() as $alias => $filter) {
+    // Only global filters should be used.
+    if (isset($filter['apply to'])) {
+      continue;
+    }
+
+    $filters[] = ($filter['debug mode'] ? '' : '?') . $alias;
+  }
+
+  $asset_factory = assetic_get_factory();
+  $asset_manager = assetic_get_manager();
+
+  $attributes = array();
+
+  $asset_name = $asset_factory->generateAssetName($file, $filters, $attributes);
+
+  // Prepend the filename of the first file to the asset name,
+  // for better debugging of assets.
+  $file_info = pathinfo($file);
+  $asset_name = $file_info['filename'] . '_' . $asset_name;
+
+  // Replace all unexpected characters with underscores.
+  $asset_name = preg_replace('/[\.\-]/', '_', $asset_name);
+
+  if (!$asset_manager->has($asset_name)) {
+    $asset = $asset_factory->createAsset($file, $filters, $attributes + array(
+      'name' => $asset_name,
+      'output' => assetic_normalize_file_path($asset_name . '.' . $type),
+    ));
+
+    $cache = new FilesystemCache(assetic_normalize_file_path('cache'));
+    $asset_cache = new AssetCache($asset, $cache);
+
+    $asset_manager->set($asset_name, $asset_cache);
+  }
+
+  return $asset_manager->get($asset_name);
+}
+
+/**
+ * Get an Assetic AssetFactory instance.
+ *
+ * @return Assetic\Factory\AssetFactory
+ *   An AssetFactory instance.
+ */
+function assetic_get_factory() {
+  $asset_factory = &drupal_static(__FUNCTION__);
+
+  if (!$asset_factory) {
+    // Create a new AssetFactory instance relative to the Drupal root.
+    $asset_factory = new AssetFactory(DRUPAL_ROOT);
+    // Set the factory in debug mode (or not).
+    $asset_factory->setDebug(variable_get('assetic_debug', FALSE));
+
+    $filter_manager = new FilterManager();
+    $asset_factory->setFilterManager($filter_manager);
+
+    // Get all defined filters.
+    list($filters, $workers) = assetic_get_filter_instances();
+
+    foreach ($filters as $filter_alias => $filter) {
+      $filter_manager->set($filter_alias, $filter);
+    }
+
+    // Add the filters for specific extensions.
+    foreach ($workers as $worker) {
+      $asset_factory->addWorker($worker);
+    }
+  }
+
+  // Return our created instance.
+  return $asset_factory;
+}
+
+function assetic_get_manager() {
+  $asset_manager = &drupal_static(__FUNCTION__);
+
+  if (!$asset_manager) {
+    // Get the AssetFactory instance.
+    $asset_factory = assetic_get_factory();
+
+    // Create a new LazyAssetManager instance.
+    $asset_manager = new LazyAssetManager($asset_factory);
+  }
+
+  $asset_manager->load();
+
+  return $asset_manager;
+}
+
+function assetic_get_writer() {
+  $asset_writer = &drupal_static(__FUNCTION__);
+
+  if (!$asset_writer) {
+    $asset_writer = new AssetWriter(DRUPAL_ROOT);
+  }
+
+  return $asset_writer;
+}
+
+/**
+ * Get the filter default values.
+ *
+ * @return array
+ *   An array containing the default values for a filter.
+ */
+function assetic_get_filter_defaults() {
+  return array(
+    'debug mode' => TRUE,
+    'weight' => 0,
+    'status' => 0,
+    'admin' => NULL,
+    'settings' => array(),
+  );
+}
+
+/**
+ * Get an array of all enabled filters in their correct order.
+ *
+ * @return array
+ *   An array containing all enabled filters in their correct order.
+ */
+function assetic_get_filter_enabled() {
+  $filters = &drupal_static(__FUNCTION__, array());
+
+  if (empty($filters)) {
+    if ($cache = cache_get('assetic_filter_enabled')) {
+      $filters = $cache->data;
+    }
+    else {
+      $result = db_query('SELECT * FROM {assetic_filter} WHERE status = 1 ORDER BY weight, module');
+      while ($record = $result->fetchAssoc()) {
+        $filters[$record['alias']] = drupal_array_merge_deep(assetic_get_filter_info($record['alias']), $record);
+        $filters[$record['alias']]['settings'] = unserialize($record['settings']);
+      }
+
+      // Store the result in our cache table.
+      cache_set('assetic_filter_enabled', $filters);
+    }
+  }
+
+  return $filters;
+}
+
+/**
+ * Get all filters defined through hook_assetic_filters().
+ *
+ * @todo Cache should be cleared through the correct hook.
+ * @see hook_assetic_filters()
+ *
+ * @param string|NULL $aliA
+ *   The alias of the filter to get info from. Leave empty to get information
+ *   about all defined filters.
+ *
+ * @return array
+ *   An array with the information about one or all filters.
+ */
+function assetic_get_filter_info($name = NULL) {
+  $filters = &drupal_static(__FUNCTION__, array());
+
+  if (empty($filters)) {
+    if ($cache = cache_get('assetic_filter_info')) {
+      $filters = $cache->data;
+    }
+    else {
+      // Get all filter info defined through hook_assetic_filters().
+      foreach (module_implements('assetic_filters_info') as $module) {
+        $module_filters = module_invoke($module, 'assetic_filters_info');
+
+        foreach ($module_filters as $alias => $filter) {
+          $filter['alias'] = $alias;
+          $filter['module'] = $module;
+
+          $result = db_query('SELECT * FROM {assetic_filter} WHERE alias = :alias', array(':alias' => $alias))->fetchAssoc();
+
+          if (isset($result['settings']) && is_string($result['settings']) && !empty($result['settings'])) {
+            $result['settings'] = unserialize($result['settings']);
+          }
+          else {
+            $result['settings'] = array();
+          }
+
+          $filter = drupal_array_merge_deep($filter, $result);
+
+          // Merge the returned filter info with default values.
+          $filters[$alias] = drupal_array_merge_deep(assetic_get_filter_defaults(), $filter);
+        }
+      }
+
+      // Let other modules modify the filters with hook_assetic_filters_alter().
+      drupal_alter('assetic_filters', $filters);
+      // Store the result in our cache table.
+      cache_set('assetic_filter_info', $filters);
+    }
+  }
+
+  // Check if the name of the needed filter exists.
+  if ($name && !isset($filters[$name])) {
+    // @todo Throw an error.
+    return NULL;
+  }
+
+  return ($name) ? $filters[$name] : $filters;
+}
+
+/**
+ * Return a list of all configured filters in the database.
+ *
+ * @deprecated
+ */
+function assetic_get_filter_list() {
+  $filters = &drupal_static(__FUNCTION__, array());
+
+  if (empty($filters)) {
+    if ($cache = cache_get('assetic_filter_list')) {
+      $filters = $cache->data;
+    }
+    else {
+      $result = db_query('SELECT * FROM {assetic_filter} ORDER BY weight, module');
+
+      while ($record = $result->fetchAssoc()) {
+        $filter_alias = $record['alias'];
+
+        $filter_info = assetic_get_filter_info($filter_alias);
+        $filters[$filter_alias] = drupal_array_merge_deep($filter_info, $record);
+
+        $filters[$filter_alias]['settings'] = unserialize($filters[$filter_alias]['settings']);
+      }
+
+      cache_set('assetic_filter_list', $filters);
+    }
+  }
+
+  return $filters;
+}
+
+/**
+ * Return all filters as usable Assetic instances.
+ *
+ * @return array
+ *   An array containing usable Assetic instances.
+ */
+function assetic_get_filter_instances() {
+  // Filters are filters applied to all extensions.
+  $filters = array();
+  // Workers are filters applied to a specific extension.
+  $workers = array();
+
+  foreach (assetic_get_filter_enabled() as $alias => $filter) {
+    // Get a reflection class based on the given class.
+    $reflection_class = new ReflectionClass($filter['class']);
+
+    $constructor_arguments = array();
+    if (isset($filter['constructor callback']) && is_callable($filter['constructor callback'])) {
+      $constructor_arguments = call_user_func_array($filter['constructor callback'], array($filter));
+
+      if (!is_array($constructor_arguments)) {
+        $constructor_arguments = array();
+      }
+    }
+
+    // Check if the class has a constructor.
+    if (!$reflection_class->getConstructor()) {
+      // Create an instance without calling the constructor.
+      $filter_instance = $reflection_class->newInstance();
+    }
+    else {
+      // Create an instance of the filter and
+      // pass the arguments to its constructor.
+      $filter_instance = $reflection_class->newInstanceArgs($constructor_arguments);
+    }
+
+    if (!$filter_instance instanceof FilterInterface) {
+      throw new Exception(sprintf('Filter % should be implementing Assetic\\FilterInterface', $alias));
+    }
+
+    $context = array(
+      'alias' => $alias,
+      'info' => $filter,
+    );
+
+    // Let other modules modify the filter instance.
+    drupal_alter(array('assetic_filter_instance', 'assetic_filter_instance_' . $alias), $filter_instance, $context);
+
+    // Check if the filter is a worker or a global filter.
+    if (isset($filter['apply to'])) {
+      $workers[$alias] = new EnsureFilterWorker($filter['apply to'], $filter_instance);
+    }
+    else {
+      $filters[$alias] = $filter_instance;
+    }
+  }
+
+  return array($filters, $workers);
+}
+
+/**
+ * Implements hook_libraries_info().
+ */
+function assetic_libraries_info() {
+  $libraries['assetic'] = array(
+    'name' => 'assetic',
+    'vendor url' => 'https://github.com/kriswallsmith/assetic',
+    'download url' => 'https://github.com/kriswallsmith/assetic/archive/v1.1.0-alpha4.tar.gz',
+    'version arguments' => array(
+      'file' => 'CHANGELOG-1.1.md',
+      'pattern' => '/^([[0-9\.]+)/',
+      'lines' => 2,
+      'cols' => 20,
+    ),
+    'xautoload' => '_assetic_libraries_xautoload_assetic',
+    'dependencies' => array(
+      'symfony-process (>=2.2.0)',
+    ),
+  );
+
+  $libraries['symfony-process'] = array(
+    'name' => 'symfony/process',
+    'vendor url' => 'https://github.com/symfony/Process',
+    'download url' => 'https://github.com/symfony/Process/archive/v2.2.0.tar.gz',
+    'version arguments' => array(
+      'file' => 'CHANGELOG.md',
+      'pattern' => '/^([0-9\.]+)/',
+      'lines' => 6,
+      'cols' => 20,
+    ),
+    'xautoload' => '_assetic_libraries_xautoload_symfony_process',
+  );
+
+  return $libraries;
+}
+
+/**
+ * Implements hook_menu().
+ */
+function assetic_menu() {
+  $items['admin/config/development/assetic'] = array(
+    'title' => 'Assetic',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('assetic_admin_form'),
+    'access arguments' => array('administer assetic settings'),
+    'file' => 'assetic.admin.inc',
+  );
+
+  $items['admin/config/development/assetic/%assetic_filter'] = array(
+    'title callback' => 'assetic_admin_filter_title',
+    'title arguments' => array(4),
+    'page callback' => 'assetic_admin_filter_page',
+    'page arguments' => array(4),
+    'access arguments' => array('administer assetic settings'),
+    'file' => 'assetic.admin.inc',
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_modules_enabled().
+ */
+function assetic_modules_enabled($modules) {
+  // Reset the static cache of module-provided filters, in case any of the
+  // newly enabled modules defines a new filter or alters existing ones.
+  drupal_static_reset('assetic_get_filter_info');
+}
+
+/**
+ * Implements hook_modules_disabled().
+ */
+function assetic_modules_disabled($modules) {
+  // Reset the static cache of module-provided filters, in case any of the
+  // newly disabled modules defined or altered any filters.
+  drupal_static_reset('assetic_get_filter_info');
+}
+
+function assetic_normalize_file_path($path, $dir = ASSETIC_DIR) {
+  $wrappers = &drupal_static(__FUNCTION__);
+
+  $path = $dir . '/' . $path;
+  if (!isset($wrappers[$path])) {
+    $wrappers[$path] = file_stream_wrapper_get_instance_by_uri($dir);
+  }
+
+  return $wrappers[$path]->getDirectoryPath() . '/' . file_uri_target($path);
+}
+
+/**
+ * Implements hook_permission().
+ */
+function assetic_permission() {
+  $items = array();
+
+  $items['administer assetic settings'] = array(
+    'title' => t('Administer Assetic'),
+    'restrict access' => TRUE,
+  );
+
+  return $items;
+}
+
+/**
+ * Callback when pre-rendering a styles element.
+ *
+ * @see assetic_element_info_alter()
+ * @see drupal_pre_render_styles()
+ */
+function assetic_pre_render_styles($elements) {
+  // Check if we are on update.php
+  if (defined('MAINTENANCE_MODE') && MAINTENANCE_MODE === 'update') {
+    return $elements;
+  }
+  // Check if we can use the Assetic library.
+  elseif (!_assetic_libraries_bootstrap_assetic()) {
+    return $elements;
+  }
+
+  // Apply the enabled Assetic filters to all stylesheets.
+  $elements['#items'] = _assetic_process_items($elements['#items'], 'css');
+
+  return $elements;
+}
+
+/**
+ * Implements hook_theme().
+ */
+function assetic_theme() {
+  return array(
+    'assetic_admin_form_filter' => array(
+      'render element' => 'element',
+      'file' => 'assetic.theme.inc',
+    ),
+  );
+}
+
+/**
+ * Callback function to check if the Assetic library is correctly installed.
+ *
+ * @return bool
+ *   A boolean indicating if the Assetic library is available.
+ */
+function _assetic_libraries_bootstrap_assetic() {
+  if (!class_exists('Assetic\\Asset\\AssetCollection')) {
+    drupal_set_message(t("The Assetic library isn't correctly installed. Please check the !status for more information.", array(
+      '!status' => l(t('status report'), 'admin/reports/status'),
+    )), 'error', FALSE);
+    return FALSE;
+  }
+
+  return TRUE;
+}
+
+/**
+ * Callback for loading the Assetic library through the X Autoload API.
+ *
+ * @see assetic_libraries_info()
+ */
+function _assetic_libraries_xautoload_assetic($api) {
+  $api->namespaceRoot('Assetic', 'src');
+}
+
+/**
+ * Callback for loading the Symfony/Process library through the X Autoload API.
+ *
+ * @see assetic_libraries_info()
+ */
+function _assetic_libraries_xautoload_symfony_process($api) {
+  $api->namespaceDeep('Symfony\\Component\\Process', '');
+}
+
+/**
+ * Loop through the given items and apply the enabled Assetic filters.
+ *
+ * @param array $items
+ *   The items that should be processed.
+ * @param string $type
+ *   The type of the items.
+ *
+ * @return array
+ *   The processed items.
+ */
+function _assetic_process_items($items, $type) {
+  // Loop through each item and apply the enabled Assetic filters.
+  foreach ($items as $index => $item) {
+    // We should only process existing files.
+    if (('file' === $item['type'] || 'theme' === $item['type']) && file_exists(DRUPAL_ROOT.'/'.$index)) {
+      $asset = assetic_get_asset_from_file($index, $type);
+
+      if ($uri = assetic_dump_asset($asset)) {
+        $item['type'] = 'file';
+        $item['data'] = $uri;
+        // Store the original file inside the item.
+        $item['original'] = $index;
+
+        // Also set the correct path in the items array.
+        $items[$uri] = $item;
+      }
+      else {
+        drupal_set_message(t('An error occured when applying filters to %file. Please check your logs for any errors', array(
+          '%file' => $index,
+        )), 'error');
+      }
+
+      // Unset the original item.
+      unset($items[$index]);
+    }
+  }
+
+  return $items;
+}
+
+/**
+ * Remove the filter settings from the DB table
+ *
+ * @param string $filter
+ *   The name of the filter.
+ *
+ * @return int
+ *   The number of rows that are removed.
+ */
+function _assetic_remove_filter($filter) {
+  return db_delete('assetic_filter')
+    ->condition('alias', 'scssphp')
+    ->execute();
+}

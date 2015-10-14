@@ -1,0 +1,305 @@
+<?php
+
+/**
+ * @file Main module file for Serialized field module.
+ */
+
+/**
+ * Implements hook_field_info().
+ */
+function serialized_field_field_info() {
+  $info = array();
+
+  $info['serialized'] = array(
+    'label' => t('Serialized data'),
+    'description' => t('This field stores arbitrary data into the database in serialized form.'),
+    'settings' => array(),
+    'instance_settings' => array(
+      // Two options: 'serialize' and 'json_encode'.
+      'serialization' => 'serialize',
+      // Assumes that the top level of array keys are module names, or a similar
+      // namespace. To support easy multiple-module use, a namespace will only
+      // be deleted from the field value if the top level key is present and
+      // set to NULL. Namespaces will not be wiped out if they are merely not
+      // present when saving.
+      'namespace' => TRUE,
+    ),
+    'default_widget' => 'serialized_hidden',
+    'default_formatter' => 'hidden',
+    // TODO: support entity_metadata_wrapper.
+    'property_type' => 'field_item_serialized',
+    'property_callbacks' => array('serialized_field_property_info_callback'),
+  );
+
+  return $info;
+}
+
+/**
+ * Additional callback to adapt the property info of serialized fields.
+ *
+ * @see entity_metadata_field_entity_property_info().
+ */
+function serialized_field_property_info_callback(&$info, $entity_type, $field, $instance, $field_type) {
+  $property = &$info[$entity_type]['bundles'][$instance['bundle']]['properties'][$field['field_name']];
+  $property['getter callback'] = 'entity_metadata_field_verbatim_get';
+  $property['setter callback'] = 'entity_metadata_field_verbatim_set';
+  $property['auto creation'] = 'serialized_field_item_create';
+  $property['property info'] = serialized_field_item_property_info();
+  $property['property info']['value']['required'] = TRUE;
+  $property['property info']['serialization']['required'] = FALSE;
+  unset($property['query callback']);
+}
+
+/**
+ * Callback for creating a new, empty serialized field item.
+ *
+ * @see serialized_field_property_info_callback()
+ */
+function serialized_field_item_create() {
+  return array(
+    'value' => array(),
+    'serialization' => NULL,
+  );
+}
+
+/**
+ * Defines info for the properties of the serialized-field item data structure.
+ */
+function serialized_field_item_property_info() {
+  $properties['value'] = array(
+    'type' => 'array',
+    'label' => t('The raw unserialized array value.'),
+    'getter callback' => 'entity_property_verbatim_get',
+    'setter callback' => 'entity_property_verbatim_set',
+  );
+  $properties['serialization'] = array(
+    'type' => 'string',
+    'label' => t('Serialization algorithm.'),
+    'getter callback' => 'entity_property_verbatim_get',
+    'setter callback' => 'entity_property_verbatim_set',
+  );
+  return $properties;
+}
+
+/**
+ * Implements hook_field_instance_settings_form().
+ */
+function serialized_field_field_instance_settings_form($field, $instance) {
+  $form = array();
+
+  $settings = $instance['settings'];
+
+  $form['serialized_field'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Serialization options'),
+    '#collapsible' => FALSE,
+    // As field_ui_default_value_widget() does, we change the #parents so that
+    // the value below is writing to $instance in the right location.
+    '#parents' => array('instance', 'settings'),
+  );
+
+  $form['serialized_field']['serialization'] = array(
+    '#type' => 'select',
+    '#title' => t('Algorithm'),
+    '#description' => t("The serialization algorithm to use when saving to the database. The options are:
+<ul>
+  <li>
+    <strong>PHP's Serialize</strong>: Faster for small datasets and supports all PHP variables (including classed objects).
+  </li>
+  <li>
+    <strong>JSON encode</strong>: Better performance on large datasets, more portable to other systems/languages and more human-readable. Not all PHP data-types can be expressed.
+  </li>
+</ul>
+"),
+    '#options' => array(
+      'serialize' => t('PHP Serialize'),
+      'json_encode' => t('JSON encode'),
+    ),
+    '#default_value' => $settings['serialization'],
+  );
+
+  $form['serialized_field']['namespace'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Namespace the data'),
+    '#description' => t("Can make it more convenient to make a 'bin' field into which any module can throw their data."),
+    '#default_value' => !empty($settings['namespace']),
+  );
+
+  return $form;
+}
+
+/**
+ * Implements hook_field_is_empty().
+ */
+function serialized_field_field_is_empty($item, $field) {
+  return empty($item['value']);
+}
+
+/**
+ * Implements hook_field_presave().
+ */
+function serialized_field_field_presave($entity_type, $entity, $field, $instance, $langcode, &$items) {
+  if ($field['type'] === 'serialized') {
+
+    list($id, $vid, $bundle) = entity_extract_ids($entity_type, $entity);
+    if ($log_uri = entity_uri($entity_type, $entity)) {
+      $log_link = url($log_uri['path'], $log_uri['options']);
+    }
+    else {
+      $log_link = '';
+    }
+    $log_vars = array('@entity_type' => $entity_type, '@entity_id' => $id, '@field_name' => $field['field_name']);
+
+    // Compare the original field values with the ones that are being saved. Use
+    // $entity->original to check this when possible, but if it isn't available,
+    // create a bare-bones entity and load its previous values instead.
+    if (isset($entity->original)) {
+      $original = $entity->original;
+    }
+    else {
+      $original = entity_create_stub_entity($entity_type, array($id, $vid, $bundle));
+      field_attach_load($entity_type, array($id => $original), FIELD_LOAD_CURRENT, array('field_id' => $field['id']));
+    }
+
+    // Our field items before these changes were made.
+    $items_original = !empty($original->{$field['field_name']}[$langcode]) ? $original->{$field['field_name']}[$langcode] : array();
+
+    foreach ($items as $delta => $item) {
+
+      if (empty($items[$delta]['value'])) {
+        $items[$delta]['value'] = array();
+      }
+
+      // Try to helpfully point out obvious errors.
+      if (!is_array($items[$delta]['value'])) {
+        $log_msg = 'Could not serialize or save @field_name on @entity_type with ID: @entity_id. Item value must be an array.';
+        drupal_set_message(t($log_msg, $log_vars), 'error');
+        watchdog('serialized_field', $log_msg, $log_vars, WATCHDOG_ERROR, $log_link);
+        throw new SerializedFieldSaveException(t($log_msg, $log_vars));
+      }
+
+      // If we are 'namespace'ing then we do *not* delete a top-level key if it
+      // is absent. We only delete them if they are present and set to NULL.
+      if (!empty($instance['settings']['namespace'])) {
+        if (!empty($items_original[$delta]['value'])) {
+          foreach ($items_original[$delta]['value'] as $module => $module_settings) {
+            if (!isset($items[$delta]['value'][$module])) {
+              // Explicitly set to NULL to remove a module's settings.
+              if (array_key_exists($module, $items[$delta]['value'])) {
+                unset($items[$delta]['value'][$module]);
+              }
+              else {
+                $items[$delta]['value'][$module] = $items_original[$delta]['value'][$module];
+              }
+            }
+          }
+        }
+      }
+
+      // Serialize!
+      $items[$delta]['serialization'] = $instance['settings']['serialization'];
+      switch ($instance['settings']['serialization']) {
+
+        case 'json_encode':
+          $encoded = json_encode($items[$delta]['value']);
+          if (isset($items[$delta]['value']) && ($encoded === NULL)) {
+            // There was an error =(.
+            $log_msg = 'json_decode failed on @field_name (delta: @delta) on @entity_type with ID: @entity_id. Could not save the value.';
+            drupal_set_message(t($log_msg, $log_vars), 'error');
+            watchdog('serialized_field', $log_msg, $log_vars, WATCHDOG_ERROR, $log_link);
+            throw new SerializedFieldSaveException(t($log_msg, $log_vars));
+          }
+          $items[$delta]['value_serialized'] = $encoded;
+          break;
+
+        case 'serialize':
+          // Pretty sure this throws a fatal error if serialization fails.
+          $items[$delta]['value_serialized'] = serialize($items[$delta]['value']);
+          break;
+
+        default:
+          // This should never happen, but let's play it safe.
+          $log_msg = 'Could not save @field_name on @entity_type with ID: @entity_id. Unrecognised serialization algorithm: "@serialization".';
+          $log_vars['@serialization'] = $items[$delta]['serialization'];
+          drupal_set_message(t($log_msg, $log_vars), 'error');
+          watchdog('serialized_field', $log_msg, $log_vars, WATCHDOG_ERROR, $log_link);
+          throw new SerializedFieldSaveException(t($log_msg, $log_vars));
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_field_load().
+ */
+function serialized_field_field_load($entity_type, $entities, $field, $instances, $langcode, &$items, $age) {
+  if ($field['type'] === 'serialized') {
+    foreach ($entities as $id => $entity) {
+      foreach ($items[$id] as $delta => $item) {
+        $items[$id][$delta]['value'] = array();
+        if (empty($items[$id][$delta]['serialization'])) {
+          $items[$id][$delta]['serialization'] = 'serialize';
+        }
+        if (!empty($items[$id][$delta]['value_serialized'])) {
+          switch ($items[$id][$delta]['serialization']) {
+
+            case 'json_encode':
+              $items[$id][$delta]['value'] = @json_decode($items[$id][$delta]['value_serialized'], TRUE);
+              break;
+
+            case 'serialize':
+              $items[$id][$delta]['value'] = @unserialize($items[$id][$delta]['value_serialized']);
+              break;
+
+            default:
+              // This should never happen, but let's keep a record.
+              $log_uri = entity_uri($entity_type, $entity);
+              $log_link = url($log_uri['path'], $log_uri['options']);
+              $log_msg = 'Could not unserialize @field_name on @entity_type with ID: @entity_id. Unrecognised serialization algorithm: "@serialization".';
+              $log_vars = array('@entity_type' => $entity_type, '@entity_id' => $id, '@field_name' => $field['field_name'], '@serialization' => $items[$id][$delta]['serialization']);
+              drupal_set_message(t($log_msg, $log_vars), 'error');
+              watchdog('serialized_field', $log_msg, $log_vars, WATCHDOG_ERROR, $log_link);
+
+          }
+          if (!is_array($items[$id][$delta]['value'])) {
+            $items[$id][$delta]['value'] = array();
+          }
+        }
+        unset($items[$id][$delta]['value_serialized']);
+      }
+    }
+  }
+}
+
+/**
+ * Thrown when there is an error serializing a field value.
+ */
+class SerializedFieldSaveException extends Exception {}
+
+/**
+ * Implements hook_field_widget_info().
+ */
+function serialized_field_field_widget_info() {
+
+  $info = array();
+
+  $info['serialized_hidden'] = array(
+    'label' => t('Hidden (Alterable)'),
+    'field types' => array('serialized'),
+  );
+
+  return $info;
+}
+
+/**
+ * Implements hook_field_widget_form().
+ */
+function serialized_field_field_widget_form(&$form, &$form_state, $field, $instance, $langcode, $items, $delta, $element) {
+
+  $element['value'] = array(
+    '#type' => 'value',
+    '#value' => isset($items[$delta]['value']) ? $items[$delta]['value'] : array(),
+  );
+
+  return $element;
+}

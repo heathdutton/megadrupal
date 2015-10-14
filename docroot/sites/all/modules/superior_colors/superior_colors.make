@@ -1,0 +1,9 @@
+api = 2
+core = 7.x
+projects[] = drupal
+projects[] = libraries
+projects[] = jquery_colorpicker
+libraries[colorpicker][download][type] = "get"
+libraries[colorpicker][download][url] = "https://github.com/downloads/reload/siteprocessor/colorpicker.zip"
+libraries[colorpicker][directory_name] = "colorpicker"
+libraries[colorpicker][destination] = "libraries"

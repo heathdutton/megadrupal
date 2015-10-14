@@ -1,0 +1,520 @@
+<?php
+// $Id: limited_views.module,v 1.2 2010/05/21 02:41:22 nickurbits Exp $
+
+/**
+ * @file
+ *  Allows restricting content views to an arbitrary number for unpriviledged users
+ */
+
+###############
+## CONSTANTS ##
+###############
+
+define('LIMITED_VIEWS_PERM_ADMIN', 'modify limited views settings');
+define('LIMITED_VIEWS_PERM_UNRESTRICTED', 'view content an unlimited amount of times');
+define('LIMITED_VIEWS_REALM_UNRESTRICTED', 'unrestricted');
+define('LIMITED_VIEWS_REALM_RESTRICTED', 'restricted');
+define('LIMITED_VIEWS_EXPIRY_TIME', variable_get('limited_views_expiry', 60*60*24*30));
+define('LIMITED_VIEWS_VIEW_THRESHOLD', variable_get('limited_views_threshold', 5));
+define('LIMITED_VIEWS_BOT_REGEX', "(GoogleBot|msnbot|Yahoo. Slurp|YahooSeeker)");
+define('LIMITED_VIEWS_REFERRER_DOMAIN_REGEX',"(google|bing|yahoo)");
+define('LIMITED_VIEWS_COOKIE_NAME_COUNT', variable_get('limited_views_cookie_name_count', 'limited_views_count'));
+define('LIMITED_VIEWS_COOKIE_NAME_ENABLED', variable_get('limited_views_cookie_name_enabled', 'limited_views_cookie_enabled'));
+
+###########
+## HOOKS ##
+###########
+/**
+ * Implement hook_init
+ */
+function limited_views_init() {
+  global $user;
+  $methods = limited_views_get_methods();
+  if ($user->uid == 0) {
+    $method_name = variable_get('limited_views_tracking_anonymous', '');
+  }
+  else {
+    $method_name = variable_get('limited_views_tracking_authenticated', '');
+  }
+  if (!$method_name) {
+    $a = array_keys($methods);
+    $method_name = $a[0];
+  }
+  
+  $GLOBALS['limited_views_active_method'] = $method_name;
+  module_load_include('inc', 'limited_views', 'inc/limited_views.'.$method_name);  
+}
+
+/**
+ * Implements hook_permission().
+ */
+function limited_views_permission() {
+  return array(
+    LIMITED_VIEWS_PERM_ADMIN => array(
+      'title' => t('Administer Limited Views'),
+      'description' => t('Control behaviour of Limited Views'),
+    ),
+    LIMITED_VIEWS_PERM_UNRESTRICTED => array(
+      'title' => t('Bypass Limited Views'),
+      'description' => t('Skip checking of view count'),
+    ),    
+  );
+}
+
+
+/**
+ * Implement hook_menu
+ */
+function limited_views_menu() {
+
+  $menu['admin/structure/limited-views'] = array(
+    'title' => 'Limited Views',
+    'description' => t('Configure the Limited Views node access module'),
+    'access callback' => 'user_access',
+    'access arguments' => array(LIMITED_VIEWS_PERM_ADMIN),
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('limited_views_admin'),
+    'type' => MENU_NORMAL_ITEM
+  );
+
+  $menu['limited-views/nocache-check'] = array(
+    'description' => t('Callback for checking that NO_CACHE cookie is set'),
+    'page callback' => 'limited_views_nocache_check',
+    'access callback' => TRUE,
+    'type' => MENU_CALLBACK,
+  );
+
+  return $menu;
+}
+
+/**
+ * A handy test for sysop's to look for NO_CACHE set as a cookie
+ * This is typically used to debug problems with Varnish/other-proxy's
+ * not passing on the request to Drupal when NO_CACHE is set as a cookie
+ * and thus there is no limited_views activity
+ */
+function limited_views_nocache_check() {
+  $return = isset($_COOKIE["NO_CACHE"]) ? t("NO_CACHE cookie cache punch-through was found") : t("NO_CACHE cookie cache punch-through was NOT found");
+  $return .="<p>Page request time ".time()."</p>";
+  $return .="<p>Cookie debug</p>";
+  $return .= "<pre>".print_r($_COOKIE, true)."</pre>";
+
+
+  return $return;
+}
+
+/**
+ * Implement hook_node_access_records
+ */
+function limited_views_node_access_records($node) {
+  $restricted_types = array_filter(variable_get('limited_views_types', array()));
+  if (in_array($node->type, $restricted_types)) {
+    // unrestricted realm
+    $grants[] = array(
+      'nid' => $node->nid,
+      'realm' => LIMITED_VIEWS_REALM_UNRESTRICTED,
+      'gid' => 1,
+      'grant_view' => 1,
+      'grant_update' => 0,
+      'grant_delete' => 0,
+      'priority' => 1
+    );
+
+    // restricted realm
+    $grants[] = array(
+      'nid' => $node->nid,
+      'realm' => LIMITED_VIEWS_REALM_RESTRICTED,
+      'gid' => 1,
+      'grant_view' => 1,
+      'grant_update' => 0,
+      'grant_delete' => 0,
+      'priority' => 1
+    );
+
+    return $grants;
+  }
+}
+
+/**
+ * Implement hook_node_grants
+ */
+function limited_views_node_grants($account, $op) {  
+  $grants = array();
+  $exceeded = FALSE;
+
+  // hook_node_grants can be triggered by other modules doing a menu_get_item
+  // inside of their hook_init, take for example domain_theme.module
+  // this means hook_node_grants in limited_views is called before hook_init
+  if(!function_exists('limited_views_get_view_count')) {
+    limited_views_init();
+  }
+
+  if( $op == 'view') {
+    if($node = node_load(arg(1)) ) {
+      // make no decision on unpublished content
+      if( $node->status ==0 ) {
+        return;
+      }
+    }
+  }
+  // continue with existing grant check
+  if (user_access(LIMITED_VIEWS_PERM_UNRESTRICTED, $account) || user_access(LIMITED_VIEWS_PERM_ADMIN, $account)) {
+    // unrestricted realm
+    $grants[LIMITED_VIEWS_REALM_UNRESTRICTED] = array(1);
+  }
+  else {
+    if (LIMITED_VIEWS_VIEW_THRESHOLD === 0) {
+      // We should just bypass all the counting if they have set it to zero.
+      $exceeded = TRUE;
+    }
+    else if ((limited_views_get_view_count() < LIMITED_VIEWS_VIEW_THRESHOLD) || limited_views_nid_in_history(arg(1)) ) {
+      // have not exceeded view threshold yet OR this is in their n-free-views history
+      $grants[LIMITED_VIEWS_REALM_RESTRICTED] = array(1);
+    }
+    else {
+      $exceeded = TRUE;
+    }
+    if ($exceeded) {
+      limited_views_has_exceeded('set', TRUE);
+      
+      // however if you have premium_content installed, we must grant some access
+      // as premium_content does not use grants, otherwise you get a 'access denied' message
+      if(module_exists('premium')) { 
+        $grants[LIMITED_VIEWS_REALM_RESTRICTED] = array(1);
+      } else {
+        // use the limited views handling method
+        // User has exceeded their threshold. Let them know if we should
+        // We use limited_views_has_exceeded to only display the message once
+        if ($message = variable_get('limited_views_message', '') && !limited_views_has_exceeded('get')) {
+          drupal_set_message(t(variable_get('limited_views_message', '')), 'warning', FALSE);
+        }        
+      }
+    }
+  }
+
+  // Allow other modules to change the grants we've assigned here
+  drupal_alter('limited_views_grants', $grants, $account, $op);
+
+  return $grants;
+}
+
+/**
+ * Implement hook_nodeapi
+ */
+function limited_views_node_view($node, $view_mode, $langcode) {
+  $allowed_types = array_filter(variable_get('limited_views_types', array()));
+
+  $unrestricted = user_access(LIMITED_VIEWS_PERM_UNRESTRICTED);
+  $admin = user_access(LIMITED_VIEWS_PERM_ADMIN);
+  
+  // if premium content is disabled for this node
+  // then skip adding the JS
+  $skip_due_to_premium = FALSE;
+  if(module_exists('premium')) {
+    $premium_level = premium_node_level_data($node);
+    if (count($premium_level) == 0 ) {
+     $skip_due_to_premium = TRUE;
+    }
+  }
+  if( !($unrestricted || $admin ) 
+      && in_array($node->type, $allowed_types) 
+      && $view_mode == 'full' &&
+      ! $skip_due_to_premium) {
+         limited_views_add_js($node->nid); // Add the cookie setting code
+  }
+}
+
+/**
+ * Implement hook_limited_views_methods
+ */
+function limited_views_limited_views_methods() {
+  return array(
+    'cookie' => array(
+      'title' => t('Cookies'),
+      'description' => t('Use cookies to track the user, especially handy for tracking anonymous users.'),
+      'file' => 'limited_views.cookie.inc',
+      'filepath' => drupal_get_path('module', 'limited_views') .'/inc',
+      'track anonymous' => TRUE,
+      'track authenticated' => TRUE,
+    ),
+    // done the session entry slightly differently for an example of defaults
+    /*'session' => array(
+      'title' => t('Sessions'),
+      'description' => t('Use sessions to track the user.'),
+      'file' => 'inc/limited_views.session.inc',
+    ),*/
+  );
+}
+
+#############
+## HELPERS ##
+#############
+
+/**
+ * Gets a list of all available tracking methods and related metadata
+ *
+ * @param bool $reset
+ *  force a refresh of the static cache
+ * @return array $methods
+ *  array of all available methods
+ */
+function limited_views_get_methods($reset = FALSE) {
+  static $methods = array();
+
+  if (empty($methods) || $reset) {
+    if ($reset) {
+      // wipe the array if we should reset the static cache
+      $methods = array();
+    }
+    $hook = 'limited_views_methods';
+    foreach (module_implements($hook) as $module) {
+      $func = $module .'_'. $hook;
+      $result = $func();
+      foreach ($result as $name => $method) {
+        $result[$name]['machine name'] = $name;
+        if (empty($method['file'])) {
+          $result[$name]['file'] = $module .'.'. $name .'.inc';
+        }
+        if (empty($method['filepath'])) {
+          $result[$name]['filepath'] = drupal_get_path('module', $module);
+        }
+        if (!isset($method['track anonymous'])) {
+          $result[$name]['track anonymous'] = FALSE;
+        }
+        if (!isset($method['track authenticated'])) {
+          $result[$name]['track authenticated'] = TRUE;
+        }
+      }
+
+      $methods = array_merge($methods, $result);
+    }
+  }
+
+  // allow other modules to make changes to the completed array
+  drupal_alter('limited_views_methods', $methods);
+
+  return $methods;
+}
+
+/**
+ * Returns an array of methods in machine_name => human_name format, suirable
+ * for Form API
+ */
+function limited_views_get_methods_options($type = 'anonymous') {
+  $options = array();
+  foreach (limited_views_get_methods() as $name => $method) {
+    if ($method['track '. $type]) {
+      $options[$name] = $method['title'];
+    }
+  }
+
+  return $options;
+}
+
+/**
+ * Page callback for settings form
+ */
+function limited_views_admin() {
+  $names = array();
+  foreach(node_type_get_types() as $node_type) {
+    $names[$node_type->type] = $node_type->name;
+  }
+  
+  $form = array(
+    'limited_views_types' => array(
+      '#title' => t('Types'),
+      '#description' => t('Select node types which should have limited views.'),
+      '#type' => 'checkboxes',
+      '#options' => $names,
+      '#default_value' => array_filter(variable_get('limited_views_types', array()) ),
+    ),
+    'limited_views_tracking_methods' => array(
+      'limited_views_tracking_anonymous' => array(
+        '#title' => t('Anonymous'),
+        '#type' => 'select',
+        '#options' => limited_views_get_methods_options(),
+        '#default_value' => variable_get('limited_views_tracking_anonymous', ''),
+      ),
+      'limited_views_tracking_authenticated' => array(
+        '#title' => t('Authenticated'),
+        '#type' => 'select',
+        '#options' => limited_views_get_methods_options('authenticated'),
+        '#default_value' => variable_get('limited_views_tracking_authenticated', ''),
+      ),
+    ),
+    'limited_views_threshold' => array(
+      '#title' => t('Page views threshold'),
+      '#description' => t('Maximum number of unique node views before denying access.'),
+      '#type' => 'textfield',
+      '#size' => 5,
+      '#default_value' => variable_get('limited_views_threshold', 5),
+    ),    
+    'limited_views_expiry' => array(
+      '#title' => t('Expiry Period'),
+      '#description' => t('Time in seconds before content views expire.'),
+      '#type' => 'textfield',
+      '#size' => 8,
+      '#default_value' => variable_get('limited_views_expiry', 60*60*24*30),
+    ),
+    'limited_views_message' => array(
+      '#title' => t('Threshold Exceeded Message'),
+      '#description' => t('The message to display to the user when they exceed their limit. <small>Leave blank to not display a message.</small>'),
+      '#type' => 'textfield',
+      '#maxlength' => 300,
+      '#default_value' => variable_get('limited_views_message', ''),
+    ),
+    '#validate' => array('limited_views_admin_validate'),
+  );
+  
+  // Support for 'First Click Free'
+  // http://support.google.com/webmasters/bin/answer.py?hl=en&answer=74536
+  // http://support.google.com/news/publisher/bin/answer.py?hl=en&answer=40543      
+  $form['limited_views_fcf'] = array (
+      '#title' => t('First Click Free settings'),
+      '#type' => 'fieldset'
+    );
+  $form['limited_views_fcf']['limited_views_support_first_click_free'] = array(
+      '#title' => t('Search Engine "First Click Free" support'),
+      '#description' => t("Allow access to search engine bot's aswell as always allow page views from search engine referrers."),
+      '#type' => 'checkbox',
+      '#default_value' => variable_get('limited_views_first_click_free', TRUE),
+    );
+  $form['limited_views_fcf']['limited_views_support_first_click_free_ua_regex'] = array(
+      '#title' => t('Regex of User-Agents to allow crawling'),
+      '#type' => 'textfield',
+      '#default_value' => variable_get('limited_views_support_first_click_free_ua_regex', LIMITED_VIEWS_BOT_REGEX),    
+  );
+  $form['limited_views_fcf']['limited_views_support_first_click_free_referral_regex'] = array(
+      '#title' => t('Regex of referral domains to allow a free view'),
+      '#type' => 'textfield',
+      '#default_value' => variable_get('limited_views_support_first_click_free_referral_regex', LIMITED_VIEWS_REFERRER_DOMAIN_REGEX),    
+    );
+  
+  if(module_exists('premium')) {
+    $form['limited_views_override_premium'] = array(
+      '#title' => t('Override "Premium Access" grant decisions until the limit is reached or search engine First Click Free is invoked.'),
+      '#description' => t('"Premium Access" module was detected, Option enables "Limited Views" to override "Premium Content" access permissions until the view limit is reached.'),
+      '#type' => 'checkbox',
+      '#default_value' => variable_get('limited_views_override_premium', TRUE),
+    );
+  }
+  return system_settings_form($form);
+}
+
+/**
+ * Validation handler for settings form
+ */
+function limited_views_admin_validate($form, &$form_state) {
+  // make sure the threshold and expiry fields are integers
+  if (!is_numeric(trim($form_state['values']['limited_views_threshold']))) {
+    $message = t('Threshold field must be a positive integer.');
+    form_set_error('limited_views_threshold', $message);
+  }
+  if (!is_numeric(trim($form_state['values']['limited_views_expiry']))) {
+    $message = t('Expiry period field must be a positive integer.');
+    form_set_error('limited_views_expiry', $message);
+  }
+}
+
+/**
+ * Statically caches if the user has exceeded their view quota
+ */
+function limited_views_has_exceeded($op="", $val = NULL) {
+  static $exceeded = FALSE;
+  if ($op == 'set') {
+    $exceeded = $val;
+  }
+  return $exceeded;
+}
+/*
+ * Helper function to do the regex to see if we
+ * are coming from a search engine
+ */
+function limited_views_is_search_engine_referrer() {
+  if(variable_get('limited_views_first_click_free', TRUE) ) {
+    // check if its a referral from a search engine
+    $regex = variable_get('limited_views_support_first_click_free_referral_regex', LIMITED_VIEWS_REFERRER_DOMAIN_REGEX);
+    if (strlen($_SERVER["HTTP_REFERER"])) {
+      // see if the domain part matches
+      preg_match_all('/^http.+'.$regex.'/Ui', $_SERVER["HTTP_REFERER"], $matches);
+      if(count($matches)) {
+        if(count($matches[0])) {
+          if(strlen($matches[0][0])) {
+            return TRUE;
+          }
+        }
+      }
+    }    
+  }
+  return FALSE;
+}
+
+/**
+ * hook_premium_access
+ * 
+ * Tell premium_access not to kick in until the user has FIRST exceeded their
+ * allowed views here
+ * 
+ * returns boolean
+ * 
+ * @param object node $node
+ * @param unknown_type $teaser
+ */
+function limited_views_premium_access($node) {
+  global $user;
+
+//print_r($node->premium);
+
+  if ( !variable_get('limited_views_override_premium', TRUE )) {
+    // return non-boolean here for no decision
+    return NULL;
+  }
+
+  // if it's not in our list of things we care about return null
+  $restricted_types = array_filter(variable_get('limited_views_types', array()));
+  if (!in_array($node->type, $restricted_types)) {
+    return NULL;
+  }  
+    
+  if( variable_get('limited_views_first_click_free', TRUE) ) {
+    // see if we need to process any decisions about First Click Free
+    // involves useragents and referrers for search engines
+    $regex = variable_get('limited_views_support_first_click_free_ua_regex', LIMITED_VIEWS_BOT_REGEX);
+    if(isset($_SERVER["HTTP_USER_AGENT"])) {
+      if(preg_match('/'.$regex.'/iU', $_SERVER["HTTP_USER_AGENT"])) {
+        return TRUE;
+      }
+    }    
+    if( limited_views_is_search_engine_referrer() ) {
+      return TRUE;
+    }
+  }
+  
+  // if we're a currently logged in user
+  // then return 'no decision' (null)
+  // as we should have no influence here
+  // as theres no configuration ability to decide
+  // what happens to premium content/limited views nodes
+  if($user->uid) {
+    return NULL;
+  }
+  
+  // if premium content is disabled for this node
+  // then allow viewing 
+  if(module_exists('premium')) {
+    $premium_level = premium_node_level_data($node);
+    if (count($premium_level) == 0 ) {
+      return TRUE;
+    }
+  }
+  
+  // final check if they have exceeded their views
+  // then tell premium content to refuse it
+  // which will give premium the handling
+  $grant = limited_views_node_grants($user, FALSE);
+  if( limited_views_has_exceeded() ) {
+    return FALSE;
+  } 
+  
+  return TRUE;
+}

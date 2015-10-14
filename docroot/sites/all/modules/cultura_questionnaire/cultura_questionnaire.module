@@ -1,0 +1,697 @@
+<?php
+
+/**
+ * @file
+ * Cultura questionnaire creation and answer aggregation for students
+ * participating in a Cultura Exchange.
+ */
+
+/**
+ * Define a constant for the Questionnaire webform node type.
+ */
+define('CULTURA_QUESTIONNAIRE_NODE_TYPE', 'cultura_questionnaire');
+
+/**
+ * Define a constant for Questionnaire Build node type.
+ */
+define('CULTURA_QUESTIONNAIRE_BUILDER_NODE_TYPE', 'cultura_questionnaire_builder');
+
+/**
+ * Define a constant for the language vocabulary machine name.
+ */
+define('CULTURA_QUESTIONNAIRE_LANGUAGE_VOCABULARY', 'cultura_questionnaire_languages');
+
+/**
+ * Define a constant for the questionnaire intro field.
+ */
+define('CULTURA_QUESTIONNAIRE_FIELD_INTROS', 'cultura_questionnaire_intros');
+
+/**
+ * Define a constant for the language field for webforms and users.
+ */
+define('CULTURA_QUESTIONNAIRE_FIELD_LANGUAGE', 'cultura_language');
+
+/**
+ * Define a constant for the webform questionnaire reference field.
+ */
+define('CULTURA_QUESTIONNAIRE_FIELD_QUESTIONNAIRE', 'cultura_questionnaire');
+
+/**
+ * Define constants for primary and secondary language term ID variable names.
+ */
+define('CULTURA_QUESTIONNAIRE_LANGUAGE_PRIMARY_TID', 'cultura_language_primary_tid');
+define('CULTURA_QUESTIONNAIRE_LANGUAGE_SECONDARY_TID', 'cultura_language_secondary_tid');
+
+/**
+ * Implements hook_module_implements_alter().
+ */
+function cultura_questionnaire_module_implements_alter(&$implementations, $hook) {
+  if ($hook == 'form_alter' && isset($implementations['cultura_questionnaire'])) {
+    $value = $implementations['cultura_questionnaire'];
+    unset($implementations['cultura_questionnaire']);
+    $implementations['cultura_questionnaire'] = $value;
+  }
+}
+
+/**
+ * Implements hook_node_access().
+ *
+ * Disallows editing after a Questionnaire is published and prevents students
+ * from accessing Questionnaires not in their language.
+ */
+function cultura_questionnaire_node_access($node, $op, $account) {
+  if ($op === 'edit' && $node->type === CULTURA_QUESTIONNAIRE_BUILDER_NODE_TYPE) {
+    if ($node->status == NODE_PUBLISHED) {
+      return NODE_ACCESS_DENY;
+    }
+  }
+  if ($op === 'view' && $node->type === CULTURA_QUESTIONNAIRE_NODE_TYPE) {
+    if (in_array('student', $account->roles)) {
+      // If we don't do a user load, account object doesn't have fields.
+      $account = user_load($account->uid);
+      $items = field_get_items('user', $account, CULTURA_QUESTIONNAIRE_FIELD_LANGUAGE);
+      $student_language_tid = ($items) ? $items[0]['tid'] : FALSE;
+      $items = field_get_items('node', $node, CULTURA_QUESTIONNAIRE_FIELD_LANGUAGE);
+      $questionnaire_language_tid = ($items) ? $items[0]['tid'] : FALSE;
+      if ($student_language_tid !== $questionnaire_language_tid) {
+        return NODE_ACCESS_DENY;
+      }
+    }
+  }
+  return NODE_ACCESS_IGNORE;
+}
+
+/**
+ * Implements hook_form_BASE_FORM_ID_alter().
+ */
+function cultura_questionnaire_form_webform_client_form_alter(&$form, &$form_state, $form_id) {
+  if ($form['#node']->type == CULTURA_QUESTIONNAIRE_NODE_TYPE) {
+    if (in_array('student', $GLOBALS['user']->roles)) {
+      $form['#submit'][] = 'cultura_questionnaire_next_webform';
+      $form['actions']['description'] = array(
+        '#markup' => '<p class="help-block">' . t('You will not be able to review nor change your answers after submitting this form.') . '</p>',
+        '#weight' => 901,
+      );
+      $nodes = cultura_questionnaire_questionnaires_not_answered_by_user(user_load($GLOBALS['user']->uid));
+      if (!empty($nodes)) {
+        $form['actions']['more'] = array(
+          '#markup' => '<p class="help-block">' . t('After submitting, you will be taken to the next questionnaire.') . '</p>',
+          '#weight' => 902,
+        );
+      }
+    }
+    else {
+      $form['actions']['description'] = array(
+        '#markup' => '<p class="help-block">' . t('Only students may submit questionnaires.') . '</p>',
+        '#weight' => 901,
+      );
+      $form['actions']['submit']['#disabled'] = TRUE;
+    }
+  }
+}
+
+/**
+ * Form submission handler for questionnaire forms.
+ *
+ * Sets next unanswered questionnaire as the form state's redirect value.
+ */
+function cultura_questionnaire_next_webform($form, &$form_state) {
+  $nodes = cultura_questionnaire_questionnaires_not_answered_by_user(user_load($GLOBALS['user']->uid));
+  if (!empty($nodes)) {
+    $form_state['redirect'] = 'node/' . key($nodes);
+  }
+  else {
+    drupal_set_message(t('Thank you for completing the questionnaires.'));
+    $form_state['redirect'] = '<front>';
+  }
+}
+
+/**
+ * Implements hook_form_BASE_FORM_ID_alter() for node_form().
+ */
+function cultura_questionnaire_form_node_form_alter(&$form, &$form_state) {
+  if ($form['#node']->type != CULTURA_QUESTIONNAIRE_BUILDER_NODE_TYPE) {
+    return;
+  }
+
+  if (!variable_get('cultura_registration_tokens')) {
+    drupal_set_message(t("Before creating a Questionnaire you must define languages for this exchange in Registration Tokens, below."), 'warning');
+    drupal_goto('admin/dashboard', array(), 303);
+  }
+
+  // Hide comment settings on Questionnaires, which are never public.
+  $form['comment_settings']['#access'] = FALSE;
+  // Path alias settings added late so can only remove in after build function.
+  $form['#after_build'][] = 'cultura_questionnaire_builder_node_form_afterbuild';
+  $form['actions']['submit']['#submit'][] = 'cultura_questionnaire_form_submit';
+  $form['actions']['publish']['#submit'][] = 'cultura_questionnaire_form_submit';
+}
+
+/**
+ * After-build callback to remove path settings from Questionnaire node form.
+ *
+ * Questionnaires are never public (they are used to build webforms) so there
+ * is no reason for them to have a custom path.
+ */
+function cultura_questionnaire_builder_node_form_afterbuild($form, &$form_state) {
+  $form['path']['#access'] = FALSE;
+
+  // Add Bootstrap column classes to double fields.
+  $form[CULTURA_QUESTIONNAIRE_FIELD_INTROS][LANGUAGE_NONE][0]['first']['#wrapper_attributes']['class'][] = 'col-sm-6';
+  $form[CULTURA_QUESTIONNAIRE_FIELD_INTROS][LANGUAGE_NONE][0]['second']['#wrapper_attributes']['class'][] = 'col-sm-6';
+
+  foreach ($form[CULTURA_QUESTIONNAIRE_FIELD_PROMPTS][LANGUAGE_NONE] as $i => $v) {
+    if (is_int($i)) {
+      $form[CULTURA_QUESTIONNAIRE_FIELD_PROMPTS][LANGUAGE_NONE][$i]['first']['#wrapper_attributes']['class'][] = 'col-sm-6';
+      $form[CULTURA_QUESTIONNAIRE_FIELD_PROMPTS][LANGUAGE_NONE][$i]['second']['#wrapper_attributes']['class'][] = 'col-sm-6';
+    }
+  }
+
+  return $form;
+}
+
+/**
+ * Form submission handler for node_form().
+ *
+ * @see cultura_questionnaire_builder_node_form_alter()
+ */
+function cultura_questionnaire_form_submit($form, &$form_state) {
+  $form_state['redirect'] = 'admin/dashboard';
+}
+
+/**
+ * Implements hook_field_widget_form_alter().
+ *
+ * Adds language labels to first item of double fields intro and prompts.
+ */
+function cultura_questionnaire_field_widget_form_alter(&$element, $form_state, $context) {
+  $instance = $context['instance'];
+  if ($instance['widget']['module'] == 'double_field'
+    && $instance['bundle'] == CULTURA_QUESTIONNAIRE_BUILDER_NODE_TYPE
+    && $context['delta'] == 0
+    // Prevent notices on content type editing and when redirected to Dashboard.
+    && variable_get('cultura_registration_tokens')
+  ) {
+    $languages = array_keys(variable_get('cultura_registration_tokens'));
+    $element['first']['#title'] = $languages[0];
+    $element['second']['#title'] = $languages[1];
+    unset($element['first']['#title_display']);
+    unset($element['second']['#title_display']);
+  }
+  // Add Bootstrap grid row class.
+  if ($instance['widget']['module'] == 'double_field'
+    && $instance['bundle'] == CULTURA_QUESTIONNAIRE_BUILDER_NODE_TYPE
+  ) {
+    $element['#attributes']['class'][] = 'row';
+  }
+}
+
+/**
+ * Implements hook_node_insert().
+ */
+function cultura_questionnaire_node_insert($node) {
+  // Act on questionnaire nodes which are being published.
+  if ($node->type === CULTURA_QUESTIONNAIRE_BUILDER_NODE_TYPE && $node->status == NODE_PUBLISHED) {
+    cultura_questionnaire_create_webforms_pair_from_questionnaire_node($node);
+  }
+}
+
+/**
+ * Implements hook_node_update().
+ */
+function cultura_questionnaire_node_update($node) {
+  // Only act on questionnaire nodes going from unpublished to published.
+  if ($node->type === CULTURA_QUESTIONNAIRE_BUILDER_NODE_TYPE) {
+    if ($node->original->status == NODE_NOT_PUBLISHED && $node->status == NODE_PUBLISHED) {
+      cultura_questionnaire_create_webforms_pair_from_questionnaire_node($node);
+    }
+  }
+}
+
+/**
+ * Creates a pair of questionnaire webforms from fields on a Questionnaire node.
+ */
+function cultura_questionnaire_create_webforms_pair_from_questionnaire_node($node) {
+  $vocab = field_get_items('node', $node, CULTURA_QUESTIONNAIRE_FIELD_QUESTION_TYPE);
+  $title = taxonomy_term_load($vocab[0]['tid'])->name;
+
+  $intros = field_get_items('node', $node, CULTURA_QUESTIONNAIRE_FIELD_INTROS);
+  $prompts = field_get_items('node', $node, CULTURA_QUESTIONNAIRE_FIELD_PROMPTS);
+
+  $languages = array_keys(variable_get('cultura_registration_tokens', array()));
+
+  // Create the webform of prompts for the first language.
+  $components = cultura_questionnaire_prepare_webform_components($prompts, 'first');
+  $first_webform = cultura_questionnaire_create_webform($title, $components, $node->nid, $languages[0], $intros[0]['first']);
+
+  // Create the webform of prompts for the second language.
+  $components = cultura_questionnaire_prepare_webform_components($prompts, 'second');
+  $second_webform = cultura_questionnaire_create_webform($title, $components, $node->nid, $languages[1], $intros[0]['second']);
+
+  drupal_set_message(t('Created Questionnaire webforms <a href="!first_url">@first_title</a> and <a href="!second_url">@second_title</a>.',
+    array(
+      '!first_url' => url('node/' . $first_webform->nid),
+      '@first_title' => $first_webform->title,
+      '!second_url' => url('node/' . $second_webform->nid),
+      '@second_title' => $second_webform->title,
+    )));
+}
+
+/**
+ * Prepares webform components given doublefield items and 'first' or 'second'.
+ */
+function cultura_questionnaire_prepare_webform_components($prompts, $position) {
+  $components = array();
+
+  $weight = 0;
+  foreach ($prompts as $key => $prompt_pair) {
+    $prompt = $prompt_pair[$position];
+    $weight += 10;
+
+    $components[] = array(
+      'name' => $prompt,
+      'form_key' => 'prompt_' . $key,
+      'type' => 'textarea',
+      'required' => 1,
+      'weight' => $weight,
+      'pid' => 0,
+      'extra' => array(
+        'title_display' => 'before',
+        'wrapper_classes' => 'form-group',
+        'css_classes' => 'form-control',
+        'cols' => 72,
+        'rows' => 2,
+        'private' => 0,
+      ),
+    );
+
+  }
+
+  return $components;
+}
+
+/**
+ * Creates a Questionnaire webform given a title, components, and body.
+ */
+function cultura_questionnaire_create_webform($title, $components, $nid, $language, $body = '', $account = NULL) {
+  if (!$account) {
+    $account = $GLOBALS['user'];
+  }
+
+  // Create the webform node.
+  $node = new stdClass();
+  $node->type = CULTURA_QUESTIONNAIRE_NODE_TYPE;
+  $node->title = $title . ' (' . $language . ')';
+
+  // Associate this webform with the creating questionnaire node.
+  // CULTURA_QUESTIONNAIRE_FIELD_QUESTIONNAIRE
+  $node->cultura_questionnaire = array(
+    LANGUAGE_NONE => array(
+      '0' => array(
+        'nid' => $nid,
+      ),
+    ),
+  );
+
+  // Record the language of and for this Questionnaire.
+  $language_term = cultura_questionnaire_language_term_from_name($language);
+  // Object notation doesn't work with constants, but the field name constant
+  // is CULTURA_QUESTIONNAIRE_FIELD_LANGUAGE.
+  // TODO replace with helper function so i don't fail to update name again.
+  $node->cultura_language = array(
+    LANGUAGE_NONE => array(
+      '0' => array(
+        'tid' => $language_term->tid,
+      ),
+    ),
+  );
+
+  // Add body (introduction) field.
+  $node->body = array(
+    LANGUAGE_NONE => array(
+      '0' => array(
+        'value' => $body,
+        'summary' => '',
+        'format' => 'full_html',
+      ),
+    ),
+  );
+  node_object_prepare($node);
+  $node->language = LANGUAGE_NONE;
+  $node->uid = $account->uid;
+
+  // Attach the webform to the node.
+  $node->webform = array(
+    'confirmation' => '',
+    'confirmation_format' => NULL,
+    'redirect_url' => '<confirmation>',
+    'status' => '1',
+    'block' => '0',
+    'teaser' => '0',
+    'allow_draft' => '0',
+    'auto_save' => '0',
+    'submit_notice' => '1',
+    'submit_text' => '',
+    'submit_limit' => '1',
+    'submit_interval' => '-1',
+    'total_submit_limit' => '-1',
+    'total_submit_interval' => '-1',
+    'record_exists' => TRUE,
+    'roles' => array(
+      0 => DRUPAL_AUTHENTICATED_RID,
+    ),
+    'emails' => array(),
+    'components' => $components,
+  );
+  // Save the webform node.
+  node_save($node);
+  return $node;
+}
+
+/**
+ * Returns Questionnaire webforms built by a given Questionnaire builder.
+ */
+function cultura_questionnaire_webforms($node) {
+  $nodes = array();
+  $query = new EntityFieldQuery();
+  $query->entityCondition('entity_type', 'node')
+    ->entityCondition('bundle', CULTURA_QUESTIONNAIRE_NODE_TYPE)
+    ->fieldCondition(CULTURA_QUESTIONNAIRE_FIELD_QUESTIONNAIRE, 'nid', $node->nid);
+  $result = $query->execute();
+  if (isset($result['node'])) {
+    $node_ids = array_keys($result['node']);
+    if (count($node_ids) !== 2) {
+      watchdog('cultura_answer', 'Instead of precisely two webform questionnaires (one for each language), there are @count webforms associated with Questionnaire Builder "@title" (node @nid).', array(
+        '@count' => count($node_ids),
+        '@title' => $node->title,
+        '@nid' => $node->nid,
+      ), WATCHDOG_WARNING);
+    }
+    $nodes = entity_load('node', $node_ids);
+  }
+  return $nodes;
+}
+
+/**
+ * Returns all published Questionnaire webforms for a given language.
+ *
+ * @param object $language
+ *   A taxonomy term from the languages vocabulary
+ */
+function cultura_questionnaire_all_published_by_language($language) {
+  if (!is_object($language)) {
+    return array();
+  }
+  $nodes = array();
+  $query = new EntityFieldQuery();
+  $query->entityCondition('entity_type', 'node')
+    ->entityCondition('bundle', CULTURA_QUESTIONNAIRE_NODE_TYPE)
+    ->propertyCondition('status', NODE_PUBLISHED)
+    ->fieldCondition(CULTURA_QUESTIONNAIRE_FIELD_LANGUAGE, 'tid', $language->tid);
+  $result = $query->execute();
+  if (isset($result['node'])) {
+    $nodes = entity_load('node', array_keys($result['node']));
+  }
+  return $nodes;
+}
+
+/**
+ * Returns all Questionnaire nodes that are not yet published.
+ */
+function cultura_questionnaire_unpublished() {
+  $nodes = array();
+  $query = new EntityFieldQuery();
+  $query->entityCondition('entity_type', 'node')
+    ->entityCondition('bundle', CULTURA_QUESTIONNAIRE_BUILDER_NODE_TYPE)
+    ->propertyCondition('status', NODE_NOT_PUBLISHED);
+  $result = $query->execute();
+  if (isset($result['node'])) {
+    $node_ids = array_keys($result['node']);
+    $nodes = entity_load('node', $node_ids);
+  }
+  return $nodes;
+}
+
+/**
+ * Returns all Questionnaire builder nodes that are published.
+ */
+function cultura_questionnaire_published() {
+  $nodes = array();
+  $query = new EntityFieldQuery();
+  $query->entityCondition('entity_type', 'node')
+    ->entityCondition('bundle', CULTURA_QUESTIONNAIRE_BUILDER_NODE_TYPE)
+    ->propertyCondition('status', NODE_PUBLISHED);
+  $result = $query->execute();
+  if (isset($result['node'])) {
+    $node_ids = array_keys($result['node']);
+    $nodes = entity_load('node', $node_ids);
+  }
+  return $nodes;
+}
+
+/**
+ * Returns all published Questionnaire pairs that have no responses yet.
+ */
+function cultura_questionnaire_unanswered() {
+  $nodes = cultura_questionnaire_published();
+  module_load_include('inc', 'webform', 'includes/webform.submissions');
+  foreach ($nodes as $key => $node) {
+    $webforms = cultura_questionnaire_webforms($node);
+    foreach ($webforms as $webform) {
+      if (webform_get_submissions($webform->nid)) {
+        unset($nodes[$key]);
+        continue;
+      }
+    }
+  }
+  return $nodes;
+}
+
+/**
+ * Returns all Questionnaire pairs with webforms that have some responses.
+ */
+function cultura_questionnaire_answered() {
+  $nodes = cultura_questionnaire_published();
+  module_load_include('inc', 'webform', 'includes/webform.submissions');
+  foreach ($nodes as $key => $node) {
+    $webforms = cultura_questionnaire_webforms($node);
+    foreach ($webforms as $webform) {
+      if ($submissions = webform_get_submissions($webform->nid)) {
+        $nodes[$key]->cultura_answers += count($submissions);
+      }
+    }
+    // Remove Questionnaire node entirely if its webforms have no responses.
+    if (!isset($node->cultura_answers)) {
+      unset($nodes[$key]);
+    }
+  }
+  return $nodes;
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter() for cultura_registration_tokens_form().
+ *
+ * Adds form submission handler form to save the two available languages.
+ */
+function cultura_questionnaire_form_cultura_registration_tokens_form_alter(&$form, &$form_state) {
+  $form['#submit'][] = 'cultura_questionnaire_cultura_registration_form_submit';
+}
+
+/**
+ * Additional form submission handler for registration tokens form.
+ *
+ * Saves the defined languages and set variables for their term IDs.
+ *
+ * @see cultura_registration_tokens_form()
+ */
+function cultura_questionnaire_cultura_registration_form_submit($form, &$form_state) {
+  $vocabulary = taxonomy_vocabulary_machine_name_load(CULTURA_QUESTIONNAIRE_LANGUAGE_VOCABULARY);
+
+  $term_primary = (object) array(
+    'name' => $form_state['values']['primary'],
+    'vid' => $vocabulary->vid,
+    'weight' => 0,
+  );
+  taxonomy_term_save($term_primary);
+
+  $term_secondary = (object) array(
+    'name' => $form_state['values']['secondary'],
+    'vid' => $vocabulary->vid,
+    'weight' => 1,
+  );
+  taxonomy_term_save($term_secondary);
+
+  variable_set(CULTURA_QUESTIONNAIRE_LANGUAGE_PRIMARY_TID, $term_primary->tid);
+  variable_set(CULTURA_QUESTIONNAIRE_LANGUAGE_SECONDARY_TID, $term_secondary->tid);
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter() for user_register_form().
+ *
+ * Associates a language with a student on registration based on link used.
+ */
+function cultura_questionnaire_form_user_register_form_alter(&$form, &$form_state) {
+  $tokens = variable_get(CULTURA_REGISTRATION_TOKENS, array());
+  // cultura_registration_menu_alter ensures we only can reach here with a valid
+  // token in the user/register/<token> position in the URL.
+  $language = array_search(arg(2), $tokens);
+  if ($language) {
+    $term = cultura_questionnaire_language_term_from_name($language);
+    $form[CULTURA_QUESTIONNAIRE_FIELD_LANGUAGE][LANGUAGE_NONE]['#type'] = 'value';
+    $form[CULTURA_QUESTIONNAIRE_FIELD_LANGUAGE][LANGUAGE_NONE]['#value'] = $term->tid;
+  }
+  else {
+    if (arg(2) === 'create') {
+      cultura_questionnaire_user_form_admin_ux($form, $form_state);
+    }
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter() for user_profile_form().
+ *
+ * Prevents anyone from changing language associated with account.
+ */
+function cultura_questionnaire_form_user_profile_form_alter(&$form, &$form_state) {
+  if (user_access('administer users')) {
+    cultura_questionnaire_user_form_admin_ux($form, $form_state);
+  }
+  else {
+    $form[CULTURA_QUESTIONNAIRE_FIELD_LANGUAGE]['#access'] = FALSE;
+  }
+}
+
+/**
+ * Implements hook_page_build().
+ *
+ * Reminds administrators to define the languages.
+ */
+function cultura_questionnaire_page_build($page) {
+  if (!variable_get(CULTURA_REGISTRATION_TOKENS, array()) && user_access('access dashboard') && !(arg(1) === 'dashboard' && arg(0) === 'admin')) {
+    drupal_set_message(t('Please define the two languages for this cultura exchange <a href="!url">on your administrative dashboard</a>.',
+      array('!url' => url('admin/dashboard'))), 'warning');
+  }
+  if (in_array('student', $GLOBALS['user']->roles)) {
+    $questionnaires = cultura_questionnaire_questionnaires_not_answered_by_user(user_load($GLOBALS['user']->uid));
+    if ($questionnaires && (arg(0) === variable_get('site_frontpage') || (arg(0) === 'node' && arg(2) === 'done'))) {
+      $node = array_shift($questionnaires);
+      $path = 'node/' . $node->nid;
+      drupal_goto($path);
+    }
+  }
+}
+
+/**
+ * Returns a language term given a language name.
+ *
+ * Note: If the ability to update language names is added, terms need to be
+ * updated with it.
+ */
+function cultura_questionnaire_language_term_from_name($language) {
+  $terms = taxonomy_get_term_by_name($language, CULTURA_QUESTIONNAIRE_LANGUAGE_VOCABULARY);
+  if ($terms) {
+    return array_shift($terms);
+  }
+  return FALSE;
+}
+
+/**
+ * Implements hook_user_login().
+ *
+ * Redirects the user to the first Questionnaire.
+ */
+function cultura_questionnaire_user_login(&$edit, $account) {
+  // If the user is not a student, this does not apply.
+  if (!in_array('student', $account->roles)) {
+    return;
+  }
+  $questionnaires = cultura_questionnaire_questionnaires_not_answered_by_user($account);
+  if ($questionnaires) {
+    drupal_set_message(t('Please answer the following @count questionnaires.',
+      array('@count' => count($questionnaires))));
+    $node = array_shift($questionnaires);
+    $_GET['destination'] = 'node/' . $node->nid;
+    // And clear the one in the session.
+    unset($_SESSION['destination']);
+    // User module then does a drupal_goto() after we return from here.
+  }
+}
+
+/**
+ * Modify user account create/edit form to tuck away language and status.
+ */
+function cultura_questionnaire_user_form_admin_ux(&$form, &$form_state) {
+  $form['account']['advanced'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Advanced'),
+    '#collapsible' => TRUE,
+    '#collapsed' => TRUE,
+    '#weight' => 40,
+  );
+  $form['account']['advanced'][CULTURA_QUESTIONNAIRE_FIELD_LANGUAGE] = $form[CULTURA_QUESTIONNAIRE_FIELD_LANGUAGE];
+  $form['account']['advanced']['status'] = $form['account']['status'];
+  unset($form[CULTURA_QUESTIONNAIRE_FIELD_LANGUAGE]);
+  unset($form['account']['status']);
+}
+
+/**
+ * Returns array of questionnaires which a given account has not yet answered.
+ */
+function cultura_questionnaire_questionnaires_not_answered_by_user($account) {
+  $items = field_get_items('user', $account, CULTURA_QUESTIONNAIRE_FIELD_LANGUAGE);
+  $language = ($items) ? taxonomy_term_load($items[0]['tid']) : FALSE;
+  $questionnaires = cultura_questionnaire_all_published_by_language($language);
+  $answered = cultura_questionnaire_answered_by_student($account);
+  return array_diff_key($questionnaires, $answered);
+}
+
+/**
+ * Returns Question type terms for each Questionnaire answered by student.
+ *
+ * @param object $account
+ *   A user account
+ *
+ * @return array
+ *   An array of questionnaire nodes
+ */
+function cultura_questionnaire_answered_by_student($account) {
+  module_load_include('inc', 'webform', 'includes/webform.submissions');
+  $submissions = webform_get_submissions(array('uid' => $account->uid));
+  $map = function ($submission) {
+    return $submission->nid;
+  };
+  return node_load_multiple(array_map($map, $submissions));
+}
+
+/**
+ * Returns nested array of language, answer counts, and student account objects.
+ *
+ * Groups all students who have answered anything by language, then by count of
+ * answered questionnaires, within which will be an array of account objects.
+ */
+function cultura_questionnaire_all_students_with_answers_by_language_and_count() {
+  $result = array();
+  $accounts = cultura_questionnaire_users_by_role('student');
+  module_load_include('inc', 'webform', 'includes/webform.submissions');
+  foreach ($accounts as $account) {
+    $items = field_get_items('user', $account, CULTURA_QUESTIONNAIRE_FIELD_LANGUAGE);
+    $language = ($items) ? taxonomy_term_load($items[0]['tid'])->name : FALSE;
+    $submissions = webform_get_submissions(array('uid' => $account->uid));
+    $count = count($submissions);
+    $result[$language][$count][] = $account;
+  }
+  return $result;
+}
+
+/**
+ * Returns all users with a given role.
+ */
+function cultura_questionnaire_users_by_role($role_name) {
+  $role = user_role_load_by_name($role_name);
+  $query = 'SELECT ur.uid
+    FROM {users_roles} AS ur
+    WHERE ur.rid = :rid';
+  $result = db_query($query, array(':rid' => $role->rid));
+  $uids = $result->fetchCol();
+  return user_load_multiple($uids);
+}

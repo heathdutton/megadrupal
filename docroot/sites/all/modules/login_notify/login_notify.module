@@ -1,0 +1,769 @@
+<?php
+
+/**
+ * @file
+ * Forces certain users to "name" their browser after logging in if they
+ * haven't already done so. The user is sent an email notifying them when their
+ * account is accessed from a new browser.
+ */
+
+define('LOGIN_NOTIFY_TOKEN_LENGTH', 32);
+define('LOGIN_NOTIFY_COOKIE_NAME', 'login_notify_browser');
+// 90 days.
+define('LOGIN_NOTIFY_COOKIE_LENGTH', 7776000);
+define('LOGIN_NOTIFY_MAX_LENGTH_NAME', 64);
+define('LOGIN_NOTIFY_MAX_LENGTH_USER_AGENT', 128);
+// 24 hours.
+define('LOGIN_NOTIFY_UNLOCK_TIMEOUT', 86400);
+
+/**
+ * Implements hook_init().
+ *
+ * This is where we check if the user has named their browser yet, and redirect
+ * to the page to name the browser if they haven't.
+ */
+function login_notify_init() {
+  global $user;
+
+  // Is login notification enabled?
+  if (!variable_get('login_notify_enabled', 0)) {
+    return;
+  }
+
+  // Don't act on our browser name page.
+  if (!empty($user->uid) && $_GET['q'] == 'user/' . $user->uid . '/browsers/name') {
+    return;
+  }
+  // Don't act on a valid, secure unlock page.
+  // This must work even if the current user is logged out because they'll be
+  // blocked immediately when they log in, so the only way to unlock the
+  // browser is to do it while logged out.
+  elseif (preg_match('/^user\/(\d+)\/browsers\/browser\/(\d+)\/unlock$/', $_GET['q'], $matches)
+          && !empty($_GET['timestamp'])
+          && !empty($_GET['key'])
+          && ($account = user_load($matches[1]))
+          && ($browser = login_notify_browser_load($matches[2]))
+          // Make sure the browser matches the account.
+          && $browser['uid'] == $account->uid) {
+    // Call the secure unlock callback.
+    module_load_include('pages.inc', 'login_notify');
+    login_notify_user_browsers_unlock_secure($account, $browser, $_GET['timestamp'], $_GET['key']);
+  }
+
+  // Check if this user requires login notification.
+  if (login_notify_user_requires_login_notify($user)) {
+    // Get the browser.
+    $browser = login_notify_browser_load_current($user);
+    $bypass_user_agent_browser = !$browser ? login_notify_browser_load_current_bypass_user_agent($user) : NULL;
+    if (!empty($browser['locked'])) {
+      // This device is locked.
+      // Send the notification email.
+      login_notify_browser_blocked_email_send($user, $browser);
+
+      // Don't delete the cookie because it's shared by all user accounts and
+      // we only want to lock them out of this account. Otherwise it would
+      // force them to rename the browser in any other account they use. Plus,
+      // this sort of prevents them from just logging in again (though that
+      // can easily be bypassed if they just delete the cookie themselves).
+      // @todo: Need a way to unlock the browser in case someone accidently
+      // locks their own browser and doesn't know to delete the cookie.
+      // Log them out.
+      // Destroy the current session, and reset $user to the anonymous user.
+      session_destroy();
+
+      print '<h1>' . t('This browser has been locked out of this account.') . '</h1>';
+      print '<p>' . t('You have been logged out.') . '</p>';
+      drupal_exit();
+    }
+    elseif ((!$browser || !empty($browser['deleted']))
+            && !$bypass_user_agent_browser) {
+      // They either didn't have a cookie or it wasn't valid.
+      // Redirect them to the page to name their browser.
+      // Need to use login_notify_get_destination() so that it goes to our URL
+      // and not the 'destination' query string param, if there is one.
+      drupal_goto('user/' . $user->uid . '/browsers/name', array('query' => login_notify_get_destination()));
+    }
+    else {
+      // Valid browser cookie or this user agent can bypass the naming process.
+      // Update the last access time.
+      $browser = $browser ? $browser : $bypass_user_agent_browser;
+      $browser['access'] = REQUEST_TIME;
+      login_notify_browser_save($browser);
+      if (!empty($browser['remember'])) {
+        // This is a rolling cookie, we set it on every page load to push back
+        // the expire date.
+        login_notify_cookie_set($user, $browser);
+      }
+      if ($bypass_user_agent_browser) {
+        // This user agent can bypass the naming process but we still send an
+        // alert email. Change the IP address so that it's identified correctly
+        // in the email.
+        $bypass_user_agent_browser['ip_address'] = ip_address();
+        login_notify_browser_bypass_user_agent_email_send($user, $bypass_user_agent_browser);
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_menu().
+ */
+function login_notify_menu() {
+  // @todo: Should this be merged into admin/config/people/accounts?
+  $items['admin/config/people/login-notify'] = array(
+    'title' => 'Login notification settings',
+    'description' => 'Configure which users require browser registration and the notification email text.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('login_notify_admin_form'),
+    'access arguments' => array('administer site configuration'),
+    'file' => 'login_notify.admin.inc',
+  );
+
+  $items['user/%user/browsers'] = array(
+    'title' => 'Registered Browsers',
+    'page callback' => 'login_notify_user_browsers',
+    'page arguments' => array(1),
+    'access callback' => 'login_notify_user_browsers_access',
+    'access arguments' => array(1),
+    'file' => 'login_notify.pages.inc',
+    'type' => MENU_LOCAL_TASK,
+  );
+
+  $items['user/%user/browsers/name'] = array(
+    'title' => 'Name your browser',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('login_notify_user_browsers_name_form', 1),
+    'access callback' => 'login_notify_user_browsers_name_access',
+    'access arguments' => array(1),
+    'file' => 'login_notify.pages.inc',
+  );
+
+  $items['user/%user/browsers/browser/%login_notify_browser'] = array(
+    'title' => 'Browser',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('login_notify_user_browsers_edit_form', 1, 4),
+    'access callback' => 'login_notify_user_browsers_browser_access',
+    'access arguments' => array(1, 4),
+    'file' => 'login_notify.pages.inc',
+  );
+  $items['user/%user/browsers/browser/%login_notify_browser/edit'] = array(
+    'title' => 'Edit Browser',
+    'type' => MENU_DEFAULT_LOCAL_TASK,
+  );
+  $items['user/%user/browsers/browser/%login_notify_browser/delete'] = array(
+    'title' => 'Delete Browser',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('login_notify_user_browsers_delete_form', 1, 4),
+    'access callback' => 'login_notify_user_browsers_browser_access',
+    'access arguments' => array(1, 4),
+    'file' => 'login_notify.pages.inc',
+  );
+  $items['user/%user/browsers/browser/%login_notify_browser/lock'] = array(
+    'title' => 'Lock Browser',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('login_notify_user_browsers_lock_form', 1, 4),
+    'access callback' => 'login_notify_user_browsers_browser_access',
+    'access arguments' => array(1, 4),
+    'file' => 'login_notify.pages.inc',
+  );
+  $items['user/%user/browsers/browser/%login_notify_browser/unlock'] = array(
+    'title' => 'Unlock Browser',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('login_notify_user_browsers_unlock_form', 1, 4),
+    'access callback' => 'login_notify_user_browsers_browser_access',
+    'access arguments' => array(1, 4),
+    'file' => 'login_notify.pages.inc',
+  );
+
+  return $items;
+}
+
+/**
+ * Menu access callback for user/%user/browsers.
+ */
+function login_notify_user_browsers_access($account) {
+  // Is login notification enabled?
+  if (!variable_get('login_notify_enabled', 0)) {
+    return FALSE;
+  }
+
+  // Only allow someone to view the registered browsers of a user they're
+  // allowed to edit.
+  if (!user_edit_access($account)) {
+    return FALSE;
+  }
+
+  // Make sure this user requires login notification.
+  if (!login_notify_user_requires_login_notify($account)) {
+    return FALSE;
+  }
+
+  return TRUE;
+}
+
+/**
+ * Menu access callback for user/%user/browsers/name.
+ */
+function login_notify_user_browsers_name_access($account) {
+  global $user;
+
+  // Make sure we can access user/%user/browsers.
+  if (!login_notify_user_browsers_access($account)) {
+    return FALSE;
+  }
+
+  // Can only name their own browser.
+  return !empty($account->uid) && !empty($user->uid) && $account->uid == $user->uid;
+}
+
+/**
+ * Menu access callback for user/%user/browsers/browser/%.
+ */
+function login_notify_user_browsers_browser_access($account, $browser) {
+  if (!user_edit_access($account)) {
+    return FALSE;
+  }
+
+  // Make sure we can access user/%user/browsers.
+  if (!login_notify_user_browsers_access($account)) {
+    return FALSE;
+  }
+
+  // Make sure it's this user's browser.
+  return $browser['uid'] == $account->uid;
+}
+
+/**
+ * Implements hook_admin_paths().
+ *
+ * Sets the browser pages to use the admin theme.
+ */
+function login_notify_admin_paths() {
+  return array(
+    'user/*/browsers' => TRUE,
+    'user/*/browsers/*' => TRUE,
+  );
+}
+
+/**
+ * Implements hook_cron().
+ *
+ * Deletes browsers that haven't accessed the site recently.
+ */
+function login_notify_cron() {
+  // Delete all the browsers that are too old.
+  // @todo: Should we also lock them?
+  db_update('login_notify_browsers')
+    ->fields(array('deleted' => TRUE))
+    ->condition('access', REQUEST_TIME - LOGIN_NOTIFY_COOKIE_LENGTH, '<')
+    ->execute();
+}
+
+/**
+ * Determines if the given user requires login notification.
+ *
+ * @param object $account
+ *   The user account to check.
+ *
+ * @return bool
+ *   TRUE if the given user requires login notification.
+ */
+function login_notify_user_requires_login_notify($account) {
+  if (empty($account->uid)) {
+    return FALSE;
+  }
+
+  $login_notify_roles_mode = variable_get('login_notify_roles_mode', 'exclude');
+  $login_notify_roles = variable_get('login_notify_roles', array(''));
+
+  if ($login_notify_roles_mode == 'all') {
+    // All authenticated users require login notification.
+    return TRUE;
+  }
+
+  $roles = drupal_map_assoc($account->roles);
+  unset($roles['authenticated user']);
+
+  if ($login_notify_roles_mode == 'include') {
+    // See if the user has any of the included roles.
+    foreach ($roles as $role) {
+      if (!empty($login_notify_roles[$role])) {
+        // They have a role that requires login notification.
+        return TRUE;
+      }
+    }
+    // Don't have any roles that are included.
+    return FALSE;
+  }
+  elseif ($login_notify_roles_mode == 'exclude') {
+    // See if the user has any roles that aren't excluded.
+    foreach ($roles as $role) {
+      if (empty($login_notify_roles[$role])) {
+        // They have a role that isn't excluded.
+        return TRUE;
+      }
+    }
+    // All of their roles are excluded.
+    return FALSE;
+  }
+  else {
+    // Shouldn't ever get here.
+    return FALSE;
+  }
+}
+
+/**
+ * Loads the current browser record from the database for the given user.
+ *
+ * @param object $account
+ *   The user account whose browser record to load from the DB.
+ *
+ * @return array
+ *   A browser record in the DB, or NULL if none is found.
+ */
+function login_notify_browser_load_current($account) {
+  if (!empty($_COOKIE[LOGIN_NOTIFY_COOKIE_NAME])) {
+    return login_notify_browser_load_by_token($account->uid, $_COOKIE[LOGIN_NOTIFY_COOKIE_NAME]);
+  }
+  else {
+    return NULL;
+  }
+}
+
+/**
+ * Loads the current browser record that's allowed to bypass browser naming.
+ *
+ * @param object $account
+ *   The user account whose browser record to load from the DB.
+ *
+ * @return array
+ *   A browser record in the DB, or NULL if none is found.
+ */
+function login_notify_browser_load_current_bypass_user_agent($account) {
+  // Blank user agents are not allowed to bypass the browser naming process.
+  if (!empty($_SERVER['HTTP_USER_AGENT'])) {
+    return login_notify_browser_load_by_bypass_user_agent($account->uid, $_SERVER['HTTP_USER_AGENT']);
+  }
+  else {
+    return NULL;
+  }
+}
+
+/**
+ * Sets the cookie for the given user account and browser record.
+ *
+ * @param object $account
+ *   The user account.
+ * @param array $browser
+ *   The browser record, as it is (or will be) in the table
+ *   login_notify_browsers.
+ */
+function login_notify_cookie_set($account, $browser, $remember_me = TRUE) {
+  $expire = $remember_me ? REQUEST_TIME + LOGIN_NOTIFY_COOKIE_LENGTH : 0;
+  setcookie(LOGIN_NOTIFY_COOKIE_NAME, $browser['token'], $expire, '/');
+}
+
+/**
+ * Deletes the cookie for the given user account.
+ *
+ * @param object $account
+ *   The user account whose browser cookie to delete.
+ */
+function login_notify_cookie_delete($account) {
+  setcookie(LOGIN_NOTIFY_COOKIE_NAME, '', REQUEST_TIME - 3600, '/');
+}
+
+/**
+ * Sends the browser notification email to the user.
+ *
+ * The email notifies them that a new browser has accessed the site using their
+ * account.
+ *
+ * @param object $account
+ *   The user account to send the email to.
+ * @param array $browser
+ *   The browser record as it is in the database.
+ *
+ * @see login_notify_mail()
+ */
+function login_notify_browser_email_send($account, $browser) {
+  $params = array(
+    'account' => $account,
+    'browser' => $browser,
+  );
+  drupal_mail('login_notify', 'browser', $account->mail, language_default(), $params);
+}
+
+/**
+ * Sends the unregistered browser notification email to the user.
+ *
+ * The email notifies them that an unregistered browser has accessed the site
+ * using their account.
+ *
+ * @param object $account
+ *   The user account to send the email to.
+ * @param array $browser
+ *   The browser record as it is in the database.
+ *
+ * @see login_notify_mail()
+ */
+function login_notify_browser_bypass_user_agent_email_send($account, $browser) {
+  $params = array(
+    'account' => $account,
+    'browser' => $browser,
+  );
+  drupal_mail('login_notify', 'browser_bypass_user_agent', $account->mail, language_default(), $params);
+}
+
+/**
+ * Sends the 'blocked' notification email to the user.
+ *
+ * The email notifies them that a locked browser attempted to access the site
+ * using their account.
+ *
+ * @param object $account
+ *   The user account to send the email to.
+ * @param array $browser
+ *   The browser record as it is in the database.
+ *
+ * @see login_notify_mail()
+ */
+function login_notify_browser_blocked_email_send($account, $browser) {
+  $params = array(
+    'account' => $account,
+    'browser' => $browser,
+  );
+  drupal_mail('login_notify', 'browser_blocked', $account->mail, language_default(), $params);
+}
+
+/**
+ * Implements hook_mail().
+ *
+ * Sends an email to the user notifying them that a new browser has accessed
+ * the site using their account.
+ *
+ * @see login_notify_browser_email_send()
+ */
+function login_notify_mail($key, &$message, $params) {
+  switch ($key) {
+    case 'browser':
+      $account = $params['account'];
+      $browser = $params['browser'];
+
+      $language = user_preferred_language($account);
+
+      $token_data = array(
+        'user' => $account,
+        'browser' => $browser,
+      );
+
+      $message['subject'] = _login_notify_mail_text('login_notify_email_subject', $language, TRUE, $token_data);
+      $message['body'][] = _login_notify_mail_text('login_notify_email_body', $language, TRUE, $token_data);
+      break;
+
+    case 'browser_bypass_user_agent':
+      $account = $params['account'];
+      $browser = $params['browser'];
+
+      $language = user_preferred_language($account);
+
+      $token_data = array(
+        'user' => $account,
+        'browser' => $browser,
+      );
+
+      $message['subject'] = _login_notify_mail_text('login_notify_email_bypass_user_agent_subject', $language, TRUE, $token_data);
+      $message['body'][] = _login_notify_mail_text('login_notify_email_bypass_user_agent_body', $language, TRUE, $token_data);
+      break;
+
+    case 'browser_blocked':
+      $account = $params['account'];
+      $browser = $params['browser'];
+
+      $language = user_preferred_language($account);
+
+      $token_data = array(
+        'user' => $account,
+        'browser' => $browser,
+      );
+
+      $message['subject'] = _login_notify_mail_text('login_notify_email_blocked_subject', $language, TRUE, $token_data);
+      $message['body'][] = _login_notify_mail_text('login_notify_email_blocked_body', $language, TRUE, $token_data);
+      break;
+  }
+}
+
+/**
+ * Returns a mail string for a variable name.
+ *
+ * This is similar to _user_mail_text().
+ *
+ * @see login_notify_mail()
+ * @see _user_mail_text()
+ */
+function _login_notify_mail_text($key, $language = NULL, $replace = TRUE, $token_data = array()) {
+  $langcode = isset($language) ? $language->language : NULL;
+
+  if ($admin_setting = variable_get($key, FALSE)) {
+    // An admin setting overrides the default string.
+    $text = $admin_setting;
+  }
+  else {
+    // No override, return default string.
+    switch ($key) {
+      case 'login_notify_email_subject':
+        $text = t('[site:name] login from "[browser:name]"', array('langcode' => $langcode));
+        break;
+
+      case 'login_notify_email_body':
+        $text = t("A new browser has logged in to your account.
+
+Details:
+  Account Username: [user:name]
+  Browser name: [browser:name]
+  IP Address: [browser:ip-address]
+  User Agent: [browser:user-agent]
+
+If this was you, disregard this email.
+
+If this wasn't you, lock this browser out here:
+  [browser:lock-url]", array('langcode' => $langcode));
+        break;
+
+      case 'login_notify_email_bypass_user_agent_subject':
+        $text = t('[site:name] login from "[browser:name]"', array('langcode' => $langcode));
+        break;
+
+      case 'login_notify_email_bypass_user_agent_body':
+        $text = t("An unregistered browser has logged in to your account.
+
+The browser had the following user agent, which is set to allow access without registering:
+[browser:user-agent]
+
+Details:
+  Account Username: [user:name]
+  Browser name: [browser:name]
+  IP Address: [browser:ip-address]
+  User Agent: [browser:user-agent]
+
+If this was you, disregard this email.
+
+If this wasn't you, lock this browser out here:
+  [browser:lock-url]", array('langcode' => $langcode));
+        break;
+
+      case 'login_notify_email_blocked_subject':
+        $text = t('[site:name] browser "[browser:name]" blocked', array('langcode' => $langcode));
+        break;
+
+      case 'login_notify_email_blocked_body':
+        $text = t("A locked browser has attempted to access your account. It was blocked.
+
+Details:
+  Account Username: [user:name]
+  Browser name: [browser:name]
+  IP Address: [browser:ip-address]
+  User Agent: [browser:user-agent]
+
+If this was you, you may unlock this browser and get back into your account here:
+  [browser:unlock-url]", array('langcode' => $langcode));
+        break;
+    }
+  }
+
+  if ($replace) {
+    $text = token_replace($text, $token_data, array(
+      'language' => $language,
+      // We do not sanitize the token replacement, since the output of this
+      // replacement is intended for an e-mail message, not a web browser.
+      'sanitize' => FALSE,
+      'clear' => TRUE,
+    ));
+  }
+
+  return $text;
+}
+
+/**
+ * Creates a secure unlock URL emailed to the user.
+ *
+ * This is similar to user_pass_reset_url() and user_pass_rehash().
+ *
+ * @see login_notify_browser_unlock_key()
+ * @see user_pass_reset_url()
+ * @see user_pass_rehash()
+ */
+function login_notify_browser_unlock_url($account, $browser) {
+  $timestamp = REQUEST_TIME;
+  $key = login_notify_browser_unlock_key($account, $browser, $timestamp);
+  return url('user/' . $account->uid . '/browsers/browser/' . $browser['browser_id'] . '/unlock', array(
+    'absolute' => TRUE,
+    'query' => array(
+      'timestamp' => $timestamp,
+      'key' => $key,
+    ),
+  ));
+}
+
+/**
+ * Creates a secure key used in the unlock URL emailed to the user.
+ *
+ * Important: the security of this is based on the assumption that the drupal
+ * hash salt is kept secret, as that's the only value used in the hash that
+ * someone using a locked browser wouldn't have access to. If that isn't a safe
+ * assumption then another field will have to be added to the browser table to
+ * store a secret value that the user would never have access to.
+ *
+ * @see login_notify_browser_unlock_url()
+ * @see user_pass_reset_url()
+ * @see user_pass_rehash()
+ */
+function login_notify_browser_unlock_key($account, $browser, $timestamp) {
+  return drupal_hmac_base64($timestamp . $browser['name'], drupal_get_hash_salt() . $browser['token']);
+}
+
+/**
+ * Loads the browser record from the database with the given browser_id.
+ *
+ * 'Deleted' browsers may be returned.
+ *
+ * @param int $browser_id
+ *   The browser_id field in the database.
+ *
+ * @return array
+ *   The browser record from the database in an associative array.
+ */
+function login_notify_browser_load($browser_id) {
+  return db_query('SELECT * FROM {login_notify_browsers} WHERE browser_id = :browser_id', array(':browser_id' => $browser_id))->fetchAssoc();
+}
+
+/**
+ * Loads the browser record from the database with the given uid and token.
+ *
+ * 'Deleted' browsers may be returned.
+ *
+ * @param int $uid
+ *   The UID of the user whose browser we want to load.
+ * @param string $token
+ *   The browser token found in the cookie.
+ *
+ * @return array
+ *   The browser record from the database in an associative array.
+ */
+function login_notify_browser_load_by_token($uid, $token) {
+  // Don't exclude deleted browsers when loading by token, otherwise if someone
+  // locked a browser and then deleted it, it wouldn't be locked anymore.
+  return db_query('SELECT * FROM {login_notify_browsers} WHERE uid = :uid AND token = :token', array(':uid' => $uid, ':token' => $token))->fetchAssoc();
+}
+
+/**
+ * Loads the browser record that's set to bypass the given user agent.
+ *
+ * @param int $uid
+ *   The UID of the user whose browser we want to load.
+ * @param string $user_agent
+ *   The user agent of the browser.
+ *
+ * @return array
+ *   The browser record from the database in an associative array.
+ */
+function login_notify_browser_load_by_bypass_user_agent($uid, $user_agent) {
+  return db_query('SELECT * FROM {login_notify_browsers} WHERE uid = :uid AND bypass_user_agent = 1 AND user_agent = :user_agent AND deleted = 0', array(':uid' => $uid, ':user_agent' => $user_agent))->fetchAssoc();
+}
+
+/**
+ * Loads the browser record from the database with the given uid and name.
+ *
+ * 'Deleted' browsers will not be returned.
+ *
+ * @param int $uid
+ *   The UID of the user whose browser we want to load.
+ * @param string $name
+ *   The name of the browser.
+ *
+ * @return array
+ *   The browser record from the database in an associative array.
+ */
+function login_notify_browser_load_by_name($uid, $name) {
+  return db_query('SELECT * FROM {login_notify_browsers} WHERE uid = :uid AND name = :name AND deleted = 0', array(':uid' => $uid, ':name' => $name))->fetchAssoc();
+}
+
+/**
+ * Saves the browser record in the database.
+ *
+ * @param array $browser
+ *   The browser record to be saved in the database, passed in by reference. If
+ *   'browser_id' is not set then a new record will be inserted into the
+ *   database and 'browser_id' will be set to the new ID.
+ */
+function login_notify_browser_save(&$browser) {
+  if (!empty($browser['user_agent'])
+      && strlen($browser['user_agent']) > LOGIN_NOTIFY_MAX_LENGTH_USER_AGENT) {
+    $browser['user_agent'] = substr($browser['user_agent'], 0, LOGIN_NOTIFY_MAX_LENGTH_USER_AGENT);
+  }
+  if (!empty($browser['browser_id'])) {
+    drupal_write_record('login_notify_browsers', $browser, 'browser_id');
+  }
+  else {
+    // Delete any browser with the same UID and token because UID and token are
+    // a unique key, but if someone deletes a browser and then has to name it
+    // again it will use the same token.
+    db_delete('login_notify_browsers')
+      ->condition('uid', $browser['uid'])
+      ->condition('token', $browser['token'])
+      ->execute();
+
+    $browser['created'] = REQUEST_TIME;
+    drupal_write_record('login_notify_browsers', $browser);
+  }
+}
+
+/**
+ * Retrieves all of a user's browser records from the database.
+ *
+ * 'Deleted' browsers will not be included.
+ *
+ * @param int $uid
+ *   The UID of the user.
+ *
+ * @return array
+ *   An array of browser records from the database, each being associative
+ *   arrays.
+ */
+function login_notify_browsers_load($uid) {
+  $browsers = array();
+  $results = db_query('SELECT * FROM {login_notify_browsers} WHERE uid = :uid AND deleted = 0 ORDER BY access DESC', array(':uid' => $uid));
+  while ($browser = $results->fetchAssoc()) {
+    $browsers[] = $browser;
+  }
+  return $browsers;
+}
+
+/**
+ * Prepares a 'destination' URL query parameter for use with drupal_goto().
+ *
+ * This is a clone of drupal_get_destination(), except that the 'destination'
+ * query string parameter is ignored.
+ *
+ * @see drupal_get_destination()
+ */
+function login_notify_get_destination() {
+  $destination = &drupal_static(__FUNCTION__);
+
+  if (isset($destination)) {
+    return $destination;
+  }
+
+  $path = $_GET['q'];
+  $query = drupal_http_build_query(drupal_get_query_parameters());
+  if ($query != '') {
+    $path .= '?' . $query;
+  }
+  $destination = array('destination' => $path);
+
+  // Remove the 'destination' query string param because it will also override
+  // the drupal_goto() call.
+  unset($_GET['destination']);
+
+  return $destination;
+}
