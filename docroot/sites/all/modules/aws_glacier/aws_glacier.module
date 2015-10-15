@@ -1,0 +1,445 @@
+<?php
+/**
+ * @file
+ * Hooks and common functions.
+ */
+
+use Drupal\aws_glacier\Entity\Vault\Vault;
+use Drupal\aws_glacier\Entity\Job\Job;
+use Drupal\aws_glacier\Entity\Archive\Archive;
+
+
+/**
+ *  Implements hook_permission().
+ */
+function aws_glacier_permission() {
+  $perms[Vault::$permission] = array(
+    'title' => t('Administer vaults'),
+  );
+  $perms[Job::$permission] = array(
+    'title' => t('Administer jobs'),
+  );
+  $perms[Archive::$permission] = array(
+    'title' => t('Administer archives'),
+  );
+  return $perms;
+}
+
+/**
+ * Implements hook_ctools_plugin_directory().
+ */
+function aws_glacier_ctools_plugin_directory($module, $plugin) {
+  if ($module == 'awssdk2' && $plugin == 'service') {
+    return 'plugins/awssdk';
+  }
+  return NULL;
+}
+
+/**
+ * Implements hook_views_api().
+ */
+function aws_glacier_views_api() {
+  return array('version' => '3.0');
+}
+
+/**
+ * Implements hook_xautoload().
+ */
+function aws_glacier_xautoload(\xautoload_InjectedAPI_hookXautoload $api) {
+  // TODO: Remove this when composer_manager does this.
+  $api->composerDir(composer_manager_vendor_dir() . '/composer', FALSE);
+}
+
+/**
+ * Implements hook_entity_info().
+ */
+function aws_glacier_entity_info() {
+  $entities['glacier_vault'] = array(
+    'module' => 'aws_glacier',
+    'label' => t('Vault'),
+    'plural label' => t('Vaults'),
+    'description' => t('A vault is a container for storing archives.'),
+    'permission labels' => array(
+      'singular' => t('Vault'),
+      'plural' => t('Vaults'),
+    ),
+    'base table' => 'glacier_vault',
+    'fieldable' => TRUE,
+    'view modes' => array(
+      'full' => array(
+        'label' => t('Full content'),
+        'custom settings' => FALSE,
+      ),
+    ),
+    'entity keys' => array(
+      'id' => 'id',
+    ),
+    'bundles' => array(),
+    'entity class' => '\Drupal\aws_glacier\Entity\Vault\Vault',
+    'controller class' => 'EntityAPIController',
+    'label callback' => 'entity_class_label',
+    'uri callback' => 'entity_class_uri',
+    'access callback' => 'aws_glacier_vault_access',
+    'metadata controller class' => '\Drupal\aws_glacier\Entity\Vault\MetadataController',
+    'rules controller class' => 'EntityDefaultRulesController',
+  );
+  $entities['glacier_job'] = array(
+    'module' => 'aws_glacier',
+    'label' => t('Job'),
+    'plural label' => t('Jobs'),
+    'description' => t('Initiate a job to retrieve either an archive or a vault inventory (a list of archives in a vault).'),
+    'permission labels' => array(
+      'singular' => t('Job'),
+      'plural' => t('Jobs'),
+    ),
+    'base table' => 'glacier_job',
+    'fieldable' => TRUE,
+    'view modes' => array(
+      'full' => array(
+        'label' => t('Full content'),
+        'custom settings' => FALSE,
+      ),
+    ),
+    'entity keys' => array(
+      'id' => 'id',
+    ),
+    'bundles' => array(),
+    'entity class' => '\Drupal\aws_glacier\Entity\Job\Job',
+    'controller class' => 'EntityAPIController',
+    'label callback' => 'entity_class_label',
+    'uri callback' => 'entity_class_uri',
+    'access callback' => 'aws_glacier_job_access',
+    'metadata controller class' => '\Drupal\aws_glacier\Entity\Job\MetadataController',
+    'rules controller class' => 'EntityDefaultRulesController',
+  );
+  $entities['glacier_archive'] = array(
+    'module' => 'aws_glacier',
+    'label' => t('Archive'),
+    'plural label' => t('Archives'),
+    'description' => 'TODO: glacier_archive',
+    'permission labels' => array(
+      'singular' => t('Archive'),
+      'plural' => t('Archives'),
+    ),
+    'base table' => 'glacier_archive',
+    'fieldable' => FALSE,
+    'view modes' => array(
+      'full' => array(
+        'label' => t('Full content'),
+        'custom settings' => FALSE,
+      ),
+    ),
+    'entity keys' => array(
+      'id' => 'id',
+    ),
+    'bundles' => array(),
+    'entity class' => '\Drupal\aws_glacier\Entity\Archive\Archive',
+    'controller class' => 'EntityAPIController',
+    'label callback' => 'entity_class_label',
+    'uri callback' => 'entity_class_uri',
+    'access callback' => 'aws_glacier_archive_access',
+    'rules controller class' => 'EntityDefaultRulesController',
+  );
+  return $entities;
+}
+
+/**
+ * Implements hook_entity_insert().
+ */
+function aws_glacier_entity_insert() {
+  return call_user_func_array('aws_glacier_entity_update', func_get_args());
+}
+
+/**
+ * Implements hook_entity_update().
+ */
+function aws_glacier_entity_update($entity, $type) {
+  $entity_info = entity_get_info($type);
+  $bundle_name = !empty($entity_info['entity keys']['bundle']) ? $entity->{$entity_info['entity keys']['bundle']} : $type;
+  if ($entity_info['fieldable']) {
+    /** @var DrupalQueueInterface $queue */
+    $queue = \DrupalQueue::get('aws_glacier_uploads');
+    foreach (field_info_fields($type, $bundle_name) as $field) {
+      if ($field['type'] == 'file') {
+        $instance = field_info_instance($type, $field['field_name'], $bundle_name);
+        $enabled = (isset($instance['settings']['aws_glacier']['status']) && $instance['settings']['aws_glacier']['status']);
+        $vault_name = !empty($instance['settings']['aws_glacier']['vault']) ? $instance['settings']['aws_glacier']['vault'] : $field['field_name'];
+        if ($enabled && isset($entity->{$field['field_name']})) {
+          /** @var \EntityStructureWrapper $wrapper */
+          $wrapper = entity_metadata_wrapper('node', $entity);
+          /** @var EntityValueWrapper $file_field */
+          if ($wrapper->{$field['field_name']} instanceof EntityListWrapper) {
+            foreach ($wrapper->{$field['field_name']} as $file_field) {
+              $archive = new Archive();
+              $archive->vaultName = $vault_name;
+              $archive->entity = $type;
+              $archive->field = $field['field_name'];
+              $archive->entity_id = $wrapper->getIdentifier();
+              $archive->file_id = $file_field->value()['fid'];
+              $queue->createItem($archive);
+            }
+          }
+          else if ($wrapper->{$field['field_name']} instanceof EntityStructureWrapper) {
+            $file_field = $wrapper->{$field['field_name']};
+            $archive = new Archive();
+            $archive->vaultName = $vault_name;
+            $archive->entity = $type;
+            $archive->field = $field['field_name'];
+            $archive->entity_id = $wrapper->getIdentifier();
+            $archive->file_id = $file_field->value()['fid'];
+            $queue->createItem($archive);
+          }
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_cron().
+ */
+function aws_glacier_cron() {
+  /** @var DrupalQueueInterface $queue */
+  $queue = \DrupalQueue::get('aws_glacier_uploads');
+  $end = time() + 60;
+  while (time() < $end && ($item = $queue->claimItem())) {
+    Drupal\aws_glacier\Upload::processQueueItem($item, $queue);
+  }
+  // Loads all jobs and makes a cleanup or refresh the metadata.
+  $jobs = glacier_job_load_multiple(FALSE);
+  foreach ($jobs as $job) {
+    /** @var Job $job */
+    if (($value = $job->getCompletionDate())) {
+      $max_time = strtotime($value) + (60 * 60 * 24);
+      if ($max_time < time()) {
+        $job->delete();
+      }
+    }
+    else {
+      $job->save();
+    }
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function aws_glacier_form_field_ui_field_edit_form_alter(&$form, $form_state) {
+  if ($form['#field']['type'] == 'file') {
+    $form['instance']['settings']['aws_glacier'] = array(
+      '#type' => 'fieldset',
+      '#title' => t('Glacier'),
+    );
+    $form['instance']['settings']['aws_glacier']['status'] = array(
+      '#type' => 'checkbox',
+      '#title' => t('Upload to glacier'),
+      '#description' => t('Enable to upload the file also to glacier.'),
+      '#default_value' => isset($form['#instance']['settings']['aws_glacier']['status']) ? $form['#instance']['settings']['aws_glacier']['status'] : 0,
+    );
+    $form['instance']['settings']['aws_glacier']['vault'] = array (
+      '#type' => 'textfield',
+      '#title' => t('Vault name'),
+      '#description' => t('Enter the name of the vault or leave empty to use the fieldname as vault name.'),
+      '#default_value' => isset($form['#instance']['settings']['aws_glacier']['vault']) ? $form['#instance']['settings']['aws_glacier']['vault'] : '',
+    );
+  }
+}
+
+/**
+ * Implements hook_entity_delete():
+ */
+function aws_glacier_entity_delete($entity, $type) {
+  if ($type == 'glacier_vault') {
+    /* @var Vault $entity */
+    return $entity->deleteCommand();
+  }
+}
+
+/**
+ * Loads a vault.
+ *
+ * @param int $id
+ * @param array $conditions
+ * @param bool $reset
+ *
+ * @return \Drupal\aws_glacier\Entity\Vault\Vault
+ */
+function glacier_vault_load($id, $conditions = array(), $reset = FALSE) {
+  $entities = glacier_vault_load_multiple(array($id), $conditions, $reset);
+  return reset($entities);
+}
+
+/**
+ * Loads multiple vaults.
+ *
+ * @param int[] $ids
+ * @param array $conditions
+ * @param bool $reset
+ *
+ * @return \Drupal\aws_glacier\Entity\Vault\Vault[]
+ */
+function glacier_vault_load_multiple($ids, $conditions = array(), $reset = FALSE) {
+  return entity_load('glacier_vault', $ids, $conditions, $reset);
+}
+
+/**
+ * Loads a job.
+ *
+ * @param int $id
+ * @param array $conditions
+ * @param bool $reset
+ *
+ * @return \Drupal\aws_glacier\Entity\Job\Job
+ */
+function glacier_job_load($id, $conditions = array(), $reset = FALSE) {
+  $entities = glacier_job_load_multiple(array($id), $conditions, $reset);
+  return reset($entities);
+}
+
+/**
+ * Loads multiple jobs.
+ *
+ * @param int[] $ids
+ * @param array $conditions
+ * @param bool $reset
+ *
+ * @return \Drupal\aws_glacier\Entity\Job\Job[]
+ */
+function glacier_job_load_multiple($ids, $conditions = array(), $reset = FALSE) {
+  return entity_load('glacier_job', $ids, $conditions, $reset);
+}
+
+/**
+ * Loads a archive.
+ *
+ * @param int $id
+ * @param array $conditions
+ * @param bool $reset
+ *
+ * @return \Drupal\aws_glacier\Entity\Archive\Archive
+ */
+function glacier_archive_load($id, $conditions = array(), $reset = FALSE) {
+  $entities = glacier_archive_load_multiple(array($id), $conditions, $reset);
+  return reset($entities);
+}
+
+/**
+ * Loads multiple archives.
+ *
+ * @param int[] $ids
+ * @param array $conditions
+ * @param bool $reset
+ *
+ * @return \Drupal\aws_glacier\Entity\Archive\Archive[]
+ */
+function glacier_archive_load_multiple($ids, $conditions = array(), $reset = FALSE) {
+  return entity_load('glacier_archive', $ids, $conditions, $reset);
+}
+
+/**
+ * Access callback for the entity API.
+ */
+function aws_glacier_vault_access($op, $type = NULL, $account = NULL) {
+  return user_access(Vault::$permission);
+}
+
+/**
+ * Access callback for the entity API.
+ */
+function aws_glacier_job_access($op, $type = NULL, $account = NULL) {
+  return user_access(Job::$permission);
+}
+
+/**
+ * Access callback for the entity API.
+ */
+function aws_glacier_archive_access($op, $type = NULL, $account = NULL) {
+  return user_access(Archive::$permission);
+}
+
+/**
+ * Getter callback for Entity Api.
+ *
+ * Converts the UTC date format to the Drupal friendly format.
+ *
+ * @see \Drupal\aws_glacier\Entity\Vault\MetadataController
+ */
+function aws_glacier_date_getter($entity, array $options, $name) {
+  if (isset($entity->{$name})) {
+    return format_date(strtotime($entity->{$name}));
+  }
+  return NULL;
+}
+
+/**
+ * Getter callback for Entity Api.
+ *
+ * Formats the size.
+ *
+ * @see \Drupal\aws_glacier\Entity\Vault\MetadataController
+ */
+function aws_glacier_sizes_getter($entity, array $options, $name) {
+  if (isset($entity->{$name})) {
+    return format_size($entity->{$name});
+  }
+  return NULL;
+}
+
+/**
+ * Wrapper function to execute an aws command.
+ */
+function aws_glacier_execute_command($command_name, array $args = array()) {
+  $data = NULL;
+  $GlacierClient = awssdk2_get_client('glacier');
+  if (empty($GlacierClient) || empty($command_name)) {
+    return $data;
+  }
+  $prepared_args = array();
+  $command = $GlacierClient->getDescription()->getOperation($command_name);
+  $param_names = $command->getParamNames();
+  foreach ($param_names as $param_name) {
+    $tmp = strtolower($param_name);
+    if (isset($args[$tmp])) {
+      $prepared_args[$param_name] = $args[$tmp];
+    }
+    else if (isset($args[$param_name])) {
+      $prepared_args[$param_name] = $args[$param_name];
+    }
+  }
+  $args = array_filter($prepared_args);
+  try {
+    $data = $GlacierClient->getCommand($command_name, $args)->getResult()->getAll();
+  }
+  catch (Exception $e) {
+    watchdog_exception('aws_glacier', $e);
+    $message = t('Unable to execute command !command: ' . $e->getMessage(), array('!command' => $command_name));
+    throw new Exception($message);
+  }
+  if (aws_glacier_debug_enabled()) {
+    $tmp = $data;
+    if (isset($tmp['body'])) {
+      $tmp['body'] = 'dummy';
+    }
+    if (isset($args['body'])) {
+      $args['body'] = 'dummy';
+    }
+    $parameter = array('@command' => $command_name, '@params' => print_r($args, TRUE), '@provides' => print_r($tmp, TRUE));
+    watchdog('aws_glacier', '@command was invoked. Parameter: <pre>@params</pre> <br>Provides: <pre>@provides</pre>', $parameter);
+  }
+  return $data;
+}
+
+
+/**
+ * Checks if debug mode is enabled.
+ *
+ * @return int $enabled
+ */
+function aws_glacier_debug_enabled() {
+  static $enabled = -1;
+  if ($enabled == -1) {
+    $data = awssdk2_service_load('glacier');
+    $enabled = !empty($data->config['debug']) ? $data->config['debug'] : 0;
+  }
+  return $enabled;
+}

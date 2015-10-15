@@ -1,0 +1,772 @@
+<?php
+
+/**
+ * @file
+ * Module to provide nested Course functionality.
+ */
+/**
+ * Include course_relationships functions.
+ */
+require_once DRUPAL_ROOT . '/' . drupal_get_path('module', 'course_relationships') . '/course_relationships.course.inc';
+
+/**
+ * Include functions for displaying course relationships.
+ */
+require_once DRUPAL_ROOT . '/' . drupal_get_path('module', 'course_relationships') . '/course_relationships.field.inc';
+
+/**
+ * Implements hook_help().
+ */
+function course_relationships_help($path, $arg) {
+  $output = '';
+  switch ($path) {
+    case "admin/help#course_relationships":
+      $output = '<p>' . t("Course module to manage families of courses.") . '</p>';
+      break;
+  }
+}
+
+/**
+ * Implements hook_form_alter().
+ *
+ * Hide the relationships nodereference if this isn't a course family. Augment
+ * the CCK nodereference field with options.
+ */
+function course_relationships_form_alter(&$form, $form_state, $form_id) {
+  // Ubercart
+  if (strpos($form_id, 'uc_product_add_to_cart_form') !== FALSE) {
+    global $user;
+    $node = $form['node']['#value'];
+    if (course_node_is_course($node)) {
+      $result = course_enroll_access($node, $user);
+
+      $has_cost = FALSE;
+      $course = course_get_course($node);
+      if (module_exists('uc_product') && course_relationships_has_subcourses($node)) {
+        // Check the children to see if any of them had prices.
+        foreach ($course->getObjects() as $courseObject) {
+          if ($courseObject->getOption('module') == 'course_relationships') {
+            $nids[] = $courseObject->getInstanceId();
+          }
+        }
+        $nids[] = $node->nid;
+        $sql = "SELECT 1 FROM {uc_products} WHERE nid IN (:nids) AND sell_price > 0";
+        $has_cost = db_query($sql, array(':nids' => $nids))->fetchField();
+      }
+
+      $purchasable_parent_and_not_purchased = !course_relationships_user_has_product($node->nid) && $node->course['relationships']['enroll_options'] == 'children';
+      $children_purchaseable = in_array($node->course['relationships']['enroll_options'], array('children', 'both'));
+      if ($purchasable_parent_and_not_purchased || $children_purchaseable) {
+        switch ($node->course['relationships']['enroll_options']) {
+          case 'both':
+          case 'parent':
+            // Can purchase parent or children. Check parent enrollment access.
+            $form['actions']['submit']['#access'] = (!empty($form['actions']['submit']['#access'])) && $result['success'];
+            break;
+          case 'children':
+            // Hide Ubercart add to cart button.
+            $form['actions']['submit']['#access'] = FALSE;
+            break;
+        }
+      }
+      elseif ((!($node->sell_price > 0) && variable_get('course_access_bypass_checkout', 1)) || (course_relationships_user_has_product($node->nid) && $node->course['outline'] == 'relationships' && $node->course['relationships']['enroll_options'] == 'parent')) {
+        // User already has this activity set, and only the parent can be purchased.
+        $form['actions']['submit']['#access'] = FALSE;
+      }
+    }
+  }
+
+  // @todo move to field_attach_form
+  if (isset($form['#node']) && ($node = $form['#node']) && course_node_is_course($node) && strpos($form_id, '_node_form')) {
+    // Show/hide the field with jQuery, based on outline selection.
+    // @see ctools/includes/dependent.inc.
+    if (module_exists('ctools')) {
+      ctools_include('dependent');
+    }
+
+    $outlines = course_get_handlers('outline');
+    $module = 'course_relationships';
+    // Get a list of course outline handlers we defined.
+    $cr_outline_types = array();
+    if (is_array($outlines[$module])) {
+      $cr_outline_types = array_keys($outlines[$module]);
+    }
+
+    if (!empty($node->course) && !is_array($node->course['relationships']) && is_string($node->course['relationships'])) {
+      $node->course['relationships'] = unserialize($node->course['relationships']);
+    }
+
+    // Add fieldset under 'course settings' for better encapsulation.
+    // @todo is this necessary, given the prefix/suffix div above?
+    $form['course']['relationships']['#tree'] = TRUE;
+    $form['course']['relationships']['#type'] = 'fieldset';
+    $form['course']['relationships']['#title'] = t('Course relationships settings');
+    $form['course']['relationships']['#weight'] = -9;
+    // @see fieldset note in ctools/includes/dependent.inc.
+    $form['course']['relationships']['#input'] = TRUE;
+    // CTools dependent API compliant.
+    $form['course']['relationships']['#process'] = array('ctools_dependent_process');
+    $form['course']['relationships']['#dependency'] = array('edit-course-outline' => $cr_outline_types);
+
+    if (module_exists('course_credit')) {
+      // Aggregate credit claim when claim is on parent.
+      $form['course']['relationships']['credit_options'] = array(
+        '#title' => t('Parent credit'),
+        '#type' => 'radios',
+        '#options' => array(
+          'normal' => t('Normal'),
+          'aggregated' => t('Roll-up'),
+        ),
+        '#default_value' => isset($node->course['relationships']['credit_options']) ? $node->course['relationships']['credit_options'] : 'normal',
+        '#description' => t("When credit claim is on the parent, roll-up min/max credit up to this course's min/max from completed children."),
+      );
+    }
+
+    $form['course']['relationships']['enroll_options'] = array(
+      '#title' => t('Enrollment settings'),
+      '#type' => 'radios',
+      '#options' => array(
+        'parent' => t('User may only enroll in parent'),
+        'children' => t('User may only enroll in direct children'),
+        'both' => t('User may enroll in parent or direct children'),
+      ),
+      '#default_value' => isset($node->course['relationships']['enroll_options']) ? $node->course['relationships']['enroll_options'] : 'parent',
+      '#description' => t('Determine how the user can enroll in this set of activities.'),
+    );
+
+    // Auto enroll option hidden / disabled until 'parent is enrollable' is selected.
+    $form['course']['relationships']['auto_enroll'] = array(
+      '#title' => t('Child enrollment options'),
+      '#type' => 'radios',
+      '#options' => array(
+        1 => t('Enroll in all child activities when enrolled in parent'),
+        0 => t('User selects child activities after enrolling in parent'),
+      ),
+      '#default_value' => isset($node->course['relationships']['auto_enroll']) ? $node->course['relationships']['auto_enroll'] : 1,
+      '#description' => t('This controls whether the user will be enrolled into all children automatically, or given the option to choose.'),
+    );
+
+    // Group these together.
+    $form['course']['outline']['#weight'] = -10;
+
+    // Swap transcript options.
+    // Give it the same title for more coherent visual swapping.
+    // @todo reset these values so they insert properly if 'relationships' is not selected.
+    // Show only if any other option but 'relationships' is selected'.
+    $other_outline_types = $form['course']['outline']['#options'];
+    foreach ($cr_outline_types as $outline_type) {
+      unset($other_outline_types[$outline_type]);
+    }
+  }
+}
+
+/**
+ * Go to the cart.
+ */
+function course_relationships_goto_cart() {
+  drupal_goto('cart');
+}
+
+/**
+ * Does the user already have an enrollment or cart item?
+ */
+function course_relationships_user_has_product($nid) {
+  global $user;
+  static $user_products = array();
+
+  if (empty($user_products) || !$user_products[$user->uid]) {
+    // @todo use db_select() to better generate a query.
+    $vals = array();
+    $vals[':uid'] = $user->uid;
+    $sql = "SELECT ce.nid AS nid, 'Enrolled' AS type FROM {course_enrollment} ce
+      LEFT JOIN {course_report} cr ON (cr.nid = ce.nid AND cr.uid = ce.uid)
+      WHERE ce.uid = :uid AND ce.status";
+    if (module_exists('uc_cart')) {
+      $sql .= " UNION SELECT nid, 'Cart' AS type FROM {uc_cart_products} WHERE cart_id = :uid1";
+      $vals[':uid1'] = $user->uid;
+    }
+    $result = db_query($sql, $vals);
+    while ($row = $result->fetchObject()) {
+      $user_products[$user->uid][$row->nid] = $row->type;
+    }
+  }
+
+  return empty($user_products[$user->uid][$nid]) ? FALSE : $user_products[$user->uid][$nid];
+}
+
+/**
+ * Helper function to determine if a node is a course relationship parent.
+ */
+function course_relationships_is_parent($node) {
+  $outline = $node->course['outline'];
+  $outlines = course_get_handlers('outline');
+  $module = 'course_relationships';
+  // Check to see if the node has selected a course outline handler we defined.
+  if (isset($outline) && is_array($outlines[$module])) {
+    $is_parent = in_array($outline, array_keys($outlines[$module]));
+  }
+
+  return $is_parent;
+}
+
+/**
+ * Implements hook_course_enroll().
+ *
+ * Enroll user in child courses when enrolled in parent. This will only enroll
+ * the user in the child when no other enrollment access hooks fail. Take course
+ * access hooks will not prevent the enrollment (i.e., user may not take course
+ * because profile is not filled out, but can enroll).
+ */
+function course_relationships_course_enroll($node, $user, $from, $code, $status) {
+  if ($node->course['outline'] == 'relationships') {
+    // We need to manually set the timestamp, because a user will never 'take'
+    // this course.
+    $enrollment = course_enrollment_load($node->nid, $user->uid);
+    if (!$enrollment->timestamp) {
+      $enrollment->timestamp = REQUEST_TIME;
+      course_enrollment_save($enrollment);
+    }
+
+    if ($status && $node->course['relationships']['auto_enroll']) {
+      // If this is a full enrollment and the course also has auto-enroll
+      // enabled, enroll the user in all direct children as long as there are
+      // no other blockers.
+      $course = course_get_course($node);
+      foreach ($course->getObjects() as $courseObject) {
+        if ($courseObject->getOption('module') == 'course_relationships') {
+          $child_node = node_load($courseObject->getInstanceId());
+
+          $blockers = course_enroll_access($child_node, $user, FALSE, TRUE);
+          $block = FALSE;
+          foreach ($blockers as $blocktype => $blocker) {
+            if ($blocktype != 'course_relationships' && !$blocker['success']) {
+              $block = TRUE;
+              break;
+            }
+          }
+
+          if (!$block) {
+            // No enrollment blockers, other than course relationship purchase
+            // options.
+            if (!course_enrollment_check($child_node->nid, $user->uid)) {
+              // New enrollment.
+              course_enroll($child_node, $user, 'course_relationships_descending');
+            }
+          }
+        }
+      }
+    }
+  }
+
+  if ($courseObject = course_get_course_object('course_relationships', 'course', $node->nid, $user)) {
+    // Course is part of another course.
+    $course = $courseObject->getCourse();
+    if (!course_enrollment_load($courseObject->getCourse()->getNode()->nid, $user->uid)) {
+      // User is enrolling in child, without being enrolled in parent. Enroll
+      // user in parent.
+      // Say we are enrolling from the child of an activity set.
+      // Enroll with status 0, we don't want enrollments to descend.
+      course_enroll($course->getNode(), $user, 'course_relationships_child', NULL, 0);
+    }
+
+    // Check access on the course object representing this course.
+    if ($courseObject->access('take', $user)) {
+      // Grant access to the course object.
+      $courseObject->grant();
+    }
+
+    $course->track();
+  }
+}
+
+/**
+ * Implements hook_course_unenroll().
+ *
+ * Descending un-enrollments to children.
+ */
+function course_relationships_course_unenroll($node, $user) {
+  $course = course_get_course($node, $user);
+  foreach ($course->getObjects() as $courseObject) {
+    // If parent course has children, un-enroll user from all of them.
+    if ($courseObject->getOption('module') == 'course_relationships') {
+      $child = node_load($courseObject->getInstanceId());
+      course_unenroll($child, $user);
+    }
+  }
+
+  return;
+  // @todo broken
+  if ($p_courseObject = course_get_course_object('course_relationships', 'course', $node->nid, $user)) {
+    $parent = $p_courseObject->getCourse()->getNode();
+    $p_enrollment = course_enrollment_load($parent->nid, $user->uid);
+    if (!$p_enrollment->status) {
+      $nids = array();
+      foreach ($p_courseObject->getCourse()->getObjects() as $courseObject) {
+        if ($courseObject->getOption('module') == 'course_relationships') {
+          $nids[] = $courseObject->getInstanceId();
+        }
+      }
+      if (!db_query("SELECT 1 FROM {course_enrollment} ce WHERE nid IN (:nids) AND uid = :uid", array(':nids' => $nids, ':uid' => $user->uid))->fetchField()) {
+        // User is still enrolled in the parent, has no more child
+        // enrollments, but has a status of 0 (only purchased/enrolled in
+        // children). Un-enroll them from the parent.
+        course_unenroll($p_courseObject->getCourse()->getNode(), $user);
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_course_report_insert().
+ *
+ * Detect a course completion and report back to the parent.
+ */
+function course_relationships_course_report_insert($course_report) {
+  $account = user_load($course_report->uid);
+  if ($courseObject = course_get_course_object('course_relationships', 'course', $course_report->nid, $account)) {
+    // This course report is for a course inside of another course.
+    if ($course_report->complete) {
+      // Complete the course object this course is linked to.
+      $courseObject->getFulfillment()->setComplete(1)->save();
+    }
+  }
+}
+
+/**
+ * Implements hook_course_report_update().
+ */
+function course_relationships_course_report_update($course_report) {
+  course_relationships_course_report_insert($course_report);
+}
+
+/**
+ * Action helper.
+ */
+function course_relationships_bulk_add_to_cart(&$object, $context = array()) {
+  global $user;
+
+  if (course_enrollment_check($object->nid, $user->uid)) {
+    // User is already enrolled in this. Workaround for the parent being
+    // checked off by default.
+    return 'enroll';
+  }
+
+  // Check if user can enroll in this course. Note that we remove
+  // course_must_purchase so a user may enroll in a sub course as part of a set.
+  // But, they may still be blocked by other conditions.
+  $blockers = course_enroll_access($object, $user, FALSE, TRUE);
+  if (!empty($blockers['course_must_purchase'])) {
+    unset($blockers['course_must_purchase']);
+  }
+  if (!empty($blockers)) {
+    $blocker = reset($blockers);
+  }
+  else {
+    $blocker['success'] = TRUE;
+  }
+  if (variable_get('course_access_bypass_checkout', 1) && (empty($object->sell_price) || (float) $object->sell_price == 0) && $blocker['success']) {
+    if (!isset($context['course_enrollment'])) {
+      $context['course_enrollment'] = array();
+    }
+    $course_enrollment = entity_create('course_enrollment', $context['course_enrollment']);
+    $course_enrollment->type = $object->course['enrollment_type'];
+    $course_enrollment->nid = $object->nid;
+    $course_enrollment->uid = $user->uid;
+    $course_enrollment->enrollmenttype = 'course_relationships_bulk';
+    course_enrollment_save($course_enrollment);
+    return 'enroll';
+  }
+  elseif (!$blocker['success']) {
+    $message = t('Cannot add %title to cart: !message', array(
+      '%title' => $object->title,
+      '!message' => $blocker['message'],
+    ));
+    drupal_set_message(check_plain($message), 'error');
+    return FALSE;
+  }
+  else {
+    $form_values['nid'] = $object->nid;
+    uc_cart_add_item($object->nid, 1, module_invoke_all('add_to_cart_data', $form_values) + array(
+      'attributes' => !empty($context['attributes']) ? $context['attributes'] : NULL,
+      'course_enrollment' => !empty($context['course_enrollment']) ? $context['course_enrollment'] : NULL,
+      ), NULL, TRUE, FALSE);
+    return 'cart';
+  }
+}
+
+/**
+ * Implements hook_course_outline_completion_links_alter().
+ */
+function course_relationships_course_outline_completion_links_alter(&$links, $node, $account) {
+  if ($courseObject = course_get_course_object('course_relationships', 'course', $node->nid, $account)) {
+    $course = $courseObject->getCourse();
+    $parent = node_load($course->getOption('nid'));
+    $has_certificate = module_exists('course_certificate') && course_certificate_course_has_certificate($course) && certificate_can_access_certificate($parent, $account);
+    if ($has_certificate) {
+      $links['download'][0] = "Download certificate";
+      $links['download'][1] = "node/$parent->nid/certificate";
+      $links['download'][2] = t("You will receive a single certificate for %title documenting all courses.", array('%title' => $parent->title));
+    }
+
+    if ($parent) {
+      // Part of an activity set.
+      $links['activity_set'][0] = t("Return to %title", array('%title' => $parent->title));
+      $links['activity_set'][1] = "node/$parent->nid";
+      $links['activity_set'][2] = t("This course is part of an activity set.", array('%title' => $parent->title));
+    }
+  }
+}
+
+/**
+ * Implements hook_FORM_ID_alter().
+ *
+ * Alter min/max credits based on completed courses in this activity set.
+ */
+function course_relationships_form_course_credit_app_form_alter(&$form, &$form_state) {
+  if ($form['#parameters'][2]->course['relationships']['credit_options'] == 'aggregated') {
+    global $user;
+    // Get all types.
+    $types = course_credit_get_credit_types();
+    // Get aggregate credit types.
+    $agg = course_relationships_calculate_credit($form['#parameters'][2], $user);
+    foreach (element_children($form['credits_claimed']) as $key) {
+      $form['credits_claimed'][$key]['#prefix'] = "{$types[$key]->title} credit can be claimed in " . number_format($agg[$key]->increments, 2) . " increments up to an aggregated maximum of " . number_format($agg[$key]->agg_max, 2);
+    }
+  }
+}
+
+/**
+ * Calculate aggregated credit for an activity set and user.
+ *
+ * @return mixed An array with aggregated eligible credit.
+ */
+function course_relationships_calculate_credit($node, $user, $parent_eligibles = NULL) {
+  // These aren't really "parent eligbles", we aren't concerned about them.
+  if (!$parent_eligibles) {
+    // We use a query here, because previously we called
+    // course_credit_user_credit_types() which just resulted in terrible things
+    // happening in complicated use cases.
+    $sql = "select cct.title, cct.description, cct.type, cc.* from {course_credit} cc
+      left join {course_credit_type} cct using (type)
+      where nid = :nid";
+    $result = db_query($sql, array(':nid' => $node->nid));
+    while ($row = $result->fetch()) {
+      $parent_eligibles[$row->type] = $row;
+    }
+  }
+
+  // Get a cache of the user's completion records in this activity set.
+  $nids = array();
+  $course = course_get_course($node);
+  foreach ($course->getObjects() as $courseObject) {
+    if ($courseObject->getComponent() == 'course') {
+      $nids[] = $courseObject->getInstanceId();
+    }
+  }
+
+  if (empty($nids)) {
+    return array();
+  }
+
+  $sql = "SELECT n.*, cn.* FROM {course_report} cr
+    LEFT JOIN {node} n ON (n.nid = cr.nid)
+    LEFT JOIN {course_node} cn ON (cn.nid = n.nid)
+    WHERE complete AND n.nid IN (:nids) AND cr.uid = :uid";
+  $result = db_query($sql, array(':nids' => $nids, ':uid' => $user->uid));
+  while ($row = $result->fetch()) {
+    // Load the node to check if it is a parent.
+    $check = node_load($row->nid);
+    if (course_relationships_is_parent($check)) {
+      $parent = $check;
+      $parent_agg = course_relationships_calculate_credit($parent, $user, $parent_eligibles);
+      foreach ($parent_eligibles as $key => $etype) {
+        $agg[$key]->agg_min += $parent_agg[$key]->agg_min;
+        $agg[$key]->agg_max += $parent_agg[$key]->agg_max;
+        if ($parent_eligibles[$key]->max < $agg[$key]->agg_max) {
+          // Don't let accumulated credit exceed parent maximum.
+          $agg[$key]->agg_max = $parent_eligibles[$key]->max;
+        }
+      }
+    }
+    else {
+      // Calculating credit for a leaf (course).
+      //$eligible = course_credit_user_credit_types($row, $user);
+      $child = node_load($row->nid);
+      $eligible = $child->course_credit;
+      foreach ($eligible as $etype) {
+        $key = $etype->type;
+        if ($etype->active) {
+          // Tally child course credit to aggregated credit array.
+          $agg[$key]->agg_min += $etype->min;
+          $agg[$key]->agg_max += $etype->max;
+          if ($parent_eligibles[$key]->max < $agg[$key]->agg_max) {
+            // Don't let accumulated credit exceed parent maximum.
+            $agg[$key]->agg_max = $parent_eligibles[$key]->max;
+          }
+        }
+      }
+    }
+  }
+
+  return $agg;
+}
+
+/**
+ * Implements hook_course_credit_user_credit_types_alter().
+ *
+ * Alter the user's valid credit types, but only when complete.
+ */
+function course_relationships_course_credit_user_credit_types_alter(&$types, $node, $user) {
+  if ($node->course['relationships']['credit_options'] == 'aggregated') {
+    $agg = course_relationships_calculate_credit($node, $user);
+    foreach ($types as $key => &$type) {
+      $type->max = $agg[$key]->agg_max;
+      $type->min = $agg[$key]->agg_min;
+    }
+  }
+}
+
+/**
+ * Implements hook_course_credit_check_completion().
+ * Block credit claim if a parent is aggregated.
+ */
+function course_relationships_course_credit_check_completion($node) {
+  global $user;
+
+  if ($courseObject = course_get_course_object('course_relationships', 'course', $node->nid, $user)) {
+    $course = course_get_course_object('course_relationships', 'course', $courseObject->getCourse()->getNode()->nid, $user);
+    if ($course && $course->getOption('course_credit_rollup') == 'aggregated') {
+      drupal_goto("node/{$course->getNode()->nid}/course-credit-app");
+    }
+  }
+}
+
+/**
+ * Implements hook_course_can_enroll().
+ *
+ * Let the parent take precedence over enrollment options.
+ */
+function course_relationships_course_access($op, $node, $user) {
+  $hooks = array();
+  if ($op == 'enroll') {
+    // Initializing, so no notice will pop-up:
+    $is_parent = FALSE;
+    $is_child = FALSE;
+
+    if (!empty($node->course) && $node->course['outline'] == 'relationships') {
+      // This course contains other courses.
+      $is_parent = TRUE;
+      $parent = $node;
+      $purchase_parent = in_array($parent->course['relationships']['enroll_options'], array('both', 'parent'));
+      $purchase_children = in_array($parent->course['relationships']['enroll_options'], array('both', 'children'));
+    }
+
+
+    if ($courseObject = course_get_course_object('course_relationships', 'course', $node->nid, $user)) {
+      // This course is part of another course that is restricting its
+      // enrollment options.
+      if ($is_parent) {
+        // Course is a child but also a parent.
+        // User can purchase this if parent allows children to be purchased. If
+        // parent was purchase parent only, they shouldn't be able to buy
+        // anything.
+        $parent = node_load($courseObject->getOption('nid'));
+        if (in_array($parent->course['relationships']['enroll_options'], array('both', 'children'))) {
+          $purchase_parent = in_array($node->course['relationships']['enroll_options'], array('both', 'parent'));
+          $purchase_children = in_array($node->course['relationships']['enroll_options'], array('both', 'children'));
+        }
+        else {
+          $purchase_parent = $purchase_children = 0;
+          $is_child = TRUE;
+        }
+      }
+      else {
+        $is_child = TRUE;
+        $parent = $courseObject->getCourse()->getNode();
+        $purchase_parent = in_array($parent->course['relationships']['enroll_options'], array('both', 'parent'));
+        $purchase_children = in_array($parent->course['relationships']['enroll_options'], array('both', 'children'));
+      }
+      $parent_enrollment = course_enrollment_load($parent->nid, $user->uid);
+    }
+
+    /*
+     * Restrict if:
+     * - Viewing a child, and cannot enroll directly into child
+     * - Viewing a parent, and cannot purchase the entire parent
+     */
+    if (empty($parent_enrollment->status)) {
+      if ($is_child && !$purchase_children) {
+        // User is not enrolled in parent, and enrolling in parent is required.
+        $message = t('You must enroll in !course to gain access to this %type.', array(
+          '%type' => str_replace('_', ' ', node_type_get_name($node->type)),
+          '!course' => l($parent->title, "node/$parent->nid"),
+        ));
+        $hooks['course_relationships'] = array(
+          'header' => '',
+          'success' => FALSE,
+          'message' => $message,
+        );
+      }
+      if ($is_parent && !$purchase_parent) {
+        $hooks['course_relationships'] = array(
+          'header' => '',
+          'success' => FALSE,
+          'message' => '',
+        );
+      }
+    }
+  }
+
+  if ($op == 'take') {
+    global $user;
+    // Enforce sequential access.
+    if ($courseObjectCourse = course_get_course_object('course_relationships', 'course', $node->nid, $user)) {
+      $course = $courseObjectCourse->getCourse();
+      $lastRequired = NULL;
+      foreach ($course->getObjects() as $courseObject) {
+        if ($courseObject->getId() == $courseObjectCourse->getId()) {
+          if ($lastRequired && !$lastRequired->getFulfillment()->isComplete()) {
+            $hooks['course_relationships_sequential'] = array(
+              'header' => '',
+              'success' => FALSE,
+              'message' => t('You must complete !link before taking this activity.', array('!link' => l($lastRequired->getTitle(), $lastRequired->getUrl()))),
+            );
+          }
+        }
+        if ($courseObject->getComponent() == 'course' && $courseObject->isRequired()) {
+          $lastRequired = clone $courseObject;
+        }
+      }
+    }
+  }
+  return $hooks;
+}
+
+/**
+ * Implements hook_menu().
+ */
+function course_relationships_menu() {
+  $items = array();
+
+  $items['node/%course/course-reports/activity-set'] = array(
+    'page callback' => 'course_relationships_activity_set_report_tree',
+    'page arguments' => array(1),
+    'access callback' => 'course_relationships_activity_set_report_tree_access',
+    'access arguments' => array(1),
+    'type' => MENU_LOCAL_TASK,
+    'title' => 'Child courses',
+    'file' => 'course_relationships.reports.inc',
+  );
+
+  return $items;
+}
+
+/**
+ * Callback for activity set report.
+ */
+function course_relationships_has_subcourses($node) {
+  if ($course = course_get_course($node)) {
+    foreach (course_get_course($node)->getObjects() as $courseObject) {
+      if ($courseObject->getOption('module') == 'course_relationships') {
+        return TRUE;
+      }
+    }
+  }
+}
+
+/**
+ * Enroll users in child activities when enrolled in a parent activity set.
+ */
+function course_relationships_cron() {
+  // Get information about users who are enrolled fully in parents but are
+  // missing enrollments in children.
+  $limit = intval(variable_get('course_relationships_enrollment_queue', 500));
+  $result = db_query("SELECT ce1.uid, co.instance as child_missing_enrollment, cn.relationships FROM {course_outline} co
+    INNER JOIN {course_enrollment} ce1 ON ce1.nid = co.nid
+    LEFT JOIN {course_enrollment} ce2 ON (ce1.uid = ce2.uid AND ce2.nid = co.instance)
+    INNER JOIN {course_node} cn ON (cn.nid = ce1.nid)
+    INNER JOIN {node} cnm ON (cnm.nid = co.instance)
+    WHERE co.module = :module AND ce2.eid IS NULL AND ce1.status = 1
+    LIMIT $limit", array(':module' => 'course_relationships'));
+  while ($row = $result->fetchObject()) {
+    $relationships = unserialize($row->relationships);
+    if ($relationships['auto_enroll']) {
+      $node = node_load($row->child_missing_enrollment);
+      $user = user_load($row->uid);
+      // Get enroll blockers for this course and user.
+      $blockers = course_enroll_access($node, $user, FALSE, TRUE);
+      $blocked = FALSE;
+      foreach ($blockers as $type => $blocker) {
+        if ($type != 'course_relationships' && !$blocker['success']) {
+          $blocked = TRUE;
+        }
+      }
+      if (!$blocked) {
+        course_enroll($node, $user, 'course_relationships_recurring');
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_node_load().
+ */
+function course_relationships_node_load($nodes, $types) {
+  foreach ($nodes as $node) {
+    if (isset($node->course['relationships'])) {
+      $node->course['relationships'] = unserialize($node->course['relationships']);
+    }
+  }
+}
+
+/**
+ * Implements hook_node_view().
+ */
+function course_relationships_node_view($node, $view_mode = 'full') {
+  if (isset($node->course['outline']) && $node->course['outline'] == 'relationships') {
+    $form = drupal_get_form('course_relationships_build_form', $node->nid);
+    $node->content['course_relationships'] = array(
+      '#type' => 'item',
+      '#markup' => drupal_render($form),
+    );
+
+    // Remove the take course button.
+    unset($node->content['course']);
+  }
+}
+
+/**
+ * Implements hook_theme().
+ */
+function course_relationships_theme() {
+  return array(
+    'course_relationships_build_form' => array(
+      'file' => 'course_relationships.field.inc',
+      'render element' => 'form',
+    ),
+  );
+}
+
+/**
+ * Implementation of hook_course_credit_awarded_insert().
+ */
+function course_relationships_course_credit_awarded_insert($course_credit_awarded) {
+  $node = node_load($course_credit_awarded->nid);
+  $account = user_load($course_credit_awarded->uid);
+  while ($courseObject = course_get_course_object('course_relationships', 'course', $node->nid, $account)) {
+    // Course is part of another course.
+    $node = $courseObject->getCourse()->getNode();
+    if ($node->course['relationships']['credit_options'] == 'aggregated') {
+      // Found a parent with aggregated credit so let's re-award its credit.
+      course_credit_award_credit($node, $account);
+      break;
+    }
+  }
+}
+
+/**
+ * Course relationship report access check
+ */
+function course_relationships_activity_set_report_tree_access($node) {
+  return _course_reports_access($node) && course_relationships_has_subcourses($node);
+}

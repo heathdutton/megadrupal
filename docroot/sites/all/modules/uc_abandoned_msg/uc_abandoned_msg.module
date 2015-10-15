@@ -1,0 +1,316 @@
+<?php
+
+/*
+ * Implementing hook_pesmission
+ */
+
+function uc_abandoned_msg_permission() {
+  return array(
+    'administer abandoned cart messages' => array(
+      'title' => t('Administer Abandoned Cart Messages'), 
+      'description' => t('Administer the settings for the Abandonded Cart Messages module.'),
+    ),
+  );
+}
+
+/*
+ * Implementing hook_menu
+ */
+function uc_abandoned_msg_menu() {
+  $items = array();  
+
+  $items['admin/store/settings/abandoned_msgs'] = array(
+    'title' => 'Abandonded Cart Settings',
+    'description' => 'Manage the settings for abandoned carts messages',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('uc_abandonded_msg_admin_form'),
+    'access arguments' => array('administer abandoned cart messages'),
+    'type' => MENU_NORMAL_ITEM,
+   );
+
+  return $items;
+}
+
+
+/**
+ * Implements hook_cron().
+ */
+function uc_abandoned_msg_cron(){    
+  
+  $testmode = variable_get('uc_am_testmode_active', TRUE);
+  
+  // Find abandoned carts within time period threshhold   
+  $result = db_query("
+  SELECT order_id, status FROM {uc_orders} o
+  LEFT JOIN {uc_abandoned_msg} a ON o.order_id = a.oid
+  WHERE a.status IS NULL AND o.order_status = :status AND o.modified > :time AND o.primary_email <> ''",
+    array(':status' => 'abandoned', ':time' => REQUEST_TIME - (86400 * variable_get('uc_abandonded_msg_history_timeout', '7'))))->fetchCol();
+  
+  $num = 0;
+  foreach ($result as $order_id) {
+    
+    // Check message limit and exit if it's reached  
+    if ($num >= variable_get('uc_abandonded_msg_limit',50)) break;
+    $num++;
+    
+    $order = uc_order_load($order_id);
+    
+    // Check if email address exists on any other order in case they came back and checked out with another cart
+    if (db_query("SELECT COUNT(*) FROM {uc_orders} WHERE order_status <> 'abandoned' AND primary_email = :primary_email", array(':primary_email' => $order->primary_email))->fetchField()) {
+        
+      // email exists already so update status so it won't get pulled again
+      if ($result){
+        $status = db_insert('uc_abandoned_msg')
+        ->fields(array(
+          'oid' => $order->order_id,
+          'status' => 1,        
+          ))->execute();
+      }
+      continue;
+    }
+    
+    
+    //watchdog('order adandoned','<pre>' . print_r($order,1) . '</pre>');
+    
+    if ($testmode){
+      $send_to = variable_get('uc_am_testmode_email');
+    }else{      
+      $send_to = $order->primary_email;
+    }         
+    
+    $params['info']['testmode'] = $testmode;
+    $params['info']['order'] = $order;
+    $params['info']['from'] = variable_get('uc_abandonded_msg_email', variable_get('site_mail'));
+    $result = drupal_mail('uc_abandoned_msg', 'abandoned_msg', $send_to, language_default(), $params, $params['info']['from']);    
+    
+    if ($testmode){
+      // Write message and order data to watchdog table for troubleshooting purposes
+      watchdog('UC Abandoned Cart Messages', 'Message # ' . $num . ' status=<pre>' . print_r($result,1) . '</pre>');
+    }else{
+      // If message successfully sent and we're not in testmode then update status for sent messages
+      if ($result){
+        $status = db_insert('uc_abandoned_msg')
+        ->fields(array(
+          'oid' => $order->order_id,
+          'status' => 1,        
+          ))->execute();
+      } 
+    }  
+  }
+}
+
+/*
+ * Implementing hook_mail
+*/
+function uc_abandoned_msg_mail($key, &$message, $params) {
+  $langcode = isset($message['language']) ? $message['language']->language : NULL;
+  if ($key == 'abandoned_msg') {        
+    $message['headers']['Content-Type'] = 'text/html; charset=UTF-8; format=flowed';
+
+    if (variable_get('uc_abandonded_msg_email_copy')){            
+      $message['headers']['Bcc'] = $params['info']['from'];   
+    }
+
+    // Perform token replacement on the subject and body.
+    $message['subject'] = token_replace(variable_get('uc_abandonded_msg_subject'),  array('order' => $params['info']['order']), $langcode ? array('language' => $message['language']) : array());    
+    
+
+    $message['body'] = token_replace(variable_get('uc_abandonded_msg_msg'), array('uc_order' => $params['info']['order']), $langcode ? array('language' => $message['language']) : array());
+    $message['body'] = str_replace('[uc_order:cart]', uc_abandoned_msg_insert_cart($params['info']['order']), $message['body']); 
+    $message['body'] = str_replace('[uc_order:dynamic-name]', uc_abandoned_msg_insert_name($params['info']['order']), $message['body']);
+
+    // Add test mode messages
+    if ($params['info']['testmode']){
+      $message['subject'] = '***TEST MODE*** ' . $message['subject'];  
+      $message['body'] = $message['body'] . '<br /><strong>*** THIS MESSAGE WAS SENT IN TEST MODE TO THE TEST MODE EMAIL ADDRESS. IN REGULAR MODE THIS MESSAGE WOULD HAVE BEEN SENT TO ' . $params['info']['order']->primary_email . '<strong>';
+    }
+    
+    // Strip newline characters from e-mail subjects.    
+    $message['subject'] = str_replace(array("\r\n", "\r", "\n"), ' ', $message['subject']);
+    
+    // Apply an input format to the message body    
+    $message['body'] = explode("\n", check_markup($message['body'], variable_get('uc_abandonded_msg_format','full_html'), $langcode));
+  }   
+}
+
+/*
+ * Inserts the order's cart contents into the email being sent
+ */
+function uc_abandoned_msg_insert_cart($order){
+  $cart = '<strong>Your cart contents:</strong><br /><br />';
+  $cart .= '<table>';
+  $cart .= '<tr><th>Qty</th><th>Title</th><th>Price Each</th></tr>';
+  foreach($order->products as $product){
+    $cart .= '<tr><td>' . $product->qty . '</td><td>' . $product->title . '</td><td>' . uc_currency_format($product->price) . '</td></tr>';
+  }
+  $cart .= '<tr><td></td><td></td><td>';
+  $cart .= '<hr /><table>';
+  foreach($order->line_items as $line_item){    
+    $cart .= '<tr><td>' . $line_item['title'] . '</td><td>' . uc_currency_format($line_item['amount']) . '</td></tr>';
+  }
+  $cart .= '<tr><td>Total</td><td>' . uc_currency_format($order->order_total) . '</td></tr>';
+  $cart .= '</table></td></tr></table>';
+  
+  $cart .= '<br /><em>Please note that the total shown may not show accurate tax and shipping charges yet.</em><br />';
+  
+  return $cart;  
+}
+
+/*
+ * Inserts the order's cart contents into the email being sent
+ */
+function uc_abandoned_msg_insert_name($order){
+  $name = '';
+  if ($order->delivery_first_name){
+    $name = 'Dear ' . $order->delivery_first_name;
+  }else{
+    $name = 'Dear Valued Customer';
+  }
+  return $name;
+}
+
+
+   
+function uc_abandonded_msg_admin_form(){
+ $form = array();  
+ $form['uc_abandonded_msg_history_timeout'] = array(
+    '#type' => 'textfield',
+    '#title' => t('How many days to go back for abandonded carts.'),
+    '#description' => t('This is to prevent the first run of this module from sending too many messages for abandoned carts from too long ago'),
+    '#default_value' => variable_get('uc_abandonded_msg_history_timeout', '7'),
+    '#required' => TRUE,
+    '#element_validate' => array('element_validate_number'),
+  );
+  
+  $form['uc_abandonded_msg_email'] = array(
+    '#type' => 'textfield',
+    '#title' => t('From Email'),
+    '#required' => TRUE,
+    '#default_value' => variable_get('uc_abandonded_msg_email', variable_get('site_mail')),
+    '#description' => t('Enter the email address to send the emails from.'),
+    '#size' => 40,
+    '#maxlength' => 40,
+    '#element_validate' => array('uc_abandoned_msg_email_element_validate'),
+  );
+    
+  
+  $form['uc_abandonded_msg_email_copy'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Send a blind carbon copy of each message to this email address?'),
+    '#description' => t('This may be useful to keep an eye on the messages that are sent.'),
+    '#default_value'=> variable_get('uc_abandonded_msg_email_copy'),
+  );
+ 
+
+ $form['uc_abandonded_msg_subject'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Email Subject Line'),
+    '#required' => TRUE,
+    '#default_value' => variable_get('uc_abandonded_msg_subject', uc_abandoned_msg_load_default('subject')),    
+    '#size' => 60,
+    '#maxlength' => 80,    
+  );
+  
+  $form['uc_abandonded_msg_limit'] = array(
+       '#type' => 'select',
+       '#title' => t('Maximum emails to send per cron run.'),
+       '#options' => array(
+         10 => t('10'),
+         50 => t('50'),
+         100 => t('100'),
+         200 => t('200'),
+         300 => t('300'),
+         400 => t('400'),
+         500 => t('500'),
+       ),
+       '#default_value' => variable_get('uc_abandonded_msg_limit', '50'),       
+   );
+ 
+ 
+ $form['uc_abandonded_msg_msg'] = array(
+    '#type' => 'textarea',
+    '#title' => t('Message Template'),
+    '#required' => TRUE,    
+    '#default_value' => variable_get('uc_abandonded_msg_msg', uc_abandoned_msg_load_default('body')),
+    '#description' => t('If you would like to include a copy of the cart contents then place this token in the template: [uc_order:cart] ')
+  ); 
+  
+  // Get a list of all formats.
+  $formats = filter_formats();
+  foreach ($formats as $format) {
+    $format_options[$format->format] = $format->name;
+  }
+  $form['uc_abandonded_msg_format'] = array(
+    '#type' => 'select',
+    '#title' => t('E-mail format'),
+    '#options' => $format_options,
+    '#default_value' => variable_get('uc_abandonded_msg_format', filter_fallback_format()),
+    '#access' => count($formats) > 1,
+    '#attributes' => array('class' => array('filter-list')),
+  ); 
+  
+  $form['uc_abandonded_msg_testmode'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Test Mode'),
+  );
+  $form['uc_abandonded_msg_testmode']['uc_am_testmode_active'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Enable Test Mode'),
+    '#default_value' => variable_get('uc_am_testmode_active', 1),
+    '#description' => t('When test mode is active all abandoned carts messages will be sent to the test email address instead of cart owner for testing purposes. When in test module the status of the message is not updated so the same messages will be sent on each cron run.'),
+  );
+   $form['uc_abandonded_msg_testmode']['uc_am_testmode_email'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Test Mode Email'),
+    '#required' => TRUE,
+    '#default_value' => variable_get('uc_am_testmode_email', variable_get('site_mail')),
+    '#description' => "Enter the email address to send the test emails to.",
+    '#size' => 40,
+    '#maxlength' => 40,
+    '#element_validate' => array('uc_abandoned_msg_email_element_validate'),
+    '#states' => array(
+      'visible' => array(
+        ':input[name="uc_am_testmode_active"]' => array('checked' => TRUE),
+        ),
+      ),
+  );  
+  
+  return system_settings_form($form);      
+}
+
+
+function uc_abandoned_msg_email_element_validate($element, &$form_state, $form) {
+   if (!valid_email_address($element['#value'])) {
+     form_error($element, t('Please enter a valid email address.'));
+   }
+}
+
+
+function uc_abandoned_msg_load_default($default){
+  $content = '';
+  
+  switch ($default){
+    case 'subject':
+      $content = 'We see you haven\'t completed your checkout at [site:name]';      
+      break;
+    case 'body':
+      $content = <<<EOD
+Dear [uc_order:first-name],<br /><br />
+
+If you have experienced any difficulty during your checkout process please call us at <strong>[store:phone]</strong> and we will be able to quickly process your order over the phone.<br />
+<br /><strong>Your pending order number is [uc_order:order-number] </strong>
+<br />
+[uc_order:cart]
+<br />
+Sincerely, <br />
+<br />
+[site:name] Customer Service<br />
+<br />
+<p>[site:url]</p>
+<p style="text-align:center;">[site:logo]  </p>
+EOD;
+      break;
+  }
+  
+  return $content;
+}

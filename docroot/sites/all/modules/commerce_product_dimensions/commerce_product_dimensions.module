@@ -1,0 +1,334 @@
+<?php
+
+define('COMMERCE_PRODUCT_DIMENSIONS_CLASS', 'product-dimension-price');
+
+include_once 'commerce_product_dimensions.line_item.inc';
+
+/**
+ * Implements hook_menu().
+ */
+function commerce_product_dimensions_menu() {
+  $items = array();
+
+  $items['admin/commerce/config/line-items/add-product-with-dimension-line-item-type'] = array(
+    'title' => 'Add a line item type for products with dimensions',
+    'description' => 'Create a new product line item type that supports dimensions.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('commerce_product_dimensions_line_item_type_form'),
+    'access arguments' => array('administer line item types'),
+    'type' => MENU_LOCAL_ACTION,
+    'file' => 'commerce_product_dimensions.line_item.inc',
+  );
+
+  foreach (commerce_line_item_types() as $type => $line_item_type) {
+    if (isset($line_item_type['callbacks']['configuration']) &&
+      $line_item_type['callbacks']['configuration'] == 'commerce_product_dimensions_line_item_configuration') {
+      $type_arg = strtr($type, '_', '-');
+      $items['admin/commerce/config/line-items/' . $type_arg . '/delete'] = array(
+        'title' => 'Delete',
+        'page callback' => 'commerce_product_dimensions_commerce_line_item_type_delete',
+        'page arguments' => array($type),
+        'access arguments' => array('administer line item types'),
+        'type' => MENU_LOCAL_TASK,
+        'context' => MENU_CONTEXT_INLINE,
+        'weight' => 10,
+      );
+    }
+  }
+
+  return $items;
+}
+
+/**
+ * Implements hook_form_BASE_FORM_ID_alter()
+ */
+function commerce_product_dimensions_form_commerce_cart_add_to_cart_form_alter(&$form, &$form_state, $form_id) {
+  $dimension_available = FALSE;
+  $ids = db_select('commerce_product_dimensions_line_item_type', 'l')
+    ->fields('l', array('id'))
+    ->execute()
+    ->fetchCol();
+  foreach ($ids as $id) {
+    $type = _commerce_product_dimensions_get_type($id);
+    if (!empty($form['line_item_fields'][$type])) {
+      $langcode = $form['line_item_fields'][$type]['#language'];
+      $fields = array(
+        'length',
+        'width',
+        'height',
+      );
+      foreach ($fields as $fieldname) {
+        if ($form['line_item_fields'][$type][$langcode][0][$fieldname]['#access']) {
+          $form['line_item_fields'][$type][$langcode][0][$fieldname]['#ajax']['callback'] = 'commerce_product_dimensions_refresh';
+          $dimension_available = TRUE;
+        }
+      }
+    }
+  }
+  if ($dimension_available) {
+    $dim_price = commerce_product_dimensions_refresh($form, $form_state);
+    $form['dim_price'] = array(
+      '#markup' => $dim_price['#commands'][0]['data'],
+    );
+  }
+}
+
+/**
+ * Ajax callback: returns AJAX commands when an attribute widget is changed.
+ */
+function commerce_product_dimensions_refresh($form, $form_state) {
+  $commands = array();
+
+  if(!empty($form_state['default_product']) and !empty($form_state['context'])){
+    $base_product = clone $form_state['default_product'];
+    $full_product = clone $form_state['default_product'];
+    $line_item = clone $form_state['line_item'];
+    $instance  = field_info_instances('commerce_line_item', $line_item->type);
+    $settings = $instance[$line_item->type]['settings'];
+    // TODO: Can we find out the mode here?
+    list($has_length, $has_more) = array(FALSE, FALSE); //_dimension_get_modes($settings['mode']);
+
+    $language = empty($base_product->language) ? LANGUAGE_NONE : $base_product->language;
+    $factor = _commerce_product_dimensions_get_factor($line_item);
+    $base_price = _commerce_product_dimensions_adjust_base_price($line_item, $base_product->commerce_price[$language][0]['amount'], $factor);
+
+    $full_product->commerce_price[$language][0]['amount'] = $base_price * $factor;
+    $full_product->display_context = $form_state['context'];
+    $full_price = field_view_field('commerce_product', $full_product, 'commerce_price', $form_state['context']['view_mode']);
+
+    $base_product->commerce_price[$language][0]['amount'] = $base_price;
+    $base_product->display_context = $form_state['context'];
+    $base_price = field_view_field('commerce_product', $base_product, 'commerce_price', $form_state['context']['view_mode']);
+
+    $element = array(
+      '#markup' => theme('commerce_product_dimensions_table', array(
+          'base_price' => drupal_render($base_price),
+          'full_price' => drupal_render($full_price),
+          'dimension' => $factor,
+          'dimension_unit' => $settings['dimension_unit'],
+          'dimension_label' => ($has_more ? ($has_length ? t('Volume') : t('Area')) : ''),
+        )
+      ),
+      '#prefix' => '<div class="' . COMMERCE_PRODUCT_DIMENSIONS_CLASS . '">',
+      '#suffix' => '</div>',
+      '#attached' => array(
+        'css' => array(
+          drupal_get_path('module', 'commerce_product_dimensions') . '/commerce_product_dimensions.css',
+        ),
+      ),
+    );
+
+    $replacement_selector = '.' . drupal_html_class($form['#form_id']) . ' .' . COMMERCE_PRODUCT_DIMENSIONS_CLASS;
+    $commands[] = ajax_command_replace($replacement_selector, drupal_render($element));
+  }
+
+  return array('#type' => 'ajax', '#commands' => $commands);
+}
+
+/**
+ * Callback to calculate the multiplier for the product price depending
+ * on dimension type and values.
+ */
+function _commerce_product_dimensions_get_factor($line_item) {
+  $factor = 1;
+  $type = $line_item->type;
+  if (!empty($line_item->{$type})) {
+    $langcode = LANGUAGE_NONE;
+    $dimensions = $line_item->{$type}[$langcode][0];
+
+    $instance  = field_info_instances('commerce_line_item', $type);
+    $settings = $instance[$type]['settings']['fields'];
+
+    $factor = dimension_calculate($dimensions, $settings);
+  }
+  return $factor;
+}
+
+function _commerce_product_dimensions_adjust_base_price($line_item, $base_price, $factor) {
+  if (isset($line_item->commerce_product)) {
+    $product = commerce_product_load($line_item->commerce_product[LANGUAGE_NONE][0]['product_id']);
+    foreach (field_info_fields() as $field_name => $field_info) {
+      if ($field_info['type'] == 'dimension_price') {
+        if (!empty($product->{$field_name})) {
+          foreach ($product->{$field_name}[LANGUAGE_NONE] as $adjustment) {
+            if ($factor >= $adjustment['dimension']) {
+              switch ($adjustment['mode']) {
+                case 'add':
+                  $base_price += $adjustment['value'];
+                  break;
+
+                case 'subtract':
+                  $base_price -= $adjustment['value'];
+                  break;
+
+                case 'multiply':
+                  $base_price *= $adjustment['value'];
+                  break;
+
+                case 'divide':
+                  if (!empty($adjustment['value'])) {
+                    $base_price /= $adjustment['value'];
+                  }
+                  break;
+
+              }
+              return $base_price;
+            }
+          }
+        }
+      }
+    }
+  }
+  return $base_price;
+}
+
+/**
+ * ------------------------ Field implementation -------------------------------
+ */
+
+/**
+ * Implements hook_field_info();
+ */
+function commerce_product_dimensions_field_info() {
+  return array(
+    'dimension_price' => array(
+      'label' => t('Dimensions Price Attributes'),
+      'description' => t('This field stores price adjustments dependent on the dimension of the line item.'),
+      'settings' => array(),
+      'default_widget' => 'dimension_price_widget',
+      'default_formatter' => 'dimension_price_widget',
+    ),
+  );
+}
+
+/**
+ * Implements hook_field_widget_info().
+ */
+function commerce_product_dimensions_field_widget_info() {
+  return array(
+    'dimension_price_widget' => array(
+      'label' => t('Dimension Price Widget'),
+      'description' => t('TODO.'),
+      'field types' => array('dimension_price'),
+    ),
+  );
+}
+
+/**
+ * Implements hook_field_instance_settings_form().
+ */
+function commerce_product_dimensions_field_instance_settings_form($field, $instance) {
+  $settings = $instance['settings'];
+  $form = array();
+  return $form;
+}
+
+/**
+ * Implements hook_field_widget_form().
+ */
+function commerce_product_dimensions_field_widget_form(&$form, &$form_state, $field, $instance, $langcode, $items, $delta, $element) {
+  $settings = $instance['settings'];
+  $item = isset($items[$delta]) ? $items[$delta] : array();
+
+  $form['#attached']['css'] = array(
+    drupal_get_path('module', 'commerce_product_dimensions') . '/commerce_product_dimensions.css',
+  );
+
+  $fields['dimension'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Dimension'),
+    '#default_value' => empty($item['dimension']) ? 0 : $item['dimension'],
+    '#size' => 6,
+    '#element_validate' => array('element_validate_number'),
+  );
+  $fields['mode'] = array(
+    '#type' => 'select',
+    '#title' => t('Operation'),
+    '#default_value' => empty($item['mode']) ? 'add' : $item['mode'],
+    '#options' => array(
+      'add' => t('Add value to base price'),
+      'subtract' => t('Subtract value from base price'),
+      'multiply' => t('Multiply base price with value'),
+      'divide' => t('Divide base price by value'),
+    ),
+  );
+  $fields['value'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Value'),
+    '#default_value' => isset($item['value']) ? $item['value'] : 0,
+    '#size' => 6,
+    '#element_validate' => array('element_validate_number'),
+  );
+
+  $element['#type'] = 'container';
+  $element['#attributes'] = array(
+    'class' => array('commerce-product-dimensions', 'dimension-price-widget'),
+  );
+  if ($delta == 0) {
+    $element['#prefix'] = t('If the dimension of a line-item is greater or equal the given dimension, the base price gets adjusted by the operation with the given value. The first matching row gets applied and no more.');
+  }
+  $element += $fields;
+  return $element;
+}
+
+/**
+ * Implements hook_field_formatter_view().
+ */
+function commerce_product_dimensions_field_formatter_view($entity_type, $entity, $field, $instance, $langcode, $items, $display) {
+  $element = array();
+  $settings = $instance['settings'];
+  return $element;
+}
+
+/**
+ * Implements hook_field_is_empty().
+ */
+function commerce_product_dimensions_field_is_empty($item, $field) {
+  return (empty($item['dimension']) && empty($item['value']));
+}
+
+/**
+ * ------------------------ Themeing -------------------------------------------
+ */
+
+/**
+ * Implements hook_theme().
+ */
+function commerce_product_dimensions_theme($existing, $type, $theme, $path) {
+  return array(
+    'commerce_product_dimensions_table' => array(
+      'variables' => array(
+        'base_price' => '0€',
+        'full_price' => '0€',
+        'dimension' => 1,
+        'dimension_unit' => '',
+        'dimension_label' => '',
+      ),
+    ),
+  );
+}
+
+/**
+ * Callback to theme dimension related info block.
+ *
+ * @param array $variable
+ * @return string
+ */
+function theme_commerce_product_dimensions_table($variable) {
+  $base_price = $variable['base_price'];
+  $full_price = $variable['full_price'];
+  $dimension = $variable['dimension'];
+  $dimension_unit = $variable['dimension_unit'];
+  $dimension_label = $variable['dimension_label'];
+
+  $output = '<table>';
+
+  $output .= '<tr class="base-price"><td><span class="label">' . t('Base price') . '</span></td><td><span class="value">' . $base_price . '</span></td></tr>';
+  if (!empty($dimension_unit)) {
+    $output .= '<tr class="dimension"><td><span class="label">' . $dimension_label . '</span></td><td><span class="value">' . $dimension . $dimension_unit . '</span></td></tr>';
+  }
+  $output .= '<tr class="full-price"><td><span class="label">' . t('Full price') . '</span></td><td><span class="value">' . $full_price . '</span></td></tr>';
+
+  $output .= '</table>';
+  return $output;
+}

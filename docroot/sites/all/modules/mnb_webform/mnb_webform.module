@@ -1,0 +1,218 @@
+<?php
+/**
+ * @file
+ * Integrate with MyNewsletterBuilder to create new subscribers via webform
+ */
+
+/**
+ * Implements hook_menu() to get the config page listed
+ */
+function mnb_webform_menu() {
+  $items = array();
+
+  $items['admin/config/services/mnb_webform'] = array(
+    'title' => 'MyNewsletterBuilder Webform',
+    'description' => 'Set up MyNewsletterBuilder Webform integration.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('mnb_webform_admin_settings'),
+    'access arguments' => array('administer site configuration'),
+    'type' => MENU_NORMAL_ITEM,
+    'file' => 'mnb_webform.admin.inc',
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_webform_component_info().
+ */
+function mnb_webform_webform_component_info() {
+  $components = array();
+
+  $components['mnb_signup'] = array(
+    'label' => t('MyNewsletterBuilder list signup'),
+    'description' => t('Checkboxes for signing up to selected lists'),
+    'features' => array(
+      'csv' => TRUE,
+      'email' => TRUE,
+      'email_address' => FALSE,
+      'email_name' => FALSE,
+      'required' => FALSE,
+      'conditional' => TRUE,
+      'group' => FALSE,
+      'attachment' => FALSE,
+    ),
+    'file' => 'components/mnb_signup.inc',
+  );
+
+  return $components;
+}
+
+/**
+ * Implements hook_webform_submission_presave().
+ *
+ * There's three possibilities here:
+ *  1. The user is filling out the webform for the first time and is creating a new subscription.
+ *  2. The user is registered and using Webform's submission editing feature to update the subscription.
+ *  3. The user is unregistered and using our multi-page webform hack to update the subscription.
+ *     This won't update the saved Webform submission.
+ *
+ *  This system also supports subscribing to multiple mailing lists by adding multiple mnb_signup
+ *  components to the webform.
+ *
+ *  @todo Handle possibility of unsubscribed users editing their data anyway.
+ */
+function mnb_webform_webform_submission_presave($node, $submission) {
+  require_once libraries_get_path('MNB_PHP_API') . '/MnbApi.class.php';
+  $mnb = new MnbApi(variable_get('mnb_webform_apikey', ''));
+
+  foreach ($node->webform['components'] as $cid => $component) {
+    if ($component['type'] == 'mnb_signup') {
+      // Extract submitted values
+      $listid = $component['extra']['lists'];
+      $listdetails = $mnb->ListDetails($listid);
+      $listname = $listdetails['name'];
+
+      // Field containing email address is based on the component configuration
+      $email = $submission->data[$component['extra']['email_field']]['value'][0];
+
+      $wantsToSubscribe = ($submission->data[$cid]['value'][0] == 1);
+      if ($wantsToSubscribe && empty($email)) {
+        // If they didn't specify an email address, don't bother sending it to MyNewsletterBuilder.
+        continue;
+      }
+
+      if (!empty($submission->data[$component['extra']['name_field']]['value'])) {
+        $name = $submission->data[$component['extra']['name_field']]['value'][0];
+      }
+      else {
+        $name = '';
+      }
+
+      $fields = array();
+      $custom_fields = array_keys(array_filter($component['extra']['custom_fields']));
+
+      foreach ($custom_fields as $field) {
+        if ($node->webform['components'][$field]['type'] == "select") {
+          $itemLines = explode("\n", $node->webform['components'][$field]['extra']['items']);
+          $items = array();
+          foreach ($itemLines as $item) {
+            $item = explode('|', $item);
+            if (count($item) < 2) {
+              continue;
+            }
+            $items[$item[0]] = trim($item[1]);
+          }
+
+          $value = array();
+          foreach ($submission->data[$field]['value'] as $val => $val) {
+            $value[] = $items[$val];
+          }
+          $value = implode(',', $value);
+          $fields[] = array('Key' => $node->webform['components'][$field]['form_key'],
+                            'Value' => $value);
+        }
+        else {
+          $fields[] = array('Key' => $node->webform['components'][$field]['form_key'],
+                            'Value' => $submission->data[$field]['value'][0]);
+        }
+      }
+
+      if ($wantsToSubscribe) {
+        $r = mnb_webform_insert_subscription($mnb, $listid, $listname, $email, $name, $fields);
+
+        // Only show success message if the admin has said we should
+        if (variable_get('mnb_showmsg', 0)) {
+
+
+          if ($r) {
+            drupal_set_message(t('You have been successfully subscribed to the list "@list".',
+                                 array('@list' => $listname)), 'status');
+          }
+          else {
+            drupal_set_message(t('An error occurred when subscribing you to the list "@list". Please try again.',
+                                 array('@list' => $listname)), 'error');
+          }
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Helper function to insert a new subscription. Warning: Will resubscribe the user
+ * if they've previously unsubscribed. Use only when they've checked the box to subscribe explicitly.
+ */
+function mnb_webform_insert_subscription(&$mnb, $lid, $lname, $email, $name, $fields) {
+  $details = array(
+    'email' => $email,
+    'full_name' => $name,
+  );
+  foreach ($fields as $fkey => $fvalue) {
+    $details[$fvalue['Key']] = $fvalue['Value'];
+  }
+  $r = $mnb->Subscribe($details,$lid);
+
+  if (($r['status'] == 'ignored') || ($r['status'] == 'error')) {
+    watchdog('mnb_webform', 'A MyNewsletterBuilder @code error occurred when subscribing @email to list "@list": @error',
+             array('@email' => $r['email'], '@error' => $r['status_msg'],
+                   '@code' => $r['status'], '@list' => $lname),
+             WATCHDOG_ERROR);
+    return FALSE;
+  }
+
+  watchdog('mnb_webform', 'Email @email is @status on list "@list" via MyNewsletterBuilder.',
+           array('@email' => $r['email'], '@status' => $r['status'], '@list' => $lname), WATCHDOG_INFO);
+  return TRUE;
+}
+
+/**
+ * Get all lists.
+ *
+ * @return array lists => list array
+ *
+ */
+function mnb_webform_get_lists() {
+  static $lists = array();
+
+  if (empty($lists)) {
+    require_once libraries_get_path('MNB_PHP_API') . '/MnbApi.class.php';
+    $mnb = new MnbAPI(variable_get('mnb_webform_apikey', ''));
+    $lists = $mnb->Lists();
+
+    if (empty($lists)) {
+        return FALSE;
+    }
+
+   return $lists;
+  }
+}
+
+/**
+ * Implements hook_help().
+ */
+function mnb_webform_help($path, $arg) {
+  $h = '';
+  switch ($path) {
+    case 'admin/help#mnb_webform':
+      $h .= '<h3>' . t('About') . '</h3>';
+      $h .= '<p>' . t('The MyNewsletterBuilder Webform module provides MyNewsletterBuilder.com integration with Webform, letting users of any Webform sign up for your newsletters or marketing campaigns with a simple checkbox. Users can also edit their subscription information or unsubscribe entirely through easy-to-implement webforms.') . '</p>';
+
+      $h .= '<h3>' . t('Creating a MyNewsletterBuilder Webform') . '</h3>';
+      $h .= '<p>' . t('Any Webform that accepts an email address can be used to subscribe a user to MyNewsletterBuilder. The process is simple:') . '</p>';
+
+      $h .= '<ol>';
+      $h .= '<li>' . t('Create a Webform that asks for whatever information you might want from the user. Be sure to include an email field for their email address.') . '</li>';
+      $h .= '<li>' . t('Add a "MyNewsletterBuilder list signup" component to the form. Label it whatever you want; the label will be displayed next to the opt-in checkbox, so make it something like "Subscribe to our newsletter".') . '</li>';
+      $h .= '<li>' . t('Choose the MyNewsletterBuilder mailing list you want the user to be signed up for if they check the box.') . '</li>';
+      $h .= '<li>' . t("Select which fields will be used as the user's name and email address. Also check which other custom fields should be sent to MyNewsletterBuilder; their field keys (shown in parentheses) must correspond to MyNewsletterBuilder's custom field names directly.") . '</li>';
+      $h .= '<li>' . t('Save the component and arrange your form as you\'d like it. If you want the user to be able to subscribe to other lists with the same form, just add another "MyNewsletterBuilder list signup" component.') . '</li>';
+      $h .= '</ol>';
+
+    case 'node/%/webform':
+      $h .= '<p>' . t('If you\'d like this form\'s results to be sent to MyNewsletterBuilder for list subscription information, make sure it has a "MyNewsletterBuilder list signup" field.') . '</p>';
+      break;
+  }
+
+  return $h;
+}

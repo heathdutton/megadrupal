@@ -1,0 +1,312 @@
+<?php
+/**
+ * @file
+ * Nodequeue Populator module.
+ *
+ * This module provides a framework for populating nodequeues
+ * with existing nodes during cron.
+ *
+ * What nodes should be added is determined by a "processor"
+ * which is provided by extension modules to Nodequeue Populator.
+ */
+
+/**
+ * Implements hook_menu().
+ */
+function nodequeue_populator_menu() {
+  $items = array();
+  $items['nodequeue_populator/subnodequeue_autocomplete'] = array(
+    'page callback' => 'nodequeue_populator_subnodequeue_autocomplete',
+    'type' => MENU_CALLBACK,
+    'access arguments' => array('manipulate queues'),
+    'file' => 'nodequeue_populator.pages.inc',
+  );
+  return $items;
+}
+
+/**
+ * Implements hook_cron().
+ */
+function nodequeue_populator_cron() {
+  nodequeue_populator_cron_process_group();
+}
+
+/**
+ * Implements hook_cron_alter().
+ *
+ * Remove the default cron job, in case we're using a
+ * cron extension (e.g. Ultimate Cron).
+ */
+function nodequeue_populator_cron_alter(&$items) {
+  unset($items['nodequeue_populator_cron']);
+}
+
+/**
+ * Implements hook_cronapi().
+ */
+function nodequeue_populator_cronapi($op, $job = NULL) {
+  switch ($op) {
+    case 'list':
+      ctools_include('export');
+      $populators = ctools_export_crud_load_all('nodequeue_populator');
+      $jobs = array();
+      foreach ($populators as $populator) {
+        if (!isset($jobs[$populator->populator_group])) {
+          $group = preg_replace('/[^a-z0-9_]+/', '_', $populator->populator_group);
+          $jobs["nodequeue_populator_cronapi_execute_$group"] = t('Nodequeue Populator @group', array('@group' => $populator->populator_group));
+        }
+      }
+      return $jobs;
+
+    case 'execute':
+      $group = str_replace('nodequeue_populator_cronapi_execute_', '', $job);
+      if ($group == $job) {
+        return;
+      }
+      nodequeue_populator_cron_process_group($group);
+      return;
+  }
+}
+
+/**
+ * Implements of hook_ctools_plugin_api().
+ */
+function nodequeue_populator_ctools_plugin_api($module, $api) {
+  if ($module == 'nodequeue_populator' && $api == 'plugins') {
+    return array('version' => 3);
+  }
+  if ($module == 'nodequeue_populator' && $api == 'nodequeue_populator') {
+    return array('version' => 3);
+  }
+}
+
+/**
+ * Implement of hook_ctools_plugin_directory().
+ */
+function nodequeue_populator_ctools_plugin_directory($module, $type) {
+  // Safety: go away if CTools is not at an appropriate version.
+  if (!module_invoke('ctools', 'api_version', '1.7')) {
+    return;
+  }
+  if ($type == 'export_ui') {
+    return 'plugins/export_ui';
+  }
+}
+
+/**
+ * Implements hook_cron().
+ */
+function nodequeue_populator_cron_process_group($group = NULL) {
+  ctools_include('export');
+  $populators = ctools_export_crud_load_all('nodequeue_populator');
+
+  if ($group) {
+    foreach ($populators as $key => $value) {
+      $group_stripped = preg_replace('/[^a-z0-9_]+/', '_', $value->populator_group);
+      if ($group == $group_stripped) {
+        if ($group_stripped != $value->populator_group) {
+          watchdog('nodequeue_populator', 'Populator %name has invalid group %group. Using %group_stripped instead.', array(
+            '%name' => $value->name,
+            '%group' => $value->populator_group,
+            '%group_stripped' => $group,
+          ), WATCHDOG_WARNING);
+        }
+      }
+      else {
+        unset($populators[$key]);
+      }
+    }
+  }
+
+  foreach ($populators as $populator) {
+    try {
+      nodequeue_populator_process_populator($populator);
+    }
+    catch (Exception $e) {
+      watchdog('nodequeue_populator', 'Error invoking processor for %populator: @error', array(
+        '%populator' => $populator->title,
+        '@error' => $e->getMessage(),
+      ), WATCHDOG_ERROR);
+      return;
+    }
+  }
+}
+
+/**
+ * Load a single nodequeue populator.
+ *
+ * @param string $name
+ *   The name of the populator.
+ *
+ * @return stdClass
+ *   The populator configuration.
+ */
+function nodequeue_populator_load($name) {
+  ctools_include('export');
+  $result = ctools_export_load_object('nodequeue_populator', 'names', array($name));
+  if (isset($result[$name])) {
+    $result[$name]->populator_group = empty($result[$name]->populator_group) ? 'default' : $result[$name]->populator_group;
+    return $result[$name];
+  }
+  return FALSE;
+}
+
+/**
+ * Load all nodequeue populators.
+ *
+ * @return array
+ *   All populator configurations keyed by name.
+ */
+function nodequeue_populator_load_all() {
+  ctools_include('export');
+  $results = ctools_export_load_object('nodequeue_populator');
+  foreach ($results as &$result) {
+    $result->populator_group = empty($result->populator_group) ? 'default' : $result->populator_group;
+  }
+  return $results;
+}
+
+/**
+ * Process an populator.
+ *
+ * Loads the data from the specified populator,
+ * and populates a nodequeue.
+ *
+ * @param object $populator
+ *   The populator object.
+ */
+function nodequeue_populator_process_populator($populator) {
+  if (!empty($populator->disabled)) {
+    return;
+  }
+
+  if (!lock_acquire('nodequeue_populator_' . $populator->name)) {
+    throw new Exception(t('Processing already in progress.'));
+  }
+
+  if (!($populator->subqueue = subqueue_load($populator->sqid))) {
+    watchdog('nodequeue_populator', 'Could not load subqueue %sqid', array('%sqid' => $populator->sqid), WATCHDOG_ERROR);
+    return;
+  }
+  if (!$populator->queue = nodequeue_load($populator->subqueue->qid)) {
+    watchdog('nodequeue_populator', 'Could not load nodequeue %qid (subqueue: %sqid)', array(
+      '%qid' => $populator->subqueue->qid,
+      '%sqid' => $populator->sqid,
+    ), WATCDOG_ERROR);
+    return;
+  }
+
+  // Store old nids in queue for comparison.
+  $populator->nids = nodequeue_populator_load_nids($populator->subqueue->sqid, FALSE, 0, 0);
+
+  // Get new nids from processor.
+  // We do an array values to ensure proper index for comparions.
+  $nids = array_values(nodequeue_populator_invoke_processor($populator->processor, $populator));
+
+  // Only update nodequeue if something has changed.
+  if ($nids == $populator->nids) {
+    watchdog('nodequeue_populator', 'Nodequeue %title has not changed. Not updating.', array(
+      '%title' => $populator->subqueue->title . ' [' . $populator->subqueue->sqid . ']',
+    ), WATCHDOG_INFO);
+    return;
+  }
+
+  // Start DB transaction and populate nodequeue.
+  $tx = db_transaction();
+
+  nodequeue_queue_clear($populator->subqueue->sqid);
+
+  foreach ($nids as $nid) {
+    nodequeue_subqueue_add($populator->queue, $populator->subqueue, $nid);
+  }
+
+  watchdog('nodequeue_populator', 'Populated nodequeue %title with @count nodes', array(
+    '%title' => $populator->subqueue->title . ' [' . $populator->subqueue->sqid . ']',
+    '@count' => count($nids),
+  ), WATCHDOG_INFO);
+
+  // Explicit commit.
+  unset($tx);
+}
+
+/**
+ * Load an array of node ids belonging to a particular nodequeue.
+ */
+function nodequeue_populator_load_nids($sqid, $backward = FALSE, $from = 0, $count = 5, $published_only = TRUE) {
+  $orderby = ($backward ? "DESC" : "ASC");
+  $query = db_select('node', 'n')
+    ->fields('n', array('nid'))
+    ->condition('nn.sqid', $sqid)
+    ->orderBy('nn.position', $orderby)
+    ->addTag('node_access');
+  $query->join('nodequeue_nodes', 'nn', 'n.nid = nn.nid');
+
+  if ($published_only) {
+    $query->condition('n.status', 1);
+  }
+
+  if ($count) {
+    $result = $query->range($from, $count)->execute();
+  }
+  else {
+    $result = $query->execute();
+  }
+
+  return $result->fetchCol();
+}
+
+/**
+ * Get available processors.
+ */
+function nodequeue_populator_get_processors() {
+  $processors = &drupal_static(__FUNCTION__);
+  if (!isset($processors)) {
+    $cache = cache_get('nodequeue_populator_processor_info');
+    if ($cache) {
+      $processors = $cache->data;
+    }
+    else {
+      $processors = module_invoke_all('nodequeue_populator_processor_info');
+      drupal_alter('nodequeue_populator_processor_info', $processors);
+      cache_set('nodequeue_populator_processor_info', $processors, 'cache');
+    }
+  }
+  return $processors;
+}
+
+/**
+ * Prepare processor callback.
+ *
+ * @param string $processor
+ *   Name of the processor.
+ *
+ * @param string $type
+ *   Type of callback (e.g. settings).
+ *
+ * @return string
+ *   Callback function.
+ */
+function nodequeue_populator_prepare_processor_callback($processor, $type = NULL) {
+  $processors = nodequeue_populator_get_processors();
+  if (empty($processors[$processor])) {
+    throw new Exception(t('processor: %processor not found', array('%processor' => $processor)));
+  }
+  if (isset($processors[$processor]['file'])) {
+    include_once $processors[$processor]['file'];
+  }
+  $key = ($type ? $type . ' ' : '') . 'callback';
+  return isset($processors[$processor][$key]) ? $processors[$processor][$key] : NULL;
+}
+
+/**
+ * Invoke a processors callback.
+ *
+ * @param string $processor
+ *   Name of the processor.
+ * @param object $populator
+ *   The populator object.
+ */
+function nodequeue_populator_invoke_processor($processor, $populator) {
+  $callback = nodequeue_populator_prepare_processor_callback($processor);
+  return call_user_func($callback, $populator);
+}

@@ -1,0 +1,1244 @@
+<?php
+
+/**
+ * @file
+ * MoneySuite First Atlantic Commerce Gateway Module
+ *
+ * Original author: Leighton Whiting - Released under GENERAL PUBLIC LICENSE
+ * Current maintenance by multiple MoneySuite users.
+ * Re: new initiative: https://www.drupal.org/node/2315653 
+ */
+
+/**
+ * Implements hook_help().
+ */
+function ms_fac_help($path, $arg) {
+  $output = '';
+  switch ($path) {
+    case "admin/moneysuite/gateways/ms_fac":
+    case "admin/help#ms_fac":
+      $output = '<p>' . t("First Atlantic Commerce Payment Gateway Module for MoneySuite. This allows
+      you to recieve payments using your First Atlantic Commerce account. This gateway supports both
+      Recurring and Non-Recurring Orders, but for Recurring Orders, the credit card information is stored
+      in the database. Even though the credit card information is encrypted, this is not a very secure method.
+      You are responsible for ensuring that your server meets or exceeds the PCI Compliance standards that are
+      put in place.") . '</p>';
+      break;
+  }
+  return $output;
+}
+
+/**
+ * Access callback that always returns true
+ */
+function ms_fac_access_test() {
+  return TRUE;
+}
+
+/**
+ * Callback function that always returns true
+ */
+function ms_fac_recurring_user_access($user, $rfid) {
+  return TRUE;
+}
+
+/**
+ * Access Callback that checks if the user can modify their order
+ */
+function ms_fac_modify_test($oid, $id) {
+  global $user;
+  $order = ms_core_order_load($oid);
+  if ($user->uid == $order->uid) {
+    return TRUE;
+  }
+  return FALSE;
+}
+
+/**
+ * Access Callback that checks if the user can cancel their order
+ */
+function ms_fac_cancel_test($oid) {
+  global $user;
+  $order = ms_core_order_load($oid);
+  if ($user->uid == $order->uid) {
+    return TRUE;
+  }
+  return FALSE;
+}
+
+/**
+ * Implements hook_menu
+ ().
+ */
+function ms_fac_menu() {
+  $items = array();
+
+  $items['ms_fac/cancel/%'] = array(
+    'title' => 'Cancel Payments',
+    'page callback' => 'ms_fac_cancel_page',
+    'page arguments' => array(2),
+    'access callback' => 'ms_fac_cancel_test',
+    'access arguments' => array(2),
+    'type' => MENU_VISIBLE_IN_BREADCRUMB,
+  );
+  $items['ms_fac/modify/%/%'] = array(
+    'title' => 'Modify Payments',
+    'page callback' => 'ms_fac_modify_page',
+    'page arguments' => array(2, 3),
+    'access callback' => 'ms_fac_modify_test',
+    'access arguments' => array(2, 3),
+    'type' => MENU_VISIBLE_IN_BREADCRUMB,
+  );
+  $items['ms/checkout/fac'] = array(
+    'title' => 'Checkout',
+    'page callback' => 'ms_fac_checkout',
+    'access callback' => 'ms_fac_access_test',
+    'type' => MENU_VISIBLE_IN_BREADCRUMB,
+  );
+  $items['ms_fac/thank-you'] = array(
+    'title' => 'Thank You',
+    'page callback' => 'ms_fac_thankyou_page',
+    'access callback' => 'ms_fac_access_test',
+    'type' => MENU_VISIBLE_IN_BREADCRUMB,
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_cron().
+ */
+function ms_fac_cron() {
+  // Process payments that need to be processed for Recurring Payments
+  $result = db_query("SELECT * FROM {ms_recurring_schedules} WHERE gateway = :gateway AND status = :status AND next_payment < :next_payment", array(':gateway' => 'ms_fac', ':status' => 'active', ':next_payment' => REQUEST_TIME));
+
+  foreach ($result as $recurring_schedule) {
+    // Load some variables
+    $order = ms_core_order_load($recurring_schedule->oid);
+    $account = user_load($order->uid);
+    $payment_profile = ms_fac_get_payment_profile($account->uid);
+
+    if ($payment_profile) {
+      // Process the next payment
+      $response = ms_fac_cim_charge($order, $recurring_schedule->main_amount, $payment_profile);
+
+      if ($response['approved']) {
+        ms_core_log('ms_fac', 'Processing Recurring Charge for Order #!num. Here are the details: @message',
+            array('!num' => $order->oid, '@message' => ms_core_print_r($recurring_schedule)));
+        // Insert the rec_payment Payment to the database
+        $payment = ms_core_new_payment($order->oid, 'ms_fac', 'rec_payment');
+        $payment->transaction = $response['data']['txn_id'];
+        $payment->amount = $recurring_schedule->main_amount;
+        $payment->currency = $order->currency;
+        $payment->data = $response['data'];
+
+        // Update the address
+        $payment->billing_address = array(
+          'street' => $payment_profile->billToAddress,
+          'city' => $payment_profile->billToCity,
+          'state' => $payment_profile->billToState,
+          'zip' => $payment_profile->billToZip,
+          'country' => $payment_profile->billToCountry,
+          'phone' => $payment_profile->billToPhoneNumber,
+        );
+        // Update the contact details
+        $payment->first_name = $payment_profile->billToFirstName;
+        $payment->last_name = $payment_profile->billToLastName;
+
+        // Add the Payment to the Order
+        ms_core_enter_payment($payment);
+
+        // Check if the recurring_schedule is done, send rec_eot
+        if ($recurring_schedule->total_occurrences <= ($recurring_schedule->current_payments + 1)) {
+          $payment->type = 'rec_eot';
+          $payment->amount = 0;
+          ms_core_enter_payment($payment);
+        }
+      }
+      else {
+        // Log the error
+        ms_core_log_error('ms_fac', 'Error Processing Charge: @message',
+          array('@message' => $response['message']));
+      }
+    }
+    else {
+      // Log the error, do something else
+      ms_core_log_error('ms_fac', 'Error Loading Profiles for Recurring Payment: @message',
+        array('@message' => ms_core_print_r($recurring_schedule)));
+    }
+  }
+}
+
+/**
+ * Admin Settings Form
+ */
+function ms_fac_admin() {
+
+  $form['information'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('API Credentials'),
+    '#description' => t('This information is required to interact with your payment gateway account.'),
+  );
+  $form['information']['ms_fac_merchant_id'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Merchant ID'),
+    '#default_value' => variable_get('ms_fac_merchant_id', ''),
+    '#required' => TRUE,
+  );
+  $form['information']['ms_fac_merchant_password'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Merchant Password'),
+    '#default_value' => variable_get('ms_fac_merchant_password', ''),
+    '#required' => TRUE,
+  );
+
+  $form['gateway'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Gateway Settings'),
+  );
+  $form['gateway']['ms_fac_txn_mode'] = array(
+    '#type' => 'radios',
+    '#title' => t('Transaction mode'),
+    '#description' => t('Only specify a developer test account if your Merchant ID and Password can be used for Test Transactions. Adjust to live transactions when you are ready to start processing real payments.'),
+    '#options' => array(
+      'live' => t('Live transactions in a live account'),
+      'developer_test' => t('Developer test account transactions'),
+    ),
+    '#default_value' => variable_get('ms_fac_txn_mode', 'live'),
+  );
+  $form['gateway']['ms_fac_prefix'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Transaction Prefix'),
+    '#description' => t("Enter a prefix for this site's transactions. Remember that each site must have a unique prefix for your account."),
+    '#default_value' => variable_get('ms_fac_prefix', 'drupal'),
+  );
+  $form['gateway']['ms_fac_dev_server'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Developer Server Host'),
+    '#description' => t("Enter the Development Server Host. Default is 'ecm.firstatlanticcommerce.com'"),
+    '#default_value' => variable_get('ms_fac_dev_server', 'ecm.firstatlanticcommerce.com'),
+  );
+  $form['gateway']['ms_fac_live_server'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Live Server Host'),
+    '#description' => t("Enter the Live Server Host. Default is 'marlin.firstatlanticcommerce.com'"),
+    '#default_value' => variable_get('ms_fac_live_server', 'marlin.firstatlanticcommerce.com'),
+  );
+  $form['information']['ms_fac_auth_cvv'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Enable CVV?'),
+    '#default_value' => variable_get('ms_fac_auth_cvv', FALSE),
+    '#required' => TRUE,
+  );
+  $form['information']['ms_fac_auth_avs'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Enable AVS?'),
+    '#default_value' => variable_get('ms_fac_auth_avs', FALSE),
+    '#required' => TRUE,
+  );
+
+  return $form;
+}
+
+/********************************************************************
+ * FUNCTIONS
+ *******************************************************************/
+
+/**
+ * Get the default payment profile for a user
+ */
+function ms_fac_get_payment_profile($uid) {
+  $result = db_query("SELECT * FROM {ms_fac_payment_profiles} WHERE uid = :uid", array(':uid' => $uid));
+
+  foreach ($result as $payment_profile) {
+    $payment_profile->cardNumber = ms_fac_decrypt_card($payment_profile->cardNumber);
+    return $payment_profile;
+  }
+
+  return FALSE;
+}
+
+/**
+ * Get the default shipping profile for a user
+ */
+function ms_fac_get_shipping_profile($uid) {
+  $result = db_query("SELECT * FROM {ms_fac_shipping_profiles} WHERE uid = :uid", array(':uid' => $uid));
+
+  foreach ($result as $shipping_profile) {
+    return $shipping_profile;
+  }
+
+  return FALSE;
+}
+
+/**
+ * Get the default payment profile for a user
+ */
+function ms_fac_get_payment_profile_by_id($id) {
+  $result = db_query("SELECT * FROM {ms_fac_payment_profiles} WHERE id = :id", array(':id' => $id));
+
+  foreach ($result as $payment_profile) {
+    $payment_profile->cardNumber = ms_fac_decrypt_card($payment_profile->cardNumber);
+    return $payment_profile;
+  }
+
+  return FALSE;
+}
+
+/**
+ * Get the default shipping profile for a user
+ */
+function ms_fac_get_shipping_profile_by_id($id) {
+  $result = db_query("SELECT * FROM {ms_fac_shipping_profiles} WHERE id = :id", array(':id' => $id));
+
+  foreach ($result as $shipping_profile) {
+    return $shipping_profile;
+  }
+
+  return FALSE;
+}
+
+/**
+ * Get the payment profiles for a user
+ */
+function ms_fac_get_payment_profiles($uid) {
+  $payment_profiles = array();
+  $result = db_query("SELECT * FROM {ms_fac_payment_profiles} WHERE uid = :uid", array(':uid' => $uid));
+
+  foreach ($result as $payment_profile) {
+    $payment_profile->cardNumber = ms_fac_decrypt_card($payment_profile->cardNumber);
+    // Clean the Card Number before it is output
+    $payment_profiles[$payment_profile->id] = t('Credit Card: @number', array('@number' => ms_core_mask_cc($payment_profile->cardNumber)));
+  }
+
+  return $payment_profiles;
+}
+
+/**
+ * Get the shipping profiles for a user
+ */
+function ms_fac_get_shipping_profiles($uid) {
+  $shipping_profiles = array();
+  $result = db_query("SELECT * FROM {ms_fac_shipping_profiles} WHERE uid = :uid", array(':uid' => $uid));
+
+  foreach ($result as $shipping_profile) {
+    $shipping_profiles[$shipping_profile->id] = t('Address: @address', array('@address' => $shipping_profile->shipToAddress));
+  }
+
+  return $shipping_profiles;
+}
+
+/**
+ * Create a Payment Profile
+ */
+function ms_fac_create_payment_profile($uid, $address, $card_num, $month, $year) {
+  $payment_profile = new stdClass();
+  $payment_profile->uid = $uid;
+  $payment_profile->billToFirstName = $address['first_name'];
+  $payment_profile->billToLastName = $address['last_name'];
+  $payment_profile->billToAddress = $address['address'];
+  $payment_profile->billToCity = $address['city'];
+  $payment_profile->billToState = $address['state'];
+  $payment_profile->billToZip = $address['zip'];
+  $payment_profile->billToCountry = $address['country'];
+  $payment_profile->billToPhoneNumber = $address['phone'];
+  $payment_profile->billToFaxNumber = $address['fax'];
+  $payment_profile->cardNumber = ms_fac_encrypt_card($card_num);
+  $payment_profile->expirationMonth = $month;
+  $payment_profile->expirationYear = $year;
+
+  ms_core_log('ms_fac', 'Creating a new Payment Profile');
+  drupal_write_record('ms_fac_payment_profiles', $payment_profile);
+  return $payment_profile;
+}
+
+/**
+ * Prepare a Payment Profile
+ */
+function ms_fac_prepare_payment_profile($v) {
+  $payment_profile = new stdClass();
+  $payment_profile->billToFirstName = trim($v['cc_first_name']);
+  $payment_profile->billToLastName = trim($v['cc_last_name']);
+  $payment_profile->billToAddress = trim($v['billing_address1']);
+  $payment_profile->billToCity = trim($v['billing_city']);
+  $payment_profile->billToState = trim($v['billing_state']);
+  $payment_profile->billToZip = trim($v['billing_zip']);
+  $payment_profile->billToCountry = trim($v['billing_country']);
+  $payment_profile->billToPhoneNumber = trim($v['billing_phone']);
+  $payment_profile->billToFaxNumber = '';
+  $payment_profile->cardNumber = $v['cc_number'];
+  $payment_profile->expirationMonth = $v['cc_exp_month'];
+  $payment_profile->expirationYear = $v['cc_exp_year'];
+
+  return $payment_profile;
+}
+
+/**
+ * Create a CIM Shipping Profile
+ */
+function ms_fac_create_shipping_profile($uid, $address) {
+  $shipping_profile = new stdClass();
+  $shipping_profile->uid = $uid;
+  $shipping_profile->shipToFirstName = $address['first_name'];
+  $shipping_profile->shipToLastName = $address['last_name'];
+  $shipping_profile->shipToAddress = $address['address'];
+  $shipping_profile->shipToCity = $address['city'];
+  $shipping_profile->shipToState = $address['state'];
+  $shipping_profile->shipToZip = $address['zip'];
+  $shipping_profile->shipToCountry = $address['country'];
+  $shipping_profile->shipToPhoneNumber = $address['phone'];
+  $shipping_profile->shipToFaxNumber = $address['fax'];
+
+  drupal_write_record('ms_fac_shipping_profiles', $shipping_profile);
+  return $shipping_profile;
+}
+
+/**
+ * Create the profiles from an order
+ */
+function ms_fac_create_cim_profiles_from_order($order, $v) {
+  $account = user_load($order->uid);
+  if ($account->uid) {
+    $address = array(
+      'first_name' => trim($v['cc_first_name']),
+      'last_name' => trim($v['cc_last_name']),
+      'address' => trim($v['billing_address1']),
+      'city' => trim($v['billing_city']),
+      'state' => trim($v['billing_state']),
+      'zip' => trim($v['billing_zip']),
+      'country' => trim($v['billing_country']),
+      'phone' => trim($v['billing_phone']),
+      'fax' => '',
+    );
+    ms_fac_create_payment_profile($account->uid, $address, trim($v['cc_number']), trim($v['cc_exp_month']), trim($v['cc_exp_year']));
+    ms_fac_create_shipping_profile($account->uid, $address);
+  }
+}
+
+/**
+ * Implements hook_ms_core_payment_gateway().
+ */
+function ms_fac_ms_core_payment_gateway() {
+  $gateways['ms_fac'] = array(
+    'name' => 'First Atlantic Commerce',
+    'display_name' => t('Credit Card'),
+    'description' => t('Pay by Credit Card'),
+    'cards' => array('visa', 'mc', 'discover', 'amex'),
+    'module' => 'ms_fac',
+    'checkout_path' => 'ms/checkout/fac',
+    'cancel_url' => 'ms_fac_get_cancel_url',
+    'modify_url' => 'ms_fac_get_modify_url',
+    'settings' => ms_fac_admin(),
+  );
+
+  return $gateways;
+}
+
+/**
+ * Get the Cancellation URL for a recurring order
+ */
+function ms_fac_get_cancel_url($order) {
+  return 'ms_fac/cancel/' . $order->oid;
+}
+
+/**
+ * Initiate a cancellation
+ */
+function ms_fac_cancel_page($oid) {
+  return drupal_get_form('ms_fac_cancel_confirm', $oid);
+}
+
+/**
+ * Initiate a cancellation
+ */
+function ms_fac_cancel_confirm($form, &$form_state, $oid) {
+  $order = ms_core_order_load($oid);
+  $form['#ms_core_oid'] = $order->oid;
+  return confirm_form($form, t('Are you sure you want to cancel your order?'), '', t('This action cannot be undone.'), t('Confirm'));
+}
+
+/**
+ * Confirm the cancel action
+ */
+function ms_fac_cancel_confirm_submit($form, &$form_state) {
+  $order = ms_core_order_load($form['#ms_core_oid']);
+
+  ms_fac_enter_payment($order, 0, 'rec_cancel', drupal_get_token(serialize($order)), ms_fac_get_payment_profile($order->uid));
+}
+
+/**
+ * Get the Modification URL for a recurring order
+ */
+function ms_fac_get_modify_url($order, $id) {
+  return 'ms_fac/modify/' . $order->oid . '/' . $id;
+}
+
+/**
+ * Initiate a modification
+ */
+function ms_fac_modify_page($oid, $id) {
+  // Enter a rec_cancel payment
+  $order = ms_core_order_load($oid);
+  $new_product = ms_core_load_module_product(ms_core_get_order_module($order), $id);
+
+  $data['new_product'] = $new_product;
+
+  $order = ms_core_add_data($order, $data);
+
+  ms_fac_enter_payment($order, 0, 'rec_modify', drupal_get_token(serialize($order)), ms_fac_get_payment_profile($order->uid));
+
+  drupal_goto();
+}
+
+/**
+ * Helper function to enter the payments
+ */
+function ms_fac_enter_payment($order, $amount, $type, $txn_id, $payment_profile) {
+  // Insert the Payment to the database
+  $payment = ms_core_new_payment($order->oid, 'ms_fac', $type);
+  $payment->transaction = $txn_id;
+  $payment->recurring_id = $order->oid;
+  $payment->amount = $amount;
+  $payment->currency = $order->currency;
+  $payment->data = $payment_profile;
+
+  // Update the address
+  $payment->billing_address = array(
+    'street' => $payment_profile->billToAddress,
+    'city' => $payment_profile->billToCity,
+    'state' => $payment_profile->billToState,
+    'zip' => $payment_profile->billToZip,
+    'country' => $payment_profile->billToCountry,
+    'phone' => $payment_profile->billToPhoneNumber,
+  );
+  // Update the contact details
+  $payment->first_name = $payment_profile->billToFirstName;
+  $payment->last_name = $payment_profile->billToLastName;
+
+  // Add the Payment to the Order
+  ms_core_enter_payment($payment);
+}
+
+/********************************************************************
+ * Checkout Forms
+ *******************************************************************/
+
+/**
+ * Make a form to show on the checkout page, to collect the CC and Address Info
+ * Then in the submit function, submit the info to the payment gateway. If it is successful, then go to thankyou page
+ */
+function ms_fac_checkout() {
+  $html = '';
+  // Stop the caching
+  $GLOBALS['conf']['cache'] = FALSE;
+
+  global $user;
+
+  if (!$order = ms_core_load_session_order()) {
+    // Error
+    return t('There was an error with the checkout');
+  }
+
+  $mode = variable_get('ms_fac_txn_mode', 'developer_test');
+  if ($mode == 'developer_test') {
+    drupal_set_message(t('Using Test Mode. Cards will not be charged.'));
+  }
+
+  // Check if the user has a saved payment profile
+  if ($user->uid AND $payment_profile = ms_fac_get_payment_profile($user->uid)) {
+    // Show the form to use the saved profile
+    $html .= drupal_get_form('ms_fac_cim_checkout_form', $order, $user);
+  }
+  else {
+    // Get the Payment Form
+    $html .= drupal_get_form('ms_fac_checkout_form', $order);
+  }
+
+  return $html;
+}
+
+/**
+ * Build the CIM Form
+ */
+function ms_fac_cim_checkout_form($form, $form_state, $order, $account) {
+  // Load the profiles
+  $payment_profiles = ms_fac_get_payment_profiles($account->uid);
+
+  $form = array();
+
+  $form['payment_id'] = array(
+    '#type' => 'radios',
+    '#title' => 'Payment Method',
+    '#options' => $payment_profiles,
+    '#description' => t("Select which method you'd like to use to pay for this purchase."),
+    '#default_value' => key($payment_profiles),
+    '#required' => TRUE,
+  );
+
+  $form['ms_oid'] = array(
+    '#type' => 'value',
+    '#value' => $order->oid,
+  );
+
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Pay Now'),
+  );
+
+  return $form;
+}
+
+/**
+ * Validate the Checkout Form, and Try to Charge the Card from the CIM Profile
+ */
+function ms_fac_cim_checkout_form_validate($form, &$form_state) {
+  $form_values = $form_state['values'];
+
+  $order = ms_core_order_load($form_values['ms_oid']);
+  $payment_profile = ms_fac_get_payment_profile_by_id($form_values['payment_id']);
+
+  switch ($order->order_type) {
+    case 'recurring':
+      // Check if there is a free trial
+      if ($order->recurring_schedule['trial_length'] AND !$order->recurring_schedule['trial_amount']) {
+        // Just insert a rec_signup payment without charging
+
+        // Insert the Payment to the database for the Free Trial
+        ms_fac_enter_payment($order, 0, 'rec_signup', drupal_get_token(serialize($order)), $payment_profile);
+
+        // Add the payment to the order
+        $form_state['values']['ms_oid'] = $order->oid;
+        $form_state['values']['ms_order_charged'] = TRUE;
+      }
+      else {
+        // Check if there is a trial
+        $amount = ($order->recurring_schedule['trial_length']) ? $order->recurring_schedule['trial_amount'] : $order->recurring_schedule['main_amount'];
+
+        // Charge the first payment, and enter rec_signup and rec_payment
+        $response = ms_fac_cim_charge($order, $amount, $payment_profile);
+
+        if ($response['approved']) {
+          // Add the payment to the order
+          $form_state['values']['ms_oid'] = $order->oid;
+          $form_state['values']['ms_order_charged'] = TRUE;
+
+          // Insert the rec_signup Payment to the database
+          ms_fac_enter_payment($order, $amount, 'rec_signup', $response['data']['txn_id'], $payment_profile);
+        }
+        else {
+          // Log the error
+          ms_core_log_error('ms_fac', 'Error Processing CIM Charge: @message', array('@message' => $response['message']));
+        }
+      }
+      break;
+
+    case 'cart':
+      $response = ms_fac_cim_charge($order, $order->amount, $payment_profile);
+
+      // Get the payment profile ID returned from the request
+      if ($response['approved']) {
+        // Add the payment to the order
+        $form_state['values']['ms_oid'] = $order->oid;
+        $form_state['values']['ms_order_charged'] = TRUE;
+
+        // Insert the Payment to the database
+        ms_fac_enter_payment($order, $order->amount, 'cart', $response['data']['txn_id'], $payment_profile);
+      }
+      else {
+        form_set_error('payment_id', t('Error: @message', array('@message' => $response['message'])));
+      }
+      break;
+  }
+}
+
+/**
+ * The card has been charged, mark the order as completed
+ */
+function ms_fac_cim_checkout_form_submit($form, &$form_state) {
+  $v = $form_state['values'];
+
+  // If the Order was charged, go to thankyou page
+  if ($v['ms_order_charged']) {
+    drupal_goto('ms/thankyou');
+  }
+  else {
+    // There was an error...
+  }
+}
+
+/**
+ * Build the Checkout Form
+ */
+function ms_fac_checkout_form($form, $form_state, $order) {
+  $form = array();
+
+  $cards = array(
+    'visa' => 'Visa',
+    'mc' => 'MasterCard',
+    'amex' => 'American Express',
+    'discover' => 'Discover',
+    'diners' => 'Diners',
+    'jcb' => 'JCB',
+  );
+
+  $allowed_cards = ms_core_get_cards($cards, variable_get('ms_fac_allowed_cards', array('visa', 'mc', 'discover', 'amex', 'echeck', 'paypal')));
+
+  ms_core_get_cc_form($form, $order, $allowed_cards);
+
+  ms_core_get_billing_form($form, $order);
+
+  $form['ms_oid'] = array(
+    '#type' => 'value',
+    '#value' => $order->oid,
+  );
+
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Pay Now'),
+  );
+
+  return $form;
+}
+
+/**
+ * Validate the Checkout Form, and Try to Charge the Card
+ */
+function ms_fac_checkout_form_validate($form, &$form_state) {
+  $v = $form_state['values'];
+
+  $order = ms_core_order_load($v['ms_oid']);
+
+  switch ($order->order_type) {
+    case 'recurring':
+      // Check if there is a free trial
+      if ($order->recurring_schedule['trial_length'] > 0 AND $order->recurring_schedule['trial_amount'] == 0) {
+        // AUTH_ONLY on the card
+        $response = ms_fac_charge($order, 1.00, $v, 'AUTH_ONLY');
+
+        if ($response['approved'] == TRUE) {
+          // Insert the Payment to the database for the Free Trial
+          ms_fac_enter_payment($order, 0, 'rec_signup', $response['data']['txn_id'], ms_fac_prepare_payment_profile($v));
+
+          // Add the payment to the order
+          $form_state['values']['ms_oid'] = $order->oid;
+          $form_state['values']['ms_order_charged'] = TRUE;
+
+          // Save the CIM profiles
+          $order = ms_core_order_load($order->oid);
+          ms_fac_create_cim_profiles_from_order($order, $v);
+        }
+        else { // The Credit Card was not approved, set an error on the form
+          form_set_error('ccnumber', t('Error') . ': ' . $response['message']);
+        }
+      }
+      else {
+        // Check if there is a trial
+        $amount = ($order->recurring_schedule['trial_length']) ? $order->recurring_schedule['trial_amount'] : $order->recurring_schedule['main_amount'];
+
+        // Process the First Charge
+        $response = ms_fac_charge($order, $amount, $v);
+
+        if ($response['approved'] == TRUE) {
+          // Insert the rec_signup payment
+          ms_fac_enter_payment($order, $amount, 'rec_signup', $response['data']['txn_id'], ms_fac_prepare_payment_profile($v));
+
+          // Add the payment to the order
+          $form_state['values']['ms_oid'] = $order->oid;
+          $form_state['values']['ms_order_charged'] = TRUE;
+
+          // Save the CIM profiles
+          $order = ms_core_order_load($order->oid);
+          ms_fac_create_cim_profiles_from_order($order, $v);
+        }
+        else { // The Credit Card was not approved, set an error on the form
+          form_set_error('ccnumber', t('Error') . ': ' . $response['message']);
+        }
+      }
+      break;
+
+    case 'cart':
+      $response = ms_fac_charge($order, $order->amount, $v);
+
+      if ($response['approved'] == TRUE) {
+        // Insert the payment
+        ms_fac_enter_payment($order, $order->amount, 'cart', $response['data']['txn_id'], ms_fac_prepare_payment_profile($v));
+
+        // Save the values
+        $form_state['values']['ms_oid'] = $order->oid;
+        $form_state['values']['ms_order_charged'] = TRUE;
+
+        // Save the CIM profiles
+        $order = ms_core_order_load($order->oid);
+        ms_fac_create_cim_profiles_from_order($order, $v);
+      }
+      else { // The Credit Card was not approved, set an error on the form
+        form_set_error('ccnumber', t('Error') . ': ' . $response['message']);
+      }
+      break;
+  }
+}
+
+/**
+ * The card has been charged, mark the order as completed
+ */
+function ms_fac_checkout_form_submit($form, &$form_state) {
+  $v = $form_state['values'];
+
+  // If the Order was charged, go to thankyou page
+  if ($v['ms_order_charged']) {
+    drupal_goto('ms/thankyou');
+  }
+  else {
+    // There was an error...
+  }
+}
+
+/********************************************************************
+ * Charge Functions
+ *******************************************************************/
+
+/**
+ * Handles authorizations and captures through AIM at Authorize.Net
+ */
+function ms_fac_charge($order, $amount, $data, $mode = 'AUTH_CAPTURE', $auth_cvv = TRUE) {
+  $my_currency = ms_fac_get_currency_code($order->currency);
+
+  $order_total = round($amount, ms_fac_get_decimals($my_currency));
+
+  $processed_amount = str_pad($order_total * pow(10, ms_fac_get_decimals($my_currency)), 12, '0', STR_PAD_LEFT);
+
+  $order_id = variable_get('ms_fac_prefix', 'drupal') . '-' . $order->oid . '-' . REQUEST_TIME;
+
+  $signature = urlencode(base64_encode(pack("H*", sha1(variable_get('ms_fac_merchant_password', '') . variable_get('ms_fac_merchant_id', '') . '464748' . $order_id . $processed_amount . $my_currency))));
+
+  $params = array(
+    'blnIsAVS' => variable_get('ms_fac_auth_avs', FALSE) ? 'True' : 'False',
+    'blnIsAVSOnly' => 'False',
+    'blnIs3DSPreAuthenticated' => 'False',
+    'intMerchantId' => variable_get('ms_fac_merchant_id', ''),
+    'intAcquirerId' => '464748',
+    'strOrderId' => $order_id,
+    'intAmount' => $processed_amount,
+    'intCurrency' => $my_currency,
+    'intCurrencyExponent' => ms_fac_get_decimals($my_currency),
+    'intCardNumber' => $data['cc_number'],
+    'intCardExpDate' => $data['cc_exp_month'] . substr($data['cc_exp_year'], -2),
+    'intCardCVV2' => '',
+    'strSignatureMethod' => 'SHA1',
+    'strSignature' => $signature,
+    'strTestFlag' => 'False',
+    'strBillToAddress' => '',
+    'strBillToZipPostCode' => '',
+    'strBillToFirstName' => '',
+    'strBillToLastName' => '',
+    'strBillToCity' => '',
+    'strBillToState' => '',
+    'intBillToCountry' => '',
+    'strBillToEmail' => '',
+    'intBillToTelephone' => '',
+    'strHDF' => '',
+    'intECIIndicator' => '',
+    'strAuthenticationResult' => '',
+    'strTransactionStain' => '',
+    'strCAVVValue' => '',
+    'intIPAddress' => '',
+  );
+
+
+  switch ($mode) {
+    case 'AUTH_CAPTURE':
+      $params['strCaptureFlag'] = 'A';
+      break;
+
+    case 'AUTH_ONLY':
+      $params['strCaptureFlag'] = 'M';
+      break;
+  }
+
+  // Authorize CVV?
+  if (variable_get('ms_fac_auth_cvv', FALSE) AND $auth_cvv) {
+    $params['intCardCVV2'] = $data['cc_cvv'];
+  }
+
+  // Authorize AVS?
+  if (variable_get('ms_fac_auth_avs', FALSE)) {
+    $params['strBillToZipPostCode'] = $data['billing_zip'];
+    $params['strBillToAddress'] = $data['billing_address1'];
+  }
+
+  // Now post the transaction
+  // Use either the live or development server
+  if (variable_get('ms_fac_txn_mode', '') == 'developer_test') {
+    $host = variable_get('ms_fac_dev_server', 'ecm.firstatlanticcommerce.com');
+  }
+  else {
+    $host = variable_get('ms_fac_live_server', 'marlin.firstatlanticcommerce.com');
+  }
+
+  $path = "/FACPG/FACPGWS.asmx/AuthNon3DS";
+  //$path = "/SENTRY/PaymentGateway/application/directauthzLink.aspx";
+
+  $fields = '';
+  foreach ($params as $key => $value) {
+    $fields .= "$key=" . $value . "&";
+  }
+  $fields = rtrim($fields, "& ");
+
+  return ms_fac_curl_process($host, $path, $fields);
+}
+
+/**
+ * Creates a new CIM charging schedule
+ */
+function ms_fac_cim_charge($order, $amount, $payment_profile) {
+  $data = array(
+    'cc_exp_month' => $payment_profile->expirationMonth,
+    'cc_exp_year' => $payment_profile->expirationYear,
+    'cc_number' => $payment_profile->cardNumber,
+    'billing_zip' => $payment_profile->billToZip,
+    'billing_address1' => $payment_profile->billToAddress,
+  );
+
+  return ms_fac_charge($order, $amount, $data, 'AUTH_CAPTURE', FALSE);
+}
+
+/**
+ * Helper Function to get the decimal format for the currencies
+ */
+function ms_fac_get_decimals($currency_code) {
+  $currency_formats = array(
+    '020' => 0,
+    '784' => 2,
+    '044' => 2,
+    '004' => 2,
+    '008' => 2,
+    '051' => 2,
+    '532' => 2,
+    '024' => 2,
+    '032' => 2,
+    '040' => 2,
+    '036' => 2,
+    '533' => 2,
+    '031' => 2,
+    '977' => 2,
+    '052' => 2,
+    '050' => 2,
+    '056' => 0,
+    '100' => 2,
+    '048' => 3,
+    '108' => 0,
+    '060' => 2,
+    '096' => 2,
+    '068' => 2,
+    '986' => 2,
+    '064' => 2,
+    '072' => 2,
+    '974' => 0,
+    '084' => 2,
+    '124' => 2,
+    '976' => 2,
+    '756' => 2,
+    '152' => 0,
+    '156' => 2,
+    '170' => 2,
+    '188' => 2,
+    '192' => 2,
+    '132' => 2,
+    '196' => 2,
+    '203' => 2,
+    '276' => 2,
+    '262' => 0,
+    '208' => 2,
+    '214' => 2,
+    '012' => 2,
+    '233' => 2,
+    '818' => 2,
+    '232' => 2,
+    '230' => 2,
+    '978' => 2,
+    '246' => 2,
+    '242' => 2,
+    '238' => 2,
+    '250' => 2,
+    '826' => 2,
+    '981' => 2,
+    '288' => 2,
+    '292' => 2,
+    '270' => 2,
+    '324' => 0,
+    '320' => 2,
+    '624' => 2,
+    '328' => 2,
+    '344' => 2,
+    '340' => 2,
+    '191' => 2,
+    '332' => 2,
+    '348' => 2,
+    '360' => 2,
+    '372' => 2,
+    '376' => 2,
+    '356' => 2,
+    '368' => 3,
+    '364' => 2,
+    '352' => 2,
+    '380' => 0,
+    '388' => 2,
+    '400' => 3,
+    '392' => 0,
+    '404' => 2,
+    '417' => 2,
+    '116' => 2,
+    '174' => 0,
+    '408' => 2,
+    '410' => 0,
+    '414' => 3,
+    '136' => 2,
+    '398' => 2,
+    '418' => 2,
+    '422' => 2,
+    '144' => 2,
+    '430' => 2,
+    '426' => 2,
+    '440' => 2,
+    '442' => 0,
+    '428' => 2,
+    '434' => 3,
+    '504' => 2,
+    '498' => 2,
+    '450' => 0,
+    '807' => 2,
+    '104' => 2,
+    '496' => 2,
+    '446' => 2,
+    '478' => 2,
+    '470' => 2,
+    '480' => 2,
+    '462' => 2,
+    '454' => 2,
+    '484' => 2,
+    '458' => 2,
+    '508' => 2,
+    '516' => 2,
+    '566' => 2,
+    '558' => 2,
+    '528' => 2,
+    '578' => 2,
+    '524' => 2,
+    '554' => 2,
+    '512' => 3,
+    '590' => 2,
+    '604' => 2,
+    '598' => 2,
+    '608' => 2,
+    '586' => 2,
+    '985' => 2,
+    '620' => 0,
+    '600' => 0,
+    '634' => 2,
+    '642' => 2,
+    '643' => 2,
+    '810' => 2,
+    '646' => 0,
+    '682' => 2,
+    '090' => 2,
+    '690' => 2,
+    '736' => 2,
+    '752' => 2,
+    '702' => 2,
+    '654' => 2,
+    '705' => 2,
+    '703' => 2,
+    '694' => 2,
+    '706' => 2,
+    '740' => 2,
+    '678' => 2,
+    '222' => 2,
+    '760' => 2,
+    '748' => 2,
+    '764' => 2,
+    '972' => 2,
+    '795' => 2,
+    '788' => 3,
+    '776' => 2,
+    '626' => 0,
+    '792' => 0,
+    '780' => 2,
+    '901' => 2,
+    '834' => 2,
+    '980' => 2,
+    '800' => 2,
+    '840' => 2,
+    '858' => 2,
+    '860' => 2,
+    '862' => 2,
+    '704' => 2,
+    '548' => 0,
+    '882' => 2,
+    '950' => 0,
+    '951' => 2,
+    '952' => 0,
+    '953' => 0,
+    '886' => 2,
+    '891' => 2,
+    '710' => 2,
+    '894' => 2,
+    '716' => 2,
+  );
+
+  return $currency_formats[$currency_code];
+}
+
+/**
+ * Helper function to get the currency code
+ */
+function ms_fac_get_currency_code($currency) {
+  $currency_codes = array(
+    'USD' => '840',
+    'GBP' => '826',
+    'CHF' => '756',
+    'EUR' => '978',
+    'ARS' => '032',
+    'AUD' => '036',
+    'ATS' => '040',
+    'BEF' => '056',
+    'BOB' => '068',
+    'CAD' => '124',
+    'CLP' => '152',
+    'COP' => '170',
+    'CRC' => '188',
+    'CZK' => '203',
+    'DKK' => '208',
+    'DOP' => '214',
+    'ECS' => '218',
+    'SVC' => '222',
+    'FIM' => '246',
+    'FRF' => '250',
+    'DEM' => '280',
+    'GRD' => '300',
+    'GTQ' => '320',
+    'HNL' => '340',
+    'HKD' => '344',
+    'HUF' => '348',
+    'INR' => '356',
+    'IEP' => '372',
+    'ILS' => '376',
+    'ITL' => '380',
+    'JPY' => '392',
+    'KRW' => '410',
+    'LUF' => '442',
+    'MYR' => '458',
+    'MXN' => '484',
+    'NLG' => '528',
+    'NZD' => '554',
+    'NIO' => '558',
+    'NOK' => '578',
+    'PAB' => '590',
+    'PYG' => '600',
+    'PEN' => '604',
+    'PHP' => '608',
+    'PTE' => '620',
+    'SAR' => '682',
+    'SGD' => '702',
+    'ZAR' => '710',
+    'ESP' => '724',
+    'SRG' => '740',
+    'SEK' => '752',
+    'THB' => '764',
+    'AED' => '784',
+    'RUR' => '810',
+    'UYU' => '858',
+    'VEB' => '862',
+    'TWD' => '901',
+    'PLZ' => '985',
+    'BRL' => '986',
+    'BSD' => '044',
+    'BBD' => '052',
+    'BMD' => '060',
+    'BZD' => '084',
+    'KYD' => '136',
+    'ECD' => '951',
+    'HTG' => '332',
+    'JMD' => '388',
+    'ANG' => '532',
+    'TTD' => '780',
+    'AWG' => '533',
+    'CYP' => '196',
+  );
+
+  return $currency_codes[$currency];
+}
+
+/**
+ * Send the Server Request using cURL
+ */
+function ms_fac_curl_process($host, $path, $fields) {
+  $return = array();
+
+  // Use cURL to send the server request
+  $ch = curl_init('https://' . $host . $path);
+  curl_setopt($ch, CURLOPT_HEADER, 0);
+  curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
+  curl_setopt($ch, CURLOPT_TIMEOUT, 300);
+  curl_setopt($ch, CURLOPT_POSTFIELDS, $fields);
+  $raw_response = curl_exec($ch);
+  curl_close($ch);
+
+  $response = array();
+  parse_str(htmlspecialchars_decode($raw_response), $response);
+
+  if (empty($response)) {
+    ms_core_log_error('ms_fac', "Transaction timed out or no response received.");
+    $return['approved'] = FALSE;
+    $return['message'] = t('Transaction timed out or no response received.');
+  }
+  else {
+    // determine if the transaction was a success
+    if ($response['ResponseCode'] == '1') {
+      $return['approved'] = TRUE;
+      $return['data']['txn_id'] = $response['ReferenceNo'];
+    }
+    else {
+      ms_core_log_error('ms_fac', "Error %reasoncode: %reasondesc",
+        array('%reasoncode' => $response['ReasonCode'], '%reasondesc' => $response['ReasonCodeDesc']));
+      $return['approved'] = FALSE;
+      $return['message'] = t("%reasoncode - %reasondesc",
+        array('%reasoncode' => $response['ReasonCode'], '%reasondesc' => $response['ReasonCodeDesc']));
+    }
+  }
+
+  return $return;
+}
+
+/**
+ * Helper function to encrypt the credit card number for storage
+ */
+function ms_fac_encrypt_card($string) {
+  $key = variable_get('ms_fac_encryption_key', '');
+  $result = '';
+  for ($i = 0; $i < strlen($string); $i++) {
+    $char = substr($string, $i, 1);
+    $keychar = substr($key, ($i % strlen($key)) - 1, 1);
+    $char = chr(ord($char) + ord($keychar));
+    $result .= $char;
+  }
+
+  return base64_encode($result);
+}
+
+/**
+ * Helper function to decrypt the credit card number
+ */
+function ms_fac_decrypt_card($string) {
+  $key = variable_get('ms_fac_encryption_key', '');
+  $result = '';
+  $string = base64_decode($string);
+
+  for ($i = 0; $i < strlen($string); $i++) {
+    $char = substr($string, $i, 1);
+    $keychar = substr($key, ($i % strlen($key)) - 1, 1);
+    $char = chr(ord($char) - ord($keychar));
+    $result .= $char;
+  }
+
+  return $result;
+}

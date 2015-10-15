@@ -1,0 +1,272 @@
+<?php
+/**
+ * @file
+ * Main module functions.
+ */
+
+require_once __DIR__ . '/vendor/autoload.php';
+require_once __DIR__ . '/neo4j_connector.index.inc';
+
+// Index names.
+define('NEO4J_CONNECTOR_ENTITY_INDEX_PREFIX', 'entity_index_');
+
+// Limit of items to process during reindex batch op.
+define('NEO4J_CONNECTOR_REINDEX_LIMIT', 100);
+
+/**
+ * Implements hook_menu().
+ */
+function neo4j_connector_menu() {
+  return array(
+    // Drupal entity tabs.
+    'node/%node/graph' => array(
+      'type' => MENU_LOCAL_TASK,
+      'title' => 'Graph info',
+      'page callback' => 'neo4j_connector_node_graph_info_page',
+      'page arguments' => array(1),
+      'file' => 'neo4j_connector.pages.inc',
+      'access callback' => TRUE,
+    ),
+    'user/%user/graph' => array(
+      'type' => MENU_LOCAL_TASK,
+      'title' => 'Graph info',
+      'page callback' => 'neo4j_connector_user_graph_info_page',
+      'page arguments' => array(1),
+      'file' => 'neo4j_connector.pages.inc',
+      'access callback' => TRUE,
+    ),
+    'taxonomy/term/%taxonomy_term/graph' => array(
+      'type' => MENU_LOCAL_TASK,
+      'title' => 'Graph info',
+      'page callback' => 'neo4j_connector_term_graph_info_page',
+      'page arguments' => array(2),
+      'file' => 'neo4j_connector.pages.inc',
+      'access callback' => TRUE,
+    ),
+
+    // Neo4J admin section.
+    'admin/config/neo4j' => array(
+      'title' => 'Neo4J',
+      'description' => 'Administration tools.',
+      'page callback' => 'system_admin_menu_block_page',
+      'access arguments' => array('access administration pages'),
+      'file' => 'system.admin.inc',
+      'file path' => drupal_get_path('module', 'system'),
+    ),
+
+    // Regenerate nodes / users.
+    'admin/config/neo4j/settings' => array(
+      'title' => 'Admin settings',
+      'page callback' => 'neo4j_connector_admin_settings_page',
+      'file' => 'neo4j_connector.pages.inc',
+      'access callback' => TRUE,
+      'description' => t('Neo4J settings'),
+    ),
+
+    // 'Eval' console.
+    'admin/config/neo4j/console' => array(
+      'title' => 'Console',
+      'page callback' => 'neo4j_connector_console_page',
+      'file' => 'neo4j_connector.pages.inc',
+      'access callback' => TRUE,
+      'description' => t('DB console'),
+    ),
+  );
+}
+
+/**
+ * Implements hook_entity_insert().
+ */
+function neo4j_connector_entity_insert($entity, $type) {
+  list ($id,,) = entity_extract_ids($type, $entity);
+  neo4j_connector_index_send_to_index($type, $id);
+}
+
+/**
+ * Implements hook_entity_update().
+ */
+function neo4j_connector_entity_update($entity, $type) {
+  list ($id,,) = entity_extract_ids($type, $entity);
+  neo4j_connector_index_send_to_index($type, $id);
+}
+
+/**
+ * Implements hook_entity_delete().
+ */
+function neo4j_connector_entity_delete($entity, $type) {
+  list ($id,,) = entity_extract_ids($type, $entity);
+
+  $indexParam = new Neo4JDrupalIndexParam(NEO4J_CONNECTOR_ENTITY_INDEX_PREFIX . $type, 'entity_id', $id);
+  Neo4JDrupal::sharedInstance()->deleteEntity($indexParam);
+
+  neo4j_connector_index_delete($type, $id);
+}
+
+/**
+ * @param $entity
+ * @param $type
+ * @param $include_fields
+ *
+ * @return \Everyman\Neo4j\Node
+ */
+function neo4j_connector_add_entity_to_neo4j($entity, $type, $include_fields = TRUE) {
+  list($id, ,) = entity_extract_ids($type, $entity);
+  $indexParam = new Neo4JDrupalIndexParam(NEO4J_CONNECTOR_ENTITY_INDEX_PREFIX . $type, 'entity_id', $id);
+
+  $properties = array();
+  drupal_alter('neo4j_connector_entity_properties', $properties, $entity, $type);
+
+  return Neo4JDrupal::sharedInstance()->addEntity($entity, $type, $properties, $indexParam, $include_fields);
+}
+
+/**
+ * Helper function to collect graph node properties of a node to store.
+ *
+ * @param $properties
+ * @param $entity
+ *  Node object.
+ * @param $entity_type
+ */
+function neo4j_connector_neo4j_connector_entity_properties_alter(&$properties, $entity, $entity_type) {
+  list($id, $vid, $bundle) = entity_extract_ids($entity_type, $entity);
+  switch ($entity_type) {
+    case 'node':
+      $properties['title'] = $entity->title;
+      break;
+
+    case 'user':
+      $properties['name'] = $entity->name;
+      $properties['mail'] = $entity->mail;
+      break;
+  }
+
+  $properties['entity_id'] = $id;
+  $properties['entity_vid'] = $vid;
+  $properties['entity_type'] = $entity_type;
+  $properties['bundle'] = $bundle;
+}
+
+/**
+ * Implements hook_cron_queue_info().
+ */
+function neo4j_connector_cron_queue_info() {
+  return array(
+    'neo4j_connector_node_regenerate' => array(
+      'worker callback' => 'neo4j_connector_queue_node_regenerate_worker',
+      'time' => 120,
+    ),
+    'neo4j_connector_user_regenerate' => array(
+      'worker callback' => 'neo4j_connector_queue_user_regenerate_worker',
+      'time' => 120,
+    ),
+  );
+}
+
+function _neo4j_connector_batch_op_mark_for_index($entity_type, &$context) {
+  if (empty($context['sandbox'])) {
+    $context['sandbox']['progress'] = 0;
+
+    $query = new EntityFieldQuery();
+    $query->entityCondition('entity_type', $entity_type);
+    $context['sandbox']['count'] = $query->count()->execute();
+  }
+
+  // @todo add not-in-() using the existing indexed ids.
+
+  $query = new EntityFieldQuery();
+  $query->entityCondition('entity_type', $entity_type);
+  $query->range($context['sandbox']['progress'], NEO4J_CONNECTOR_REINDEX_LIMIT);
+  $query->entityOrderBy('entity_id');
+  $result = $query->execute();
+
+  if (!empty($result[$entity_type])) {
+    foreach (array_keys($result[$entity_type]) as $entity_id) {
+      neo4j_connector_index_send_to_index($entity_type, $entity_id);
+      $context['sandbox']['progress']++;
+    }
+  }
+
+  $context['message'] = t('@current out of @total @type entity have been marked in the index.', array(
+    '@current' => $context['sandbox']['progress'],
+    '@total' => $context['sandbox']['count'],
+    '@type' => $entity_type,
+  ));
+  $finished = $context['sandbox']['count'] == 0 ? 1 : $context['sandbox']['progress'] / $context['sandbox']['count'];
+  $context['finished'] = $finished;
+}
+
+function _neo4j_connector_batch_op_reindex(&$context) {
+  if (empty($context['sandbox'])) {
+    $index_stat = neo4j_connector_index_get_stat();
+    $context['sandbox']['total'] = $index_stat['non-indexed'];
+  }
+
+  neo4j_connector_index_process_index();
+
+  $index_stat = neo4j_connector_index_get_stat();
+
+  $context['message'] = t('@count item(s) left.', array('@count' => $index_stat['non-indexed']));
+  $finished = $index_stat['non-indexed'] == 0 ? 1 : $index_stat['non-indexed'] / $context['sandbox']['total'];
+  $context['finished'] = $finished;
+}
+
+/**
+ * @param $entity_type
+ * @param $entity_id
+ *
+ * @return \Everyman\Neo4j\Node|FALSE
+ */
+function neo4j_connector_send_to_index_without_fields($entity_type, $entity_id) {
+  $entity = entity_load_single($entity_type, $entity_id);
+  $node = neo4j_connector_add_entity_to_neo4j($entity, $entity_type, FALSE);
+
+  if ($node) {
+    _neo4j_connector_index_mark($entity_type, $entity_id, NEO4J_CONNECTOR_INDEX_STATUS_UPDATE);
+    return $node;
+  }
+  else {
+    watchdog(__FUNCTION__, 'Graph node could not be created. Type: @type id: @id.', array('@type' => $entity_type, '@id' => $entity_id), WATCHDOG_ERROR);
+  }
+
+  return FALSE;
+}
+
+/**
+ * Implements hook_cron().
+ */
+function neo4j_connector_cron() {
+  neo4j_connector_index_process_index();
+}
+
+function neo4j_connector_purge_db() {
+  // Delete all relationships.
+  Neo4JDrupal::sharedInstance()->query("
+    START n = node(*)
+    MATCH (n)-[r]->()
+    DELETE r
+  ");
+
+  // Delete all nodes.
+  Neo4JDrupal::sharedInstance()->query("
+    START n = node(*)
+    DELETE n
+  ");
+
+  neo4j_connector_index_delete_all();
+}
+
+function neo4j_connector_send_content_to_index() {
+  $entity_types = entity_get_info();
+
+  $operations = array();
+  foreach ($entity_types as $type => $info) {
+    $operations[] = array('_neo4j_connector_batch_op_mark_for_index', array($type));
+  }
+
+  $batch = array(
+    'operations' => $operations,
+    'title' => 'Re-indexing entities',
+  );
+
+  batch_set($batch);
+}

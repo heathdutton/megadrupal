@@ -1,0 +1,1735 @@
+<?php
+
+/**
+ * @file
+ * Implements the Be2Bill payment service for Drupal Commerce.
+ */
+
+// Be2Bill transaction modes.
+define('COMMERCE_BE2BILL_TXN_MODE_LIVE', 'live');
+define('COMMERCE_BE2BILL_TXN_MODE_SANDBOX', 'sandbox');
+
+// Be2Bill capture time limit delay in days.
+define('COMMERCE_BE2BILL_CAPTURE_MAX_DELAY_DAYS', 30);
+// Be2Bill maximum cancellation delay in days.
+define('COMMERCE_BE2BILL_REFUND_MAX_DELAY_DAYS', 120);
+// Be2Bill maximum authorization delay in days.
+define('COMMERCE_BE2BILL_AUTHORIZATION_MAX_DELAY_DAYS', 7);
+
+// Be2Bill specific error codes.
+define('COMMERCE_BE2BILL_ALIAS_NOT_FOUND', '2001');
+define('COMMERCE_BE2BILL_ENROLLED_CARD_ID_NEEDED', '0001');
+define('COMMERCE_BE2BILL_TRANSACTION_ACCEPTED', '0000');
+define('COMMERCE_BE2BILL_SUCCESS', 0);
+
+// Payment transaction status info constants.
+define('COMMERCE_BE2BILL_PAYMENT_STATUS_REFUND_OK', 'b2bll_refund');
+define('COMMERCE_BE2BILL_PAYMENT_STATUS_REFUND_FAILS', 'b2bll_refund_fails');
+
+// SSL peer (endpoint) validation.
+define('COMMERCE_BE2BILL_SSL_PEER_VALIDATE', TRUE);
+// The path to the Certificate Authority root certificate.
+define('COMMERCE_BE2BILL_SSL_CA_FILE',
+       sprintf('%s/ca/thawte_CA_Bundle.pem', drupal_get_path('module', 'commerce_be2bill')));
+
+// Debug mode. Since you do development in a local machine you need to define
+// an IP that is authorized on your Be2Bill account.
+define('COMMERCE_BE2BILL_DEBUG_ENABLED', variable_get('commerce_be2bill_debug_enabled', FALSE));
+// Set this to an IP that is authorized in your Be2Bill account.
+define('COMMERCE_BE2BILL_DEBUG_CLIENT_IP', variable_get('commerce_be2bill_debug_IP', '127.0.0.1'));
+// Set this to TRUE if your client IP is on a reserved IP address
+// http://en.wikipedia.org/wiki/Reserved_IP_addresses.
+define('COMMERCE_BE2BILL_USE_FIXED_CLIENT_IP', variable_get('commerce_be2bill_debug_reserved_IP', TRUE));
+
+/**
+ * Implements hook_menu().
+ */
+function commerce_be2bill_menu() {
+  $items = array();
+  // Menu item for capturing authorizations.
+  $items['admin/commerce/orders/%commerce_order/payment/%commerce_payment_transaction/be2bill/capture'] = array(
+    'title' => 'Capture',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('commerce_be2bill_capture_form', 3, 5),
+    'access callback' => 'commerce_be2bill_capture_access',
+    'access arguments' => array(3, 5),
+    'type' => MENU_DEFAULT_LOCAL_TASK,
+    'context' => MENU_CONTEXT_INLINE,
+    'weight' => 2,
+    'file' => 'includes/commerce_be2bill.admin.inc',
+  );
+  // Menu item for refunds.
+  $items['admin/commerce/orders/%commerce_order/payment/%commerce_payment_transaction/be2bill/refund'] = array(
+    'title callback' => 'commerce_be2bill_refund_void_title',
+    'title arguments' => array(3),
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('commerce_be2bill_refund_void_form', 3, 5),
+    'access callback' => 'commerce_be2bill_refund_void_access',
+    'access arguments' => array(3, 5),
+    'type' => MENU_DEFAULT_LOCAL_TASK,
+    'context' => MENU_CONTEXT_INLINE,
+    'weight' => 2,
+    'file' => 'includes/commerce_be2bill.admin.inc',
+  );
+  // Return callback invoked by Be2Bill whenever a transaction completes.
+  $items['be2bill/return'] = array(
+    'title' => '',
+    'page callback' => 'commerce_be2bill_post_return',
+    'access callback' => TRUE,
+    'type' => MENU_CALLBACK,
+  );
+  //   // Return callback invoked by Be2Bill whenever a transaction is cancelled.
+  $items['be2bill/cancel'] = array(
+    'title' => '',
+    'page callback' => 'commerce_be2bill_post_cancel',
+    'access callback' => TRUE,
+    'type' => MENU_CALLBACK,
+  );
+  // URI to be hit by Be2Bill for Instant Payment Notification (IPN).
+  $items['be2bill/ipn'] = array(
+    'page callback' => 'commerce_be2bill_ipn',
+    'page arguments' => array(),
+    'access callback' => TRUE,
+    'type' => MENU_CALLBACK,
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_commerce_payment_method_info().
+ */
+function commerce_be2bill_commerce_payment_method_info() {
+  $payment_methods = array();
+  $payment_methods['be2bill'] = array(
+    'base' => 'commerce_be2bill',
+    'title' => t('Be2Bill'),
+    'short_title' => t('Be2Bill'),
+    'display_title' => t('Credit card'),
+    'description' => t('Integrates Be2Bill'),
+    'terminal' => FALSE,
+    'offsite' => TRUE,
+    'offsite_autoredirect' => TRUE,
+    'cardonfile' => array(
+      // Just implemented the cardonfile delete function because Be2Bill has no
+      // API to update or create an new alias.
+      'delete callback' => 'commerce_be2bill_cardonfile_delete',
+    ),
+  );
+
+  return $payment_methods;
+}
+
+
+/**
+ * Determines access to the prior authorization Be2Bill capture form.
+ *
+ * @param object $order
+ *   The order related to this transaction.
+ * @param object $transaction
+ *   The payment transaction object.
+ *
+ * @return bool
+ *   TRUE if access is allowed, FALSE if not.
+ */
+function commerce_be2bill_capture_access($order, $transaction) {
+  // Checks that it's really a Be2Bill and is ready to be captured.
+  $balance = commerce_payment_order_balance($order);
+  if ($transaction->payment_method != 'be2bill' || $transaction->remote_status != 'authorization' || $balance['amount'] == 0 || REQUEST_TIME - $transaction->created > 3600 * 24 * COMMERCE_BE2BILL_CAPTURE_MAX_DELAY_DAYS) {
+    return FALSE;
+  }
+
+  // Allow access if the user can update payments on this transaction.
+  return commerce_payment_transaction_access('update', $transaction);
+}
+
+/**
+ * Be2Bill refund/void (cancellation) access callback.
+ *
+ * @param object $order
+ *   The order the transaction is on.
+ * @param object $transaction
+ *   The payment transaction object to be voided.
+ *
+ * @return bool
+ *   TRUE if access is granted, FALSE if not.
+ */
+function commerce_be2bill_refund_void_access($order, $transaction) {
+  // Get the amount available for refunding.
+  $refund_amount = commerce_be2bill_get_refund_amount($order, $transaction);
+
+  // Checks that transaction is for Be2Bill, is successful and the amount to refund is 0,
+  // success status or has an amount of 0 or less, or if the max delay for a refund is surpassed.
+  if ($transaction->payment_method != 'be2bill' || $transaction->status != 'success' || $transaction->amount <= 0 ||  $refund_amount == 0 || REQUEST_TIME - $transaction->created > 3600 * 24 * COMMERCE_BE2BILL_REFUND_MAX_DELAY_DAYS) {
+    return FALSE;
+  }
+
+  // Allow access if the user can update this transaction.
+  return commerce_payment_transaction_access('update', $transaction);
+}
+
+/**
+ * Menu callback for Be2Bill post back cancel URL.
+ */
+function commerce_be2bill_post_cancel() {
+
+  // Extract the Drupal Commerce order_id from the received order ID string.
+  list($order_id) = explode('-', $_GET['ORDERID']);
+
+  // Load the relevant Drupal Commerce order..
+  $order = commerce_order_load($order_id);
+
+  // Redirect to the proper page.
+  drupal_goto(url('checkout/' . $order->order_id . '/payment/back/' . $order->data['payment_redirect_key'], array('absolute' => TRUE)));
+}
+
+/**
+ * Menu callback for Be2Bill post back URL.
+ */
+function commerce_be2bill_post_return() {
+
+  // Grab the Be2Bill response.
+  $response = drupal_get_query_parameters();
+
+  // Exit now if the $_GET was empty.
+  if (empty($response) || !isset($response['EXECCODE'])) {
+    watchdog('commerce_be2bill', 'Be2Bill IPN returned without GET parameters.', array(), WATCHDOG_WARNING);
+    return FALSE;
+  }
+
+  // Extract the Drupal Commerce order ID from the received order ID.
+  list($order_id) = explode('-', $response['ORDERID']);
+
+  // Load the Drupal Commerce order given in the response.
+  $order = commerce_order_load($order_id);
+  $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+
+  // Get the payment gateway instance settings.
+  $payment_method = commerce_payment_method_instance_load($order->data['payment_method']);
+  $settings = $payment_method['settings'];
+
+  // Check the response returned hash to determine validity of the response.
+  $generatedhash = commerce_be2bill_signature($settings['password'], $response);
+  if ($generatedhash != $response['HASH']) {
+    watchdog('commerce_be2bill', 'Be2Bill IPN returned with invalid hash.', array(), WATCHDOG_WARNING);
+    return FALSE;
+  }
+
+  // Is this valid? Ideally the IPN access callback should use use the
+  // timestamp and order ID. TBD.
+  $response['TIMESTAMP'] = REQUEST_TIME;
+
+  // Try to find if a transaction has already been saved for the remote_id.
+  $transactions = commerce_payment_transaction_load_multiple(array(), array('instance_id' => $payment_method['instance_id'], 'remote_id' => $response['TRANSACTIONID'], 'remote_status' => $response['OPERATIONTYPE']));
+
+  // Get the order balance.
+  $orderbalance = commerce_payment_order_balance($order);
+
+  // Be2Bill sends the amount price in cents with two decimals numbers. For
+  // currencies that are using more than 2 decimals numbers we are obliged to
+  // raise the amount received to a power of 10.
+  $currency = commerce_currency_load($response['CURRENCY']);
+  $amount = commerce_be2bill_convert_decimals($response['AMOUNT'], $currency);
+
+  $transaction = commerce_payment_transaction_new('be2bill', $order_id);
+  $transaction->amount = $amount;
+  $transaction->currency_code = $order_wrapper->commerce_order_total->currency_code->value();
+  $transaction->payload[REQUEST_TIME] = $response;
+  $transaction->remote_status = $response['OPERATIONTYPE'];
+  $transaction->instance_id = $order->data['payment_method'];
+  $transaction->remote_id = $response['TRANSACTIONID'];
+
+  if (empty($transactions) && isset($orderbalance['amount']) && $orderbalance['amount'] > 0) {
+    if ($orderbalance['amount'] <= $amount) {
+      if ($response['EXECCODE'] == COMMERCE_BE2BILL_SUCCESS) {
+        // Set the transaction status based on the type of transaction this was.
+        switch ($response['OPERATIONTYPE']) {
+          case 'authorization':
+            $transaction->status = COMMERCE_PAYMENT_STATUS_PENDING;
+            $transaction->message = t('The payment has been authorized.');
+            break;
+
+          case 'payment':
+            $transaction->status = COMMERCE_PAYMENT_STATUS_SUCCESS;
+            $transaction->message = t('The payment has completed.');
+            break;
+        }
+
+        if (module_exists('commerce_cardonfile')) {
+          $context =  commerce_be2bill_payment_session_load($order->order_id);
+
+          if ($context && isset($context['cardonfile_store'])) {
+            $billing_address = $order_wrapper->commerce_customer_billing->commerce_customer_address->value();
+            // Create a fake credit card validity date for cardonfile because
+            // Be2Bill doesn't send this information in their response.
+            // Adding approximately 1 and half year to the current date.
+            $card_validity = REQUEST_TIME + 47170800;
+            // Store card locally.
+            $card_data = array(
+              'uid' => $order->uid,
+              'payment_method' => $payment_method['method_id'],
+              'instance_id' => $payment_method['instance_id'],
+              'remote_id' => $response['ALIAS'],
+              'card_type' => 'card',
+              'card_name' => !empty($billing_address['name_line']) ? $billing_address['name_line'] : '',
+              'card_number' => substr($response['CARDCODE'], -4),
+              'card_exp_month' => date('m', $card_validity),
+              'card_exp_year' => date('Y', $card_validity),
+              'instance_default' => $context['cardonfile_default'],
+              'status' => 1,
+            );
+            // Save the new card on file.
+            $card = commerce_cardonfile_new($card_data);
+            commerce_cardonfile_save($card);
+            // Delete all stored customer's information.
+            commerce_be2bill_payement_session_delete($order->order_id);
+          }
+        }
+
+        commerce_payment_redirect_pane_next_page($order);
+      }
+      else {
+        // Redirect the user to the previous page with an error message
+        // containing the return code.
+        $transaction->status = COMMERCE_PAYMENT_STATUS_FAILURE;
+        $transaction->message = t("The payment has failed.");
+        drupal_set_message(t('There was an error with your payment. Please try again or contact your bank.'), 'error');
+        watchdog('commerce_be2bill', 'Be2Bill payment failure on the order @orderid: [@code] - @return_text.', array(
+                   '@orderid' => $order_id,
+                   '@code' => "{$response['EXECCODE']}",
+                   '@return_text' => $response['MESSAGE'],
+                 ), WATCHDOG_WARNING);
+        commerce_payment_redirect_pane_previous_page($order);
+      }
+      commerce_payment_transaction_save($transaction);
+    }
+    else {
+      watchdog('commerce_be2bill', 'Be2Bill return URL accessed with amount greater than balance on order #@orderid.', array('@orderid' => $order_id), WATCHDOG_WARNING);
+      drupal_set_message(t('We encountered an error processing your payment with Be2Bill. Please try again or contact us for assistance.'), 'error');
+      commerce_payment_redirect_pane_previous_page($order);
+    }
+  }
+  else {
+    // This case happens when the ipn feedback is faster than the normal
+    // checkout process. The IPN has already saved the transaction in the
+    // database and updated the order.
+    if (module_exists('commerce_cardonfile')) {
+      $context = commerce_be2bill_payment_session_load($order->order_id);
+      if ($context && $context['cardonfile_store']) {
+        $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+        $billing_address = $order_wrapper->commerce_customer_billing->commerce_customer_address->value();
+        // @todo: This needs to be fixed. We must recover the validity date
+        // from the IPN sent data.
+        // Create a fake credit card validity date for cardonfile because
+        // Be2Bill doesn't send this information in their response.
+        // Adding approximately 1 and half year to the current date.
+        $card_validity = REQUEST_TIME + 47170800;
+
+        // Store card locally.
+        $card_data = array(
+          'uid' => $order->uid,
+          'payment_method' => $payment_method['method_id'],
+          'instance_id' => $payment_method['instance_id'],
+          'remote_id' => $response['ALIAS'],
+          'card_type' => 'card',
+          'card_name' => !empty($billing_address['name_line']) ? $billing_address['name_line'] : '',
+          'card_number' => substr($response['CARDCODE'], -4),
+          'card_exp_month' => date('m', $card_validity),
+          'card_exp_year' => date('Y', $card_validity),
+          'instance_default' => $context['cardonfile_default'],
+          'status' => 1,
+        );
+        // Save the new card on file.
+        $card = commerce_cardonfile_new($card_data);
+        commerce_cardonfile_save($card);
+        // Delete all stored customer's information.
+        commerce_be2bill_payement_session_delete($order->order_id);
+      }
+    }
+    commerce_payment_redirect_pane_next_page($order);
+  }
+  drupal_goto(commerce_checkout_order_uri($order));
+}
+
+/**
+ * Define the default settings for the Be2Bill payment method.
+ */
+function commerce_be2bill_default_settings() {
+  return array(
+    'identifier' => '',
+    'password' => '',
+    'txn_mode' => COMMERCE_BE2BILL_TXN_MODE_SANDBOX,
+    'txn_type' => 'payment',
+    'email_customer' => FALSE,
+    'log' => array('request' => '0', 'response' => '0'),
+    'ipn_logging' => 'notification',
+    // Default options.
+    'options' => array(
+      '3DSecure' => FALSE,
+      'hide_client_email' => FALSE,
+      'hide_card_full_name' => FALSE,
+      'language' => 'fr',
+    ),
+    'show_payment_instructions' => FALSE,
+    // REST and form endpoint addresses default settings.
+    'override_server_address' => FALSE,
+    'custom_server_address_live_form' => 'https://secure-magenta1.be2bill.com/front/form/process.php',
+    'custom_server_address_live_server' => 'https://secure-magenta1.be2bill.com/front/service/rest/process',
+    'custom_server_address_sandbox_form' => 'https://secure-test.be2bill.com/front/form/process.php',
+    'custom_server_address_sandbox_server' => 'https://secure-test.be2bill.com/front/service/rest/process'
+  );
+}
+
+/**
+ * Payment method settings form callback.
+ */
+function commerce_be2bill_settings_form($settings = NULL) {
+  // Merge default settings into the stored settings array.
+  $settings += commerce_be2bill_default_settings();
+
+  $form = array();
+
+  $form['identifier'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Account Identifier'),
+    '#description' => t('Your Be2Bill Account ID'),
+    '#default_value' => $settings['identifier'],
+    '#required' => TRUE,
+  );
+  $form['password'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Account Password'),
+    '#description' => t('Your Be2Bill Account Password'),
+    '#default_value' => $settings['password'],
+    '#required' => TRUE,
+  );
+  $form['txn_mode'] = array(
+    '#type' => 'radios',
+    '#title' => t('Transaction mode'),
+    '#description' => t('Adjust to live transactions when you are ready to start processing real payments.'),
+    '#options' => array(
+      COMMERCE_BE2BILL_TXN_MODE_LIVE => t('Live transactions in a live account'),
+      COMMERCE_BE2BILL_TXN_MODE_SANDBOX => t('Developer test account transactions'),
+    ),
+    '#default_value' => $settings['txn_mode'],
+  );
+
+  // REST and form endpoint addresses related settings.
+  $form['override_server_address'] = array(
+    '#type' => 'checkbox',
+    '#title' => t("Override Be2Bill server's addresses."),
+    '#default_value' => $settings['override_server_address'],
+  );
+  $form['custom_server_address_live_form'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Custom server address for "Form" method (Live mode)'),
+    '#default_value' => $settings['custom_server_address_live_form'],
+    '#states' => array(
+      'visible' => array(
+        ':input[name$="[override_server_address]"]' => array('checked' => TRUE),
+        ':input[name$="[txn_mode]"]' => array('value' => COMMERCE_BE2BILL_TXN_MODE_LIVE),
+      ),
+    ),
+  );
+  $form['custom_server_address_live_server'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Custom server address for "Server" method (Live mode)'),
+    '#default_value' => $settings['custom_server_address_live_server'],
+    '#states' => array(
+      'visible' => array(
+        ':input[name$="[override_server_address]"]' => array('checked' => TRUE),
+        ':input[name$="[txn_mode]"]' => array('value' => COMMERCE_BE2BILL_TXN_MODE_LIVE),
+      ),
+    ),
+  );
+  $form['custom_server_address_sandbox_form'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Custom server address for "Form" method (Sandbox mode)'),
+    '#default_value' => $settings['custom_server_address_sandbox_form'],
+    '#states' => array(
+      'visible' => array(
+        ':input[name$="[override_server_address]"]' => array('checked' => TRUE),
+        ':input[name$="[txn_mode]"]' => array('value' => COMMERCE_BE2BILL_TXN_MODE_SANDBOX),
+      ),
+    ),
+  );
+  $form['custom_server_address_sandbox_server'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Custom server address for "Server" method (Sandbox mode)'),
+    '#default_value' => $settings['custom_server_address_sandbox_server'],
+    '#states' => array(
+      'visible' => array(
+        ':input[name$="[override_server_address]"]' => array('checked' => TRUE),
+        ':input[name$="[txn_mode]"]' => array('value' => COMMERCE_BE2BILL_TXN_MODE_SANDBOX),
+      ),
+    ),
+  );
+  $form['txn_type'] = array(
+    '#type' => 'radios',
+    '#title' => t('Default credit card transaction type'),
+    '#description' => t('The default will be used to process transactions during checkout.'),
+    '#options' => array(
+      'payment' => t('Authorization and capture'),
+      'authorization' => t('Authorization only (requires manual or automated capture after checkout)'),
+    ),
+    '#default_value' => $settings['txn_type'],
+  );
+  $form['email_customer'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Tell Be2Bill to e-mail the customer a receipt based on your account settings.'),
+    '#default_value' => $settings['email_customer'],
+  );
+  // Add the logging configuration form elements.
+  $form['log'] = array(
+    '#type' => 'checkboxes',
+    '#title' => t('Log the following messages for debugging'),
+    '#options' => array(
+      'request' => t('API request messages'),
+      'response' => t('API response messages'),
+    ),
+    '#default_value' => $settings['log'],
+  );
+  $form['ipn_logging'] = array(
+    '#type' => 'radios',
+    '#title' => t('Silent POST logging'),
+    '#options' => array(
+      'notification' => t('Log notifications during validation and processing.'),
+      'full_ipn' => t('Log notifications with the full IPN during validation and processing (used for debugging).'),
+    ),
+    '#default_value' => $settings['ipn_logging'],
+  );
+  $form['options'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Optional'),
+    '#collapsible' => TRUE,
+    '#collapsed' => FALSE,
+  );
+  $form['options']['3DSecure'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('3DSecure'),
+    '#default_value' => $settings['options']['3DSecure'],
+  );
+  // Card on File support.
+  if (module_exists('commerce_cardonfile')) {
+    $form['options']['cardonfile'] = array(
+      '#type' => 'checkbox',
+      '#title' => t('Enable Card on File functionality'),
+      '#description' => t('Allow the customer to use a credit card used for a previously order.'),
+      '#default_value' => isset($settings['options']['cardonfile']) ? $settings['options']['cardonfile'] : TRUE,
+    );
+  }
+  $form['options']['hide_client_email'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Hide Client Email'),
+    '#default_value' => $settings['options']['hide_client_email'],
+  );
+  $form['options']['hide_card_full_name'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Hide Card Full Name'),
+    '#default_value' => $settings['options']['hide_card_full_name'],
+  );
+  $form['options']['language'] = array(
+    '#type' => 'select',
+    '#title' => t('Language'),
+    '#options' => array(
+      'fr' => t('French'),
+      'en' => t('English'),
+    ),
+    '#default_value' => $settings['options']['language'],
+  );
+  $form['show_payment_instructions'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Show a message on the checkout form when Be2Bill payment method is selected telling the customer to "Continue with checkout to complete payment via be2bill."'),
+    '#default_value' => $settings['show_payment_instructions'],
+  );
+
+  return $form;
+}
+
+/**
+ * Payment method callback: adds a message and CSS to the submission form.
+ */
+function commerce_be2bill_submit_form($payment_method, $pane_values, $checkout_pane, $order) {
+  $form = array();
+
+  if (!empty($payment_method['settings']['show_payment_instructions'])) {
+    $form['be2bill_information'] = array(
+      '#markup' => '<span class="commerce-be2bill-info">' . t('(Continue with checkout to complete payment via Be2Bill.)') . '</span>',
+    );
+  }
+
+  return $form;
+}
+
+/**
+ * Payment method callback: wraps the module's function for generating the form.
+ */
+function commerce_be2bill_redirect_form($form, &$form_state, $order, $payment_method) {
+  // Load a context to know if the user chose a stored card or not.
+  $context = commerce_be2bill_payment_session_load($order->order_id);
+  // If we're adding a new card to
+  if ($context['cardonfile'] === NULL || $context['cardonfile'] == 'new') {
+    return commerce_be2bill_order_form($form, $form_state, $order, $payment_method['settings']);
+  }
+  else {
+    return commerce_be2bill_order_cof_form($form, $form_state, $order, $payment_method);
+  }
+}
+
+/**
+ * Builds review form for Be2Bill aliases.
+ */
+function commerce_be2bill_order_form($form, &$form_state, $order, $settings) {
+
+  $settings += commerce_be2bill_default_settings();
+  $user = user_load($order->uid);
+  $parameters = commerce_be2bill_request_payment($settings, $order, $user);
+
+  $form['#method'] = 'post';
+  $server_addresses = array();
+
+  // If the servers url are overridden.
+  if ($settings['override_server_address']) {
+    $server_addresses['custom_server_address_live_form'] = $settings['custom_server_address_live_form'];
+    $server_addresses['custom_server_address_live_server'] = $settings['custom_server_address_live_server'];
+    $server_addresses['custom_server_address_sandbox_form'] = $settings['custom_server_address_sandbox_form'];
+    $server_addresses['custom_server_address_sandbox_server'] = $settings['custom_server_address_sandbox_server'];
+  }
+  $form['#action'] = commerce_be2bill_server_url($settings['txn_mode'], 'form', $server_addresses);
+
+  // Build the data array that will be translated into hidden form values.
+  foreach ($parameters as $name => $value) {
+    $form[$name] = array(
+      '#type' => 'hidden',
+      '#value' => $value,
+    );
+  }
+
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Proceed to Payment Form'),
+  );
+
+  // Because commerce_cardonfile will exit if no credit card field exit, we add
+  // a fake field to past the test.
+  // @TODO: Find a better way to past that commerce_cardonfile requierement.
+  if (module_exists('commerce_cardonfile')) {
+    $form['credit_card']['cardonfile_store'] = array(
+      '#type' => 'value',
+      '#value' => TRUE,
+    );
+  }
+
+  return $form;
+}
+
+/**
+ * Builds the form for payment processing using cardonfile.
+ */
+function commerce_be2bill_order_cof_form($form, &$form_state, $order, &$payment_method) {
+
+  // Load the stored cards on file.
+  $stored_cards = commerce_cardonfile_load_multiple_by_uid($order->uid, $payment_method['instance_id']);
+  // Load the cardonfile data store in a session variable.
+  $context = commerce_be2bill_payment_session_load($order->order_id);
+  // Get the selected card.
+  $card = $stored_cards[$context['cardonfile']];
+  // Fill in the form with the selected cardonfile.
+  $form['card'] = array('#type' => 'value', '#value' => $card);
+  $form['payment_method'] = array('#type' => 'value', '#value' => $payment_method);
+  // Submit handler for cardonfile.
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Proceed to Payment'),
+    '#submit' => array('commerce_be2bill_order_cof_form_submit'),
+  );
+
+  return $form;
+}
+
+/**
+ * Submit handler that issues the POST request to process the payment.
+ */
+function commerce_be2bill_order_cof_form_submit($form, &$form_state) {
+
+  $order = $form_state['order'];
+  $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+  $payment_method = $form_state['values']['payment_method'];
+  $settings = $payment_method['settings'];
+
+  // Build the request to Be2Bill.
+  $options = array(
+    'method' => 'POST',
+    'data' => http_build_query(
+      array(
+        'method' => $settings['txn_type'],
+        'params' => commerce_be2bill_request_payment_with_alias($settings, $order, $form_state['values']['card']),
+      )
+    ),
+    'headers' => array('Content-Type' => 'application/x-www-form-urlencoded; charset=utf-8'),
+    // Create a stream context to force SSL peer validation and use the CA
+    // certificate provided to avoid dependencies on the cURL version library
+    // SSL store. No self signed certificates.
+    'context' => _commerce_be2bill_ssl_context(
+      TRUE,
+      COMMERCE_BE2BILL_SSL_PEER_VALIDATE,
+      COMMERCE_BE2BILL_SSL_CA_FILE
+    ),
+  );
+
+  // Issue the HTTP request.
+  $result = drupal_http_request(commerce_be2bill_server_url($settings['txn_mode'], 'server'),
+                                $options);
+  $response = isset($result->data) ? drupal_json_decode($result->data) : NULL;
+
+  if (!empty($response)) {
+    $response['TIMESTAMP'] = REQUEST_TIME;
+    // Balance the order in function of the processed payment.
+    $orderbalance = commerce_payment_order_balance($order);
+    // Instantiate a new Drupal Commerce transaction entity.
+    $transaction = commerce_payment_transaction_new('be2bill', $order->order_id);
+
+    // Be2Bill uses an integer amount already, hence no conversion is needed.
+    $transaction->amount = $order_wrapper->commerce_order_total->amount->value();
+    $transaction->currency_code = $order_wrapper->commerce_order_total->currency_code->value();
+    $transaction->payload[REQUEST_TIME] = $response;
+    $transaction->remote_status = $response['OPERATIONTYPE'];
+    $transaction->instance_id = $order->data['payment_method'];
+
+    if (isset($orderbalance['amount']) && $orderbalance['amount'] > 0) {
+      if ($response['EXECCODE'] == COMMERCE_BE2BILL_SUCCESS) {
+        $transaction->remote_id = $response['TRANSACTIONID'];
+        // Set the transaction status based on the type of transaction this was.
+        switch ($response['OPERATIONTYPE']) {
+          case 'authorization':
+            $transaction->status = COMMERCE_PAYMENT_STATUS_PENDING;
+            $transaction->message = t('The payment has been authorized.');
+            break;
+          case 'payment':
+            $transaction->status = COMMERCE_PAYMENT_STATUS_SUCCESS;
+            $transaction->message = t('The payment has completed.');
+            break;
+        }
+        commerce_payment_redirect_pane_next_page($order);
+      }
+      else {
+        // Redirect the user to the previous page with an error message containing
+        // the return code.
+        $transaction->status = COMMERCE_PAYMENT_STATUS_FAILURE;
+        $transaction->message = t("The payment has failed.");
+        // Log the unsuccessfully processed payment.
+        drupal_set_message(t('There was an error with your payment. Please try again or contact your bank.'), 'error');
+        watchdog('commerce_be2bill', 'Be2Bill payment failure on the order @orderid: [@code] - @return_text.', array(
+                   '@orderid' => $order->order_id,
+                   '@code' => "{$response['EXECCODE']}",
+                   '@return_text' => $response['MESSAGE'],
+                 ), WATCHDOG_WARNING);
+
+        commerce_payment_redirect_pane_previous_page($order);
+
+        // Delete the stored card if the payment gateway returned an "alias not
+        // found" error code.
+        if ($response['EXECCODE'] == COMMERCE_BE2BILL_ALIAS_NOT_FOUND) {
+          commerce_cardonfile_delete($card->card_id);
+        }
+
+      }
+      commerce_payment_transaction_save($transaction);
+      commerce_be2bill_payement_session_delete($order->order_id);
+      drupal_goto(commerce_checkout_order_uri($order));
+    }
+    else {
+      watchdog('commerce_be2bill', 'Be2Bill return URL accessed for already paid order #@orderid.', array('@orderid' => $order->order_id), WATCHDOG_WARNING);
+    }
+  }
+  else {
+    drupal_set_message(t('The operation failed!'));
+    watchdog('commerce_be2bill',
+             'Operation failed with request result @result',
+             array('@result' => $result),
+             WATCHDOG_WARNING);
+  }
+}
+
+/**
+ * Implements hook_commerce_cardonfile_checkout_pane_form_alter().
+ */
+function commerce_be2bill_commerce_cardonfile_checkout_pane_form_alter(&$payment_details, &$form) {
+  $payment_details['cardonfile_option'] = array(
+    '#type' => 'checkbox',
+    '#title' => t("Check this box If you'd like to store your credit card future purchases."),
+    '#default_value' => FALSE,
+    '#weight' => 5,
+  );
+  $payment_details['cardonfile_instance_default']['#weight'] = 10;
+  $payment_details['cardonfile_instance_default']['#states'] = array(
+    'visible' => array(
+      ':input[name$="[cardonfile_option]"]' => array('checked' => TRUE),
+    ),
+  );
+
+}
+
+/**
+ * Implements hook_commerce_checkout_pane_info_alter().
+ */
+function commerce_be2bill_commerce_checkout_pane_info_alter(&$checkout_panes) {
+  // Add custom validation to be able to save the values in session.
+  $checkout_panes['commerce_payment']['callbacks']['checkout_form_validate'] = '_commerce_be2bill_commerce_payment_checkout_custom_validation';
+}
+
+/**
+ * Payment validation handler.
+ */
+function _commerce_be2bill_commerce_payment_checkout_custom_validation($form, &$form_state, $checkout_pane, $order) {
+
+  if ($form_state['values']['commerce_payment']['payment_method'] == 'be2bill|commerce_payment_be2bill'
+      && isset($form_state['values']['commerce_payment']['payment_details']['cardonfile'])) {
+
+    if ($form_state['values']['commerce_payment']['payment_details']['cardonfile_option'] == TRUE) {
+      // Array of information to store until the customer purchase his order.g
+      $cardonfile = array(
+        'cardonfile' => $form_state['values']['commerce_payment']['payment_details']['cardonfile'],
+        'cardonfile_store' => TRUE,
+        'cardonfile_default' => $form_state['values']['commerce_payment']['payment_details']['cardonfile_instance_default'] ? TRUE : FALSE,
+      );
+    }
+    else {
+      $cardonfile = array(
+        'cardonfile' => $form_state['values']['commerce_payment']['payment_details']['cardonfile'],
+      );
+    }
+
+    // Store the array in the customer's session.
+    commerce_be2bill_payment_session_save($order->order_id, $cardonfile);
+    return TRUE;
+  }
+  // Do nothing, but still return TRUE.
+  return TRUE;
+}
+
+/**
+ * Menu title callback for a refund.
+ *
+ * @param object $order
+ *   The current order.
+ * @return string
+ *   The title for this menu item.
+ */
+function commerce_be2bill_refund_void_title($order) {
+  return commerce_payment_order_balance($order) == 0 ? t('Refund/void') : t('Refund');
+}
+
+/**
+ * Saves the card on file choices in a session variable.
+ *
+ * @param int $order_id
+ *   The order ID.
+ * @param int $choices
+ *   The ID for a stored card.
+ * @return void
+ *   Side effects only.
+ */
+function commerce_be2bill_payment_session_save($order_id, $choices) {
+  $_SESSION["order_$order_id"] = $choices;
+}
+
+/**
+ * Store the card on file choices in a session variable.
+ *
+ * @param int $order_id
+ *   The order ID.
+ * @return array
+ *   The component of the session where the card on file ID is stored.
+ */
+function commerce_be2bill_payment_session_load($order_id) {
+  return isset($_SESSION["order_$order_id"]) ? $_SESSION["order_$order_id"] : NULL;
+}
+
+/**
+ * Delete the "card on file" choices stored in a session variable.
+ *
+ * @param $order_id
+ */
+function commerce_be2bill_payement_session_delete($order_id = NULL) {
+  if ($order_id) {
+    unset($_SESSION['order_' . $order_id]);
+  }
+}
+
+/**
+ * Returns the endpoint URL of the Be2Bill server based on the type of
+ * transaction.
+ *
+ * @param string $txn_mode
+ *   The transaction mode that relates to the live or test server.
+ * @param string $request_mode
+ *   The request mode is how the request will be sent either by form or server.
+ * @param array $server_addresses
+ *   Associative array of server addresses for the Be2Bill endpoints.
+ *
+ * @return string
+ *   The URL of the endpoint for processing the transaction.
+ */
+function commerce_be2bill_server_url($txn_mode, $request_mode = 'form', $server_addresses = array()) {
+  switch ($txn_mode) {
+    case 'sandbox':
+      switch ($request_mode) {
+        case 'form':
+          return isset($server_addresses['custom_server_address_sandbox_form']) ? $server_addresses['custom_server_address_sandbox_form'] : 'https://secure-test.be2bill.com/front/form/process.php';
+        case 'server':
+          return isset($server_addresses['custom_server_address_sandbox_server']) ? $server_addresses['custom_server_address_sandbox_server'] : 'https://secure-test.be2bill.com/front/service/rest/process';
+      }
+
+    case 'live':
+      switch ($request_mode) {
+        case 'form':
+          return isset($server_addresses['custom_server_address_live_form']) ? $server_addresses['custom_server_address_live_form'] : 'https://secure-magenta1.be2bill.com/front/form/process.php';
+        case 'server':
+          return isset($server_addresses['custom_server_address_live_server']) ? $server_addresses['custom_server_address_live_server'] : 'https://secure-magenta1.be2bill.com/front/service/rest/process';
+      }
+  }
+}
+
+/**
+ * Builds a request array based on the operation type.
+ *
+ * @param array $settings
+ *   Rule settings.
+ * @param stdClass $order
+ *   Order object returned by commerce_order_load.
+ *
+ * @return array
+ *   Array of parameters to be sent for all requests.
+ */
+function commerce_be2bill_request_base($settings, $order) {
+  // Required for all requests.
+  $parameters = array(
+    'IDENTIFIER' => $settings['identifier'],
+    'ORDERID' => $order->order_id . '-' . REQUEST_TIME,
+    'VERSION' => '2.0',
+  );
+  return $parameters;
+}
+
+/**
+ * Builds a request array for the Payment and Authorization types.
+ *
+ * @param array $settings
+ *   Rule settings.
+ * @param stdClass $order
+ *   Order object returned by commerce_order_load.
+ * @param stdClass $user
+ *   User object tied to the order.
+ *
+ * @return array
+ *   Array of parameters to be sent for a Payment or Authorization request.
+ */
+function commerce_be2bill_request_payment($settings, $order, $user) {
+  global $base_url;
+  $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+  if (isset($order_wrapper->commerce_customer_billing) && isset($order_wrapper->commerce_customer_billing->commerce_customer_address)) {
+    $billing_address = $order_wrapper->commerce_customer_billing->commerce_customer_address->value();
+  }
+  else {
+    drupal_set_message(t('Billing address required for payment processing.'), 'error');
+    return FALSE;
+  }
+  // Prepare the billing address for use in the request.
+  $parameters = commerce_be2bill_request_base($settings, $order);
+  $order_total = $order_wrapper->commerce_order_total->value();
+
+  $parameters += array(
+    'OPERATIONTYPE' => $settings['txn_type'],
+    'AMOUNT' => commerce_be2bill_price_amount($order_total['amount'], $order_total['currency_code']),
+    'CLIENTIDENT' => commerce_be2bill_get_client_id($order->uid, $order_wrapper->mail->value()),
+    'CARDFULLNAME' => commerce_be2bill_get_name($billing_address, 'join'),
+    'CLIENTEMAIL' => $order_wrapper->mail->value(),
+    'EXTRADATA' => $order->data['payment_redirect_key'],
+    'DESCRIPTION' => t('Order #@order_id from @site_name(@site_url)',
+                       array(
+                         '@order_id' => $order->order_id,
+                         '@site_name' => variable_get('site_name', 'DEFAULT_SITE'),
+                         '@site_url' => $base_url
+                       )
+    ),
+  );
+
+  // Add optional parameters.
+  if ($settings['options']['3DSecure']) {
+    $parameters['3DSECURE'] = 'yes';
+  }
+  if ($settings['options']['cardonfile']) {
+    $parameters['CREATEALIAS'] = 'yes';
+  }
+  if ($settings['options']['hide_client_email']) {
+    $parameters['HIDECLIENTEMAIL'] = 'yes';
+  }
+  if ($settings['options']['hide_card_full_name']) {
+    $parameters['HIDECARDFULLNAME'] = 'yes';
+  }
+  if (isset($settings['options']['language'])) {
+    $parameters['LANGUAGE'] = $settings['options']['language'];
+  }
+
+  // Hash is created from other parameters then added as a parameter.
+  $parameters['HASH'] = commerce_be2bill_signature($settings['password'], $parameters);
+
+  return $parameters;
+}
+
+/**
+ * Builds a request array for the Payment and Authorization types with a credit
+ * card alias.
+ *
+ * @param array $settings
+ *   Rule settings.
+ * @param stdClass $order
+ *   Order object returned by commerce_order_load.
+ * @param stdClass $user
+ *   User object tied to the order.
+ * @param array $card
+ *   Customer cardonfile information.
+ *
+ * @return array
+ *   Array of parameters to be sent for a Payment or Authorization request.
+ */
+function commerce_be2bill_request_payment_with_alias($settings, $order, $card) {
+  global $base_url;
+
+  $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+  if (isset($order_wrapper->commerce_customer_billing) && isset($order_wrapper->commerce_customer_billing->commerce_customer_address)) {
+    $billing_address = $order_wrapper->commerce_customer_billing->commerce_customer_address->value();
+  }
+  else {
+    drupal_set_message(t('Billing address required for payment processing.'), 'error');
+    return FALSE;
+  }
+
+  // Prepare the billing address for use in the request.
+  $parameters = commerce_be2bill_request_base($settings, $order);
+  $parameters += array(
+    'OPERATIONTYPE' => $settings['txn_type'],
+    'AMOUNT' => $order_wrapper->commerce_order_total->amount->value(),
+    'CLIENTIDENT' => commerce_be2bill_get_client_id($order->uid, $order_wrapper->mail->value()),
+    'CARDFULLNAME' => commerce_be2bill_get_name($billing_address),
+    'CLIENTEMAIL' => $order_wrapper->mail->value(),
+    'CLIENTREFERRER' => $_SERVER['HTTP_REFERER'],
+    'CLIENTUSERAGENT' => $_SERVER['HTTP_USER_AGENT'],
+    'CLIENTIP'  => $_SERVER['REMOTE_ADDR'],
+    'CLIENTEMAIL'  => $order_wrapper->mail->value(),
+    'EXTRADATA' => $order->data['payment_redirect_key'],
+    'ALIAS' => $card->remote_id,
+    'ALIASMODE' => 'oneclick',
+    'DESCRIPTION' => t('Order #@order_id from @site_name(@site_url)',
+                       array(
+                         '@order_id' => $order->order_id,
+                         '@site_name' => variable_get('site_name', 'DEFAULT_SITE'),
+                         '@site_url' => $base_url,
+                       )
+    ),
+  );
+  // Add optional parameters.
+  if ($settings['options']['3DSecure']) {
+    $parameters['3DSECURE'] = 'yes';
+  }
+  if (isset($settings['options']['language'])) {
+    $parameters['LANGUAGE'] = $settings['options']['language'];
+  }
+
+  // Debug/development setup.
+  if (COMMERCE_BE2BILL_DEBUG_ENABLED) {
+    commerce_be2bill_debugging_set($parameters);
+  }
+
+  // Hash is created from other parameters then added as a parameter.
+  $parameters['HASH'] = commerce_be2bill_signature($settings['password'], $parameters);
+
+  return $parameters;
+}
+
+/**
+ * Builds a request array for the Capture type.
+ *
+ * @param array $settings
+ *   Rule settings.
+ * @param stdClass $order
+ *   Order object returned by commerce_order_load.
+ *
+ * @return array
+ *   Array of parameters to be sent for a capture request.
+ */
+function commerce_be2bill_request_capture($settings, $order, $transaction, $amount) {
+  global $base_url;
+
+  $parameters = commerce_be2bill_request_base($settings, $order);
+  $parameters += array(
+    'OPERATIONTYPE' => 'capture',
+    'TRANSACTIONID' => $transaction->remote_id,
+    'DESCRIPTION' => t('Capturing @amount for Order# @order_id from @site_name(@site_url)',
+                       array(
+                         '@amount' => $amount,
+                         '@order_id' => $order->order_id,
+                         '@site_name' => variable_get('site_name', 'DEFAULT_SITE'),
+                         '@site_url' => $base_url
+                       )
+    ),
+    'AMOUNT' => commerce_be2bill_price_amount($amount, $transaction->currency_code),
+  );
+
+  // Hash is created from other parameters then added as a parameter.
+  $parameters['HASH'] = commerce_be2bill_signature($settings['password'], $parameters);
+
+  return $parameters;
+}
+
+/**
+ * Builds a request array for the Capture type.
+ *
+ * @param array $settings
+ *   Rule settings
+ * @param stdClass $order
+ *   Order object returned by commerce_order_load
+ *
+ * @return array
+ *   Array of parameters to be sent for a refund/void request.
+ */
+function commerce_be2bill_request_refund_void($settings, $order, $transaction, $amount) {
+  global $base_url;
+
+  $parameters = commerce_be2bill_request_base($settings, $order);
+  // Get the payment ID for refunding purposes.
+  $payment_id = commerce_be2bill_refund_get_payment_id($transaction);
+  // Request parameters.
+  $parameters += array(
+    'OPERATIONTYPE' => 'refund',
+    'TRANSACTIONID' =>  empty($payment_id) ? $transaction->remote_id : $payment_id,
+    'DESCRIPTION' => t('Refunding @amount for Order# @order_id from @site_name(@site_url)',
+                       array(
+                         '@amount' => $amount,
+                         '@order_id' => $order->order_id,
+                         '@site_name' => variable_get('site_name', 'DEFAULT_SITE'),
+                         '@site_url' => $base_url
+                       )
+    ),
+    'AMOUNT' => commerce_be2bill_price_amount($amount, $transaction->currency_code),
+  );
+
+  // Hash is created from other parameters then added as a parameter.
+  $parameters['HASH'] = commerce_be2bill_signature($settings['password'], $parameters);
+
+  return $parameters;
+}
+
+/**
+ * Menu callback for Be2Bill IPN process.
+ */
+function commerce_be2bill_ipn() {
+
+  // Grab the response from Be2Bill IPN.
+  $request = drupal_get_query_parameters();
+
+  // Process the IPN request.
+  if (!empty($request) && commerce_be2bill_process_ipn($request) === TRUE) {
+    // Be2Bill need to see a 'Ok' message if the IPN request succeed.
+    echo 'OK';
+  }
+  else {
+    // Exit if the $request was empty or if an error occured during the IPN
+    // processing.
+    watchdog('commerce_be2bill', 'IPN URL accessed with no data submitted.', array(), WATCHDOG_WARNING);
+    echo t('The IPN request has failed');
+  }
+
+  // Exit here so the page response content is kept to a minimum.
+  drupal_exit();
+}
+
+/**
+ * Processes an incoming IPN.
+ *
+ * @param array $request
+ *   Be2Bill request parameters.
+ *
+ * @return bool
+ *   Return a boolean whether or not if the IPN processing succeed.
+ */
+function commerce_be2bill_process_ipn($request) {
+  // Load the default payment method.
+  $payment_method = commerce_payment_method_instance_load('be2bill|commerce_payment_be2bill');
+
+  // Generate a hash based on a copy of the received params to compare it with
+  // the received HASH.
+  $request_copy = $request;
+  $request_copy['IDENTIFIER'] = $payment_method['settings']['identifier'];
+  unset($request_copy['HASH']);
+
+  // Hash is created from other parameters then added as a parameter.
+  if ($request['HASH'] !== commerce_be2bill_signature($payment_method['settings']['password'], $request_copy)) {
+    watchdog('commerce_be2bill', 'IPN rejected: invalid hash comparison; must match the hash sended by Be2Bill.', array(), WATCHDOG_ERROR);
+    return FALSE;
+  }
+
+  // Load the order based on the IPN's order number.
+  if ($request['ORDERID']) {
+    // Extract Drupalcommerce order_id from the received order_id.
+    list($order_id) = explode('-', $request['ORDERID']);
+    $request['ORDERID'] = $order_id;
+    $order = commerce_order_load($order_id);
+  }
+  else {
+    watchdog('commerce_be2bill', 'IPN rejected: the request do not have a valid order_id. !request. Operation type (@operation_type).', array('!request' => '<pre>' . check_plain(print_r($request, TRUE)) . '</pre>', '@operation_type' => $request['OPERATIONTYPE']), WATCHDOG_WARNING);
+    return FALSE;
+  }
+
+  // If the payment method specifies full IPN logging, do it now.
+  if (!empty($payment_method['settings']['ipn_logging']) &&
+      $payment_method['settings']['ipn_logging'] == 'full_ipn') {
+    watchdog('commerce_be2bill', 'Attempting to process IPN @remote_id. !request', array('@remote_id' => $request['TRANSACTIONID'], '!request' => '<pre>' . check_plain(print_r($request, TRUE)) . '</pre>'), WATCHDOG_NOTICE);
+  }
+
+  if (!empty($request['TRANSACTIONID']) && $prior_ipn = commerce_be2bill_ipn_load($request['TRANSACTIONID'])) {
+    // Exit if the IPN has already been processed.
+    if ($prior_ipn['payment_status'] == $request['EXECCODE']) {
+      watchdog('commerce_be2bill', 'Attempted to process an IPN that has already been processed with transaction ID @remote_id.', array('@remote_id' => $request['TRANSACTIONID']), WATCHDOG_NOTICE);
+      return FALSE;
+    }
+  }
+
+  if (commerce_be2bill_ipn_validate($order, $payment_method, $request) === FALSE) {
+    return FALSE;
+  }
+
+  // Give the payment method module an opportunity to process the IPN.
+  if (commerce_be2bill_ipn_process($order, $payment_method, $request) !== FALSE) {
+    commerce_be2bill_ipn_save($request);
+  }
+  else {
+    return FALSE;
+  }
+  return TRUE;
+}
+
+/**
+ * Validate an IPN request.
+ *
+ * @param object $order
+ *   The order the transaction is on.
+ * @param array $payment_method
+ *   The payment method instance array that originally made the payment.
+ * @param array $request
+ *   The received params.
+ *
+ * @return bool
+ *   Return false if the validation fail.
+ */
+function commerce_be2bill_ipn_validate($order, $payment_method, $request) {
+  // Do not perform any processing transactions here that do not have remote_id.
+  if (empty($request['TRANSACTIONID'])) {
+    watchdog('commerce_be2bill', 'IPN rejected: the request do not have a remote_id value !request. Operation type (@operation_type) for order @order_number.', array('!request' => '<pre>' . check_plain(print_r($request, TRUE)) . '</pre>', '@operation_type' => $request['OPERATIONTYPE'], '@order_number' => $order->order_number), WATCHDOG_WARNING);
+    return FALSE;
+  }
+
+  // Exit when we don't get an payment type we recognize.
+  if (!in_array($request['OPERATIONTYPE'], array('authorization', 'capture', 'payment', 'refund'))) {
+    watchdog('commerce_be2bill', 'IPN rejected: invalid operation type (@operation_type) for order @order_number.', array('@operation_type' => $request['OPERATIONTYPE'], '@order_number' => $order->order_number), WATCHDOG_WARNING);
+    return FALSE;
+  }
+
+  // Exit if we haven't found an order associated to this IPN.
+  if (empty($order)) {
+    watchdog('commerce_be2bill', 'IPN rejected: invalid order identifier specified for order @order_number', array('@order_number' => $order->order_number), WATCHDOG_WARNING);
+    return FALSE;
+  }
+}
+
+/**
+ * Process an IPN once it's been validated.
+ *
+ * @param object $order
+ *   The order the transaction is on.
+ * @param array $payment_method
+ *   The payment method instance array that originally made the payment.
+ * @param array $request
+ *   The IPN params.
+ *
+ * @return void
+ *   Return false if the process failed.
+ */
+function commerce_be2bill_ipn_process($order, $payment_method, &$request) {
+  // Do not perform any processing if the request failed.
+  if ($request['EXECCODE'] != COMMERCE_BE2BILL_SUCCESS) {
+    watchdog(
+      'commerce_be2bill',
+      'IPN processed failed for Order @order_number with ID @remote_id due to a failed request. Returned: @exec_code',
+      array('@remote_id' => $request['TRANSACTIONID'],
+            '@order_number' => $order->order_number,
+            '@exec_code' => $request['EXECCODE']),
+      WATCHDOG_INFO);
+    return FALSE;
+  }
+
+  // Authorization transactions should only be created by the payment method
+  // itself, otherwise the be2bill IPN will be created before the normal
+  // transaction process.
+  if ($request['OPERATIONTYPE'] == 'authorization') {
+    return TRUE;
+  }
+
+  // Try to find if a transaction has already been saved for the remote_id.
+  $transactions = commerce_payment_transaction_load_multiple(array(), array('instance_id' => $payment_method['instance_id'], 'remote_id' => $request['TRANSACTIONID'], 'remote_status' => $request['OPERATIONTYPE']));
+  $transaction = array_pop($transactions);
+
+  // If not, try to find a transaction for the order_id and for the previous
+  // transaction step.
+  if (empty($transaction)) {
+    list($order_id) = explode('-', $request['ORDERID']);
+
+    $conditions = array(
+      'instance_id' => $payment_method['instance_id'],
+      'order_id' => $order_id,
+    );
+
+    switch ($request['OPERATIONTYPE']) {
+      case 'capture':
+        // Find a transaction in an "authorization" mode.
+        $conditions['remote_status'] = 'authorization';
+        break;
+
+      case 'refund':
+        // Find a transaction in a "capture" or "payment" mode.
+        $conditions['remote_status'] = array('capture', 'payment');
+        break;
+    }
+
+    $transactions = commerce_payment_transaction_load_multiple(array(), $conditions);
+    $transaction = array_pop($transactions);
+  }
+  else {
+    // Do nothing if a transaction has been found, just send info to save the
+    // ipn request.
+    $request['transaction_id'] = $transaction->transaction_id;
+    $request['txn_type'] = $transaction->transaction_id;
+    return TRUE;
+  }
+
+  // If no transaction has been found, create a new one.
+  if (empty($transaction)) {
+    $transaction = commerce_payment_transaction_new('be2bill', $request['ORDERID']);
+    $transaction->uid = $order->uid;
+    $transaction->instance_id = $payment_method['instance_id'];
+  }
+
+  $transaction->remote_id = $request['TRANSACTIONID'];
+  $transaction->remote_status = $request['OPERATIONTYPE'];
+
+  // Be2Bill sends the amount price in cents with two decimals numbers. For
+  // currencies that are using more than 2 decimals numbers we are obliged to
+  // raise the amount received to a power of 10.
+  $currency = commerce_currency_load($request['CURRENCY']);
+  $amount = commerce_be2bill_convert_decimals($request['AMOUNT'], $currency);
+
+  $transaction->amount = $amount;
+  $transaction->currency_code = $request['CURRENCY'];
+  $transaction->payload[REQUEST_TIME . '-ipn'] = $request;
+
+  // Set the transaction status based on the type of transaction this was.
+  switch ($request['OPERATIONTYPE']) {
+    case 'capture':
+      $transaction->status = COMMERCE_PAYMENT_STATUS_SUCCESS;
+      $transaction->message .= '<br />' . t('Captured: @date', array('@date' => format_date(REQUEST_TIME, 'short')));
+      $request['txn_type'] = COMMERCE_CREDIT_CAPTURE_ONLY;
+      break;
+
+    case 'payment':
+      $transaction->status = COMMERCE_PAYMENT_STATUS_SUCCESS;
+      $transaction->message = t('The payment has completed.');
+      $request['txn_type'] = COMMERCE_CREDIT_AUTH_CAPTURE;
+      break;
+
+    case 'refund':
+      $transaction->status = COMMERCE_PAYMENT_STATUS_SUCCESS;
+      $transaction->message .= '<br />' . t('Refunded: @date', array('@date' => format_date(REQUEST_TIME, 'short')));
+      // Update the transaction amount.
+      $transaction->amount = commerce_currency_decimal_to_amount(0, $transaction->currency_code);
+      $request['txn_type'] = COMMERCE_CREDIT_VOID;
+      break;
+  }
+
+  // Save the transaction information.
+  commerce_payment_transaction_save($transaction);
+
+  // Add the transaction id to the IPN request array.
+  $request['transaction_id'] = $transaction->transaction_id;
+
+  watchdog('commerce_be2bill', 'IPN processed for Order @order_number with ID @remote_id.', array('@remote_id' => $request['TRANSACTIONID'], '@order_number' => $order->order_number), WATCHDOG_INFO);
+}
+
+/**
+ * Loads a stored IPN by ID.
+ *
+ * @param int $id
+ *   The ID of the IPN to load.
+ * @param string $type
+ *   The type of ID you've specified, either the serial numeric ipn_id or the
+ *     actual remote_id. Defaults to remote_id.
+ *
+ * @return bool
+ *   The original IPN with some meta data related to local processing.
+ */
+function commerce_be2bill_ipn_load($id, $type = 'remote_id') {
+  return db_select('commerce_be2bill_ipn', 'cbi')
+    ->fields('cbi')
+    ->condition(sprintf('cbi.%s', check_plain($type)), $id)
+    ->execute()
+    ->fetchAssoc();
+}
+
+/**
+ * Saves an IPN with some meta data related to local processing.
+ *
+ * @param array $request
+ *   An IPN request array with additional parameters.
+ *
+ * @return array
+ *   The operation performed by drupal_write_record() on save; since the IPN is
+ *     received by reference, it will also contain the serial numeric ipn_id
+ *     used locally.
+ */
+function commerce_be2bill_ipn_save($request) {
+  // Since Be2Bill wants a unique ID that differs from the UID we need to
+  // extract it so as not to overload the IPN schema.
+  $m = array();
+  preg_match('|^(\d+)::.*$|', $request['CLIENTIDENT'], $m);
+
+  // Prepare the IPN record to be written to the DB.
+  $ipn = array(
+    'remote_id' => $request['TRANSACTIONID'],
+    // If we cannot extract the UID then set it to 0. Not very kosher at all.
+    'uid' => count($m[1]) > 1 ? $m[1] : 0,
+    'merchant_id' => $request['IDENTIFIER'],
+    'payer_email' => $request['CLIENTEMAIL'],
+    'order_id' => $request['ORDERID'],
+    'transaction_id' => $request['transaction_id'],
+    'amount' => $request['AMOUNT'],
+    'currency' => $request['CURRENCY'],
+    'payment_status' => $request['EXECCODE'],
+    'operation_type' => $request['OPERATIONTYPE'],
+    'changed' => REQUEST_TIME,
+  );
+
+  if (!empty($ipn['ipn_id']) && commerce_be2bill_ipn_load($ipn['remote_id'])) {
+    return drupal_write_record('commerce_be2bill_ipn', $ipn, 'ipn_id');
+  }
+  else {
+    $ipn['created'] = REQUEST_TIME;
+    return drupal_write_record('commerce_be2bill_ipn', $ipn);
+  }
+
+  return $ipn;
+}
+
+/**
+ * Deletes a stored IPN by ID.
+ *
+ * @param int $id
+ *   The ID of the IPN to delete.
+ * @param string $type
+ *   The type of ID you've specified, either the serial numeric ipn_id or the
+ *     actual be2bill remote_id. Defaults to remote_id.
+ */
+function commerce_be2bill_ipn_delete($id, $type = 'remote_id') {
+  db_delete('commerce_be2bill_ipn')
+    ->condition(check_plain($type), $id)
+    ->execute();
+}
+
+/**
+ * Generate the hash for validating form submission.
+ *
+ * @param string $password
+ *   Password as defined by Be2Bill for your account.
+ * @param array $parameters
+ *   Parameters to be hashed.
+ *
+ * @return string
+ *   Validation hash for the Be2Bill payment.
+ */
+function commerce_be2bill_signature($password, array $parameters) {
+  // Lexicographic sort.
+  ksort($parameters);
+
+  // Build the string to be hashed.
+  $clear_string = $password;
+  // Build the string to be hashed.
+  foreach ($parameters as $key => $value) {
+    if ($key != 'HASH' && $key != 'q') {
+      $clear_string = sprintf('%s%s=%s%s', $clear_string, $key, $value, $password);
+    }
+  }
+  // Do a SHA 256 hash.
+  return hash('sha256', $clear_string);
+}
+
+/**
+ * Gets the name to be included in the request as full card name.
+ *
+ * @param array $address
+ *   The given address.
+ * @return string|bool
+ *   A name if given an address, FALSE otherwise.
+ */
+function commerce_be2bill_get_name(array $address = array()) {
+  // If there's no name line on the given billing address for the card
+  // generate one from the first and last name.
+  return isset($address['name_line']) ? $address['name_line'] : sprintf('%s %s', $address['first_name'], $address['last_name']);
+}
+
+/**
+ * Formats a price amount as expected by Be2Bill.
+ *
+ * Converts the amount into a decimal amount and multiplied it by 100 in order
+ * to manage currencies with several decimals values.
+ *
+ * @param int $amount
+ *   An integer amount value.
+ * @param string $currency_code
+ *   The currency code.
+ *
+ * @return int
+ *   The price amount as expected by the Be2Bill API servers.
+ */
+function commerce_be2bill_price_amount($amount, $currency_code) {
+  // Convert the amount to a decimal amount.
+  $amount = commerce_currency_amount_to_decimal($amount, $currency_code);
+  // Round the amount to specific currency.
+  $rounded_amount = commerce_currency_round($amount, commerce_currency_load($currency_code));
+  // Multiply the amount by 100 and round it to have a valid amount for Be2Bill.
+  return round($rounded_amount * 100);
+}
+
+/**
+ * Card on file callback: deletes the associated customer billing profile.
+ */
+function commerce_be2bill_cardonfile_delete($form, &$form_state, $payment_method, $card_data) {
+  return TRUE;
+}
+
+/**
+ * Generate a unique client ID as required by the Be2Bill API.
+ *
+ * @param int $uid
+ *   The Drupal user ID (UID).
+ * @param string $email
+ *   The client email address extracted from the billing address.
+ * @return string
+ *   The unique client ID.
+ */
+function commerce_be2bill_get_client_id($uid, $email) {
+  // Since we can have the same UID, email combination in diverse sites we add
+  // the HTTP host to reduce the entropy, i.e., reduce the possibility having
+  // collisions.
+  return sprintf('%d::%s::%s', $uid, $email, $_SERVER['HTTP_HOST']);
+}
+
+/**
+ * Get the payment ID for refunding purposes.
+ *
+ * @param object $transaction
+ *   The transaction we get payment id for.
+ * @return boolean|string
+ *   The payment id or FALSE if no such transaction exists.
+ */
+function commerce_be2bill_refund_get_payment_id($transaction) {
+  if (!empty($transaction->payload)) {
+    $payloads = array_reverse($transaction->payload, TRUE);
+    foreach ($payloads as $operation) {
+      if (in_array($operation['OPERATIONTYPE'], array('payment', 'capture'))
+          &&
+          ($operation['EXECCODE'] == COMMERCE_BE2BILL_TRANSACTION_ACCEPTED
+           ||
+           $operation['EXECCODE'] == COMMERCE_BE2BILL_ENROLLED_CARD_ID_NEEDED)) {
+        return $operation['TRANSACTIONID'];
+      }
+    }
+  }
+  return FALSE;
+}
+
+/**
+ * Implements hook_commerce_payment_transaction_status_info().
+ */
+function commerce_be2bill_commerce_payment_transaction_status_info() {
+  $statuses = array();
+  $img_module_path = sprintf('%s/images/', drupal_get_path('module', 'commerce_be2bill'));
+
+  // Define statuses specific for refunding.
+  $statuses[COMMERCE_BE2BILL_PAYMENT_STATUS_REFUND_OK] = array(
+    'status' => COMMERCE_BE2BILL_PAYMENT_STATUS_REFUND_OK,
+    'title' => t('Refund'),
+    'icon' =>  "$img_module_path/icon-refund.png" ,
+    'total' => FALSE,
+  );
+
+  $statuses[COMMERCE_BE2BILL_PAYMENT_STATUS_REFUND_FAILS] = array(
+    'status' => COMMERCE_BE2BILL_PAYMENT_STATUS_REFUND_FAILS,
+    'title' => t('Refund fails'),
+    'icon' => "$img_module_path/icon-refund-fails.png" ,
+    'total' => FALSE,
+  );
+
+  return $statuses;
+}
+
+/**
+ * Implements hook_commerce_payment_totals_row_info().
+ */
+function commerce_be2bill_commerce_payment_totals_row_info($totals, $order) {
+  $rows = array();
+
+  // Compute the amount to refund.
+  $refunds_amount = commerce_be2bill_order_refund_balance($order->order_id);
+
+  // Loop over each refund amount (iterating over the currency codes).
+  foreach($refunds_amount as $current_currency_code => $current_refund) {
+    if (isset($totals[$current_currency_code])
+        &&
+        count($totals[$current_currency_code]) == 1
+        &&
+        $current_refund > 0) {
+
+      // Add a row for the total amount refunded.
+      $rows[] = array(
+        'data' => array(
+          array('data' => t('Total refunded in @currency', array('@currency' => $current_currency_code)),
+                'class' => array('label')),
+          array(
+            'data' => commerce_currency_format($current_refund, $current_currency_code),
+            'class' => array('total')
+          ),
+        ),
+        'class' => array('total-refunded'),
+        'weight' => 1,
+      );
+    }
+  }
+
+  return $rows;
+}
+
+/**
+ * Return the total refund amount for the given order ID.
+ *
+ * @param int $order_id
+ *   The order ID.
+ *
+ * @return array.
+ *   An array keyed by currency_code with the respective amount to refund.
+ */
+function commerce_be2bill_order_refund_balance($order_id) {
+
+  $transactions = commerce_payment_transaction_load_multiple(
+    array(), array(
+      'order_id' => array($order_id),
+      'status' => array(COMMERCE_BE2BILL_PAYMENT_STATUS_REFUND_OK)
+    )
+  );
+
+  $refunds = array();
+  if (!empty($transactions)) {
+    // Computing the total amount to refund for each currency.
+    foreach ($transactions as $transaction) {
+      $refunds[$transaction->currency_code] = isset($refunds[$transaction->currency_code])
+        ?
+        $refunds[$transaction->currency_code] + $transaction->amount
+        :
+        $transaction->amount;
+    }
+  }
+
+  // Return all refunds.
+  return $refunds;
+}
+
+function _commerce_be2bill_ssl_context($ssl_host = TRUE, $ssl_peer = FALSE,
+                                       $ca_file = NULL, $self_signed = FALSE) {
+  // Create a stream context to force SSL peer validation and use the CA
+  // certificate provided to avoid dependencies on the cURL version library
+  // SSL store. No self signed certificates.
+
+  $ssl_context_options = array(
+    // Minimally the host should be checked.
+    'verify_host' => $ssl_host,
+    'verify_peer' => $ssl_peer,
+    // No self signed certs.
+    'allow_self_signed' => $self_signed,
+  );
+
+  // If a CA file is given then add it to the SSL context options.
+  if (!empty($ca_file)) {
+    $ssl_context_options['cafile'] = $ca_file;
+  }
+
+  // Return the socket stream context.
+  stream_context_create(array('ssl' => $ssl_context_options));
+}
+
+/**
+ * Convert the returned amount so that we stick to the decimal places
+ * for each currency. Be2Bill always returns 2 decimals as an integer.
+ *
+ * @param float $value
+ *   The value returned by Be2Bill.
+ * @param array $currency
+ *   The current currency.
+ * @return int
+ *   The received amount so that we get the correct decimals as an integer.
+ */
+function commerce_be2bill_convert_decimals($value, $currency = NULL) {
+  return empty($currency) || $currency['decimals'] < 3 ? $value : $value * pow(10, ($currency['decimals'] - 2));
+}
+
+/**
+ * Get the amount still available for refunding.
+ *
+ * @param object $order
+ *   The current order entity.
+ * @param object $transaction
+ *   The current transaction entity.
+ * @return float
+ *   The amount to refund.
+ */
+function commerce_be2bill_get_refund_amount($order, $transaction) {
+
+  // Take the amount from the order balance to substract it to the total.
+  $balance = commerce_payment_order_balance($order);
+  $default_amount = $balance['amount'] > 0 && $balance['amount'] < $transaction->amount ? $balance['amount'] : $transaction->amount;
+
+  // Get the refunded amount so far in order to compute the amount still possible to refund.
+  $refund_amount = commerce_be2bill_order_refund_balance($order->order_id);
+  $refund_amount = !empty($refund_amount) ? $default_amount - $refund_amount[$transaction->currency_code] : $transaction->amount;
+  return commerce_currency_amount_to_decimal($refund_amount, $transaction->currency_code);
+}
+
+/**
+ * Set the client IP to a value so that we can access the Be2Bill API and form.
+ *
+ * @param array $request_parameters
+ *   The HTTP request parameters.
+ * @return void
+ *   Side effects only.
+ */
+function commerce_be2bill_debugging_set(array &$request_parameters) {
+  // Check if the the client IP and set it to a fixed value to make it work
+  // with Be2Bill IP access restrictions. We test for localhost only. To test
+  // for reserved addresses is too much of regexes (IPv4 and IPv6).
+  if (isset($request_parameters['CLIENTIP'])
+      &&
+      (COMMERCE_BE2BILL_USE_FIXED_CLIENT_IP
+       ||
+       $request_parameters['CLIENTIP'] == '::1'
+       ||
+       $request_parameters['CLIENTIP'] == '127.0.0.1')) {
+    $request_parameters['CLIENTIP'] = COMMERCE_BE2BILL_DEBUG_CLIENT_IP;
+  }
+}

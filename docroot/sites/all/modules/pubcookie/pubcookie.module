@@ -1,0 +1,341 @@
+<?php
+
+/**
+ * @file
+ * Integrates pubcookie login system with Drupal.
+ */
+
+// Do you want the post-pubcookie-server-visit $_SERVER vars dumped to the screen
+// (useful for getting the pubcookie.module set up for the first time)?
+define('PUBCOOKIE_DEBUG_MODE', 0);
+
+// Enable for lots of watchdog messages showing what's going on.
+define('PUBCOOKIE_VERBOSE_LOGGING', 1);
+
+/**
+ * Implementation of hook_menu().
+ */
+function pubcookie_menu() {
+  $items[pubcookie_login_link()] = array(
+    'title' => 'Pubcookie login',
+    'page callback' => 'pubcookie_page',
+    'access callback' => TRUE,
+    'type' => MENU_CALLBACK
+  );
+  $items['admin/config/people/pubcookie'] = array(
+    'title' => 'Pubcookie',
+    'description' => 'Configure settings for pubcookie authentication.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('pubcookie_settings'),
+    'access arguments' => array('administer site configuration'),
+    'file' => 'pubcookie.admin.inc',
+  );
+  $items['login'] = array(
+    'page callback' => 'pubcookie_login_redirect',
+    'access callback' => TRUE,
+    'type' => MENU_CALLBACK,
+  );
+
+  return $items;
+}
+
+/**
+ * Redirect user from http://example.edu/login to the location of the
+ * pubcookie login directory containing the .htaccess file. This location
+ * is set in the Login directory field at admin/config/people/pubcookie.
+ */
+function pubcookie_login_redirect() {
+  drupal_goto(pubcookie_login_link());
+}
+
+/**
+ * Handle a client who has just been redirected to a pubcookie server,
+ * authenticated, and returned.
+ */
+function pubcookie_page() {
+   global $base_url;
+   global $user;
+   // Raw user from Apache's REMOTE USER || REDIRECT_REMOTE_USER
+   global $_pubcookie_user;
+   // Domain of pubcookie server.
+   global $_pubcookie_domain;
+
+  if ($user->uid) {
+    drupal_goto(variable_get('pubcookie_success_url', $base_url));
+  }
+
+  if (PUBCOOKIE_DEBUG_MODE) {
+    print '<pre>';
+    print_r($_SERVER);
+    print '</pre>';
+  }
+
+  if ($_SERVER['HTTPS'] != 'on') {
+    watchdog('pubcookie', 'Pubcookie request received over non-secure protocol.', array(), WATCHDOG_WARNING);
+    drupal_set_message(t('Pubcookie login failed.'), 'error');
+    drupal_goto();
+  }
+
+  if (!isset($_SERVER['REMOTE_USER']) && !isset($_SERVER['REDIRECT_REMOTE_USER'])) {
+    watchdog('pubcookie', 'Pubcookie request received but neither REMOTE_USER nor REDIRECT_REMOTE_USER were set.', array(), WATCHDOG_WARNING);
+    drupal_set_message(t('Pubcookie login failed.'), 'error');
+    drupal_goto();
+  }
+
+  if (isset($_SERVER['REMOTE_USER'])) {
+    $_pubcookie_user = check_plain($_SERVER['REMOTE_USER']);
+  }
+  else {
+    $_pubcookie_user = check_plain($_SERVER['REDIRECT_REMOTE_USER']);
+  }
+  watchdog('pubcookie', 'Received login request from %user', array('%user' => $_pubcookie_user));
+  if (PUBCOOKIE_VERBOSE_LOGGING) {
+    watchdog('pubcookie', 'Session ID is %sessid', array('%sessid' => check_plain(session_id())));
+  }
+
+  if ((variable_get('pubcookie_id_is_email', 1) && module_exists('pubcookiesiteaccess'))) {
+    $allowed = pubcookiesiteaccess_is_allowed($_pubcookie_user);
+    if (!$allowed) {
+      watchdog('pubcookie', '%user not in allowed usernames list', array('%user' => $_pubcookie_user));
+      $account = user_load_by_name($_pubcookie_user);
+      if (is_array($account) && isset($account->uid) && $account->uid == 1) {
+        watchdog('pubcookie', '%user is superuser. Allowing access.', array('%user' => $_pubcookie_user));      
+      }
+      else {
+        watchdog('pubcookie', '%user is not superuser. Denying access.', array('%user' => $_pubcookie_user));
+        drupal_access_denied();
+        drupal_exit();
+      }
+    }
+  }
+
+  $domain = variable_get('pubcookie_domain', '');
+
+  if ($domain == '') {
+    watchdog('pubcookie', 'Login failed. Set the pubcookie domain under Administer - Configuration - People - Pubcookie.', array(), WATCHDOG_ERROR);
+    return MENU_ACCESS_DENIED;
+  }
+  $_pubcookie_domain = check_plain($domain);
+
+  // If LDAP was used, the pubcookie name may not match the username,
+  // so we check the authmap table first.
+  $account = user_external_load($_pubcookie_user);
+  if (!$account) {
+    // No record of this user yet in Drupal but user has
+    // authenticated with pubcookie. Create new Drupal user.
+    user_external_login_register($_pubcookie_user, 'pubcookie');
+    $variables['pubcookie_user'] = $_pubcookie_user;
+    $variables['pubcookie_domain'] = $_pubcookie_domain;
+    module_invoke_all('pubcookie_post_register', $variables);
+  }
+  else {
+    $form_state['uid'] = $account->uid;
+    user_login_submit(array(), $form_state);
+  }
+
+  if ($user->uid && $user->uid != 1) {
+    // Login successful.
+    if (PUBCOOKIE_VERBOSE_LOGGING) {
+      watchdog('pubcookie', "uid of authenticated user is '%uid'", array('%uid' => $user->uid));
+    }
+    $url = variable_get('pubcookie_success_url', $base_url);
+    drupal_goto($url);
+  }
+
+  drupal_set_message(t('Pubcookie login failed.'), 'error');
+  drupal_goto();
+}
+
+/**
+ * Implements hook_user_presave().
+ *
+ * user_save() requires that mail key be set.
+ */
+function pubcookie_user_presave(&$edit, $account, $category) {
+  global $_pubcookie_user;
+  global $_pubcookie_domain;
+  // Set the mail column of the user table (which is typically blank for users with external auth) only if
+  // pubcookie_user@pubcookie_domain is also an email address.
+  if ($account->is_new && isset($_pubcookie_user)) {
+    $edit['mail'] = variable_get('pubcookie_id_is_email', 1) ? "$_pubcookie_user@$_pubcookie_domain" : '';
+    if ((variable_get('pubcookie_id_is_email', 1) && module_exists('pubcookiesiteaccess'))) {
+      // Give user preassigned roles, if any.
+      $roles = pubcookiesiteaccess_get_preassigned_roles_for_user($_pubcookie_user);
+      foreach ($roles as $rid => $role) {
+        $edit['roles'][$rid] = $role;
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_entity_presave().
+ *
+ * Potentially prepopulate data from LDAP.
+ */
+function pubcookie_entity_presave($entity, $type) {
+  global $_pubcookie_user;
+  
+  if ($type == 'user' && isset($entity->is_new) && $entity->is_new && $_pubcookie_user) {
+    // Return if LDAP is not enabled.
+    if (variable_get('pubcookie_ldap_server', '') == '') {
+      return;
+    }
+    
+    // Retrieve LDAP record for this user.
+    $records = pubcookie_ldap_search($_pubcookie_user);
+    $ldap_record = $records[0];
+    
+    // Possibly use a field value from LDAP for the username.
+    $ldap_usernamefield = variable_get('pubcookie_ldap_usernamefield', '');
+    if ($ldap_usernamefield && isset($ldap_record[$ldap_usernamefield])) {
+      if ($ldap_record[$ldap_usernamefield]) {
+        $entity->name = $ldap_record[$ldap_usernamefield];
+      }
+    }
+  
+    // Add LDAP information. For example, if there is a Drupal field
+    // called field_displayname and an LDAP field called displayname
+    // then put the value from LDAP into $user->displayname.
+    $instances = field_info_instances('user', 'user');
+    foreach ($instances as $field) {
+      $fieldname = $field['field_name'];
+      if (drupal_substr($fieldname, 0, 6) == 'field_') {
+        $fieldname = drupal_substr($fieldname, 6);
+      }
+      $field_language = field_language('user', 'user', $field['field_name']);
+      if (isset($ldap_record[$fieldname])) {
+        $entity->$field['field_name'] = array(
+          $field_language => array(
+            0 => array(
+              'value' => $ldap_record[$fieldname],
+            )
+          )
+        );
+        if (PUBCOOKIE_VERBOSE_LOGGING) {
+          watchdog('pubcookie', 'Set %field to %value', array('%field' => $fieldname, '%value' => $ldap_record[$fieldname]));  
+        }
+      }
+    }
+  }
+}
+
+/*
+ * Implements hook_block_info().
+ *
+ * Display the pubcookie "Log in" link.
+ */
+function pubcookie_block_info() {
+  $blocks['pubcookie_login'] = array(
+    'info' => t('Pubcookie Login'),
+  );
+  return $blocks;
+}
+
+function pubcookie_block_view($delta) {
+  switch ($delta) {
+    case 'pubcookie_login':
+      global $user;
+
+      $block = array();
+      if (user_is_anonymous()) {
+        $block['subject'] = '';
+        $block['content'] = theme('pubcookie_login');
+      }
+      return $block;
+  }
+}
+
+/**
+ * Implementation of hook_theme().
+ */
+function pubcookie_theme() {
+  return array(
+    'pubcookie_login' => array(
+      'arguments' => array(),
+    ),
+  );
+}
+
+/**
+ * Theme function for pubcookie login link.
+ */
+function theme_pubcookie_login() {
+  if (variable_get('pubcookie_success_url', '')) {
+    return l(t('Log in'), pubcookie_login_link());
+  }
+  else {
+    return l(t('Log in'), pubcookie_login_link(), array('query' => array('destination' => drupal_get_path_alias(current_path()))));
+  }
+}
+
+/*
+ *  The link must be to a nonexistent file in a directory containing an .htaccess
+ *  file with proper pubcookie directives. The file must not exist so it can
+ *  "fall through" Apache to Drupal's menu system and be directed to the
+ *  pubcookie_page() function. By default we look for a nonexistent file named pc.
+ */
+function pubcookie_login_link() {
+  return variable_get('pubcookie_login_dir', 'login') . '/pc';
+}
+
+/*
+ * Query an LDAP server for more information about $username.
+ * You can pass in a custom filter by using $filter.
+ */
+function pubcookie_ldap_search($username, $filter = NULL) {
+  $records = array();
+  if (!function_exists('ldap_connect')) {
+    watchdog('pubcookie', 'PHP LDAP extension not installed');
+    return $records;
+  }
+
+  if (!isset($filter)) {
+    $filter = str_replace('%username', $username, variable_get('pubcookie_ldap_searchfield', '(|(uid=%username))'));
+  }
+
+  $ldap_server = variable_get('pubcookie_ldap_server', '');
+  $ldap_dn = variable_get('pubcookie_ldap_basedn', '');
+  if ($ldap_server == '' || $ldap_dn == '') {
+    watchdog('pubcookie', 'LDAP server not set; check pubcookie module settings', array(), WATCHDOG_WARNING);
+    return $records;
+  }
+
+  $directory_service = ldap_connect($ldap_server);
+  if (!$directory_service) {
+    watchdog('pubcookie', 'Could not connect to LDAP server %server', array('%server' => $ldap_server), WATCHDOG_WARNING);
+    return $records;
+  }
+
+  if (PUBCOOKIE_VERBOSE_LOGGING) {
+    watchdog('pubcookie', 'LDAP server is %server', array('%server' => $ldap_server));
+    watchdog('pubcookie', 'LDAP base dn is %base_dn', array('%base_dn' => $ldap_dn));
+    watchdog('pubcookie', 'Attempting LDAP search on filter %filter', array('%filter' => $filter));
+  }
+
+  ldap_set_option($directory_service, LDAP_OPT_PROTOCOL_VERSION, 3);
+  $r = ldap_bind($directory_service);
+  $sr = ldap_search($directory_service, $ldap_dn, $filter);
+
+  $info = ldap_get_entries($directory_service, $sr);
+  for ($i = 0; $i < $info['count']; $i++) {
+    $data = array();
+    foreach ($info[$i] as $key => $value) {
+      if (!is_numeric($key) && $key != 'objectclass') {
+        if (is_array($info[$i][$key])) {
+          $data[$key] = $info[$i][$key][0];
+        }
+        else {
+          $data[$key] = $info[$i][$key];
+        }
+      }
+    }
+    $records[] = $data;
+  }
+  ldap_close($directory_service);
+  if (PUBCOOKIE_VERBOSE_LOGGING) {
+    watchdog('pubcookie', 'Records returned: %num; first record has %rows rows', array('%num' => count($records), '%rows' => count($records[0])));
+  }
+
+  return $records;
+}

@@ -1,0 +1,853 @@
+<?php
+
+/**
+ * @file
+ * weDeal payment services for use in Drupal Commerce.
+ */
+
+
+/*
+* Implements hook_cron().
+*/
+function commerce_wedeal_cron(){
+
+	// Load all orders and the order queue
+	$orders = entity_load('commerce_order');
+	$queue = DrupalQueue::get('commerce_orders');
+
+	foreach ($orders as $order) {
+
+		// Only check certain orders(less than  1 week old, pending or in payment, with reference and payed with wedeal)
+		if($order->revision_timestamp >= (time()-604800) && ($order->status == 'pending' || $order->status == 'checkout_payment') && (strpos($order->data['payment_method'], 'wedeal_') !== false) && isset($order->data['reference'])) {
+
+			// Put order in check queue
+			$queue->createItem($order);
+		}
+	}
+}
+
+/*
+* Implements hook_cron_queue_info().
+*/
+function commerce_wedeal_cron_queue_info(){
+
+	// Define order queue with a 120 second timeout
+	$queues['commerce_orders'] = array(
+		'worker callback' => 'commerce_wedeal_cron_check',
+		'time' => 120,
+	);
+	return $queues;
+}
+
+function commerce_wedeal_cron_check($order) {
+	if(isset($order->order_id)) {
+
+		// Get the payment method
+		$method = explode('|', $order->data['payment_method']);
+
+		// Create a new transaction for this payment
+		$transaction = commerce_payment_transaction_new($method[0], $order->order_id);
+
+		// Set some default values for this transaction
+		$transaction->instance_id = $order->data['payment_method'];
+		$transaction->amount = 0;
+		$transaction->currency_code = 'EUR';
+		$transaction->status = COMMERCE_PAYMENT_STATUS_PENDING;
+		$reference = $order->data['reference'];
+
+		// Load the payment data from weDeal by reference ID
+		$payment = commerce_wedeal_validate_payment($reference);
+
+		// Only do stuff we actually got payment data
+		if($payment != NULL) {
+
+			// Parse the result into a workable format
+			$payment_status = commerce_wedeal_result_parse($payment['state']);
+
+			// Check existing payments for this payment ID so we only have 1 transaction per payment
+			$known = FALSE;
+			foreach (commerce_payment_transaction_load_multiple(array(), array('order_id' => $order->order_id)) as $transaction2) {
+
+				// Payment ID matches, replace payment data
+				if($transaction2->remote_id == $payment['id']) {
+					$transaction2->remote_id = $payment['id'];
+					$transaction2->remote_status = $payment['state'];
+					$transaction2->status = $payment_status['code'];
+					$transaction2->message = $payment_status['message'];
+					$transaction2->amount = ($payment['amount']*100);
+					commerce_payment_transaction_save($transaction2);
+					$known = TRUE;
+				}
+			}
+
+			// Did not find this payment ID, save the newly created transaction
+			if($known == FALSE) {
+				$transaction->remote_id = $payment['id'];
+				$transaction->remote_status = $payment['state'];
+				$transaction->status = $payment_status['code'];
+				$transaction->message = $payment_status['message'];
+				$transaction->amount = ($payment['amount']*100);
+				commerce_payment_transaction_save($transaction);
+			}
+
+		}
+	}
+}
+
+
+/**
+ * Implements hook_permission().
+ */
+function commerce_wedeal_permission() {
+
+	// Define weDeal permission
+	return array(
+		'administer wedeal' => array(
+			'title' => t('Administer weDeal'),
+			'restrict access' => TRUE,
+		),
+	);
+}
+
+/**
+ * Implements hook_menu().
+ */
+function commerce_wedeal_menu() {
+
+	// Define weDeal configure page and redirect to fix the weDeal return url check
+	$items = array();
+
+	$items['admin/commerce/config/wedeal'] = array(
+		'title' => t('weDeal integration settings'),
+		'description' => t('Configure weDeal'),
+		'page callback' => 'drupal_get_form',
+		'page arguments' => array('commerce_wedeal_settings'),
+		'access arguments' => array('administer wedeal'),
+	);
+	$items['wedeal/redirect'] = array(
+		'title' => t('WeDeal Redirect'),
+		'description' => t('Redirect for WeDeal'),
+		'page callback' => 'commerce_wedeal_redirect',
+		'page arguments' => array(),
+		'access callback' => TRUE
+	);
+
+	return $items;
+}
+
+/**
+ * Local redirect for WeDeal
+ */
+function commerce_wedeal_redirect() {
+
+	// Do a local redirect for weDeal as they check what kind of code the return url returns
+	// if it returns something else than 200 OK, it breaks.
+	if(isset($_GET['goto']) && !url_is_external($_GET['goto']) && drupal_valid_path($_GET['goto'])) {
+		$extra = array(
+			'Reference' => $_GET['Reference'],
+			'PaymentState' => $_GET['PaymentState'],
+			'Username' => $_GET['Username'],
+			'Password' => $_GET['Password'],
+			'ID' => $_GET['ID'],
+			'PaymentMethod' => $_GET['PaymentMethod'],
+			'Description' => $_GET['Description'],
+		);
+
+		// Redirect to the proper return URl
+		drupal_goto($_GET['goto'], array('query' => $extra));
+	}
+	else
+	{
+		drupal_goto();
+	}
+}
+
+/**
+ * weDeal settings page callback
+ */
+function commerce_wedeal_settings() {
+	$form = array();
+
+	// load the weDeal merchant data
+	$merchant_user = variable_get('wedeal_merchant_username');
+	$merchant_password = variable_get('wedeal_merchant_password');
+
+	$form['wedeal_merchant_username'] = array(
+		'#type' => 'textfield',
+		'#title' => t('Username'),
+		'#required' => TRUE,
+		'#description' => t('Your weDeal username for this website'),
+		'#default_value' => $merchant_user,
+	);
+
+	// Check if password is set, this method allows us to save the form without showing the original pass
+	// But still being able to edit the password
+	$pass_required = FALSE;
+	$pass_default = array();
+	if(empty($merchant_password)) {
+		$pass_required = TRUE;
+		$pass_default = array('1');
+	}
+
+	$form['wedeal_enable_password'] = array(
+		'#type' => 'checkboxes',
+		'#options' => array('1' => t('Edit password')),
+		'#default_value' => $pass_default
+	);
+
+	$form['wedeal_merchant_password'] = array(
+		'#type' => 'textfield',
+		'#title' => t('Password'),
+		'#required' => $pass_required,
+		'#description' => t('Your weDeal password for this website'),
+		'#default_value' => '',
+		'#states' => array(
+			'visible' => array(
+				':input[name="wedeal_enable_password[1]"]' => array('checked' => TRUE),
+			),
+		),
+	);
+
+	$form['wedeal_enabled_methods'] = array(
+		'#type' => 'select',
+		'#title' => t('Enabled methods'),
+		'#multiple' => TRUE,
+		'#options' => commerce_wedeal_get_method_list(),
+		'#default_value' => variable_get('wedeal_enabled_methods'),
+	);
+
+	// 0 = full processing, 1 = test mode (Transactions are registered with weDeal, but not forwarded the issuer)
+	$form['wedeal_mode'] = array(
+		'#type' => 'radios',
+		'#title' => t('Mode'),
+		'#options' => array(
+			'1' => ('Test account - for testing purposes only'),
+			'0' => ('Production account - use for processing real transactions'),
+		),
+		'#default_value' => variable_get('wedeal_mode', '1'),
+	);
+	return system_settings_form($form);
+}
+
+	/**
+	 * weDeal settings page submit callback
+	 */
+function commerce_wedeal_settings_validate(&$form, &$form_state) {
+
+	// No password set, load it from variables
+	if(empty($form['wedeal_merchant_password']['#value'])) {
+		$form['wedeal_merchant_password']['#value'] = variable_get('wedeal_merchant_password');
+		$form_state['values']['wedeal_merchant_password'] = variable_get('wedeal_merchant_password');
+	}
+}
+
+/**
+ * weDeal get method list
+ */
+function commerce_wedeal_get_method_list() {
+
+	// Make this function static, as it is called quite often
+	$return = &drupal_static(__FUNCTION__);
+
+	// Not in cache, make the actual call
+	if (empty($return)) {
+		$return = array();
+
+		// Load available methods from weDeal
+		$response = commerce_wedeal_do_xml_request('https://www.paydutch.nl/api/processreq.aspx', array('type' => 'listmethod'));
+		if($response != NULL && isset($response['method']) && $response['count'] > 0) {
+
+			// Due to weDeal weird XML forming, we have to check the count to create a workable array
+			if($response['count'] == 1) {
+				$return = array($response['method']['methodcode'] => $response['method']['methodname']);
+			}
+			else {
+				// Multiple methods, looooopppp
+				foreach($response['method'] as $method) {
+					$return[$method['methodcode']] = $method['methodname'];
+				}
+			}
+
+		}
+	}
+	return $return;
+
+}
+
+/**
+ * weDeal get enabled method list
+ */
+
+function commerce_wedeal_get_enabled_method_list() {
+
+	// First load the method list from weDeal
+	$methods = commerce_wedeal_get_method_list();
+
+	// Get the anbled methods
+	$enabled = variable_get('wedeal_enabled_methods');
+
+	// Cross check the two arrays to get the actual usable methods
+	foreach($methods as $mkey => $method) {
+		if(!isset($enabled[$mkey]))
+		{
+			unset($methods[$mkey]);
+		}
+	}
+	return $methods;
+}
+
+
+/**
+ * Implements hook_commerce_payment_method_info().
+ */
+function commerce_wedeal_commerce_payment_method_info() {
+
+	// Define available payment methods by this module
+	// Because we have multiple payment methods for one module, we loop through the enabled methods
+
+	// Load enabled methods
+	$enabled_methods = commerce_wedeal_get_enabled_method_list();
+	$payment_methods = array();
+
+	// Set the base settings, like the module it should use
+	$base = array(
+		'base' => 'commerce_wedeal',
+		'terminal' => FALSE,
+		'offsite' => TRUE,
+		'offsite_autoredirect' => TRUE,
+    'active' => TRUE,
+	);
+
+	// Loop through enabled methods to tell commerce which payment methods we have
+	foreach($enabled_methods as $mkey => $method) {
+		$payment_methods['wedeal_'.$mkey] = $base + array(
+			'title' => t($method),
+			'short_title' => t($method),
+			'display_title' => t($method),
+			'description' => t('!type through weDeal', array('!type' => $method)),
+		);
+	}
+	return $payment_methods;
+}
+
+/**
+ * Payment method callback: redirect form
+ *
+ * returns form elements that should be submitted to the redirected
+ * payment service; because of the array merge that happens upon return,
+ * the service's URL that should receive the POST variables should be set in
+ * the #action property of the returned form array
+ */
+function commerce_wedeal_redirect_form($form, &$form_state, $order, $payment_method) {
+	$merchant_user = variable_get('wedeal_merchant_username');
+	$merchant_password = variable_get('wedeal_merchant_password');
+
+	$settings = array(
+		// weDeal configuration
+		'merchant_user' => $merchant_user,
+		'merchant_password' => $merchant_password,
+		'mode' => variable_get('wedeal_mode'),
+
+		// Return to the previous page when payment is canceled
+		'cancel_return' => url('wedeal/redirect', array('absolute' => TRUE, 'query' => array('goto' => 'checkout/' . $order->order_id . '/payment/back/' . $order->data['payment_redirect_key']))),
+
+		// Return to the payment redirect page for processing successful payments
+		'return' 	=> url('wedeal/redirect', array('absolute' => TRUE, 'query' => array('goto' => 'checkout/' . $order->order_id . '/payment/return/' . $order->data['payment_redirect_key']))),
+
+		// Specify the current payment method instance ID in the notify_url
+		'payment_method' => $payment_method['instance_id'],
+	);
+
+	return commerce_wedeal_build_redirect_form($form, $form_state, $order, $settings, $payment_method);
+}
+
+
+/**
+ * Builds an weDeal payment form from an order object.
+ */
+function commerce_wedeal_build_redirect_form($form, &$form_state, $order, $settings, $payment_method) {
+
+	// This function creates the redirect form for weDeal
+	// Ceate a wrapper for the order
+	$wrapper = entity_metadata_wrapper('commerce_order', $order);
+
+	$currency_code = $wrapper->commerce_order_total->currency_code->value();
+	$amount = str_replace('.', ',', ($wrapper->commerce_order_total->amount->value()/100));
+	$payment_method_id = explode('wedeal_', $payment_method['method_id']);
+	$payment_method_id = $payment_method_id[1];
+
+	// Generate an invoice number
+	$invoice_number = _commerce_wedeal_generate_invoice($order);
+	$order->data['reference'] = $invoice_number;
+
+	// Save order to put the reference in the DB, this reference ID is needed for the cron
+	commerce_order_save($order);
+
+	// Create a array to send to weDeal
+	$data = array(
+		'methodcode' => $payment_method_id,
+		'reference' => $invoice_number,
+		'description' => t('Payment for order number !order', array('!order' => $order->order_id)),
+		'amount' => $amount,
+		'successurl' => $settings['return'],
+		'failurl' => $settings['cancel_return'],
+		'test' => 'false',
+	);
+
+	// Is this a test payment?
+	if(variable_get('wedeal_mode', '1') == '1') {
+		$data['test'] = 'true';
+	}
+
+	// Send the call to weDeal
+	$response = commerce_wedeal_do_xml_request('https://www.paydutch.nl/api/processreq.aspx', array('type' => 'transaction', 'structure' => $data));
+
+	// Do we have a response?
+	if($response != NULL) {
+		$form['#action'] = $response;
+
+		// Set the base data in the form too
+		foreach ($data as $name => $value) {
+			if (isset($value)) {
+				$form[$name] = array('#type' => 'hidden', '#value' => $value);
+			}
+		}
+
+		$form['submit'] = array(
+			'#type' => 'submit',
+			'#value' => t('Pay with weDeal'),
+		);
+
+		return $form;
+	}
+}
+
+/**
+ * Validates weDeal form after payment
+ */
+
+function commerce_wedeal_redirect_form_validate($order, $payment_method) {
+
+	// Process the weDeal response
+	$response = array();
+	$response = array_map('check_plain', $_REQUEST);
+
+	if(isset($order->order_id)) {
+
+		// Create a new transaction for this payment
+		$transaction = commerce_payment_transaction_new($payment_method['method_id'], $order->order_id);
+
+		// Set some default values for this transaction
+		$transaction->amount = 0;
+		$transaction->currency_code = 'EUR';
+		$transaction->status = COMMERCE_PAYMENT_STATUS_PENDING;
+		$transaction->remote_id = $response['ID'];
+		$reference = $response['Reference'];
+		$transaction->instance_id = $payment_method['instance_id'];
+
+		// Load the payment data from weDeal by reference ID
+		$payment = commerce_wedeal_validate_payment($reference);
+
+		// Only do stuff we actually got payment data
+		if($payment != NULL) {
+
+			// Parse the result into a workable format
+			$payment_status = commerce_wedeal_result_parse($payment['state']);
+
+			// Check existing payments for this payment ID so we only have 1 transaction per payment
+			$known = FALSE;
+			foreach (commerce_payment_transaction_load_multiple(array(), array('order_id' => $order->order_id)) as $transaction2) {
+
+				// Payment ID matches, replace payment data
+				if($transaction2->remote_id == $payment['id']) {
+					$transaction2->remote_id = $payment['id'];
+					$transaction2->remote_status = $payment['state'];
+					$transaction2->status = $payment_status['code'];
+					$transaction2->message = $payment_status['message'];
+					$transaction2->amount = ($payment['amount']*100);
+					commerce_payment_transaction_save($transaction2);
+					$known = TRUE;
+				}
+			}
+
+
+			// Did not find this payment ID, save the newly created transaction
+			if($known == FALSE) {
+				$transaction->remote_status = $response['PaymentState'];
+				$transaction->status = $payment_status['code'];
+				$transaction->message = $payment_status['message'];
+				$transaction->amount = ($payment['amount']*100);
+				commerce_payment_transaction_save($transaction);
+			}
+		}
+	}
+}
+
+/**
+ * Validate weDeal payment
+ */
+function commerce_wedeal_validate_payment($reference) {
+
+	// Retrieve payment details from weDeal
+	$return = commerce_wedeal_check_payment_status($reference);
+	if($return != NULL)
+	{
+		// Do we have a result?
+		if($return['count'] > 0)
+		{
+			$paymentinfo = $return['paymentinfo'];
+			return $paymentinfo;
+		}
+	}
+	return NULL;
+}
+
+/**
+ * Check weDeal payment status
+ */
+
+function commerce_wedeal_check_payment_status($reference) {
+
+	// Create the request to send to weDeal
+	$test = 'false';
+	if(variable_get('wedeal_mode', '1') == '1') {
+		$test = 'true';
+	}
+
+	// send request to weDeal
+	$response = commerce_wedeal_do_xml_request('https://www.paydutch.nl/api/processreq.aspx', array('type' => 'query', 'structure' => array('reference' => $reference, 'test' => $test)));
+	return $response;
+}
+
+
+/**
+ * Parse weDeal result code
+ *
+ * @param $code
+ */
+function commerce_wedeal_result_parse($code) {
+
+	// Parse the result from weDeal to a commerce payment status and a weDeal message by weDeal code
+
+	switch ($code) {
+		case 'Income':
+			$st = COMMERCE_PAYMENT_STATUS_SUCCESS;
+			$msg = t('Consumer paid successfully to DPG account.');
+			break;
+		case 'Assemble':
+			$st = COMMERCE_PAYMENT_STATUS_SUCCESS;
+			$msg = t('After the contractual period the payments are going to be assembled.');
+			break;
+		case 'Payout':
+			$st = COMMERCE_PAYMENT_STATUS_SUCCESS;
+			$msg = t('The assembled payments are set ready for payout to the merchants account.');
+			break;
+		case 'Success':
+			$st = COMMERCE_PAYMENT_STATUS_SUCCESS;
+			$msg = t('Payout confirmed by the Bank Statement');
+			break;
+		case 'Cancelled':
+			$st = COMMERCE_PAYMENT_STATUS_FAILURE;
+			$msg = t('Consumer cancelled the payment.');
+			break;
+		case 'Failed':
+			$st = COMMERCE_PAYMENT_STATUS_FAILURE;
+			$msg = t('Failed payment.');
+			break;
+		case 'Register':
+			$st = COMMERCE_PAYMENT_STATUS_PENDING;
+			$msg = t('Payment registered, consumer initiated link.');
+			break;
+		case 'Processing':
+			$st = COMMERCE_PAYMENT_STATUS_PENDING;
+			$msg = t('Payment in process, consumer is paying at the moment.');
+			break;
+		default:
+			$st = COMMERCE_PAYMENT_STATUS_FAILURE;
+			$msg = t('Unknown status (response code @code)', array('@code' => $code));
+	}
+
+	// Return both messages
+	return array(
+		'code' => $st,
+		'message' => $msg,
+	);
+}
+
+/**
+ * weDeal xml wrapper
+ */
+function commerce_wedeal_do_xml_request($url, $data = array(), $add_merchant = TRUE) {
+
+	// Create XML root element
+	$request = new SimpleXMLElement('<?xml version="1.0" encoding="UTF-8"?><request></request>');
+
+	// Load merchant data
+	$merchant_user = variable_get('wedeal_merchant_username');
+	$merchant_password = variable_get('wedeal_merchant_password');
+
+	// Add the request type to the XML
+	if(isset($data['type']))
+	{
+		$request->addChild('type', $data['type']);
+	}
+	else
+	{
+		$data['type'] == '';
+	}
+
+	// Do we need to add the merchant data to the XML, and not a transaction type?
+	if($add_merchant == TRUE && $data['type'] != 'transaction')
+	{
+		// Do we even have the merchant data?
+		if (!empty($merchant_user) && !empty ($merchant_password)) {
+
+			// Add merchant data to XML
+			$merchant = $request->addChild('merchant');
+			$merchant->addChild('username', $merchant_user);
+			$merchant->addChild('password', $merchant_password);
+		}
+	}
+
+	// Is this a query type? Merge the structure with merchant XML structure
+	if($data['type'] == 'query' && isset($merchant)) {
+		_commerce_wedeal_array_to_simplexml($data['structure'], $merchant);
+	}
+
+	// Is this a transacton type?
+	if($data['type'] == 'transaction') {
+
+		// Add a transactionreq child element to $request element
+		$transreq = $request->addChild('transactionreq');
+
+		// Do we have merchant data?
+		if (!empty($merchant_user) && !empty ($merchant_password)) {
+			// Add merchant data to $transreq element
+			$transreq->addChild('username', $merchant_user);
+			$transreq->addChild('password', $merchant_password);
+		}
+
+		// Merge structure with $transreq
+		_commerce_wedeal_array_to_simplexml($data['structure'], $transreq);
+	}
+
+	// Use drupal_http_request to call weDeal
+	$result = drupal_http_request($url, array('headers' => array('Content-Type' => 'text/xml'), 'method' => 'POST', 'data' => $request->asXML()));
+
+	// Did we get a HTTP error? Put in watchdog
+	if(isset($result->error) && $result->error != '') {
+		watchdog('commerce_wedeal', 'Error in API call to weDeal: '.$result->error);
+		return NULL;
+	}
+	else {
+
+		// weDeal doesn't use XML all the time, so we have to guess what kind of return we got
+		@$return = simplexml_load_string($result->data);
+
+		// Did they return a URL?
+		$url = preg_match("#^https?://.+#", $result->data);
+
+		// Is it XML, or type is transaction and we got a URL?
+		if($return !== FALSE || ($data['type'] == 'transaction' && $url == 1))	{
+
+			// We got a URL, just return the URL and we are done
+			if($url == 1) {
+				return $result->data;
+			}
+			else
+			{
+				// No URL, return the XML
+				return _commerce_wedeal_simplexml_to_array($return);
+			}
+		}
+		else
+		{
+
+			// Not a proper return from weDeal, log it
+			watchdog('commerce_wedeal', 'Improper return from weDeal: '.$result->data);
+			return NULL;
+		}
+	}
+}
+
+/**
+ * weDeal SimpleXML to array
+ * Snipper from http://www.php.net/manual/fr/book.simplexml.php#105697
+ */
+/**
+ * Converts a simpleXML element into an array. Preserves attributes.<br/>
+ * You can choose to get your elements either flattened, or stored in a custom
+ * index that you define.<br/>
+ * For example, for a given element
+ * <code>
+ * <field name="someName" type="someType"/>
+ * </code>
+ * <br>
+ * if you choose to flatten attributes, you would get:
+ * <code>
+ * $array['field']['name'] = 'someName';
+ * $array['field']['type'] = 'someType';
+ * </code>
+ * If you choose not to flatten, you get:
+ * <code>
+ * $array['field']['@attributes']['name'] = 'someName';
+ * </code>
+ * <br>__________________________________________________________<br>
+ * Repeating fields are stored in indexed arrays. so for a markup such as:
+ * <code>
+ * <parent>
+ *     <child>a</child>
+ *     <child>b</child>
+ *     <child>c</child>
+ * ...
+ * </code>
+ * you array would be:
+ * <code>
+ * $array['parent']['child'][0] = 'a';
+ * $array['parent']['child'][1] = 'b';
+ * ...And so on.
+ * </code>
+ * @param simpleXMLElement    $xml            the XML to convert
+ * @param boolean|string    $attributesKey    if you pass TRUE, all values will be
+ *                                            stored under an '@attributes' index.
+ *                                            Note that you can also pass a string
+ *                                            to change the default index.<br/>
+ *                                            defaults to null.
+ * @param boolean|string    $childrenKey    if you pass TRUE, all values will be
+ *                                            stored under an '@children' index.
+ *                                            Note that you can also pass a string
+ *                                            to change the default index.<br/>
+ *                                            defaults to null.
+ * @param boolean|string    $valueKey        if you pass TRUE, all values will be
+ *                                            stored under an '@values' index. Note
+ *                                            that you can also pass a string to
+ *                                            change the default index.<br/>
+ *                                            defaults to null.
+ * @return array the resulting array.
+ */
+function _commerce_wedeal_simplexml_to_array(SimpleXMLElement $xml,$attributesKey=null,$childrenKey=null,$valueKey=null) {
+	if($childrenKey && !is_string($childrenKey)){$childrenKey = '@children';}
+	if($attributesKey && !is_string($attributesKey)){$attributesKey = '@attributes';}
+	if($valueKey && !is_string($valueKey)){$valueKey = '@values';}
+
+	$return = array();
+	$name = $xml->getName();
+	$_value = trim((string)$xml);
+	if(!strlen($_value)){$_value = null;};
+
+	if($_value!==null){
+		if($valueKey){$return[$valueKey] = $_value;}
+		else{$return = $_value;}
+	}
+
+	$children = array();
+	$first = true;
+	foreach($xml->children() as $elementName => $child){
+		$value = _commerce_wedeal_simplexml_to_array($child,$attributesKey, $childrenKey,$valueKey);
+		if(isset($children[$elementName])){
+			if(is_array($children[$elementName])){
+				if($first){
+					$temp = $children[$elementName];
+					unset($children[$elementName]);
+					$children[$elementName][] = $temp;
+					$first=false;
+				}
+				$children[$elementName][] = $value;
+			}else{
+				$children[$elementName] = array($children[$elementName],$value);
+			}
+		}
+		else{
+			$children[$elementName] = $value;
+		}
+	}
+	if($children){
+		if($childrenKey){$return[$childrenKey] = $children;}
+		else{$return = array_merge($return,$children);}
+	}
+
+	$attributes = array();
+	foreach($xml->attributes() as $name=>$value){
+		$attributes[$name] = trim($value);
+	}
+	if($attributes){
+		if($attributesKey){$return[$attributesKey] = $attributes;}
+		else{$return = array_merge($return, $attributes);}
+	}
+
+	return $return;
+}
+
+/**
+ * weDeal array to SimpleXML
+ */
+function _commerce_wedeal_array_to_simplexml($array, &$xml = NULL){
+
+	// No root XML, create a new root
+	if($xml == NULL){
+		$xml = new SimpleXMLElement('<root/>');
+	}
+
+	// Loop through array and create XML childs
+	foreach($array as $key => $value){
+		if(is_array($value)){
+			array2xml($value, $xml->addChild($key));
+		}else{
+			$xml->addChild($key, $value);
+		}
+	}
+
+	// Return the XML
+	return $xml->asXML();
+}
+
+
+/**
+ * Generate a unique invoice number based on the Order ID and timestamp.
+ */
+function _commerce_wedeal_generate_invoice($order) {
+
+	// Use order number and request time to get a unique ID
+	return $order->order_id . '-' . REQUEST_TIME;
+}
+
+
+/*
+ * Implements hook_requirements()
+ */
+function commerce_wedeal_requirements($phase) {
+  $require = array();
+  if($phase == 'runtime') {
+
+
+    // Load merchant data
+    $merchant_user = variable_get('wedeal_merchant_username');
+    $merchant_password = variable_get('wedeal_merchant_password');
+
+    // Simple check to test data
+    $response = commerce_wedeal_do_xml_request('https://www.paydutch.nl/api/processreq.aspx', array('type' => 'listmethod'));
+
+    $description = '';
+    $status = REQUIREMENT_OK;
+    $value = 'Settings present';
+    if (empty($merchant_user) || empty ($merchant_password)) {
+      $description = 'You did not enter the weDeal login settings, you can enter them here: '. l('weDeal settings', 'admin/commerce/config/wedeal');
+      $status = REQUIREMENT_WARNING;
+      $value = 'No settings found';
+    }
+    elseif($response == NULL || (isset($response['method']) && $response['count'] == 0))
+    {
+      $description = 'You did not enter the correct weDeal login settings, you can enter them here: '. l('weDeal settings', 'admin/commerce/config/wedeal');
+      $status = REQUIREMENT_ERROR;
+      $value = 'Wrong settings found';
+    }
+
+    $require[] = array(
+      'title' => t('weDeal login settings'),
+      'description' => $description,
+      'value' => $value,
+      'severity' => $status,
+    );
+  }
+  return $require;
+}

@@ -1,0 +1,342 @@
+<?php
+
+// Constants definition
+define('cRoboXchangeActionUrl', 'https://merchant.roboxchange.com/Index.aspx');
+define('cRoboXchangeRateUrl'  , 'https://merchant.roboxchange.com/WebService/Service.asmx/GetRates');
+
+/**
+ * Implements hook_menu().
+ */
+function pg_roboxchange_menu() {
+  $items = array();
+  $items['roboxchange/done'] = array(
+    'title' => 'Internal Data',
+    'page callback' => 'pg_roboxchange_done_payment',
+    'access callback' => TRUE,
+    'file' => 'pg_roboxchange.pages.inc',
+    'type' => MENU_CALLBACK,
+  );
+  $items['roboxchange/success'] = array(
+    'title' => 'RoboXchange processing',
+    'page callback' => 'pg_roboxchange_payment_end',
+    'page arguments' => array('success'),
+    'access callback' => TRUE,
+    'file' => 'pg_roboxchange.pages.inc',
+    'type' => MENU_CALLBACK,
+  );
+  $items['roboxchange/fail'] = array(
+    'title' => 'RoboXchange processing',
+    'page callback' => 'pg_roboxchange_payment_end',
+    'page arguments' => array('fail'),
+    'access callback' => TRUE,
+    'file' => 'pg_roboxchange.pages.inc',
+    'type' => MENU_CALLBACK,
+  );
+  $items['admin/config/pgapi/roboxchange'] = array(
+    'title' => 'RoboXchange',
+    'description' => 'RoboXchange payment settings.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('pg_roboxchange_settings'),
+    'access arguments' => array('administer pgapi'),
+    'file' => 'pg_roboxchange.admin.inc',
+  );
+  return $items;
+}
+
+
+/**
+ * Implements hook_cron().
+ */
+function pg_roboxchange_cron() {
+  // 5 minutes looks reasonable default.
+  $frequency_minutes = variable_get('pg_roboxchange_frequency', 5);
+  if ((REQUEST_TIME - variable_get('pg_roboxchange_last_update', 0)) > $frequency_minutes) {
+    // Do not query too often.
+    _pg_roboxchange_get_rates();
+    variable_set('pg_roboxchange_last_update', REQUEST_TIME);
+  }
+}
+
+/**
+ * Accesses robokassa web-service to get rates.
+ *
+ * @todo better detection of not active merchant to fallback a demo account.
+ */
+function _pg_roboxchange_get_rates() {
+  $merchant_login = variable_get('pg_roboxchange_mrh', '');
+  if (empty($merchant_login)) {
+    // This should work always. Not activated merchant can't use services.
+    $merchant_login = 'demo';
+  }
+  // Setup defaults to query rates.
+  $options = array(
+    'MerchantLogin' => $merchant_login,
+    'Language' => $GLOBALS['language']->language,
+    'IncCurrLabel' => '',
+    'OutSum' => 1,
+  );
+  $url = url(variable_get('pg_roboxchange_rate_url', cRoboXchangeRateUrl), array(
+    'query' => $options,
+    'external' => TRUE,
+  ));
+  // Query web-service with HTTP GET method.
+  $xml = drupal_http_request($url, array('method' => 'GET'));
+  if (!isset($xml->error) && isset($xml->data)) {
+    $data = $xml->data;
+  }
+  if (!empty($data)) {
+    // Parse result.
+    try {
+      $element = new SimpleXMLElement($data);
+    }
+    catch (Exception $e) {
+      // SimpleXMLElement::__construct produces an E_WARNING error message for
+      // each error found in the XML data and throws an exception if errors
+      // were detected. Catch any exception and return failure (NULL).
+      return;
+    }
+    $result_code = (int) $element->Result->Code;
+    switch ($result_code) {
+      case 0:
+        // Success. Parse result.
+        $number_items = 0;
+        if (isset($element->Groups)) {
+          foreach ($element->Groups->children() as $group) {
+            // Update rates.
+            if ($group->Items->Currency->count() == 1) {
+              // Single value.
+              db_merge('pg_roboxchange_rates')
+                ->key(array('type' => (string) $group->Items->Currency['Label']))
+                ->fields(array(
+                  'name' => (string) $group->Items->Currency['Name'],
+                  'rate' => (float) $group->Items->Currency->Rate['IncSum'],
+                  ))
+                ->execute();
+              $number_items++;
+            }
+            else {
+              // Multiple items.
+              foreach ($group->Items->children() as $currency) {
+                // Store each rate.
+                db_merge('pg_roboxchange_rates')
+                  ->key(array('type' => (string) $currency['Label']))
+                  ->fields(array(
+                    'name' => (string) $currency['Name'],
+                    'rate' => (float) $currency->Rate['IncSum'],
+                    ))
+                  ->execute();
+                $number_items++;
+              }
+            }
+          }
+        }
+        watchdog('pg_roboxchange', 'Robokassa updated %count items', array(
+          '%count' => $number_items), WATCHDOG_INFO);
+        break;
+
+      default:
+        // 2 - MerchantLogin is wrong.
+        // 1000 - internal service error.
+        watchdog('pg_roboxchange', 'Robokassa error %code: %message', array(
+          '%code' => $result_code,
+          '%message' => (string) $element->Result->Description), WATCHDOG_ERROR);
+        break;
+    }
+  }
+  else {
+    // No data accepted.
+    watchdog('pg_roboxchange', 'Failed to communicate Robokassa web-service: %error', array('%error' => $xml->error), WATCHDOG_ERROR);
+  }
+}
+
+/**
+ * Implements hook_pgapi_gw().
+ */
+function pg_roboxchange_pgapi_gw($op, $a3 = NULL, $a4 = NULL) {
+  switch ($op) {
+    case 'display name':
+      $ret = t('RoboXchange Payment Gateway');
+      break;
+    case 'payment page':
+      $ret = url('payment/roboxchange/' . $a3, array('absolute' => TRUE));
+      break;
+    case 'payment gateway info':
+      $ret['name'] = theme('image', array(
+        'path' => drupal_get_path('module', 'pg_roboxchange') . '/images/robokassa.png',
+        'alt' => t('RoboXchange'),
+        'title' => t('RoboXchange'),
+      ));
+      $rates = pg_roboxchange_get_rates();
+      $checked = variable_get('pg_roboxchange_checked', array());
+      $prices = array();
+      foreach ($rates as $type => $rate) {
+        // Only allowed methods are passed.
+        if (isset($checked[$type])) {
+          $prices[$rate->name] = round(($a3 * $rate->rate * variable_get('pg_roboxchange_rate', '1.00')), 2);
+        }
+      }
+      $ret['price'] = $prices;
+      break;
+    case 'process form':
+      $transaction = $a3;
+      $form_state  = $a4;
+      $ret = _pg_roboxchange_process_form($form_state, $transaction);
+      break;
+    case 'get form':
+      // $a3 - transaction
+      // $a4 - form_state
+      $ret = drupal_retrieve_form('pg_roboxchange_extraform', $a4, $a3);
+      unset($ret['#form_id']);
+      break;
+    default:
+      $ret = '';
+  }
+  return $ret;
+}
+
+/**
+ * Implements hook_pgapi_transaction().
+ */
+function pg_roboxchange_pgapi_transaction($status, $transaction) {
+  switch ($status) {
+    case PG_PENDING:
+      $transaction->extra['amount'] =  $transaction->amount * variable_get('pg_roboxchange_rate', '1.00');
+      break;
+  }
+}
+
+/**
+ * Process robox payment form
+ */
+function _pg_roboxchange_process_form($form_state, $transaction) {
+  // Update transaction.
+  $transaction->gateway = 'pg_roboxchange';
+  pgapi_transaction_save($transaction);
+  // Build redirect form.
+  $form = drupal_get_form('pg_roboxchange_payform', $form_state, $transaction);
+  unset($form["#form_id"]);
+  unset($form["form_id"]);
+  unset($form["form_token"]);
+  unset($form["form_build_id"]);
+  $output = drupal_render($form);
+  // @todo fix the wtf.
+  echo '<html><body>' . $output . '<script>pgpayform.submit();</script></body>';
+  exit();
+}
+
+/**
+ * Return roboxchange extra form
+ */
+function pg_roboxchange_extraform($form, $form_state, $transaction) {
+  // Build variables for form
+  $def_rate = variable_get('pg_roboxchange_rate', '1.00');
+
+  // Build array with robox rates
+  $prices = array();
+  foreach (pg_roboxchange_get_rates() as $rate) {
+    $prices[$rate->type] = round(($transaction->amount * $rate->rate * $def_rate), 2) . " " . $rate->name;
+  }
+
+  $form['currency'] = array(
+    '#type' => 'select',
+    '#title' => t("Payment method"),
+    '#options' => $prices,
+    '#default_value' => key($prices),
+  );
+  return $form;
+}
+
+/**
+ * Return roboxchange payment form
+ */
+function pg_roboxchange_payform($form, $form_state, $post, $transaction) {
+  $amount = round(($transaction->amount * variable_get('pg_roboxchange_rate', '1.00')), 2);
+  $mrh = variable_get('pg_roboxchange_mrh', '');
+
+  $form['MrchLogin'] = array(
+    '#type' => 'hidden',
+    '#value' => $mrh,
+  );
+  $form['OutSum'] = array(
+    '#type' => 'hidden',
+    '#value' => $amount,
+  );
+  $form['InvId'] = array(
+    '#type' => 'hidden',
+    '#value' => $transaction->txnid,
+  );
+  // Calculate md5 checksum from data.
+  // sMerchantLogin:nOutSum:nInvId:sMerchantPass1[:alpha sorted list of params]
+  $fields = implode(':', array(
+    $mrh, $amount, $transaction->txnid, variable_get('pg_roboxchange_mps1', ''),
+    /*$transaction->title, $GLOBALS['user']->mail, $post['currency']*/
+  ));
+  $form['SignatureValue'] = array(
+    '#type' => 'hidden',
+    '#value' => md5($fields),
+  );
+  // @todo check this params to calculate crc.
+  /*
+  $form['Desc'] = array(
+    '#type' => 'hidden',
+    '#default_value' => $transaction->title,
+  );
+  $form['Email'] = array(
+    '#type' => 'hidden',
+    '#value' => $GLOBALS['user']->mail,
+  );
+  $form['IncCurrLabel'] = array(
+    '#type' => 'hidden',
+    '#value' => $post['currency'],
+  );
+  */
+  $form['#attributes'] = array('name' => 'pgpayform');
+  $form['#action'] = variable_get('pg_roboxchange_action_url', cRoboXchangeActionUrl);
+  return $form;
+}
+
+
+/**
+ * Returns the URL to the specified Robokassa server.
+ *
+ * @param $server
+ *   Either test or live indicating which server to get the URL for.
+ *
+ * @return
+ *   The URL to use to submit requests to the Robokassa server.
+ */
+function pg_roboxchange_server_url($server) {
+  switch ($server) {
+    case 'test':
+      return 'http://test.robokassa.ru/Index.aspx';
+    case 'live':
+      return 'https://merchant.roboxchange.com/Index.aspx';
+  }
+}
+
+/**
+ * Returns all rates from DB.
+ *
+ * @param $enabled
+ *   Filter only enabled items.
+ *
+ * @return
+ *   Rate if key exists or An associative array containing rates keyed by type.
+ *  - type: payment type
+ *  - name: printable name
+ *  - rate: numberic rate value
+ */
+function pg_roboxchange_get_rates($enabled = TRUE) {
+  // Stically cache rates.
+  $rates = &drupal_static(__FUNCTION__);
+  if (!isset($rates)) {
+    $rates = db_query('SELECT * FROM {pg_roboxchange_rates} ORDER BY type')->fetchAllAssoc('type');
+  }
+  if ($enabled) {
+    $checked_rates = variable_get('pg_roboxchange_checked', array());
+    return array_intersect_key($rates, $checked_rates);
+  }
+  else {
+    return $rates;
+  }
+}

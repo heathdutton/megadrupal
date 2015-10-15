@@ -1,0 +1,30 @@
+api = 2
+core = 7.x
+
+; Libraries
+libraries[jquery-bbq][directory_name] = jquery-bbq
+libraries[jquery-bbq][download][type] = file
+libraries[jquery-bbq][download][url] = https://github.com/cowboy/jquery-bbq/archive/master.zip
+libraries[jquery-bbq][patch][2138761] = https://drupal.org/files/issues/twbs_jquery-bbq_no_legacy_ie-2138761-1.patch
+libraries[jquery-bbq][type] = library
+libraries[jquery-cookie][directory_name] = jquery-cookie
+libraries[jquery-cookie][download][type] = file
+libraries[jquery-cookie][download][url] = https://github.com/carhartl/jquery-cookie/archive/v1.4.0.zip
+libraries[jquery-cookie][type] = library
+libraries[jquery-form][directory_name] = jquery-form
+libraries[jquery-form][download][type] = file
+libraries[jquery-form][download][url] = https://github.com/malsup/form/archive/3.46.0.zip
+libraries[jquery-form][type] = library
+libraries[jquery-once][directory_name] = jquery-once
+libraries[jquery-once][download][type] = file
+libraries[jquery-once][download][url] = https://github.com/RobLoach/jquery-once/archive/1.2.6.zip
+libraries[jquery-once][type] = library
+libraries[jquery-ui][directory_name] = jquery-ui
+libraries[jquery-ui][download][type] = file
+libraries[jquery-ui][download][url] = http://jqueryui.com/resources/download/jquery-ui-1.10.3.zip
+libraries[jquery-ui][type] = library
+libraries[jquery][directory_name] = jquery
+libraries[jquery][download][filename] = jquery.min.js
+libraries[jquery][download][type] = file
+libraries[jquery][download][url] = http://code.jquery.com/jquery-1.10.2.min.js
+libraries[jquery][type] = library

@@ -1,0 +1,249 @@
+<?php
+/**
+ * @file
+ * Core module file.
+ *
+ * Module provide authoring mechanisms for PostgreSQL queries. Whenever possible
+ * every query is issued with credentials related to current Drupal user.
+ */
+
+/**
+ * Implements hook_menu().
+ */
+function pgsign_menu() {
+  $items = array();
+
+  $items['admin/config/people/pgsign'] = array(
+    'title' => 'Postgres Signature',
+    'description' => 'Change settings of Postgres signature.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('pgsign_admin_settings'),
+    'access arguments' => array('administer site configuration'),
+    'file' => 'pgsign.admin.inc',
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_boot().
+ *
+ * Core function of the module. In case of authenticated user
+ * we're forcing Drupal to act not as a default user but as user with the same
+ * name as Drupal's user.
+ */
+function pgsign_boot() {
+  global $databases, $user;
+
+  // Anonymous do not need any special tracking.
+  if ($user->uid == 0) {
+    return;
+  }
+
+  // 'admin' is not real user either.
+  if ($user->name == 'admin') {
+    return;
+  }
+
+  // Make a copy of original in case we need to restore or refer.
+  $original_db = &drupal_static('pgsign_original_databases');
+  $original_db = $databases;
+
+  // $unsigned_connection = $databases['default'];
+
+  Database::closeConnection();
+
+  // Iterate over all connection and change username/password.
+  foreach ($databases as $key => &$info) {
+    // Keep it away from auxiliary connections.
+    if ($key != 'default') {
+      continue;
+    }
+    foreach ($info as &$item) {
+      foreach ($item as $key => &$value) {
+        if ($key == 'username') {
+          $new_value = _pgsign_get_db_username($user);
+          $value = empty($new_value) ? $value : $new_value;
+        }
+        elseif ($key == 'password') {
+          $new_value = _pgsign_get_db_password($user);
+          $value = empty($new_value) ? $value : $new_value;
+        }
+      }
+    }
+  }
+
+  // Reload configuration.
+  Database::parseConnectionInfo();
+
+  try {
+    // Check the connection.
+    db_query("SELECT 42");
+  }
+  catch (PDOException $e) {
+    // Fall back to default.
+    $databases = $original_db;
+    Database::parseConnectionInfo();
+    return;
+  }
+}
+
+/**
+ * Retrieve database login name for given Drupal user name.
+ *
+ * @param object $user
+ *   Drupal user object.
+ *
+ * @return string
+ *   Valid PostgreSQL user name.
+ */
+function _pgsign_get_db_username($user) {
+  $name = preg_replace('/\W/', '_', $user->name);
+
+  // Check if there no meaningful symbols left, provide at least something.
+  if (preg_match('/[a-z]/', $name) == 0) {
+    $name = "drupal_user_" . $user->uid;
+  }
+
+  return strtolower($name);
+}
+
+/**
+ * Default implementation is simple - default password from original connection.
+ * Expecting that DB is protected by administration methods. However quite
+ * complicated algorithm can be used here, like include username into password.
+ *
+ * @param object $user
+ *   Drupal user object.
+ *
+ * @return string
+ *   Password for corresponding PostgreSQL user.
+ */
+function _pgsign_get_db_password($user) {
+  global $databases;
+  $original_db = &drupal_static('pgsign_original_databases', $databases);
+  $password = isset($original_db['default']['default']['password']) ? $original_db['default']['default']['password'] : '';
+  return $password;
+}
+
+/**
+ * Adding a Postgres user.
+ *
+ * @param object $user
+ *   Drupal user object.
+ */
+function _pgsign_add_db_user($user) {
+  $username = _pgsign_get_db_username($user);
+  $password = _pgsign_get_db_password($user);
+
+  $command = variable_get('pgsign_sql_add_new_user', "CREATE USER %username WITH PASSWORD '%password'; GRANT drupal TO %username;");
+  $args = array('%username' => $username, '%password' => $password);
+  $command = strtr($command, $args);
+
+  try {
+    // Close connection to flush all possible transaction.
+    Database::closeConnection();
+    db_query($command);
+  }
+  catch (PDOException $e) {
+    watchdog('pgsign', $e->getMessage(), array(), WATCHDOG_WARNING);
+    return;
+  }
+}
+
+/**
+ * Removing a Postgres user.
+ *
+ * @param object $user
+ *   Drupal user object.
+ */
+function _pgsign_drop_db_user($user) {
+  // Retriesve SQL username from Drupal object.
+  $username = _pgsign_get_db_username($user);
+
+  // Even if it is extra check - let it be extra care.
+  $reserved_sql_users = _pgsign_get_reserved_users();
+
+  if (in_array($username, $reserved_sql_users)) {
+    // Reserved users like 'postgres' should never be deleted.
+    return FALSE;
+  }
+
+  $command = strtr("DROP USER IF EXISTS %username;", array('%username' => $username));
+
+  try {
+    // Close connection to flush all possible transaction.
+    Database::closeConnection();
+    db_query($command);
+  }
+  catch (PDOException $e) {
+    watchdog('pgsign', $e->getMessage(), array(), WATCHDOG_WARNING);
+    return FALSE;
+  }
+
+  return TRUE;
+}
+
+/**
+ * Retrieve list of Postgres users.
+ */
+function _pgsign_get_user_list() {
+  $result = db_query("SELECT usename FROM {pg_user};");
+
+  $db_users = $result->fetchCol();
+  return is_array($db_users) ? drupal_map_assoc($db_users) : array();
+}
+
+/**
+ * Retrieve list of Postgres users which should not be deleted.
+ *
+ * @return array
+ *   usernames.
+ */
+function _pgsign_get_reserved_users() {
+  global $databases, $user;
+  $reserved_sql_users[] = 'postgres';
+
+  foreach ($databases['default'] as $item) {
+    foreach ($item as $key => &$value) {
+      if ($key == 'username') {
+        $new_value = _pgsign_get_db_username($user);
+        $value = empty($new_value) ? $value : $new_value;
+        $reserved_sql_users[] = $value;
+      }
+    }
+  }
+
+  return $reserved_sql_users;
+}
+
+/**
+ * Implements hook_user_insert().
+ */
+function pgsign_user_insert(&$edit, $account, $category) {
+  _pgsign_add_db_user($account);
+}
+
+/**
+ * Implements hook_user_delete().
+ */
+function pgsign_user_delete($account) {
+  _pgsign_drop_db_user($account);
+}
+
+/**
+ * Implements hook_user_update().
+ */
+function pgsign_user_update(&$edit, $account, $category) {
+  // Anonymous/Drushcalls are not allowed.
+  if ($user->uid == 0) {
+    return;
+  }
+
+  $old_name = $account->original->name;
+  $new_name = $account->name;
+  if ($new_name != $old_name) {
+    _pgsign_drop_db_user($account->original);
+    _pgsign_add_db_user($account);
+  }
+}

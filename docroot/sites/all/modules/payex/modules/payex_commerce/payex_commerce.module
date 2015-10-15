@@ -1,0 +1,191 @@
+<?php
+
+/**
+ * @file
+ * PayEx payment integration with Drupal commerce payment.
+ *
+ */
+
+/**
+ * Implements hook_commerce_payment_method_info().
+ */
+function payex_commerce_commerce_payment_method_info() {
+  $payment_methods = array();
+
+  $payment_methods['payex_commerce'] = array(
+    'title' => t('PayEx'),
+    'description' => t('Payment using the PayEx provider.'),
+    'display_title' => t('Credit card'),
+    'offsite' => TRUE,
+  );
+
+  return $payment_methods;
+}
+
+/**
+ * Payment method callback: checkout form.
+ */
+function payex_commerce_submit_form($payment_method, $pane_values, $checkout_pane, $order) {
+  $form = array();
+
+  $form['info'] = array(
+    '#markup' => t('You will be redirected to the PayEx payment site to complete your payment. You will be returned here when you have completed your payment on the PayEx site.'),
+    '#prefix' => '<div>',
+    '#suffix' => '</div>',
+  );
+
+  return $form;
+}
+
+/**
+ * Payment method callback: checkout form validation.
+ */
+function payex_commerce_submit_form_validate($payment_method, $pane_form, $pane_values, $order, $form_parents = array()) {
+  // Make sure that it's possible to use the PayEx payment solution.
+  // TODO, this should probably be integrated in the rule that allows the PayEx payment.
+  $payex_settings = variable_get('payex_settings', array('encryption_key' => '', 'merchant_account' => ''));
+  if (empty($payex_settings['merchant_account']) || empty($payex_settings['encryption_key'])) {
+    drupal_set_message(t('The PayEx payment solution cannot be used at this time'), 'error');
+    // Return FALSE to stop the submission flow.
+    return FALSE;
+  }
+}
+
+/**
+ * Payment method callback: checkout form submission.
+ */
+function payex_commerce_submit_form_submit($payment_method, $pane_form, $pane_values, $order, $charge) {
+  $transaction = commerce_payment_transaction_new('payex_commerce', $order->order_id);
+  $transaction->instance_id = $payment_method->instance_id;
+  $transaction->amount = $charge['amount'];
+  $transaction->currency_code = $charge['currency_code'];
+  $transaction->status = COMMERCE_PAYMENT_STATUS_PENDING;
+
+  commerce_payment_transaction_save($transaction);
+}
+
+/**
+ * Send customers to PayEx.
+ */
+function payex_commerce_redirect_form($form, &$form_state, $order, $payment_method) {
+  // The user get's here, before and after payment is completed.
+  // First we get the PayEx transaction id for this order.
+  $sql = "SELECT transaction_id FROM {commerce_payment_transaction}
+          WHERE order_id = :order_id
+          AND payment_method = 'payex_commerce'
+          AND status = :status
+          LIMIT 1;";
+  $transaction_id = db_query($sql, array(':order_id' => $order->order_id, ':status' => COMMERCE_PAYMENT_STATUS_PENDING))->fetchField();
+  // This should be imppossible, if it does happen, we do some checks.
+  if (empty($transaction_id)) {
+    $balance = commerce_payment_order_balance($order);
+    // Order is not paid, and no transaction is created:
+    // redirect back to payment selection.
+    if ($balance && $balance['amount'] > 0) {
+      drupal_set_message(t('An error happened with the payment, please select payment method again.'), 'error');
+      return drupal_goto('checkout/' . $order->order_number . '/payment/back/' . $order->data['payment_redirect_key']);
+    }
+    // Order is paid or doesn't need to be paid to the best of our knowledge:
+    // Complete the order
+    else {
+      return drupal_goto('checkout/' . $order->order_number . '/payment/return/' . $order->data['payment_redirect_key']);
+    }
+  }
+  // If we get this far, we have a transaction_id: get transaction.
+  $transaction = commerce_payment_transaction_load($transaction_id);
+  // Check if the a PayEx url has been generated.
+  if (isset($transaction->payload['payex_order_ref']) && !empty($transaction->payload['payex_order_ref'])) {
+    // Check if the payment has been completed
+    $pxc = payex_order_complete(array('orderRef' => $transaction->payload['payex_order_ref']));
+    if (!isset($pxc['orderStatus'])) {
+      drupal_set_message(t('An error occured while validating your payment. Please contact technical support or try a different payment method.'), 'error');
+      // Update transaction.
+      $transaction->status = COMMERCE_PAYMENT_STATUS_FAILURE;
+      commerce_payment_transaction_save($transaction);
+      return drupal_goto('checkout/' . $order->order_number . '/payment/back/' . $order->data['payment_redirect_key']);
+    }
+    // 0 is a completed order.
+    elseif ($pxc['orderStatus'] == 0 ) {
+      $transaction->payload['orderStatus'] = 0;
+      $transaction->payload['transactionStatus'] = $pxc['transactionStatus'];
+      if (in_array($pxc['transactionStatus'], array(0, 3, 6))) {
+        // Update transaction.
+        $transaction->status = COMMERCE_PAYMENT_STATUS_SUCCESS;
+        commerce_payment_transaction_save($transaction);
+        return drupal_goto('checkout/' . $order->order_number . '/payment/return/' . $order->data['payment_redirect_key']);
+      }
+      // Cancel
+      elseif ($pxc['transactionStatus'] == 4) {
+        $transaction->status = COMMERCE_PAYMENT_STATUS_FAILURE;
+        $transaction->message = 'Canceled';
+        commerce_payment_transaction_save($transaction);
+        $order->status = 'checkout_review';
+        commerce_order_save($order);
+        drupal_set_message(t('You canceled your payment, you can cancel checkout or continue checkout.'), 'error');
+        return drupal_goto('checkout/' . $order->order_number . '/review');
+      }
+      // Failure
+      elseif ($pxc['transactionStatus'] == 5) {
+        $transaction->status = COMMERCE_PAYMENT_STATUS_FAILURE;
+        $transaction->message = 'Failed';
+        commerce_payment_transaction_save($transaction);
+        $order->status = 'checkout_review';
+        commerce_order_save($order);
+        drupal_set_message(t('You payment failed, you can try again or contact techincal support if the problem perists.'), 'error');
+        return drupal_goto('checkout/' . $order->order_number . '/review');
+      }
+      // Shouldn't be able to happen so we just redirect back to payment site.
+      else {
+        commerce_payment_transaction_save($transaction);
+        return drupal_goto($transaction->payload['payex_redirect_url']);
+      }
+    }
+    // 1 is a non-complete order. Redirect to the payment form.
+    elseif ($pxc['orderStatus'] == 1) {
+      $transaction->payload['orderStatus'] = 1;
+      $transaction->payload['transactionStatus'] = $pxc['transactionStatus'];
+      return drupal_goto($transaction->payload['payex_redirect_url']);
+    }
+    // 2 is an order that was not found, either because it never existed
+    // or it is outdated.
+    elseif ($pxc['orderStatus'] == 2) {
+      drupal_set_message(t('Could not detect payment selection, please select again..'), 'error');
+      $transaction->status = COMMERCE_PAYMENT_STATUS_SUCCESS;
+      $transaction->payload['orderStatus'] = 2;
+      $transaction->payload['transactionStatus'] = $pxc['transactionStatus'];
+      commerce_payment_transaction_save($transaction);
+      return drupal_goto('checkout/' . $order->order_number . '/payment/back/' . $order->data['payment_redirect_key']);
+    }
+  }
+  // No PayEx payment transaction, initialize one.
+  // Initialize PayEx order.
+  global $language;
+  $pxo = payex_order_initialize(array(
+    'purchaseOperation' => 'AUTHORIZATION', // No immediate capture.
+    'price' => $transaction->amount,
+    'currency' => $transaction->currency_code,
+    'orderID' => $order->order_number,
+    'clientIPAddress' => $_SERVER['REMOTE_ADDR'],
+    'returnUrl' => url('checkout/' . $order->order_number . '/payment', array('absolute' => TRUE)),
+    'view' => 'CREDITCARD',
+    'clientLanguage' => payex_get_language($language->language),
+    'productNumber' => $order->order_number, // We don't really know what was bought, so just use order id as this is required.
+    'description' => t('Payment for site @site_name', array('@site_name' => variable_get('site_name', "Drupal commerce website"))),
+  ));
+  if (isset($pxo['redirectUrl'])) {
+    // Save info on transaction
+    $transaction->payload += array(
+      'payex_order_ref' => $pxo['orderRef'],
+      'payex_redirect_url' => $pxo['redirectUrl'],
+      'orderStatus' => NULL,
+      'transactionStatus' => NULL,
+    );
+    commerce_payment_transaction_save($transaction);
+    drupal_goto($pxo['redirectUrl']);
+  }
+  else {
+    watchdog('payex_commerce', 'Failed to get PayEx redirect url: @description', array('@description' => isset($pxo['status']['description']) ? $pxo['status']['description'] : 'Unknown'), WATCHDOG_ERROR);
+    drupal_set_message(t('Error getting redirect URL from PayEx. Cannot proceed to payment. Please contact technical support or select a different payment method.'), 'error');
+    return drupal_goto('checkout/' . $order->order_number . '/payment/back/' . $order->data['payment_redirect_key']);
+  }
+}

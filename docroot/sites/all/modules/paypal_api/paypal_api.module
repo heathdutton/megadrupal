@@ -1,0 +1,1058 @@
+<?php
+// $Id$
+
+/**
+ * Implements the Paypal API for Drupal sites.
+ *
+ * With this module you may configure content types to require payment for creating or viewing.  You may further limit viewing to
+ * payment per instance, or payment to view any instance of a given type.
+ *
+ * Payments may be configured to be made either through a Pay Now button you create through your Paypal account, or by using
+ * the Paypal API.
+ *
+ * If you choose to use the Paypal API, you will need to store your Paypal account email in your Drupal web site.
+ * Use of Pay Now buttons created through your control panel do not have this requirement.
+ *
+ * Either way, the Paypal API module handles your IPN (instant payment notification) for you, and you may create custom code in your
+ * own module to handle the payment notification (through hook_paypal_api_ipn()) or else query Paypal API as necessary.  See
+ * paypal_api.api.php in this package for more documentation.
+ *
+ *
+ * PAYPAL BUTTONS OR API
+ * You should use pre-configured Paypal buttons that you create yourself if the products you are selling have a fixed price and
+ * you will not be adding discounts or changing prices according to user role or other variables.
+ *
+ * You should use Paypal API buttons if you want to change the amount of the sale from transaction to transaction.
+ */
+
+/**
+ * Implement hook_menu().
+ */
+function paypal_api_menu() {
+  $items = array(
+    'admin/config/system/paypal_api' => array(
+      'title'	            => "Paypal API configuration",
+      'description'				=> "General settings for the Paypal API module",
+      'page callback'     => 'drupal_get_form',
+      'page arguments'    => array('paypal_api_system_settings'),
+      'access arguments'	=> array('administer paypal api'),
+      'file'						  => 'paypal_api.admin.inc'
+    ),
+    'admin/settings/paypal_api/%' => array(
+      'title'	            => "Paypal API content type configuration",
+      'description'				=> "Settings for this content type in the Paypal API module",
+      'page callback'     => 'drupal_get_form',
+      'page arguments'    => array('paypal_api_type_settings', 3),
+      'access arguments'	=> array('administer paypal api'),
+      'file'						  => 'paypal_api.admin.inc'
+    ),
+    'paypal/payment/%/%' => array(
+      'title'	            => "This content requires payment",
+      'description'				=> "Payment form for paying for content through Paypal",
+      'page callback'     => 'paypal_api_payment',
+      'page arguments'    => array(2, 3),
+      'access arguments'	=> array('access content'),
+      'file'						  => 'paypal_api.pages.inc',
+      'type'              => MENU_CALLBACK
+    ),
+    'paypal/ipn/%/%/%/%' => array(
+      'title'	            => "IPN listener for Paypal",
+      'page callback'     => 'paypal_api_ipn',
+      'page arguments'    => array(2, 3, 4, 5),
+      'access arguments'	=> array('access content'),
+      'file'						  => 'paypal_api.ipn.inc',
+      'type'              => MENU_CALLBACK
+    ),
+    'paypal/success/%/%/%/%' => array(
+      'title'	            => "Thank you for your payment",
+      'page callback'     => 'paypal_api_success_page',
+      'page arguments'    => array(2, 3, 4, 5),
+      'access arguments'	=> array('access content'),
+      'file'						  => 'paypal_api.pages.inc',
+      'type'              => MENU_CALLBACK
+    ),
+    'paypal/cancel/%/%/%/%' => array(
+      'title'	            => "Your transaction has been cancelled",
+      'page callback'     => 'paypal_api_cancel_page',
+      'page arguments'    => array(2, 3, 4, 5),
+      'access arguments'	=> array('access content'),
+      'file'						  => 'paypal_api.pages.inc',
+      'type'              => MENU_CALLBACK
+    ),
+    'paypal/payment-required' => array(
+      'title'	            => "This content requires payment",
+      'page callback'     => 'paypal_api_403',
+      'page arguments'    => array(),
+      'access arguments'	=> array('access content'),
+      'file'						  => 'paypal_api.pages.inc',
+      'type'              => MENU_CALLBACK
+    )
+  );
+
+  return $items;
+}
+
+/**
+ * Implement hook_node_access()
+ *
+ * NOTE:
+ * Not understanding how these parameters get generated at all.  Filed a bug report for what I think
+ * is strange behaviour -- more later.
+ *
+ * In the meantime, we'll also check arg() to make sure we're actually interested
+ *
+ * Note that protection on nodes set for deferred_create is handled differently.
+ */
+function paypal_api_node_access($node, $op, $account) {
+  if (!in_array($op, array('create', 'view'))) {
+    return NODE_ACCESS_IGNORE;
+  }
+
+  if (arg(0) != 'node') {
+    return NODE_ACCESS_IGNORE;
+  }
+
+  $bundle = (is_object($node))? $node->type : $node;
+  $nid    = (is_object($node))? $node->nid : NULL;
+  $config = paypal_api_bundle_config($bundle);
+
+  // check to see if this is an active content type
+  if (!$config) {
+    return NODE_ACCESS_IGNORE;
+  }
+
+  // sanity checks for this call (see comment above)
+  if (is_numeric(arg(1)) && $op == 'create') {
+    // seemingly running a create op on 'node/XX'
+    return NODE_ACCESS_IGNORE;
+  }
+  if (arg(1) == 'add' && $op != 'create') {
+    // seemingly running 'view' on 'node/add/TYPE'
+    return NODE_ACCESS_IGNORE;
+  }
+
+  // check for create protection
+  if ($op == 'create' && !$config['create']) {
+    return NODE_ACCESS_IGNORE;
+  }
+
+  // check for deferred_create protection, and if this has been created
+  // but not yet paid for, send them to the payment page.
+  if ($op == 'view' && $config['deferred_create'] && $nid) {
+    if ($node->status != 1) {
+      // not published, so offer a way to pay
+      paypal_api_show_payment_option('deferred_create', $bundle, $nid);
+    }
+
+    // otherwise, let standard permissions decide whether the user can view this content or not
+    return NODE_ACCESS_IGNORE;
+  }
+
+  // check for view protection
+  if ($op == 'view' && !($config['instance'] || $config['view'])) {
+    return NODE_ACCESS_IGNORE;
+  }
+
+  if ($config['instance'] && $nid) {
+    $op = 'instance';
+  }
+
+  // this is protected, so check to see if it's been paid for
+  $quantity = paypal_api_purchased_quantity($op, $bundle, $account->uid, $nid);
+  $ret = (is_null($quantity))? NODE_ACCESS_DENY : NODE_ACCESS_ALLOW;
+
+  if ($ret == NODE_ACCESS_DENY) {
+    paypal_api_show_payment_option($op, $bundle, $nid);
+  }
+
+  if ($ret == NODE_ACCESS_ALLOW) {
+    paypal_api_update_purchased_quantity($account->uid, $op, $bundle, $nid, -1);
+  }
+  return $ret;
+}
+
+function paypal_api_show_payment_option($op, $bundle, $nid) {
+  $settings = variable_get('paypal_api_settings', array());
+
+  $param = ($op == 'instance' || $op == 'deferred_create')? $nid : $bundle;
+  if (isset($settings['pay_link_message']) && $settings['pay_link_message']) {
+    $url = "paypal/payment/$op/$param";
+    drupal_set_message(t("You must pay to access this content.  !link", array('!link' => l(t("Pay for this content now."), $url))), 'warning');
+  }
+  elseif (isset($settings['replace_403']) && $settings['replace_403']) {
+    $_SESSION['paypal_op']     = $op;
+    $_SESSION['paypal_param']  = $param;
+  }
+  else {
+    watchdog("paypal_api", "Incomplete Paypal API configuration detected.  Please set the payment handling method at admin/config/system/paypal_api", NULL, WATCHDOG_CRITICAL, l(t('edit configuration'), 'admin/config/system/paypal_api'));
+    drupal_set_message("Access denied because Paypal API has been configured to require payment for this operation.  However, the configuration is incomplete.  A site admin must complete the configuration by activating the appropriate method in the Paypal API configuration page.", 'error');
+    if (user_access('administer paypal api')) {
+      drupal_set_message(l(t("Configure payment handling now"), "admin/config/system/paypal_api"));
+    }
+  }
+}
+
+/**
+ * Implements hook_node_presave()
+ *
+ * If this node is set for deferred_create protection, unpublish the node, unless the user
+ * has override permissions.
+ */
+function paypal_api_node_presave($node) {
+  global $user;
+
+  if (user_access('bypass paypal api access control')) {
+    return;
+  }
+
+  $config = paypal_api_bundle_config($node->type);
+  if (!$config) {
+    // not one of our content types
+    return;
+  }
+
+  if (!isset($config['deferred_create']) || !$config['deferred_create']) {
+    // not a deferred create protection node
+    return;
+  }
+
+  $quantity = paypal_api_ledger_quantity('publish', $node->type, $user->uid, $node->nid);
+  if (is_null($quantity)) {
+    // set to unpublished
+    $node->status = 0;
+  }
+}
+
+/**
+ * Implements hook_nod_view()
+ */
+function paypal_api_node_view($node, $view_mode, $langcode) {
+  global $user;
+
+  $config = paypal_api_bundle_config($node->type);
+  if (!$config) {
+    // not one of our content types
+    return;
+  }
+
+  if (!isset($config['deferred_create']) || !$config['deferred_create']) {
+    // not a deferred create protection node
+    return;
+  }
+
+  if ($node->status == 0 && $node->uid == $user->uid) {
+    drupal_set_message(t("This content must be paid for before it may be published.  !link", array('!link' => l(t("Pay for this content now."), "paypal/payment/deferred_create/" . $node->nid))));
+  }
+}
+
+/**
+ * Implement hook_trigger_info()
+ */
+function paypal_api_trigger_info() {
+  return array(
+    'paypal_api' => array(
+      'paypal_transaction' => array(
+        'label' => t('When an IPN notification is received Paypal with the status "Completed"'),
+      )
+    )
+  );
+}
+
+/**
+ * Implement hook_form_HOOK_alter()
+ */
+function paypal_api_form_node_type_form_alter(&$form, &$form_state) {
+  if (!user_access('administer paypal api')) {
+    return;
+  }
+
+  $bundle   = $form['old_type']['#value'];
+  $settings = variable_get('paypal_api_settings', array());
+  $active   = isset($settings['types'][$bundle]);
+
+  $form['paypal_api'] = array(
+    '#type'		      => 'fieldset',
+    '#title'	      => t("Paypal API"),
+    '#group'	      => 'additional_settings',
+    'paypal_active'	=> array(
+      '#type'		        => 'checkbox',
+      '#title'	        => t("Activate this content for Paypal payments"),
+      '#default_value'	=> $active
+    )
+  );
+
+  if ($active) {
+    $form['paypal_api']['settings'] = array(
+      '#markup'	=> l(t("Configure this content type"), "admin/settings/paypal_api/" . $bundle)
+    );
+  }
+
+  $form['#submit'][] = 'paypal_api_node_type_form_submit';
+}
+
+/**
+ *
+ * Handle node type edit form submit
+ *
+ * @param $form
+ * @param $form_values
+ */
+function paypal_api_node_type_form_submit($form, &$form_values) {
+  $settings  = variable_get('paypal_api_settings', array());
+  $bundle    = $form_values['values']['type'];
+
+  if(!isset($settings['types'][$bundle]) && $form_values['values']['paypal_active']) {
+    $settings['types'][$bundle] = array(
+      'method'		=> 'paypal',
+      'create'	  => 1,
+      'view'			=> 1
+    );
+
+    drupal_set_message(t("Paypal API activated for this content type.  !link", array('!link' => l(t("Configure this content type now"), "admin/settings/paypal_api/" . $bundle))), 'ok');
+  }
+  else {
+    unset($settings['types'][$bundle]);
+  }
+
+  variable_set('paypal_api_settings', $settings);
+}
+
+
+/**
+ * Implement hook_form_alter()
+ *
+ * This adds our tab to the additional settings group if this is an active type and the op mode is 'instance'
+ */
+function paypal_api_form_alter(&$form, &$form_state, $form_id) {
+  if (!isset($form['#node_edit_form']) || $form['#node_edit_form'] !== TRUE) {
+    return;
+  }
+
+  $config   = paypal_api_bundle_config($form['type']['#value']);
+  $nid      = (isset($form['nid']) && $form['nid']['#value'])? $form['nid']['#value'] : NULL;
+
+  if (!$config || !$config['instance']) {
+    return;
+  }
+
+  $settings = ($nid)? paypal_api_get_instance($nid, $config) : array();
+
+  $form['paypal_api'] = array(
+    '#type'	  => 'fieldset',
+    '#title'	=> t("Paypal API settings"),
+    '#group'	=> "additional_settings",
+    'paypal_active' => array(
+      '#type'			     => 'checkbox',
+      '#title'		     => t("Activate for Paypal API"),
+      '#default_value' => isset($settings['active'])? $settings['active'] : FALSE,
+      '#description'	 => t("If this box is checked, the Paypal API system will require payment to see this node.")
+    ),
+    'paypal_quantity' => array(
+      '#type'			     => 'textfield',
+      '#title'		     => t("Quantity"),
+      '#default_value' => (isset($settings['quantity']))? $settings['quantity'] : 1,
+      '#required'			 => TRUE
+    )
+  );
+
+  if ($config['method'] == 'paypal') {
+    $form['paypal_api']['paypal_help'] = array(
+      '#markup'	=> "
+      	<div class='messages'>
+      		<h3>" . t("Paypal API configuration") . "</h3>
+        	<p>" . t("You may require payment to view this content by copying and pasting HTML code for a button created through Paypal.") . "</p>
+        </div>
+      	"
+    );
+    $form['paypal_api']['paypal_button'] = array(
+      '#type'		       => 'textarea',
+      '#title'	       => t("Paypal button embed code"),
+      '#description'	 => "
+      	<p>" . t("Copy and paste your button code here.  The button will appear on the payment page for this node content.") . "</p>
+      	",
+      '#default_value' => (isset($settings['button']))? $settings['button'] : "",
+    );
+    if ($nid) {
+      $form['paypal_api']['paypal_button']['#description'] .= "
+      	<p style='font-weight: bold'>" . t("IMPORTANT: Insert the node id of this content (!nid) as the Item ID when you create the button", array('!nid' => $form['nid']['#value'])) . "</p>
+      ";
+    }
+    else {
+      $form['paypal_api']['paypal_button']['#description'] .= "
+      	<p style='font-weight: bold'>" . t("IMPORTANT: After saving this node, return to this section of the form to get the node id of the content. Insert the node id as the Item ID when you create the button", array('!nid' => $form['nid']['#value'])) . "</p>
+      ";
+    }
+  }
+
+  if ($config['method'] == 'api') {
+    $item_name = (isset($settings['item_name']) && $settings['item_name'])? $settings['item_name'] : ((isset($form['title']['#default_value']))? $form['title']['#default_value'] : "");
+    if ($nid) {
+      $form['paypal_api']['paypal_help'] = array(
+        '#markup'	=> "
+        	<div class='messages'>
+        		<h3>" . t("Paypal API configuration") . "</h3>
+          	<p>" . t("Insert the cost and other basic information for this item.  These settings will be used to create the Paypal button used to pay for this item.") . "</p>
+          </div>
+        	"
+      );
+      $form['paypal_api']['paypal_cost'] = array(
+        '#type'		        => 'textfield',
+        '#title'					=> t("Cost"),
+        '#default_value'	=> (isset($settings['cost']))? $settings['cost'] : '',
+        '#description'		=> t("Insert the cost for this item.  You may implement hook_paypal_api_prepay() to override this value at the time of transaction.")
+      );
+      $form['paypal_api']['paypal_currency'] = array(
+        '#type'		        => 'select',
+        '#title'					=> t("Currency"),
+        '#default_value'	=> (isset($settings['currency']))? $settings['currency'] : '',
+        '#options'				=> paypal_api_currencies(),
+        '#description'		=> t("Insert the currency for this item.  You may implement hook_paypal_api_prepay() to override this value at the time of transaction.")
+      );
+      $form['paypal_api']['paypal_item_name'] = array(
+        '#type'		        => 'textfield',
+        '#title'					=> t("Item name"),
+        '#default_value'	=> $item_name,
+        '#description'		=> t("Insert the name for this item as it will appear on the Paypal payment form.")
+      );
+      $form['paypal_api']['paypal_success'] = array(
+        '#type'		        => 'textfield',
+        '#title'					=> t("Success URL"),
+        '#default_value'	=> (isset($settings['success']))? $settings['success'] : '',
+        '#description'		=> t("The page the user will be returned to after a successful sale.  If you leave this blank, Paypal API will supply a suitable generic page.")
+      );
+      $form['paypal_api']['paypal_cancel'] = array(
+        '#type'		        => 'textfield',
+        '#title'					=> t("Item name"),
+        '#default_value'	=> (isset($settings['cancel']))? $settings['cancel'] : '',
+        '#description'		=> t("The page the user will be returned to after a cancelled sale.  If you leave this blank, Paypal API will supply a suitable generic page.")
+      );
+    }
+    else {
+      $form['paypal_api']['paypal_help'] = array(
+        '#markup'	=> "
+        	<div class='messages'>
+        		<h3>" . t("Save this content to set Paypal API configuration") . "</h3>
+          </div>
+        	"
+      );
+    }
+  }
+
+  $form['paypal_api']['configure'] = array(
+    '#markup'	=>  l(t("Configure Paypal API settings for this content type now"), "admin/settings/paypal_api/" . $form['type']['#value'])
+  );
+
+  $form['#submit'][] = 'paypal_api_node_form_submit';
+}
+
+/**
+ *
+ * Save node settings for this node, which has an op mode on 'instance'
+ *
+ * @param $form
+ *
+ * @param $form_state
+ *
+ */
+function paypal_api_node_form_submit($form, &$form_state) {
+  $config = paypal_api_bundle_config($form['type']['#value']);
+  $type   = (isset($form_state['values']['type']))? $form_state['values']['type'] : '';
+  $nid    = (isset($form_state['values']['nid']))? (int) $form_state['values']['nid'] : '';
+
+  if (!$config || !$config['instance']) {
+    return;
+  }
+
+  if (!$form_state['values']['paypal_active']) {
+    paypal_api_delete_instance($nid);
+    return;
+  };
+
+  $settings = array();
+  foreach (array('button', 'cost', 'currency', 'item_name', 'success', 'cancel', 'quantity') as $field) {
+    $form_field = 'paypal_' . $field;
+    $settings[$field] = (isset($form_state['values'][$form_field]))? $form_state['values'][$form_field] : '';
+  }
+
+  paypal_api_save_instance($nid, $type, $settings);
+}
+
+/**
+ * Implement hook_permission().
+ */
+function paypal_api_permission() {
+  return array(
+    'bypass paypal api access control' => array(
+      'title' => t('Bypass Paypal API access control'),
+      'description' => t('Allow the user to have normal access to any node content, regardless of Paypal API settings.'),
+    ),
+    'administer paypal api' => array(
+      'title' => t('Administer Paypal API'),
+      'description' => t('Administer Paypal API system settings.'),
+    ),
+    'manage paypal api nodes' => array(
+      'title' => t('Manage Paypal API nodes'),
+      'description' => t('Allow the user to set or remove Paypal buttons on node instances.'),
+    )
+  );
+}
+
+/**
+ * Implement hook_theme()
+ */
+function paypal_api_theme($existing, $type, $theme, $path) {
+  return array(
+    'paypal_payment_page' => array(
+      'render element'	=> 'element',
+      'template'				=> 'templates/paypal-pay',
+      'arguments'				=> array('nid' => NULL, 'bundle' => '', 'op' => '', 'button' => '')
+    ),
+    'paypal_success_page' => array(
+      'render element'	=> 'element',
+      'template'				=> 'templates/paypal-success',
+      'arguments'				=> array('nid' => NULL, 'bundle' => '', 'op' => '', 'button' => '')
+    ),
+    'paypal_cancel_page' => array(
+      'render element'	=> 'element',
+      'template'				=> 'templates/paypal-cancel',
+      'arguments'				=> array('nid' => NULL, 'bundle' => '', 'op' => '', 'button' => '')
+    )
+  );
+}
+
+/**
+ *
+ * Retrieve instance settings for this nid
+ *
+ * @param $nid
+ * The node id associated with this button.
+ *
+ * @param $config = array()
+ * Optionally pass default values for this instance
+ *
+ * @param $create = TRUE
+ * If no stored settings are found, create them from the defaults given in $config.
+ *
+ * @return
+ * An array of settings for this instance
+ */
+function paypal_api_get_instance($nid, $config = array()) {
+  $settings = db_query("SELECT * FROM {paypal_api_instance} WHERE nid = :nid", array(':nid' => $nid,))->fetchAssoc();
+
+  if (!$settings) {
+    $settings = array('active' => FALSE);
+  }
+  else {
+    $settings['active'] = TRUE;
+  }
+
+  foreach ($config as $k => $v) {
+    if (!isset($settings[$k])) {
+      $settings[$k] = $v;
+    }
+  }
+
+  return $settings;
+}
+
+/**
+ *
+ * Save payment settings for a single instance to our table
+ *
+ * @param $nid
+ * The node id associated with this button.
+ *
+ * @param $bundle
+ * The bundle (content type) of the node associated with this button.
+ *
+ * @param $settings
+ */
+function paypal_api_save_instance($nid, $bundle, $settings) {
+  $params = array();
+  $fields = array('nid', 'bundle', 'button', 'cost', 'currency', 'item_name', 'success', 'cancel', 'quantity');
+  $values = array();
+
+  foreach ($fields as $field) {
+    $key = ':' . $field;
+    $values[] = $key;
+    $params[$key] = (isset($settings[$field]) && $settings[$field])? $settings[$field] : NULL;
+  }
+  $params[':nid']    = $nid;
+  $params[':bundle'] = $bundle;
+
+  $sql = "
+  	INSERT INTO
+  		{paypal_api_instance}
+  	(" . join(",", $fields) . ")
+  	VALUES(" . join(",", $values) . ")
+  ";
+
+  paypal_api_delete_instance($nid);
+  db_query($sql, $params);
+}
+
+/**
+ *
+ * Delete payment settings for a single instance from our table
+ *
+ * @param $nid
+ * The node id associated with this button.
+ *
+ * @param $bundle
+ * The bundle (content type) of the node associated with this button.
+ */
+function paypal_api_delete_instance($nid) {
+  db_query("DELETE FROM {paypal_api_instance} WHERE nid = :nid", array(':nid' => $nid));
+}
+
+/**
+ *
+ * Delete all records in our instances table for this content type.
+ *
+ * @param $bundle
+ */
+function paypal_api_remove_instances($bundle) {
+  db_query("DELETE FROM {paypal_api_instance} WHERE bundle = :bundle", array(':bundle' => $bundle));
+}
+
+/**
+ *
+ * Check to see if this account has credit for the given content type (and the given id,
+ * if this is an 'instance' protected type).
+ *
+ * If this is an unprotected instance (ie. the instance has no payment information attached) then
+ * this function returns the unlimited value (zero).
+ *
+ * @param $op
+ *
+ * @param $bundle
+ *
+ * @param $uid
+ *
+ * @param $nid = NULL
+ *
+ * @return
+ * An integer indicating how many of these operations the user has paid for. Note that the value zero indicates
+ * an unlimited amount.  The vaue NULL indicates the user has no operations left.
+ */
+function paypal_api_purchased_quantity($op, $bundle, $uid, $nid = NULL) {
+  $config = paypal_api_bundle_config($bundle);
+
+  if (!isset($config[$op]) || !$config[$op]) {
+    // no protection for this op on this bundle type, so return 'unlimited' value
+    return 0;
+  }
+
+  // if this is set to protect per instance, and this is not an instance, or there is no record in the instance
+  // table, just return the 'unlimited' value
+  if ($op == 'instance' && !paypal_api_protected_instance($nid)) {
+    return 0;
+  }
+
+  return paypal_api_ledger_quantity($op, $bundle, $uid, $nid);
+}
+
+/**
+ * Get the current quantity owned by the given user for the given operation on the given bundle.
+ *
+ * @param $op
+ *
+ * @param $bundle
+ *
+ * @param $uid = NULL
+ * Defaults to the current user
+ *
+ * @param $nid = NULL
+ * Only used for instance and publish ops
+ *
+ * @return
+ * An integer indicating how many of these operations the user has paid for. Note that the value zero indicates
+ * an unlimited amount.  The vaue NULL indicates the user has no operations left.
+ */
+function paypal_api_ledger_quantity($op, $bundle, $uid = NULL, $nid = NULL) {
+  if (!$uid) {
+    global $user;
+    $uid = $user->uid;
+  }
+
+  $query = db_select("paypal_api_ledger", 'pal');
+  $query->fields('pal', array('quantity'));
+  $query->condition('uid', $uid, '=');
+  $query->condition('bundle', $bundle, '=');
+  $query->condition('op', $op, '=');
+
+  if ($nid) {
+    $query->condition('nid', $nid, '=');
+  }
+  else {
+    $query->condition('nid', NULL, 'IS');
+  }
+
+  $quantity = $query->execute()->fetchColumn();
+  return ($quantity === FALSE)? NULL : (int) $quantity;
+}
+
+/**
+ *
+ * Increment the given user's quantity of the indicated operation by the given amount.
+ *
+ * Note that deferred_create operations are one time operations that remain unaltered after the first payment.
+ *
+ * @param $uid
+ * @param $op
+ * @param $bundle
+ * @param $nid
+ * @param $quantity
+ * The amount to alter by.  May be negative
+ *
+ * @return
+ * The new quantity
+ */
+function paypal_api_update_purchased_quantity($uid, $op, $bundle, $nid = NULL, $quantity = 0) {
+  $current = paypal_api_ledger_quantity($op, $bundle, $uid, $nid);
+  watchdog('paypal_api', "current: $current");
+  if (is_null($current)) {
+    $current = 0;
+  }
+  elseif ($current < 1) {
+    return 0;
+  }
+
+  $new_quantity = (int) $current + (int) $quantity;
+  if ($current > 0 && $new_quantity == 0) {
+    // they just ran out of credits
+    $new_quantity = NULL;
+  }
+
+  paypal_api_set_quantity($uid, $op, $bundle, $nid, $new_quantity);
+
+  return $new_quantity;
+}
+
+/**
+ *
+ * Update the amount of operations remaining for this user with the given node type or instance.
+ *
+ * @param $uid
+ * @param $bundle
+ * @param $op
+ * @param $nid = NULL
+ * @param $quantity = 0
+ *
+ * Note that setting the quantity to 0 means unlimited access.  Set to NULL to remove access.
+ */
+function paypal_api_set_quantity($uid, $op, $bundle, $nid = NULL, $quantity = 0) {
+  $delete = db_delete('paypal_api_ledger');
+  $delete->condition('bundle', $bundle, '=');
+  $delete->condition('uid', $uid, '=');
+  $delete->condition('op', $op, '=');
+  if ($nid) {
+    $delete->condition('nid', $nid, '=');
+  }
+  $delete->execute();
+
+  // if quantity is NULL, just remove the record
+  if (is_null($quantity)) {
+    return;
+  }
+
+  $fields = array(
+    'uid'       => $uid,
+    'op'        => $op,
+    'bundle'    => $bundle,
+    'quantity'  => $quantity
+  );
+  if ($nid) {
+    $fields['nid'] = $nid;
+  }
+
+  $query = db_insert('paypal_api_ledger');
+  $query->fields($fields);
+  $query->execute();
+}
+
+/**
+ *
+ *
+ * Determine whether this node requires payment for viewing.
+ *
+ * @param $nid
+ *
+ * @return
+ * TRUE if payment is required.
+ */
+function paypal_api_protected_instance($nid) {
+  if (!$nid) {
+    return FALSE;
+  }
+
+  $sql = "SELECT count(nid) FROM {paypal_api_instance} WHERE nid = :nid";
+  $count = db_query($sql, array(':nid' => $nid))->fetchField();
+  return ((int) $count);
+}
+
+/**
+ *
+ * Get our settings for the given bundle
+ *
+ * @param $bundle
+ *
+ * @return
+ * An array of configuration settings.  An empty array means no configuration exists, and this bundle is not active
+ */
+function paypal_api_bundle_config($bundle) {
+  $settings = variable_get('paypal_api_settings', array());
+  if (!$settings || !isset($settings['types']) || !isset($settings['types'][$bundle])) {
+    return array();
+  }
+
+  return $settings['types'][$bundle];
+}
+
+/**
+ *
+ * Get the settings for a given instance, with default settings already loaded.
+ *
+ * @param $nid
+ *
+ * @return
+ * An array of configuration settings.  An empty array means no configuration exists, and this instance is not active
+ */
+function paypal_api_instance_config($nid) {
+  $node = node_load($nid);
+  if (!$node) {
+    return array();
+  }
+
+  // get the default config to populate missing values in this instance
+  $config   = paypal_api_bundle_config($node->type);
+  return paypal_api_get_instance($nid, $config);
+}
+
+/**
+ *
+ * Store Paypal transaction to the transaction table
+ *
+ * @param $uid
+ * @param $op
+ * @param $bundle
+ * @param $nid
+ * @param $data
+ * The post data from Paypal
+ */
+function paypal_api_save_transaction($uid, $op, $bundle, $nid, $data) {
+  db_query("
+  	INSERT INTO
+  		{paypal_api_transaction}
+
+  		(uid, op, bundle, nid, received_date, paypal_data)
+  		VALUES (:uid, :op, :bundle, :nid, :received_date, :paypal_data)",
+    array(
+    	':uid'           => $uid,
+      ':op'            => $op,
+      ':bundle'        => $bundle,
+      ':nid'           => $nid,
+      ':received_date' => time(),
+      ':paypal_data'   => serialize($data),
+    ));
+}
+
+/**
+ * If this node has deferred create protection, publish it.
+ *
+ * @param $bundle
+ *
+ * @param $nid
+ *
+ * @param $uid
+ */
+function paypal_api_publish_deferred($bundle, $nid, $uid) {
+  $settings = paypal_api_bundle_config($bundle);
+  if (!$settings || !$settings['deferred_create']) {
+    // this node doesn't have deferred create protection
+    return;
+  }
+
+  $node = node_load($nid);
+  if (!$node) {
+    watchdog('paypal_api', "Invalid nid parameter passed to paypal_api_publish_deferred()", NULL, WATCHDOG_ERROR);
+    return;
+  }
+
+  if ($node->status == NODE_PUBLISHED) {
+    //already published
+    return;
+  }
+
+  // if the user was anonymous when this was created, update the node
+  // to the newly created user account
+  if ($node->uid == 0) {
+    $node->uid = $uid;
+  }
+
+  $current = paypal_api_ledger_quantity('deferred_create', $bundle, $uid);
+  if (is_null($current)) {
+    // they have no more credit
+    return;
+  }
+
+  // can't use node_save() or we have trouble with our presave hook
+  db_query("UPDATE {node} SET status = 1, uid = :uid WHERE nid = :nid", array(':nid' => $node->nid, ':uid' => $node->uid));
+  db_query("UPDATE {node_revision} SET status = 1, uid = :uid WHERE nid = :nid", array(':nid' => $node->nid, ':uid' => $node->uid));
+
+  // decrement allowed deferred creates by one
+  paypal_api_update_purchased_quantity($uid, 'deferred_create', $bundle, NULL, -1);
+
+  // ensure that saving this node in the future doesn't cause us to set it to unpublished again
+  // by setting up a ledger row with our special internal 'publish' op
+  paypal_api_update_purchased_quantity($uid, 'publish', $bundle, $nid, 0);
+}
+
+/**
+ *
+ * Return an array of allowed currencies as defined by Paypal
+ */
+function paypal_api_currencies() {
+  return array(
+    'AUD' => "Australian Dollar",
+    'BRL' => "Brazilian Real",
+    'CAD' => "Canadian Dollar",
+    'CZK' => "Czech Koruna",
+    'DKK' => "Danish Krone",
+    'EUR' => "Euro",
+    'HKD' => "Hong Kong Dollar",
+    'HUF' => "Hungarian Forint",
+    'ILS' => "Israeli New Sheqel",
+    'JPY' => "Japanese Yen",
+    'MYR' => "Malaysian Ringgit",
+    'MXN' => "Mexican Peso",
+    'NOK' => "Norwegian Krone",
+    'NZD' => "New Zealand Dollar",
+    'PHP' => "Philippine Peso",
+    'PLN' => "Polish Zloty",
+    'GBP' => "Pound Sterling",
+    'SGD' => "Singapore Dollar",
+    'SEK' => "Swedish Krona",
+    'CHF' => "Swiss Franc",
+    'TWD' => "Taiwan New Dollar",
+    'THB' => "Thai Baht",
+    'TRY' => "Turkish Lira",
+    'USD' => "U.S. Dollar"
+  );
+}
+
+/**
+ * Get the correct URL for contacting Paypal.
+ *
+ * @param $add_path = TRUE
+ * Add the cgi-bin path to the URL
+ *
+ * @return
+ * A URL to the live site, unless we're set to run through the sandbox.
+ */
+function paypal_api_url($add_path = TRUE) {
+  $settings = variable_get('paypal_api_settings', array());
+
+  $url = "www.";
+  if (isset($settings['sandbox']) && $settings['sandbox']) {
+    $url .= "sandbox.";
+  }
+  $url .= "paypal.com";
+
+  if ($add_path) {
+    $url .= "/cgi-bin/webscr";
+  }
+
+  return $url;
+}
+
+/**
+ *
+ * Get the correct IPN path for this transaction.
+ *
+ * @param $op
+ * create, view or instance
+ *
+ * @param $bundle
+ * The content type
+ *
+ * @param $nid = 'x'
+ * If this is an instance transcation, the nid
+ *
+ * @return
+ * A URL to our IPN handler
+ */
+function paypal_api_ipn_url($op, $bundle, $nid = 'x') {
+  return paypal_api_create_url('ipn', $op, $bundle, $nid);
+}
+
+/**
+ *
+ * Get the generic success path for this transaction.
+ *
+ * @param $op
+ * create, view or instance
+ *
+ * @param $bundle
+ * The content type
+ *
+ * @param $nid = 'x'
+ * If this is an instance transcation, the nid
+ *
+ * @return
+ * A URL to our success handler
+ */
+function paypal_api_success_url($op, $bundle, $nid = 'x') {
+  return paypal_api_create_url('success', $op, $bundle, $nid);
+}
+
+/**
+ *
+ * Get the generic cancel path for this transaction.
+ *
+ * @param $op
+ * create, view or instance
+ *
+ * @param $bundle
+ * The content type
+ *
+ * @param $nid = 'x'
+ * If this is an instance transcation, the nid
+ *
+ * @return
+ * A URL to our cancel handler
+ */
+function paypal_api_cancel_url($op, $bundle, $nid = 'x') {
+  return paypal_api_create_url('cancel', $op, $bundle, $nid);
+}
+
+/**
+ *
+ * Generic wrapper for URL creation
+ *
+ * @param $method
+ *
+ * @param $op
+ * create, view or instance
+ *
+ * @param $bundle
+ * The content type
+ *
+ * @param $nid = 'x'
+ * If this is an instance transcation, the nid
+ *
+ * @return
+ * A URL
+ */
+function paypal_api_create_url($method, $op, $bundle, $nid = 'x') {
+  global $user;
+
+  if (!$nid) {
+    $nid = 'x';
+  }
+
+  $settings = variable_get('paypal_api_settings', array());
+  $server = (isset($settings['domain']) && $settings['domain'])? $settings['domain'] : $_SERVER['SERVER_NAME'];
+
+  return "http://" . $server . "/paypal/" . $method . "/" . $user->uid . "/" . $op . "/" . $bundle . "/" . $nid;
+}

@@ -1,0 +1,516 @@
+<?php
+
+/**
+ * @file
+ * Generates taxonomy terms from menu items.
+ */
+
+require_once DRUPAL_ROOT . '/' . drupal_get_path('module', 'menu_to_taxonomy') . '/menu_to_taxonomy.database.inc';
+require_once DRUPAL_ROOT . '/' . drupal_get_path('module', 'menu_to_taxonomy') . '/menu_to_taxonomy.children.inc';
+require_once DRUPAL_ROOT . '/' . drupal_get_path('module', 'menu_to_taxonomy') . '/menu_to_taxonomy.batch.inc';
+
+/**
+ * Implements hook_form_alter().
+ *
+ * Modifies the vocabulary edit form at admin/structure/taxonomy/xx/edit. We add
+ * our menu_to_taxonomy options in here.
+ */
+function menu_to_taxonomy_form_alter(&$form, &$form_state, $form_id) {
+  if ($form_id == 'taxonomy_form_vocabulary') {
+
+    // Do not alter on deletion confirmation.
+    if (isset($form_state['confirm_delete']) && isset($form_state['values']['vid'])) {
+      return;
+    }
+
+    // Choose a menu to add link items to.
+    $menus = menu_get_menus();
+    array_unshift($menus, t('- Disabled -'));
+
+    $form['menu_to_taxonomy'] = array(
+      '#type' => 'fieldset',
+      '#collapsible' => TRUE,
+      '#title' => t('Menu to taxonomy'),
+      '#weight' => 10,
+      '#tree' => TRUE,
+    );
+
+    $item = array('mlid' => 0);
+    $menu_items = menu_parent_options(menu_get_menus(), $item);
+    array_unshift($menu_items, t('= DISABLED ='));
+
+    // The vid isn't set when a new vocabulary is being created.
+    if (isset($form['vid']['#value'])) {
+      $vocab_parent_default = variable_get(_menu_to_taxonomy_build_variable('vocab_menu', $form['vid']['#value']), NULL) . ':' .
+          variable_get(_menu_to_taxonomy_build_variable('vocab_parent', $form['vid']['#value']), NULL);
+      if (!isset($menu_items[$vocab_parent_default])) {
+        $vocab_parent_default = 0;
+      }
+    }
+    else {
+      $vocab_parent_default = 0;
+    }
+
+    // TODO: UX for this select box is problematic with big hierarchies and
+    // several menus. To look into hierarchical select integration.
+    $form['menu_to_taxonomy']['vocab_parent'] = array(
+      '#type' => 'select',
+      '#title' => t('Menu to sync from'),
+      '#default_value' => $vocab_parent_default,
+      '#options' => $menu_items,
+      '#description' => t('The menu and parent from which we will insert taxonomy terms into this vocabulary.'),
+      '#attributes' => array('class' => array('menu-title-select')),
+    );
+
+    // Set up maximum depth.
+    $form['menu_to_taxonomy']['max_depth'] = array(
+      '#type' => 'select',
+      '#title' => t('Maximum depth'),
+      '#description' => t('Limit how many levels of the menu tree to process.'),
+      '#options' => array(0 => t('Unlimited'), 1 => 1, 2 => 2, 3 => 3, 4 => 4, 5 => 5, 6 => 6, 7 => 7, 8 => 8, 9 => 9),
+      '#default_value' => isset ($form['vid']['#value']) ? variable_get(_menu_to_taxonomy_build_variable('max_depth', $form['vid']['#value']), 0) : 0,
+    );
+
+    // Rebuild the menu.
+    $form['menu_to_taxonomy']['rebuild'] = array(
+      '#type' => 'checkbox',
+      '#title' => t('Select to rebuild the vocabulary on submit.'),
+      '#default_value' => 0,
+      '#weight' => 20,
+      '#description' => t('Rebuild the vocabulary on submit. <strong>Warning</strong>: This will delete then re-create all of the taxonomy terms ever linked to menu items in this vocabulary. Only use this option if you are experiencing issues like missing taxonomy terms or other inconsistencies.'),
+    );
+    // Move the buttons to the bottom of the form.
+    $form['submit']['#weight'] = 49;
+    $form['delete']['#weight'] = 50;
+
+    // Add an extra submit handler to save these settings.
+    $form['#submit'][] = 'menu_to_taxonomy_vocab_submit';
+
+  }
+}
+
+/**
+ * Submit handler for the extra settings added to the taxonomy vocab form.
+ *
+ * Check to see if the user has selected a different menu, and only rebuild
+ * if this is the case.
+ *
+ * @see taxonomy_menu_vocab_submit
+ */
+function menu_to_taxonomy_vocab_submit($form, &$form_state) {
+  $vid = $form_state['values']['vid'];
+  $changed = FALSE;
+
+  if (is_numeric($form_state['values']['menu_to_taxonomy']['vocab_parent'])) {
+    // Menu location has been set to disabled, don't want to throw notices.
+    $form_state['values']['menu_to_taxonomy']['vocab_parent'] = '0:0';
+  }
+
+  // Split the menu location into menu name and menu item id.
+  list($vocab_parent['vocab_menu'], $vocab_parent['vocab_parent']) = explode(':', $form_state['values']['menu_to_taxonomy']['vocab_parent']);
+
+  // Add maximum depth.
+  $vocab_parent['max_depth'] = $form_state['values']['menu_to_taxonomy']['max_depth'];
+
+  // Init flag variables to avoid notices if changes haven't happened.
+  $changed_menu = FALSE;
+
+  // Set the menu name and check for changes.
+  $variable_name = _menu_to_taxonomy_build_variable('vocab_menu', $vid);
+  if (_menu_to_taxonomy_check_variable($variable_name, $vocab_parent['vocab_menu'])) {
+    $changed_menu = TRUE;
+  }
+  variable_set($variable_name, $vocab_parent['vocab_menu']);
+  // Set the menu parent item and check for changes.
+  $variable_name = _menu_to_taxonomy_build_variable('vocab_parent', $vid);
+  if (_menu_to_taxonomy_check_variable($variable_name, $vocab_parent['vocab_parent'])) {
+    $changed_menu = TRUE;
+  }
+  variable_set($variable_name, $vocab_parent['vocab_parent']);
+  // Set up the maximum depth for the menu and check for changes.
+  $variable_name = _menu_to_taxonomy_build_variable('max_depth', $vid);
+  if (_menu_to_taxonomy_check_variable($variable_name, $vocab_parent['max_depth'])) {
+    $changed_menu = TRUE;
+  }
+  variable_set($variable_name, $vocab_parent['max_depth']);
+
+  // If the menu hasn't changed and is disabled then do not do anything else.
+  if ($form_state['values']['menu_to_taxonomy']['rebuild'] ||
+      $changed_menu ||
+      (!$changed_menu && variable_get(_menu_to_taxonomy_build_variable('vocab_menu', $vid), FALSE) == 0)) {
+    // Rebuild if rebuild is selected or menu has changed.
+    if ($form_state['values']['menu_to_taxonomy']['rebuild'] || $changed_menu) {
+      $message = _menu_to_taxonomy_rebuild($vid);
+    }
+    // If setting has changed and a menu item is enabled, then update all of
+    // the menu items.
+    elseif ($changed && variable_get(_menu_to_taxonomy_build_variable('vocab_menu', $vid), FALSE)) {
+      $message = _menu_to_taxonomy_update_link_items($vid);
+    }
+
+    // Only send a message if one has been created.
+    if (isset($message) && $message) {
+      // $message is sanitized coming out of its source function,
+      // no need to reclean it here.
+      drupal_set_message($message, 'status');
+    }
+  }
+}
+
+/**
+ * Builds a variable from the supplied name and machine name of the vocabulary.
+ *
+ * @param string $name
+ *   String to be added to the returned variable.
+ * @param int $vid
+ *   VID of the vocabulary from which the machine name will be taken.
+ *
+ * @return bool|string
+ *   The variable name or FALSE.
+ */
+function _menu_to_taxonomy_build_variable($name, $vid) {
+  $vocabulary = taxonomy_vocabulary_load($vid);
+  if ($vocabulary) {
+    return 'menu_to_taxonomy_' . $name . '_' . $vocabulary->machine_name;
+  }
+  else {
+    return FALSE;
+  }
+}
+
+
+/**
+ * Checks to see if the variable has changed.
+ *
+ * @param string $variable
+ *   The name of the variable.
+ *
+ * @return bool
+ *   TRUE if it has changed.
+ */
+function _menu_to_taxonomy_check_variable($variable, $new_value) {
+  if ($new_value != variable_get($variable, FALSE)) {
+    return TRUE;
+  }
+  return FALSE;
+}
+
+/**
+ * Implements hook_menu_link_insert().
+ */
+function menu_to_taxonomy_menu_link_insert($link) {
+  _menu_to_taxonomy_term_save($link);
+}
+
+/**
+ * Implements hook_menu_link_update().
+ */
+function menu_to_taxonomy_menu_link_update($link) {
+  _menu_to_taxonomy_term_save($link);
+}
+
+/**
+ * Implements hook_menu_link_delete().
+ */
+function menu_to_taxonomy_menu_link_delete($link) {
+  $vocabularies_to_update = _menu_to_taxonomy_get_vocabularies_to_update($link);
+  foreach ($vocabularies_to_update as $vid) {
+    $tid = _menu_to_taxonomy_get_tid($link['mlid'], $vid);
+    $term = taxonomy_term_load($tid);
+    if (empty($term)) {
+      return;
+    }
+    // No worries about the children, as these already have been reasssigned to
+    // the parent of the deleted term.
+    taxonomy_term_delete($term->tid);
+  }
+}
+
+/**
+ * Find out which vocabularies we need to update when adding a given link.
+ *
+ * @param array $link
+ *   Menu link item.
+ *
+ * @return array
+ *   Vids to update
+ */
+function _menu_to_taxonomy_get_vocabularies_to_update(array $link) {
+  $vocabularies_to_update = array();
+  // Load all vocabularies.
+  $vocabularies = taxonomy_vocabulary_load_multiple(FALSE);
+  foreach ($vocabularies as $vocabulary) {
+    // Check whether this vocabulary needs to be synced with the menu this link
+    // belongs to.
+    $variable_name = _menu_to_taxonomy_build_variable('vocab_menu', $vocabulary->vid);
+    if (variable_get($variable_name, FALSE) == $link['menu_name']) {
+      // Get the menu parent item under which we start syncing terms.
+      $parent_mlid = variable_get(_menu_to_taxonomy_build_variable('vocab_parent', $vocabulary->vid), FALSE);
+      if (!empty($parent_mlid)) {
+        $parent_link = array(
+          'mlid' => $parent_mlid,
+          'menu_name' => $link['menu_name'],
+        );
+        // Get all children of the menu parent item under which we start syncing
+        // terms.
+        $children = _menu_to_taxonomy_get_all_menu_children($parent_link);
+        // Test whether the parent of the menu link item being saved is amongst
+        // children of the menu parent item under which we start syncing terms.
+        if ($link['plid'] == $parent_link['mlid'] || in_array($link['plid'], $children)) {
+          // Do nothing.
+        }
+        else {
+          // No need to update this vocabulary.
+          continue;
+        }
+      }
+      // Menu link item complies with the menu condition (in any case) and the
+      // parent condition (if defined), meaning this vocabulary will be updated.
+      $vocabularies_to_update[] = $vocabulary->vid;
+    }
+  }
+  return $vocabularies_to_update;
+}
+
+/**
+ * Updates/creates a linked term and saves a DB record for the mlid/tid link.
+ *
+ * @param array $link
+ *   Menu link item array.
+ */
+function _menu_to_taxonomy_term_save(array $link) {
+  global $menu_to_taxonomy_skip_term_access;
+  if (empty($link['mlid']) || empty($link['menu_name']) || empty($link['link_title'])) {
+    return;
+  }
+  // Find out which vocabularies we need to update.
+  $vocabularies_to_update = _menu_to_taxonomy_get_vocabularies_to_update($link);
+  // Defaults to use, whether creating a new term or updating an existing one.
+  $term_defaults = (object) array(
+    // Use the Link title as the term name.
+    'name' => $link['link_title'],
+    // NOTE: this copies the weight verbatim!
+    'weight' => $link['weight'],
+    // Using the termstatus module.
+    'status' => ($link['hidden'] == 1) ? 0 : 1,
+  );
+  // Get the description from the menu link item, if it has been set.
+  if (!empty($link['options']['attributes']['title'])) {
+    $term_defaults->description = $link['options']['attributes']['title'];
+  }
+
+  foreach ($vocabularies_to_update as $vid) {
+    // Get the terms linked to this menu item for this vocabulary.
+    $tid = _menu_to_taxonomy_get_tid($link['mlid'], $vid);
+
+    // Make sure that the link isn't deeper than the maximum depth defined for
+    // this vocabulary.
+    $max_depth = variable_get(_menu_to_taxonomy_build_variable('max_depth', $vid), 0);
+    if ($max_depth > 0 && $link['depth'] > $max_depth) {
+      // Check if a term already exists.
+      if (!empty($tid)) {
+        // Term is out-of-scope, delete it.
+        taxonomy_term_delete($tid);
+      }
+      // Skip this vocabulary.
+      continue;
+    }
+
+    // Set default.
+    $term = clone $term_defaults;
+    // Get the parent for this vocabulary.
+    if (isset($link['plid'])) {
+      // Get the terms associated to the parent's menu link item ID.
+      $parent_tid = _menu_to_taxonomy_get_tid($link['plid'], $vid);
+      if (!empty($parent_tid)) {
+        $term->parent = array($parent_tid);
+      }
+    }
+
+    if (empty($tid)) {
+      // This will be a new term.
+      $term->vid = $vid;
+    }
+    else {
+      // This is an existing term.
+      $term_existing = _menu_to_taxonomy_load_term_without_access_control($tid);
+      if (empty($term_existing)) {
+        throw new Exception('Could not synchronize term.');
+      }
+      // Overwrite values of existing term.
+      foreach ($term as $property => $value) {
+        $term_existing->{$property} = $value;
+      }
+      // Save the term with the overwitten values.
+      unset($term);
+      $term = clone $term_existing;
+    }
+    // Save the term and its menu link item sync record.
+    _menu_to_taxonomy_term_save_term_and_sync($term, $link);
+  }
+}
+
+/**
+ * Loads a taxonomy term while ignoring access control query tags.
+ *
+ * @param int $tid
+ *   Term ID.
+ *
+ * @return object
+ *   The taxonomy term object.
+ */
+function _menu_to_taxonomy_load_term_without_access_control($tid) {
+  // Get original implementations for term_access query tag into
+  // "module_implements" static cache, so we can temporarily override these.
+  module_implements('query_term_access_alter');
+
+  // Override statically cached "module_implements" implementations, skipping
+  // term_access query tag during term load so we also load inaccessible terms.
+  // Alternatively we could have just reset the cache by calling
+  // "module_implements(FALSE, FALSE, TRUE);" but this would have been slower.
+  $implementations = &drupal_static('module_implements');
+  if (isset($implementations['query_term_access_alter'])) {
+    // Save original query tags so we can restore these later.
+    $original = $implementations['query_term_access_alter'];
+  }
+
+  // Temporarily override the query tags, turning off term access control.
+  $implementations['query_term_access_alter'] = array();
+
+  // Reset the drupal_alter cache so that module_implements data will be reloaded.
+  // for loading the query tag hooks.
+  drupal_static_reset('drupal_alter');
+
+  // Reset the taxonomy term cache so we don't get any old results.
+  entity_get_controller('taxonomy_term')->resetCache(array($tid));
+
+  // Get the term.
+  $term = taxonomy_term_load($tid);
+
+  // As we only needed to override during the previous taxonomy_term_load()
+  // call, stop overriding here and reset static cache to original value.
+  if (isset($original)) {
+    $implementations['query_term_access_alter'] = $original;
+    drupal_static_reset('drupal_alter');
+    // Reset the cached term.
+    entity_get_controller('taxonomy_term')->resetCache(array($tid));
+  }
+
+  return $term;
+}
+
+/**
+ * Saves a taxonomy term while ignoring access control query tags.
+ *
+ * @param object $term
+ *   The taxonomy term object.
+ */
+function _menu_to_taxonomy_save_term_without_access_control($term) {
+  // Get original implementations for term_access query tag into
+  // "module_implements" static cache, so we can temporarily override these.
+  module_implements('query_term_access_alter');
+
+  // Override statically cached "module_implements" implementations, skipping
+  // term_access query tag during term load so we also load inaccessible terms.
+  // Alternatively we could have just reset the cache by calling
+  // "module_implements(FALSE, FALSE, TRUE);" but this would have been slower.
+  $implementations = &drupal_static('module_implements');
+  if (isset($implementations['query_term_access_alter'])) {
+    // Save original query tags so we can restore these later.
+    $original = $implementations['query_term_access_alter'];
+  }
+
+  // Temporarily override the query tags, turning off term access control.
+  $implementations['query_term_access_alter'] = array();
+
+  // Reset the drupal_alter cache so that module_implements data will be reloaded.
+  // for loading the query tag hooks.
+  drupal_static_reset('drupal_alter');
+
+  // Reset the taxonomy term cache so we don't get any old results.
+  entity_get_controller('taxonomy_term')->resetCache(array($term->tid));
+
+  // Save the term.
+  taxonomy_term_save($term);
+
+  // As we only needed to override during the previous taxonomy_term_load()
+  // call, stop overriding here and reset static cache to original value.
+  if (isset($original)) {
+    $implementations['query_term_access_alter'] = $original;
+    drupal_static_reset('drupal_alter');
+    // Reset the cached term.
+    entity_get_controller('taxonomy_term')->resetCache(array($term->tid));
+  }
+
+  return $term;
+}
+
+/**
+ * Saves a term and its menu link item sync record.
+ *
+ * @param object $term
+ *   The term object.
+ * @param array $link
+ *   The link array.
+ *
+ * @throws Exception
+ *   If something goes wrong during save.
+ */
+function _menu_to_taxonomy_term_save_term_and_sync($term, array $link) {
+  $transaction = db_transaction();
+  try {
+    // Save the term.
+    _menu_to_taxonomy_save_term_without_access_control($term);
+    // Save the link between the menu link item <=> term ID.
+    $record = array(
+      'tid' => $term->tid,
+      'vid' => $term->vid,
+      'mlid' => $link['mlid'],
+    );
+    _menu_to_taxonomy_record_save($record);
+  }
+  catch (Exception $e) {
+    $transaction->rollback();
+    watchdog_exception('menu_to_taxonomy', $e);
+    throw $e;
+  }
+  // Clear cache for this term.
+  entity_get_controller('taxonomy_term')->resetCache(array($term->tid));
+
+}
+
+/**
+ * Implements hook_taxonomy_term_delete().
+ *
+ * Invoked by taxonomy_term_delete() which will also run upon vocabulary
+ * deletion or menu link item deletion (through
+ * menu_to_taxonomy_menu_link_delete).
+ */
+function menu_to_taxonomy_taxonomy_term_delete($term) {
+  // When a term is deleted, delete the sync record.
+  db_delete('menu_to_taxonomy')
+    ->condition('tid', $term->tid)
+    ->execute();
+}
+
+/**
+ * Rebuilds a vocabulary.
+ *
+ * @param int $vid
+ *   The vocabulary ID.
+ *
+ * @return string
+ *   Message that is displayed.
+ */
+function _menu_to_taxonomy_rebuild($vid) {
+  // Remove all of the menu items for this vocabulary.
+  _menu_to_taxonomy_delete_all_terms($vid);
+
+  // Only insert the terms if a menu is set.
+  if (variable_get(_menu_to_taxonomy_build_variable('vocab_menu', $vid), FALSE)) {
+    _menu_to_taxonomy_insert_terms_batch($vid);
+    return t('The Menu structure in this vocabulary has been rebuilt.');
+  }
+
+  return t('The terms linked to menu items in this vocabulary have been removed.');
+}

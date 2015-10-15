@@ -1,0 +1,652 @@
+<?php
+/**
+ * @file
+ * Drupal Inspect module
+ */
+
+
+//D8:use Drupal\Inspect\Inspect as Inspector;
+
+
+//  Hooks implemented.
+
+/**
+ * Implements hook_permission().
+ *
+ * @return array
+ */
+function inspect_permission() {
+  return array(
+    'inspect log' => array(
+      'title' => t('Log variable/trace inspections to watchdog or file'),
+      'description' => t('Turn inspections (being logged to watchdog or file) \'on\' for that user role.'),
+    ),
+    'inspect get' => array(
+      'title' => t('Get outputs of variable/trace inspections'),
+      'restrict access' => TRUE,
+      'warning' => t('Warning: Allows inspections to show up on pages of your site.'),
+    ),
+    'inspect frontend log' => array(
+      'title' => t('Allow frontend Javascript inspector to log to backend'),
+      'restrict access' => TRUE,
+      'description' => t('A sub set of logging, that is: the user must also be allowed to log.'),
+      'warning' => t('Warning: Allows Javascript to log to backend watchdog.'),
+    ),
+  );
+}
+
+/**
+ * Implements hook_menu().
+ *
+ * Declares configuration page.
+ *
+ * @return array
+ */
+function inspect_menu() {
+  return array(
+    'admin/config/development/inspect' => array(
+      'title' => 'Inspect vars and traces',
+      'description' => 'Configure the Inspect module',
+      'page callback' => 'drupal_get_form',
+      'page arguments' => array('inspect_admin_form'),
+      'access arguments' => array('administer site configuration'),
+      'file' => 'admin/inspect.admin.inc',
+      'type' => MENU_NORMAL_ITEM,
+      'weight' => -1,
+    ),
+    // % ~ Inspect session counter / log no. / log severity
+    'inspect/ajax/%/%/%' => array(
+      'page callback' => 'inspect_ajax_callback',
+      'page arguments' => array(2, 3, 4),
+      'access arguments' => array('inspect frontend log'),
+      'access callback' => TRUE,
+      'type' => MENU_CALLBACK,
+    ),
+  );
+}
+
+/**
+ * Establish (init) inspect session number, (last) page load number - if session
+ * counting enabled.
+ *
+ * Counters will only be set and updated if conf var inspect_session_counters,
+ * because this feature uses a cookie, and it also adds a slight performance hit
+ * to each and every request.
+ *
+ * Implements hook_init().
+ */
+function inspect_init() {
+  Inspect::sessionCounters();
+}
+
+/**
+ * Updates session counter's page load number, if session counting enabled.
+ *
+ * Counters will only be set and updated if conf var inspect_session_counters,
+ * because this feature uses a cookie, and it also adds a slight performance hit
+ * to each and every request.
+ *
+ * Implements hook_preprocess_html().
+ */
+function inspect_preprocess_html() {
+  if (variable_get('inspect_session_counters')) {
+    Inspect::updatePageLoadNumber();
+    // jQuery.cookie.
+    drupal_add_library('system', 'cookie');
+  }
+}
+
+/**
+ * Implements hook_help().
+ *
+ * Creates help page.
+ *
+ * @param string $path
+ * @param unknown $arg
+ *   Default: NULL.
+ *
+ * @return string
+ */
+function inspect_help($path, $arg = NULL) {
+  module_load_include('inc', 'inspect', 'admin/inspect.admin');
+  return _inspect_help($path);
+}
+
+
+//  Module functions.
+
+//  Variable inspection.
+
+/**
+ * Inspect variable and log to watchdog, if permitted.
+ *
+ *   Like PHP native var_dump()/var_export() except:
+ *   - is controlled by permissions
+ *   - has much more options, and far better formatting (JSONesque)
+ *   - doesnt fail on inspecting $GLOBALS
+ *   - aborts if producing too large output, or taking too much time
+ *   - doesnt echo, logs to watchdog
+ *
+ *   Integer value of $options (depth):
+ *   - the value controls how deeply an object/array variable will to be
+ *     analyzed
+ *
+ *   Array/object value of $options (any number of options):
+ *   - (integer) depth (default 10, max 20)
+ *   - (integer) truncate (default 1000, max 100000)
+ *   - (integer|float) output_max (default variable inspect_output_max) float
+ *     less than 1 will be multiplied by default max.
+ *   - (boolean) hide_scalars: hide values of scalar vars, and type of resource
+ *     (also supported as value 'hide_scalars')
+ *   - (boolean) hide_paths: only optional for log (mandatory for get) (also
+ *     supported as value 'hide_paths') NB: document root is always hidden.
+ *   - (string) name: '$var_name' or "\$var_name", must be escaped, will be
+ *     truncated to 255 (use 'none' to omit)
+ *   - (string) message, will be truncated to 255 (default empty)
+ *   - (string) type: logging type (default inspect)
+ *   - (string) category: alias of type
+ *   - (integer|string) severity: default ~ 'debug'
+ *   - (integer) code: default zero
+ *   - (object) logger: PSR-3, default none, use Inspect's standard logger
+ *   - (integer) wrappers: the (inspect) function/method is wrapped in one or
+ *     more local logging functions/methods (default zero)
+ *   - (string|array) filter: filter out that|those key name(s) (default empty)
+ *   - (array) needles: additional list of char|string needles to be used in
+ *     str_replace
+ *   - (array) replacers: additional list of char|string replacers to be used in
+ *     str_replace
+ *   - (boolean) one_lined: create one-lined formatting (also supported as value
+ *     'one_lined')
+ *   - (boolean) no_fileline: don't display file and line of call to inspect
+ *     function/method (also supported as value 'no_fileline')
+ *   - (boolean) no_preface: omit [Inspect... preface (also supported as value
+ *     'no_preface')
+ *
+ *   String truncation:
+ *   - truncate option less than 1 (hide strings) doesnt apply to strings that
+ *     solely consist of digits (stringed integers)
+ *   - a string bucket of an object/array keyed pass or password (lowercase)
+ *     will always be hidden (no matter it's content)
+ *
+ *   Removes paths at the beginning of variables:
+ *   - always removes document root
+ *   - always removes relative and absolute paths when getting (optional when
+ *     logging)
+ *
+ *   Reports non-integer numbers:
+ *   - double as float
+ *   - NaN as NaN and infinite as infinite
+ *
+ *   Reports string lengths and path removal (path reduced to filename):
+ *   - un-truncated string, and when hiding scalar values: (multibyte
+ *     length|ascii length)
+ *   - truncated string: (multibyte length|ascii length|truncation length)
+ *   - if path removed: there will be a fourth flag (exclamation mark), if no
+ *     truncation truncation length will be hyphen
+ *
+ *   Recursive:
+ *   - detects if a bucket of an object references the object itself
+ *     (marked *RECURSION*)
+ *   - detects GLOBALS array's self-referencing GLOBALS bucket
+ *     (marked *RECURSION*)
+ *   - doesnt check identity for arrays (not possible in PHP), nor 'same-ness'
+ *     (too heavy, and prone to err)
+ *
+ * Executes variable analysis within try-catch.
+ *
+ * @see Inspect::log()
+ *
+ * @param mixed $var
+ * @param mixed $options
+ *   Array|object: list of options.
+ *   Integer: interprets to suggested depth.
+ *   String: interprets to message.
+ *   Default: NULL.
+ * @return boolean|NULL
+ *   NULL: user isnt permitted to log inspections.
+ *   FALSE: on error.
+ */
+function inspect($var, $options = NULL) {
+  return Inspect::log($var, $options);
+}
+
+/**
+ * Inspect variable and log to file, if permitted.
+ *
+ *   Array/object value of $options are like inspect()'s options, except:
+ *   - (boolean) by_user: log to user specific file instead of common file
+ *
+ * Deliberately doesn't escape strings, because the target is a file
+ * (not HTTP output).
+ *
+ * @see inspect()
+ * @see Inspect::file()
+ *
+ * @param mixed $var
+ * @param mixed $options
+ *   Array|object: list of options.
+ *   Integer: interprets to suggested depth.
+ *   String: interprets to message.
+ *   Default: NULL.
+ * @return boolean|NULL
+ *   NULL: user isnt permitted to log inspections.
+ *   FALSE: on error (other error than exceeding max. output length).
+ */
+function inspect_file($var, $options = NULL) {
+  return Inspect::file($var, $options);
+}
+
+/**
+ * Inspect variable and get the output as string, if permitted.
+ *
+ * Example:
+ * @code
+ * // Remember echo, if you want to print to screen.
+ * echo inspect_get($weird_var);
+ * @endcode
+ *
+ * @see inspect()
+ * @see Inspect::get()
+ *
+ * @param mixed $var
+ * @param mixed $options
+ *   Array|object: list of options.
+ *   Integer: interprets to suggested depth.
+ *   String: interprets to message.
+ *   Default: NULL.
+ * @return string
+ *   Empty: user isnt permitted to get inspections, or on error.
+ */
+function inspect_get($var, $options = NULL) {
+  return Inspect::get($var, $options);
+}
+
+
+//  Stack tracing.
+
+/**
+ * Inspect and log stack trace to watchdog, if permitted.
+ *
+ * Logging an error message and/or exception message is always allowed, if
+ * severity is more severe than WATCHDOG_DEBUG.
+ *
+ * Integer value of options evalutuates to severity.
+ *
+ *   Array/object value of $options are like Inspect::log()'s options, except:
+ *   - (integer) limit: maximum stack frame depth, configurable in the settings
+ *     page (default 5, max 100)
+ *   - (string) type: inspect trace
+ *   - (string) pre_indent
+ *   - (string) trace_spacer: spacer between frames (default hyphen dotted line,
+ *     length 49)
+ *
+ * See inspect() for specifics of variable analysis.
+ *
+ * watchdog severity: WATCHDOG_DEBUG
+ *
+ * Executes variable analysis within try-catch.
+ *
+ * @see inspect()
+ * @see Inspect::trace()
+ *
+ * @param Exception|NULL $exception
+ *   Default: NULL (~ create new backtrace).
+ *   Exception: trace that.
+ * @param mixed $options
+ *   Array|object: list of options.
+ *   Integer: interprets to severity.
+ *   String: interprets to message.
+ *   Default: NULL.
+ * @return boolean|NULL
+ *   NULL: user isnt permitted to log inspections.
+ *   FALSE: error.
+ */
+function inspect_trace($exception = NULL, $options = NULL) {
+  return Inspect::trace($exception, $options);
+}
+
+/**
+ * Inspect and log stack trace to file, if permitted.
+ *
+ * Filing an error message and/or exception message is always allowed, if
+ * severity is more severe than WATCHDOG_DEBUG.
+ *
+ *   Array/object value of $options are like Inspect::trace()'s options, except:
+ *   - (boolean) by_user: log to user specific file instead of common file
+ *
+ * Deliberately doesn't escape strings, because the target is a file
+ * (not HTTP output).
+ *
+ * @see inspect_trace()
+ * @see Inspect::traceFile()
+ *
+ * @param Exception|NULL $exception
+ *   Default: NULL (~ create new backtrace).
+ *   Exception: trace that.
+ * @param mixed $options
+ *   Array|object: list of options.
+ *   Integer: interprets to severity.
+ *   String: interprets to message.
+ *   Default: NULL.
+ *
+ * @return boolean|NULL
+ *   NULL: user isnt permitted to log inspections.
+ *   FALSE: error.
+ */
+function inspect_trace_file($exception = NULL, $options = NULL) {
+  return Inspect::traceFile($exception, $options);
+}
+
+/**
+ * Inspect stack trace and get the output as string, if permitted.
+ *
+ * @see inspect_trace()
+ * @see Inspect::traceGet()
+ *
+ * @param Exception|NULL $exception
+ *   Default: NULL (~ create new backtrace).
+ *   Exception: trace that.
+ * @param mixed $options
+ *   Array|object: list of options.
+ *   Integer: interprets to severity.
+ *   String: interprets to message.
+ *   Default: NULL.
+ * @return string
+ *   Empty: isnt permitted to get inspections, or on error.
+ */
+function inspect_trace_get($exception = NULL, $options = NULL) {
+  return Inspect::traceGet($exception, $options);
+}
+
+
+//  Simple logging.
+
+/**
+ * Log a message - and file + line of the call to this function - to watchdog,
+ * if permitted.
+ *
+ * Checks message length against maximum allowed database query/syslog length.
+ *
+ * @see Inspect::logMessage()
+ * @param string $message
+ *   Default: empty string.
+ * @param string $type
+ *   Default: inspect log.
+ * @param integer $severity
+ *   Default: WATCHDOG_DEBUG.
+ * @return boolean|NULL
+ *   NULL: user isnt permitted to log inspections.
+ *   FALSE: on error.
+ */
+function inspect_log_message($message = '', $type = 'inspect log', $severity = WATCHDOG_DEBUG) {
+  return Inspect::logMessage($message, $type, $severity);
+}
+
+/**
+ * Log a message to file, if permitted.
+ *
+ * Deliberately doesn't escape message, because the target is a file (not HTTP
+ * output).
+ *
+ * @see Inspect::fileMessage()
+ * @param string $message
+ *   Default: empty string.
+ * @param string $type
+ *   Default: inspect log.
+ * @param integer $severity
+ *   Default: WATCHDOG_DEBUG.
+ * @param boolean $by_user
+ *   Truthy: logs to user specific log file.
+ *   Default: FALSE (~ logs to common log file).
+ * @return boolean|NULL
+ *   NULL: user isnt permitted to log inspections.
+ *   FALSE: on error.
+ */
+function inspect_file_message($message = '', $type = 'inspect log', $severity = WATCHDOG_DEBUG, $by_user = FALSE) {
+  return Inspect::fileMessage($message, $type, $severity, $by_user);
+}
+
+
+//  Miscellaneous.
+
+/**
+ * Get request time start - in milliseconds - more accurately than the
+ * REQUEST_TIME constant.
+ *
+ * The value is usually slightly higher than REQUEST_TIME, apparantly the latter
+ * is a floor'ed value.
+ *
+ * Uses either $_SERVER['REQUEST_TIME_FLOAT'] (PHP>=5.4), request header
+ * X-Request-Received-Processed, or REQUEST_TIME.
+ *
+ * To enable use of the custom request header (Apache only), add the following
+ * to document root .htaccess:
+ * @code
+ * <IfModule mod_headers.c>
+ *   RequestHeader set X-Request-Received-Processing "%t %D"
+ * </IfModule>
+ * @endcode
+ *
+ * @return float
+ */
+function inspect_request_time_milli() {
+  return Inspect::requestTimeMilli();
+}
+
+
+//  Documentation.
+
+/**
+ * Finds function descriptions (first line only) and function signatures in a
+ * module file.
+ *
+ * @param string $module
+ * @param string $filename
+ *   Non-empty: relative to module directory.
+ *   Default: empty (~ uses $module.module).
+ * @param string $filename
+ * @param array|NULL $skip_names
+ *   Array: list of full names.
+ *   Default: NULL (~ only skips function names ending like listed in
+ *   $skip_ends).
+ * @param array|NULL $skip_ends
+ *   Skip function names ending like...
+ *   Default: array (_permission, _boot, _init, _menu, _preprocess_html, _help,
+ *   _form, _submit).
+ * @return array|NULL
+ *   Array: [ [ 'name', 'parameters', 'description' ], [ 'name', 'parameters',
+ *   'description' ], ... ]
+ *   NULL: on error, and sets drupal_set_message.
+ */
+function inspect_doc_functions($module, $filename = '', $skip_names = NULL, $skip_ends = array('_permission', '_boot', '_init', '_menu', '_help', '_preprocess_html', '_form', '_submit')) {
+  if (!module_exists($module)) {
+    drupal_set_message(
+      t('Module[!module] not present.', 'warning', array('!module' => check_plain($module)))
+    );
+    return NULL;
+  }
+  if (!($hndl = fopen(drupal_get_path('module', $module) . '/' . ($fn = !$filename ? ($module . '.module') : $filename), 'r'))) {
+    drupal_set_message(
+      t('Cant find file[!filename].', 'warning', array('!filename' => check_plain($fn)))
+    );
+    return NULL;
+  }
+  $skip_ends = $skip_ends ? join('|', $skip_ends) : NULL;
+  $list = array();
+  $docStart = FALSE;
+  $desc = '';
+  while (($line = fgets($hndl)) !== FALSE) {
+    // Deliberately not drupal_strlen(); multibyte irrelevant.
+    if (strlen($line = trim($line))) {
+      if (!$docStart) {
+        if (strpos($line, '/**') === 0) {
+          $docStart = TRUE;
+          $docEnd = FALSE;
+          $desc = '';
+        }
+      }
+      elseif (strpos($line, '*/') === 0) {
+        $docEnd = TRUE;
+      }
+      elseif ($line{0} === '*') {
+        // Deliberately not drupal_substr(); multibyte irrelevant.
+        if (!$desc && strlen($line = trim(substr($line, 1))) && $line{0} !== '@') {
+          $desc = $line;
+        }
+      }
+      // Deliberately not drupal_strpos(); multibyte irrelevant.
+      elseif (strpos($line, 'function ') === 0) {
+        // Deliberately not drupal_strlen(); multibyte irrelevant.
+        if (strlen($func = preg_replace('/^function ([^\ \(]+)[\ ]?\(.+$/', '$1', $line))
+            && (!$skip_names || !in_array($func, $skip_names))
+            && (!$skip_ends || !preg_match('/^.+(' . $skip_ends . ')$/', $func))) {
+          $list[] = array(
+            $func,
+            '(' . preg_replace('/[\/\*]/', '', preg_replace('/^function ([^\ \(]+)[\ ]?\((.*)\).*$/', '$2', $line)) . ')',
+            $desc,
+          );
+        }
+        $docStart = $docEnd = FALSE;
+        $desc = '';
+      }
+    }
+  }
+  fclose($hndl);
+  return $list;
+}
+
+/**
+ * Logs message from frontend to backend watchdog.
+ *
+ *  Required POST vars:
+ *  - (integer) log_no
+ *  - (string) kind: info | inspect | trace
+ *  - (string) type: will always get 'frontend' prefixed (plaintext)
+ *  - (string) header (plaintext)
+ *  - (string) body (HTML allowed, will be escaped)
+ *
+ * @param string $sessionCounter
+ * @param integer $logNo
+ * @param string $severity
+ *   info | notice | warning | error, etc. must have watchdog severity constant
+ *   equivalent.
+ *
+ * @return void
+ *   Exits.
+ *   Sends 403 header if the expected POST vars arent set or their values aren't
+ *   acceptable.
+ */
+function inspect_ajax_callback($sessionCounter, $logNo, $severity) {
+  Inspect::logFromFrontend($sessionCounter, $logNo, $severity);
+}
+
+
+// Deprecated.
+
+/**
+ * Obsolete since 7.x-6.0; logs error - and the function won't exist in next
+ * version.
+ *
+ * @deprecated
+ *
+ * @code
+ * // Alternative:
+ * inspect(func_get_args(), 'one_lined');
+ * @endcode
+ *
+ * @param mixed $options
+ *
+ * @return boolean
+ */
+function inspect_args($options = NULL) {
+  // @todo: Remove this function/method from version > 7.x-6.0.
+  watchdog(
+    'inspect',
+    'Use inspect(func_get_args(), \'one_lined\'); instead - function inspect_args() is obsolete since Inspect v. 7.x-6.0, and won\'t exist in next version',
+    NULL,
+    WATCHDOG_ERROR
+  );
+  return FALSE;
+}
+
+/**
+ * Obsolete since 7.x-6.0; logs error - and the function won't exist in next
+ * version.
+ *
+ * @deprecated
+ *
+ * @code
+ * // Alternative:
+ * inspect_get(func_get_args(), 'one_lined');
+ * @endcode
+ *
+ * @param mixed $options
+
+ * @return string
+ */
+function inspect_args_get($options = 'one_lined') {
+  // @todo: Remove this function/method from version > 7.x-6.0.
+  watchdog(
+    'inspect',
+    'Use inspect_get(func_get_args(), \'one_lined\'); instead - function inspect_args_get() is obsolete since Inspect v. 7.x-6.0, and won\'t exist in next version',
+    NULL,
+    WATCHDOG_ERROR
+  );
+  return '';
+}
+
+/**
+ * Obsolete since 7.x-6.0; logs error - and the function won't exist in next
+ * version.
+ *
+ * @deprecated
+ *
+ * @code
+ * // Alternative:
+ * $constants = get_defined_constants(TRUE);
+ * inspect($constants['user']);
+ * @endcode
+ *
+ * @param string|object|falsy $cat_or_instance_or_classname
+ * @param mixed $options
+ *
+ * @return boolean
+ */
+function inspect_constants($cat_or_instance_or_classname = 'user', $options = NULL) {
+  // @todo: Remove this function/method from version > 7.x-6.0.
+  watchdog(
+    'inspect',
+    'Use $constants = get_defined_constants(TRUE); inspect($constants[\'user\']); instead - function inspect_constants() is obsolete since Inspect v. 7.x-6.0, and won\'t exist in next version',
+    NULL,
+    WATCHDOG_ERROR
+  );
+  return FALSE;
+}
+
+/**
+ * Obsolete since 7.x-6.0; logs error - and the function won't exist in next
+ * version.
+ *
+ * @deprecated
+ *
+ * @code
+ * // Alternative:
+ * $constants = get_defined_constants(TRUE);
+ * inspect_get($constants['user']);
+ * @endcode
+ *
+ * @param string|object|falsy $cat_or_instance_or_classname
+ * @param mixed $options
+
+ * @return string
+ */
+function inspect_constants_get($cat_or_instance_or_classname = 'user', $options = NULL) {
+  // @todo: Remove this function/method from version > 7.x-6.0.
+  watchdog(
+    'inspect',
+    'Use $constants = get_defined_constants(TRUE); /*echo*/ inspect_get($constants[\'user\']); instead - function inspect_constants() is obsolete since Inspect v. 7.x-6.0, and won\'t exist in next version',
+    NULL,
+    WATCHDOG_ERROR
+  );
+  return '';
+}
