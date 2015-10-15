@@ -1,3 +1,0 @@
-PayEx module for Drupal
-=======================
-

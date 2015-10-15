@@ -1,1 +1,0 @@
-Trotoar Base Theme.
