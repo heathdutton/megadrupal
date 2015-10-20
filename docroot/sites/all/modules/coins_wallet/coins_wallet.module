@@ -1,0 +1,737 @@
+<?php
+
+/**
+ * @file
+ * Bind Drupal accounts to Devcoin/Bitcoin accounts in bitcoind, maintain user's address book, make payments.
+ *
+ * @author ssm2017 Binder
+ * inspired by a module made by m0Ray.
+ *
+ * @license GNU/GPL, http://www.gnu.org/licenses/gpl-2.0.html
+ * Coins is free software. This version may have been modified pursuant
+ * to the GNU General Public License, and as distributed it includes or
+ * is derivative of works licensed under the GNU General Public License or
+ * other free or open source software licenses.
+ */
+
+define('COINS_WALLET_DEFAULT_SERVER_SCHEME', 'http');
+define('COINS_WALLET_DEFAULT_SERVER_HOST', 'localhost');
+define('COINS_WALLET_DEFAULT_SERVER_PORT', '8332');
+define('COINS_WALLET_DEFAULT_SERVER_USERNAME', 'rpcuser');
+define('COINS_WALLET_DEFAULT_SERVER_PASSWORD', 'password');
+define('COINS_WALLET_DEFAULT_ACCOUNT_PREFIX', 'drupal_');
+define('COINS_WALLET_DEFAULT_ENABLE_INTERNAL', 0);
+define('COINS_WALLET_DEFAULT_MAX_ADDRESSES', 10);
+define('COINS_WALLET_DEFAULT_MAX_TRANSACTIONS', 10);
+
+/**
+ * Get the server object
+ */
+function _coins_wallet_get_server($params=NULL) {
+  if (!is_array($params)) {
+    $params = array(
+      'scheme' => variable_get('coins_wallet_server_scheme', COINS_WALLET_DEFAULT_SERVER_SCHEME),
+      'host' => variable_get('coins_wallet_server_host', COINS_WALLET_DEFAULT_SERVER_HOST),
+      'port' => variable_get('coins_wallet_server_port', COINS_WALLET_DEFAULT_SERVER_PORT),
+      'username' => variable_get('coins_wallet_server_username', COINS_WALLET_DEFAULT_SERVER_USERNAME),
+      'password' => variable_get('coins_wallet_server_password', COINS_WALLET_DEFAULT_SERVER_PASSWORD),
+      'key_file' => ''
+    );
+  }
+  $bitcon_php_path = libraries_get_path("bitcoin-php", TRUE);
+  require_once DRUPAL_ROOT. $bitcon_php_path. '/src/bitcoin.inc';
+  $bitcoin_client = new BitcoinClient(
+      $params['scheme'],
+      $params['username'],
+      $params['password'],
+      $params['host'],
+      $params['port'],
+      $params['key_file']);
+  if (is_object($bitcoin_client)) {
+    try {
+      $bitcoin_client->getinfo();
+    }
+    catch (BitcoinClientException $e) {
+      watchdog('coins_wallet', "The server failed on getinfo with fault string: !fault", array('!fault' => $e->getMessage()), WATCHDOG_ALERT);
+      drupal_set_message(t('The wallet server can not be reached.'), 'error');
+      return NULL;
+    }
+    return $bitcoin_client;
+  }
+  else {
+    return NULL;
+  }
+}
+
+/**
+ * Utility function: retrieve user settings from db
+ */
+function _coins_wallet_get_user_data($uid = NULL) {
+  if (is_null($uid)) {
+    $uid = $GLOBALS['user']->uid;
+  }
+  $data = db_query('SELECT data FROM {coins_wallet_user} WHERE uid=:uid', array(':uid' => $uid))->fetchField();
+  if ($data) {
+    return unserialize($data);
+  }
+  else {
+    return array();
+  }
+}
+
+/**
+ * Utility function: save user settings to db
+ */
+function _coins_wallet_save_user_data($data, $uid = NULL) {
+  if (is_null($uid)) {
+    $uid = $GLOBALS['user']->uid;
+  }
+  $q = db_query('SELECT uid FROM {coins_wallet_user} WHERE uid=:uid', array(':uid' => $uid))->fetchField();
+  if ($q) {
+    db_query('UPDATE {coins_wallet_user} set data=:data where uid=:uid', array(':data' => serialize($data), ':uid' => $uid));
+  }
+  else {
+    db_query('INSERT INTO {coins_wallet_user}(uid,data) VALUES (:uid, :data)', array(':data' => serialize($data), ':uid' => $uid));
+  }
+}
+
+/**
+ * Utility function: retrieve address data from db
+ */
+function _coins_wallet_get_address_data($address, $uid = NULL) {
+  if (is_null($uid)) {
+    $data = db_query('SELECT data FROM {coins_wallet_addresses} WHERE address=:address', array(':address' => $address))->fetchField();
+  }
+  else {
+    $data = db_query('SELECT data FROM {coins_wallet_addresses} WHERE address=:address and uid=:uid', array(':address' => $address, ':uid' => $uid))->fetchField();
+  }
+  if ($data) {
+    return unserialize($data);
+  }
+  else {
+    return NULL;
+  }
+}
+
+/**
+ * Utility function: save address data to db
+ */
+function _coins_wallet_save_address_data($address, $uid, $data) {
+  if ($uid = intval($uid)) {
+    $data['uid'] = $uid;
+    $ai = db_query('SELECT address FROM {coins_wallet_addresses} WHERE address=:address and uid=:uid', array(':address' => $address, ':uid' => $uid))->fetchField();
+    if ($ai) {
+      db_query('UPDATE {coins_wallet_addresses} set data=:data where address=:address', array(':data' => serialize($data), ':address' => $address));
+    }
+    else {
+      db_query('INSERT INTO {coins_wallet_addresses}(address,uid,data) VALUES (:address, :uid, :data)', array(':address' => $address, ':uid' => $uid, ':data' => serialize($data)));
+    }
+  }
+}
+
+/**
+ * Implementation of hook_menu()
+ */
+function coins_wallet_menu() {
+  $items['coins-wallet'] = array(
+    'title' => 'Coins wallet',
+    'page callback' => 'coins_wallet_general_page',
+    'access callback' => 'coins_wallet_general_access',
+    'type' => MENU_NORMAL_ITEM,
+    'menu_name' => 'user-menu',
+  );
+  $items['coins-wallet/general'] = array(
+    'title' => 'General',
+    'page callback' => 'coins_wallet_general_page',
+    'access callback' => 'coins_wallet_general_access',
+    'type' => MENU_DEFAULT_LOCAL_TASK,
+    'weight' => 0,
+  );
+  $items['coins-wallet/addressbook'] = array(
+    'title' => 'Your addresses',
+    'page callback' => 'coins_wallet_addressbook_page',
+    'access callback' => 'coins_wallet_addressbook_access',
+    'type' => MENU_LOCAL_TASK,
+    'weight' => 1,
+  );
+  $items['coins-wallet/addressbook/edit'] = array(
+    'title' => 'Address book',
+    'page callback' => 'coins_wallet_address_edit_page',
+    'access callback' => 'coins_wallet_addressbook_access',
+    'type' => MENU_CALLBACK,
+    'weight' => 1,
+  );
+  $items['coins-wallet/transactions'] = array(
+    'title' => 'Transactions',
+    'page callback' => 'coins_wallet_transactions_page',
+    'access callback' => 'coins_wallet_transactions_access',
+    'type' => MENU_LOCAL_TASK,
+    'weight' => 2,
+  );
+  $items['coins-wallet/pay'] = array(
+    'title' => 'Send',
+    'page callback' => 'coins_wallet_pay_page',
+    'access callback' => 'coins_wallet_pay_access',
+    'type' => MENU_LOCAL_TASK,
+    'weight' => 3,
+  );
+  $items['coins-wallet/pay/confirm/%/%'] = array(
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('coins_wallet_pay_confirm_form', 3, 4),
+    'access callback' => 'coins_wallet_pay_access',
+  );
+  $items['admin/config/coins-wallet'] = array(
+    'title' => 'Coins wallet',
+    'page callback' => 'system_admin_menu_block_page',
+    'access callback' => 'coins_wallet_admin_access',
+    'file' => 'system.admin.inc',
+    'file path' => drupal_get_path('module', 'system'),
+  );
+  $items['admin/config/coins-wallet/settings'] = array(
+    'title' => 'Configure coins wallet',
+    'description' => 'Configure coins wallet',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('coins_wallet_admin_form'),
+    'access callback' => 'coins_wallet_admin_access',
+    'type' => MENU_NORMAL_ITEM,
+    'file' => 'coins_wallet.admin.inc'
+  );
+  return $items;
+}
+
+/**
+ * Implementation of hook_permission()
+ */
+function coins_wallet_permission() {
+  return array(
+    'administer coins wallet' => array(
+      'title' => t('administer coins wallet'),
+      'description' => t('Perform administration tasks for coins wallet.'),
+    ),
+    'multiple coins wallet addresses' => array(
+      'title' => t('multiple coins wallet addresses'),
+      'description' => t('Allow the users to have multiple coins wallet addresses.'),
+    ),
+    'send coins with wallet' => array(
+      'title' => t('send coins with wallet'),
+      'description' => t('Allow the users to send coins using his wallet.'),
+    ),
+    'unlimited coins wallet addresses' => array(
+      'title' => t('unlimited coins wallet addresses'),
+      'description' => t('Allow the users to have unlimited coins wallet addresses.'),
+    ),
+    'use coins wallet' => array(
+      'title' => t('use coins wallet'),
+      'description' => t('Allow the users to use coins wallet.'),
+    ),
+  );
+}
+
+/**
+ * General page access handler
+ */
+function coins_wallet_general_access() {
+  return (!user_is_anonymous()) and user_access('use coins wallet');
+}
+
+/**
+ * Address book page access handler
+ */
+function coins_wallet_addressbook_access() {
+  $cwcu_data = _coins_wallet_get_user_data();
+  if (!isset($cwcu_data['enable'])) {
+    return FALSE;
+  }
+  return (!user_is_anonymous()) and user_access('use coins wallet') and user_access('multiple coins wallet addresses') and $cwcu_data['enable'];
+}
+
+/**
+ * Transactions page access handler
+ */
+function coins_wallet_transactions_access() {
+  $cwcu_data = _coins_wallet_get_user_data();
+  if (!isset($cwcu_data['enable'])) {
+    return FALSE;
+  }
+  return (!user_is_anonymous()) and user_access('use coins wallet') and $cwcu_data['enable'];
+}
+
+/**
+ * Pay page access handler
+ */
+function coins_wallet_pay_access() {
+  $cwcu_data = _coins_wallet_get_user_data();
+  if (!isset($cwcu_data['enable'])) {
+    return FALSE;
+  }
+  return (!user_is_anonymous()) and user_access('use coins wallet') and user_access('send coins with wallet') and $cwcu_data['enable'];
+}
+
+/**
+ * Admin page access handler
+ */
+function coins_wallet_admin_access() {
+  return (!user_is_anonymous()) and user_access('administer coins wallet');
+}
+
+/**
+ * General page handler
+ */
+function coins_wallet_general_page() {
+  global $user;
+  $out = '';
+  $cwcu_data = _coins_wallet_get_user_data();
+  $account_name = variable_get('coins_wallet_account_prefix', COINS_WALLET_DEFAULT_ACCOUNT_PREFIX). $user->uid;
+  if (isset($cwcu_data['enable']) && $cwcu_data['enable']) {
+    if ($server = _coins_wallet_get_server()) {
+      $address_list = $server->getaddressesbyaccount($account_name);
+      if (user_access('multiple coins wallet addresses')) {
+        if (user_access('unlimited coins wallet addresses')) {
+          $out = t('Addresses') . ': ' . count($address_list);
+        }
+        else {
+          $out = t('Addresses') . ': ' . count($address_list) . '/' . variable_get('coins_wallet_max_addresses', COINS_WALLET_DEFAULT_MAX_ADDRESSES);
+        }
+      }
+      else {
+        // check if the user already have an address
+        if (count($address_list) == 0) {
+          _coins_wallet_save_address_data($address = $server->getnewaddress($account_name), $user->uid, array('name' => t('default')));
+        }
+        else {
+          $address = db_query('SELECT address FROM {coins_wallet_addresses} WHERE uid=:uid', array(':uid' => $user->uid))->fetchField();
+          if (is_null($address)) {
+            _coins_wallet_save_address_data($address = $server->getnewaddress($account_name), $user->uid, array('name' => t('default')));
+          }
+        }
+        $out = t('Address') . ': ' . $address;
+      }
+      $out .= '<br/>' . t('Balance') . ': ' . $server->getBalance($account_name);
+    }
+    else {
+      return t('Sorry, you can not use your wallet now.'). ' '. t('Please try again later');
+    }
+  }
+  $general_form = drupal_get_form('coins_wallet_general_form', $cwcu_data);
+  return $out . drupal_render($general_form);
+}
+
+/**
+ * General page form
+ */
+function coins_wallet_general_form($form, &$form_state, $data = array()) {
+  $form['enable'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Enabled'),
+    '#default_value' => isset($data['enable'])? $data['enable']:0,
+  );
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Save'),
+  );
+  return $form;
+}
+
+/**
+ * General page form submission handler
+ */
+function coins_wallet_general_form_submit($form, &$form_state) {
+  global $user;
+  $data = _coins_wallet_get_user_data();
+  $data['enable'] = $form_state['values']['enable'] ? TRUE : FALSE;
+  $server = _coins_wallet_get_server();
+  if (is_null($server)) {
+    return;
+  }
+  else {
+    $account_name = variable_get('coins_wallet_account_prefix', COINS_WALLET_DEFAULT_ACCOUNT_PREFIX). $user->uid;
+    $address_list = $server->getaddressesbyaccount($account_name);
+    if (count($address_list) == 0) {
+      _coins_wallet_save_address_data($address = $server->getnewaddress($account_name), $user->uid, array('name' => t('default')));
+    }
+    else {
+      foreach ($address_list as $address) {
+        _coins_wallet_save_address_data($address, $user->uid, array('name' => t('default')));
+      }
+    }
+  }
+  _coins_wallet_save_user_data($data);
+}
+
+/**
+ * Address book page handler
+ */
+function coins_wallet_addressbook_page() {
+  global $user;
+  $tdata = array();
+  $rows = db_query('SELECT address,data from {coins_wallet_addresses} WHERE uid=:uid', array(':uid' => $user->uid))->fetchAll();
+  foreach ($rows as $row) {
+    $rd = unserialize($row->data);
+    $tdata[$row->address] = $rd['name'];
+  }
+  if ($server = _coins_wallet_get_server()) {
+    $account_name = variable_get('coins_wallet_account_prefix', COINS_WALLET_DEFAULT_ACCOUNT_PREFIX). $user->uid;
+    $address_list = $server->getaddressesbyaccount($account_name);
+    $data = array();
+    foreach ($address_list as $address) {
+      if (isset($tdata[$address])) {
+        $data[] = array($address, $tdata[$address], l(t('Edit'), 'coins-wallet/addressbook/edit/' . $address));
+      }
+    }
+    $variables = array(
+      'header' => array(t('Address'), t('Name'), t('Actions')),
+      'rows' => $data,
+      'attributes' => array(),
+      'colgroups' => array(),
+      'sticky' => array(),
+      'empty' => array(),
+      'caption' => t('Addresses'),
+    );
+    return theme_table($variables) .
+        ((user_access('multiple coins wallet addresses') and
+        (user_access('unlimited coins wallet addresses') or
+         count($address_list) < variable_get('coins_wallet_max_addresses', COINS_WALLET_DEFAULT_MAX_ADDRESSES))
+        ) ? l(t('Create'), 'coins-wallet/addressbook/edit') : NULL)
+    ;
+  }
+  else {
+    return t('Sorry, you can not use your wallet now.'). ' '. t('Please try again later');
+  }
+}
+
+/**
+ * Edit address book entry page handler
+ */
+function coins_wallet_address_edit_page($address = NULL) {
+  global $user;
+  if ($server = _coins_wallet_get_server()) {
+    $account_name = variable_get('coins_wallet_account_prefix', COINS_WALLET_DEFAULT_ACCOUNT_PREFIX). $user->uid;
+    $address_list = $server->getaddressesbyaccount($account_name);
+    if (!is_null($adata = _coins_wallet_get_address_data($address, $user->uid)) or in_array($address, $address_list)) {
+      $adata['address'] = $address;
+      return drupal_get_form('coins_wallet_address_edit_form', $adata);
+    }
+    else {
+      if (user_access('multiple coins wallet addresses') and
+          (user_access('unlimited coins wallet addresses') or
+          count($address_list) < variable_get('coins_wallet_max_addresses', COINS_WALLET_DEFAULT_MAX_ADDRESSES)
+          )) {
+        return drupal_get_form('coins_wallet_address_edit_form', NULL);
+      }
+      else {
+        drupal_set_message(t('You have reached the maximum number of coins addresses'));
+      }
+    }
+  }
+  else {
+    return t('Sorry, you can not use your wallet now.'). ' '. t('Please try again later');
+  }
+}
+
+/**
+ * Edit address book entry page form
+ */
+function coins_wallet_address_edit_form($form, &$form_state, $data) {
+  $form['back_to_address_list'] = array(
+    '#markup' => l(t('Go to the addresses list'), 'coins-wallet/addressbook')
+  );
+  $form['address'] = array(
+    '#type' => 'fieldset',
+    '#title' => t(is_null($data) ? 'Create new address' : 'Edit address') . (is_null($data) ? NULL : ': ' . $data['address']),
+  );
+  $form['address']['address'] = array(
+    '#type' => 'value',
+    '#default_value' => $data['address'],
+  );
+  $form['address']['name'] = array(
+    '#type' => 'textfield',
+    '#default_value' => $data['name'],
+    '#title' => t('Name'),
+  );
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t(is_null($data) ? 'Create' : 'Save'),
+  );
+  $form['#redirect'] = 'coins-wallet/addressbook';
+  return $form;
+}
+
+/**
+ * Edit address book entry form submission handler
+ */
+function coins_wallet_address_edit_form_submit($form, &$form_state) {
+  global $user;
+  if ($server = _coins_wallet_get_server()) {
+    $account_name = variable_get('coins_wallet_account_prefix', COINS_WALLET_DEFAULT_ACCOUNT_PREFIX). $user->uid;
+    $address_list = $server->getaddressesbyaccount($account_name);
+    if ($form_state['values']['address'] and in_array($form_state['values']['address'], $address_list)) {
+      $data = _coins_wallet_get_address_data($form_state['values']['address']);
+      $data['name'] = $form_state['values']['name'];
+      _coins_wallet_save_address_data($form_state['values']['address'], $user->uid, $data);
+      drupal_set_message(t('Success!'));
+    }
+    else {
+      if (user_access('multiple coins wallet addresses') and
+          (user_access('unlimited coins wallet addresses') or
+          count($address_list) < variable_get('coins_wallet_max_addresses', COINS_WALLET_DEFAULT_MAX_ADDRESSES)
+          )) {
+        $data['name'] = $form_state['values']['name'];
+        _coins_wallet_save_address_data($server->getnewaddress($account_name), $user->uid, $data);
+        drupal_set_message(t('Success!'));
+      }
+      else {
+        drupal_set_message(t('You have reached the maximum number of coins addresses'));
+      }
+    }
+  }
+  else {
+    return;
+  }
+}
+
+/**
+ * Transactions page handler
+ */
+function coins_wallet_transactions_page() {
+  global $user;
+  if ($server = _coins_wallet_get_server()) {
+    $prefix = variable_get('coins_wallet_account_prefix', COINS_WALLET_DEFAULT_ACCOUNT_PREFIX);
+    $account_name = $prefix. $user->uid;
+    $transactions_list = $server->query('listtransactions', $account_name, variable_get('coins_wallet_max_transactions', COINS_WALLET_DEFAULT_MAX_TRANSACTIONS));
+    $data = array();
+    foreach ($transactions_list as $transaction) {
+      // check if this is an internal transaction
+      if(isset($transaction['otheraccount'])) {
+        // extract the uid from the account name
+        if (preg_match('/^' . addslashes($prefix) . '/', $transaction['otheraccount'])) {
+          $uid = intval(substr($transaction['otheraccount'], strlen($prefix)));
+          if (($dest_user = user_load($uid)) !== FALSE) {
+           $user_name = l($dest_user->name, 'user/'. $dest_user->uid);;
+          }
+         }
+      }
+      // build the txid link
+      $txid = '';
+      if (isset($transaction['txid'])) {
+        $txid = $transaction['txid'];
+        $block_explorer_link = variable_get('coins_wallet_block_explorer_link', '');
+        if (!empty($block_explorer_link)) {
+          $txid = l(substr($txid, 0, 8). '...', $block_explorer_link. '/'. $txid);
+        }
+      }
+      $data[] = array(
+        isset($user_name) ? $user_name : $txid,
+        $transaction['amount'],
+        isset($transaction['confirmations']) ? $transaction['confirmations'] : 0,
+        $transaction['category'],
+      );
+    }
+    $variables = array(
+      'header' => array(t('Tx ID') . '/' . t('User'), t('Amount'), t('Confirmations'), t('Category')),
+      'rows' => $data,
+      'attributes' => array(),
+      'colgroups' => array(),
+      'sticky' => array(),
+      'empty' => array(),
+      'caption' => t('Transactions'),
+    );
+    return theme_table($variables);
+  }
+  else {
+    return t('Sorry, you can not use your wallet now.'). ' '. t('Please try again later');
+  }
+}
+
+/**
+ * Pay page handler
+ */
+function coins_wallet_pay_page() {
+  $output = '';
+  if ($server = _coins_wallet_get_server()) {
+    $fees = 0.0;
+    $_SESSION['coins_wallet']['fees'] = 0.0;
+    // get the server fees
+    if ($server_infos = $server->getinfo()) {
+      $fees = $server_infos['paytxfee'];
+      $_SESSION['coins_wallet']['fees'] = $fees;
+      if ($fees > 0.0) {
+        $output .= t('Transactions fees'). ': '. number_format($fees, 8);
+      }
+    }
+    $pay_form = drupal_get_form('coins_wallet_pay_form', $fees);
+    return $output. drupal_render($pay_form);
+  }
+  else {
+    return t('Sorry, you can not use your wallet now.'). ' '. t('Please try again later');
+  }
+}
+
+/**
+ * Payment form
+ */
+function coins_wallet_pay_form($form, &$form_state, $fees) {
+  $form['address'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Target address'),
+    '#description' => t('Make sure you entered the address correctly!'),
+  );
+  $form['amount'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Amount'),
+    '#description' => t('You can not send more that you have.'),
+  );
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Send payment'),
+  );
+  $form['#redirect'] = 'coins-wallet/transferts';
+  return $form;
+}
+
+/**
+ * Payment form validation handler
+ */
+function coins_wallet_pay_form_validate($form, &$form_state) {
+  global $user;
+  if ($server = _coins_wallet_get_server()) {
+    $result = $server->validateaddress($form_state['values']['address']);
+    // check if the address is valid
+    if (!$result['isvalid']) {
+      form_set_error('address', t('Invalid Coin address.'));
+    }
+    // check if the amount is good
+    $amount = floatval($form_state['values']['amount']);
+    if ($amount <= 0) {
+      form_set_error('amount', t('Must be a positive value.'));
+    }
+    // check if the balance is good
+    $account_name = variable_get('coins_wallet_account_prefix', COINS_WALLET_DEFAULT_ACCOUNT_PREFIX). $user->uid;
+    if ($server->getbalance($account_name) < $amount + $_SESSION['coins_wallet']['fees']) {
+      form_set_error('amount', t("You don't have enough credits."));
+    }
+    // check if the payment is internal
+    if (!is_null($address_data = _coins_wallet_get_address_data($form_state['values']['address']))) {
+      if (!variable_get('coins_wallet_enable_internal_payments', COINS_WALLET_DEFAULT_ENABLE_INTERNAL)) {
+        form_set_error('', t("Internal payments are disabled."));
+      }
+    }
+  }
+  else {
+    form_set_error('', t('Transaction cancelled.'));
+    return;
+  }
+}
+
+/**
+ * Payment confirmation call
+ */
+function coins_wallet_pay_form_submit($form, &$form_state) {
+  $form_state['redirect'] = 'coins-wallet/pay/confirm/' . $form_state['values']['address']. '/'. $form_state['values']['amount'];
+}
+
+/**
+ * Payment confirmation form
+ */
+function coins_wallet_pay_confirm_form($form, &$form_state, $address, $amount) {
+  $form = array();
+  $form['address'] = array(
+    '#type' => 'hidden',
+    '#value' => $address
+  );
+  $form['amount'] = array(
+    '#type' => 'hidden',
+    '#value' => $amount
+  );
+  $form['payment_infos'] = array(
+    '#type' => 'fieldset',
+    '#title' => 'Payment infos',
+    '#collapsible' => FALSE
+  );
+  $form['payment_infos']['address'] = array(
+    '#type' => 'item',
+    '#title' => 'Address',
+    '#markup' => $address
+  );
+  $fees = $_SESSION['coins_wallet']['fees'];
+  if ($fees > 0.0) {
+    $form['payment_infos']['amount'] = array(
+      '#type' => 'item',
+      '#title' => 'Amount',
+      '#markup' => $amount
+    );
+    $form['payment_infos']['fees'] = array(
+      '#type' => 'item',
+      '#title' => 'Fees',
+      '#markup' => number_format($_SESSION['coins_wallet']['fees'], 8)
+    );
+  }
+  $form['payment_infos']['total'] = array(
+    '#type' => 'item',
+    '#title' => 'Total',
+    '#markup' => $amount + $fees,
+    '#prefix' => '<strong>',
+    '#suffix' => '</strong>'
+  );
+  // check if this is an internal payment
+  if (!is_null($address_data = _coins_wallet_get_address_data($address))) {
+    // get the destination user name
+    $dest = user_load($address_data['uid']);
+    // generate the link to the user account page
+    $link = l($dest->name, 'user/'. $dest->uid);
+    $form['payment_infos']['dest'] = array(
+      '#type' => 'item',
+      '#title' => 'User',
+      '#markup' => $link
+    );
+    $form['dest_uid'] = array(
+      '#type' => 'hidden',
+      '#value' => $dest->uid
+    );
+    $form['dest_link'] = array(
+      '#type' => 'hidden',
+      '#value' => $link
+    );
+  }
+  return confirm_form($form, t('Do you really want to pay ?'), "coins-wallet/pay");
+}
+
+/**
+ * Payment form submission handler
+ */
+function coins_wallet_pay_confirm_form_submit($form, &$form_state) {
+  global $user;
+  if ($server = _coins_wallet_get_server()) {
+    $prefix = variable_get('coins_wallet_account_prefix', COINS_WALLET_DEFAULT_ACCOUNT_PREFIX);
+    $amount = floatval($form_state['values']['amount']) + floatval($_SESSION['coins_wallet']['fees']);
+    if (!isset($form_state['values']['dest_uid'])) {
+      try {
+        $server->sendfrom($prefix. $user->uid, $form_state['values']['address'], $amount);
+      }
+      catch (BitcoinClientException $e) {
+        drupal_set_message(t('Error sending coins. Maybe, you do not have enough depending on destination server fees.'), 'error');
+        $_SESSION['coins_wallet']['fees'] = 0.0;
+        $form_state['redirect'] = 'coins-wallet/pay';
+        return;
+      }
+      drupal_set_message(t('Payment sent.'). ' '. t('Tx ID'). ': '. check_plain($result));
+    }
+    else {
+      try {
+        $server->move($prefix. $user->uid, $prefix. $form_state['values']['dest_uuid'], $amount);
+      }
+      catch (BitcoinClientException $e) {
+        drupal_set_message(t('Error sending coins. Maybe, you do not have enough depending on destination server fees.'), 'error');
+        $_SESSION['coins_wallet']['fees'] = 0.0;
+        $form_state['redirect'] = 'coins-wallet/pay';
+        return;
+      }
+      drupal_set_message(t('Payment sent to !link.', array('!link' => $form_state['values']['dest_link'])));
+    }
+    $_SESSION['coins_wallet']['fees'] = 0.0;
+  }
+  else {
+    $form_state['redirect'] = 'coins-wallet/pay';
+    return;
+  }
+  $form_state['redirect'] = 'coins-wallet/pay';
+}

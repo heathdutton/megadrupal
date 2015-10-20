@@ -1,0 +1,556 @@
+<?php
+
+/**
+ * @file
+ * Integrates RCCPagos payment services.
+ *
+ * http://www.rccpagos.coop
+ */
+
+define('UC_RCCPAGOS_SERVER', 'https://www.rccpagos.coop/servicios.php');
+
+/**
+ * Implements hook_menu().
+ */
+function uc_rccpagos_menu() {
+  // rccpagos/success/verification_string/order_id
+  $items['rccpagos/success/%/%uc_order'] = array(
+    'title' => 'RCCPagos success return URL',
+    'page arguments' => array(2, 3),
+    'page callback' => 'uc_rccpagos_success',
+    'access callback' => TRUE,
+    'type' => MENU_CALLBACK,
+    'file' => 'uc_rccpagos.pages.inc',
+  );
+  // rccpagos/error/verification_string/error_code/order_id
+  $items['rccpagos/error/%/%/%uc_order'] = array(
+    'title' => 'RCCPagos error return URL',
+    'page callback' => 'uc_rccpagos_error',
+    'page arguments' => array(2, 3, 4),
+    'access callback' => TRUE,
+    'type' => MENU_CALLBACK,
+    'file' => 'uc_rccpagos.pages.inc',
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_uc_line_item().
+ */
+function uc_rccpagos_uc_line_item() {
+  $items[] = array(
+    'id' => 'rccpagos_interest',
+    'title' => t('Interest'),
+    'weight' => 2,
+    'default' => FALSE,
+    'stored' => TRUE,
+    'add_list' => FALSE,
+    'calculated' => TRUE,
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_uc_order().
+ */
+function uc_rccpagos_uc_order($op, $order, $arg2) {
+  switch ($op) {
+    case 'save':
+      // Remove old interest from the order before adding the new ones.
+      foreach ($order->line_items as $item) {
+        if ($item['type'] == 'rccpagos_interest') {
+          $order->order_total -= floatval($item['amount']);
+          uc_order_delete_line_item($item['line_item_id']);
+        }
+      }
+
+      // Update order total with the calculated interests.
+      if (!empty($order->rcc_payment_method) && !empty($order->rcc_installments)) {
+        $total = _uc_rccpagos_get_total($order->order_total, $order->rcc_payment_method, $order->rcc_installments);
+        $interest = floatval($total) - floatval($order->order_total);
+        if ($interest > 0) {
+          uc_order_line_item_add($order->order_id, 'rccpagos_interest', t('Interest'), $interest);
+        }
+      }
+      break;
+  }
+}
+
+/**
+ * Implements hook_uc_payment_method().
+ */
+function uc_rccpagos_uc_payment_method() {
+  $methods['rccpagos'] = array(
+    'id' => 'rccpagos',
+    'name' => t('RCCPagos'),
+    'title' => t('Payment through RCCPagos'),
+    'desc' => t('Redirect users to submit payments through RCCPagos.'),
+    'callback' => 'uc_rccpagos_uc_payment_method_callback',
+    'redirect' => 'uc_rccpagos_form',
+    'weight' => 1,
+    'checkout' => FALSE,
+    'no_gateway' => TRUE,
+  );
+
+  return $methods;
+}
+
+/**
+ * Implements hook_uc_payment_method_callback().
+ */
+function uc_rccpagos_uc_payment_method_callback($op, &$order, $form = NULL, &$form_state = NULL) {
+  switch ($op) {
+    // Settings form.
+    case 'settings':
+      return _uc_rccpagos_settings_form();
+
+    // Options for RCCPagos in checkout (payment method and installments).
+    case 'cart-details':
+      return _uc_rccpagos_payment_form($order);
+
+    // Add payment info in checkout review page.
+    case 'cart-review':
+      $payment_methods = _uc_rccpagos_methods();
+      $payment_method = $payment_methods[$order->rcc_payment_method];
+      if (empty($payment_method)) {
+        return;
+      }
+      if ($order->rcc_payment_method == 'imprimo_pago') {
+        $info = $payment_method;
+      }
+      else {
+        $info = format_plural($order->rcc_installments, '!payment_method in @count installment', '!payment_method in @count installments', array('!payment_method' => $payment_method));
+      }
+      $review = array(
+        '#markup' => '<tr><td class="title-col">' . t('RCCPagos payment method') . ':</td><td class="data-col">' . $info . '</td></tr>',
+      );
+      return $review;
+
+    // Process RCCPagos checkout options.
+    case 'cart-process':
+      $rcc_payment_method = $form_state['values']['panes']['payment']['details']['rccpagos_payment_method'];
+      $installments = '1';
+      if ($rcc_payment_method != 'imprimo_pago') {
+        $installments = $form_state['values']['panes']['payment']['details']['rcc_pagos_' . $rcc_payment_method .  '_container']['uc_rccpagos_installments_' . $rcc_payment_method];
+      }
+      $order->rcc_payment_method = $rcc_payment_method;
+      $order->rcc_installments = $installments;
+
+      return _uc_rccpagos_save_options($rcc_payment_method, $installments, $order);
+
+    // The order is being loaded, we add rccpagos information.
+    case 'order-load':
+      $query = db_select('uc_rccpagos_payment_options', 'rcc')
+        ->fields('rcc', array('rcc_payment_method', 'rcc_installments'))
+        ->condition('rcc.order_id', $order->order_id);
+      $result = $query->execute()->fetchObject();
+      if ($result) {
+        $order->rcc_payment_method = $result->rcc_payment_method;
+        $order->rcc_installments = $result->rcc_installments;
+      }
+      break;
+
+    // The order is being deleted, we need to clean up.
+    case 'order-delete':
+      db_delete('uc_rccpagos_payment_options')
+        ->condition('order_id', $order->order_id)
+        ->execute();
+      break;
+  }
+}
+
+/**
+ * Builds the form to redirect to RCCPagos.
+ *
+ * This form is used in place of the Finish form in checkout review. It
+ * redirects the user to RCCPagos to finish the payment.
+ */
+function uc_rccpagos_form($form, &$form_state, $order) {
+  global $user;
+
+  $data['rccpagosEmpresa'] = variable_get('uc_rccpagos_account', NULL);
+  $data['rccpagosImporte'] = $order->order_total;
+  $data['rccpagosMoneda'] = variable_get('uc_rccpagos_currency', '0');
+  $data['rccpagosOrden'] = $order->order_id;
+  // ###VERIF### and ###ERROR### are placeholders, RCCPagos will replace them
+  // with a checksum or an error code when calling the URL.
+  $data['rccpagosURLError'] = url('rccpagos/error/###VERIF###/###ERROR###/' . $order->order_id, array('absolute' => TRUE));
+  $data['rccpagosURLOk'] = url('rccpagos/success/###VERIF###/' . $order->order_id, array('absolute' => TRUE));
+  $data['rccpagosUsuario'] = (isset($user->name)) ? $user->name : $order->primary_email;
+  $data['rccpagosMedioDePago'] = _uc_rccpagos_get_payment_method($order);
+  $data['rccpagosVencimiento'] = variable_get('uc_rccpagos_expiration', '');
+  $data['rccpagosCorreoElectronico'] = $order->primary_email;
+  $data['rccpagosCuotas'] = $order->rcc_installments;
+  $data['rccpagosVerificacion'] = _uc_rccpagos_checksum($data, $order->order_id);
+
+  foreach ($data as $field => $value) {
+    $form[$field] = array('#type' => 'hidden', '#value' => $value);
+  }
+
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => variable_get('uc_rccpagos_button_text', t('Continue')),
+  );
+
+  $form['#action'] = UC_RCCPAGOS_SERVER;
+
+  return $form;
+}
+
+/**
+ * Returns the payment methods enabled for RCCPagos in the method settings.
+ */
+function _uc_rccpagos_enabled_methods() {
+  $methods = _uc_rccpagos_methods();
+  foreach (variable_get('uc_rccpagos_payment_methods', array()) as $method => $enabled) {
+    if ($enabled) {
+      $enabled_methods[$method] = $methods[$method];
+    }
+  }
+  return $enabled_methods;
+}
+
+/**
+ * Returns available payment methods for RCCPagos.
+ */
+function _uc_rccpagos_methods() {
+  return array(
+    'imprimo_pago' => t('imprimoYpago'),
+    'cabal' => t('Cabal'),
+    'cabal_bcc' => t('Cabal banco Credicoop'),
+    'visa' => t('Visa'),
+    'visa_bcc' => t('Visa banco Credicoop'),
+    'mastercard' => t('Mastercard'),
+    'mastercard_bcc' => t('Mastercard banco Credicoop'),
+    'amex' => t('American Express'),
+    'nativa' => t('Nativa'),
+    'naranja' => t('Naranja'),
+  );
+}
+
+/**
+ * Returns the form for configuring RCCPagos in the payment methods settings.
+ */
+function _uc_rccpagos_settings_form() {
+  $payment_methods = _uc_rccpagos_methods();
+  $form = array();
+  $form['uc_rccpagos_account'] = array(
+    '#type' => 'textfield',
+    '#title' => t('RCCPagos account'),
+    '#default_value' => variable_get('uc_rccpagos_account', ''),
+    '#size' => 80,
+    '#maxlength' => 255,
+    '#required' => TRUE,
+  );
+  $form['uc_rccpagos_secret_key'] = array(
+    '#type' => 'textfield',
+    '#title' => t('RCCPagos secret key'),
+    '#description' => t('The alphanumeric secret key as informed by RCCPagos.'),
+    '#default_value' => variable_get('uc_rccpagos_secret_key', ''),
+    '#size' => 80,
+    '#maxlength' => 255,
+    '#required' => TRUE,
+  );
+  // Currently only ARS is allowed, we leave the option here just in case.
+  $form['uc_rccpagos_currency'] = array(
+    '#type' => 'radios',
+    '#title' => t('RCCPagos currency'),
+    '#default_value' => variable_get('uc_rccpagos_currency', '0'),
+    // Dollar (1) and euro (2) are disabled right now.
+    '#options' => array(
+      '0' => t('Pesos'),
+    ),
+    '#required' => TRUE,
+  );
+  $form['uc_rccpagos_payment_methods'] = array(
+    '#type' => 'checkboxes',
+    '#title' => t('RCCPagos payment methods'),
+    '#description' => t('Remember to set the options below for each enabled method.'),
+    '#default_value' => variable_get('uc_rccpagos_payment_methods', array()),
+    '#options' => $payment_methods,
+    '#required' => TRUE,
+  );
+
+  // Conditional options, controlled by the selected payment methods.
+  // Settings for the imprimoYpago payment method.
+  $form['imprimo_pago_settings_container'] = array(
+    '#type' => 'container',
+    '#states' => array(
+      'visible' => array(
+        ':input[name="uc_rccpagos_payment_methods[imprimo_pago]"]' => array('checked' => TRUE),
+      ),
+    ),
+  );
+  $form['imprimo_pago_settings_container']['imprimo_pago_settings_fieldset'] = array(
+    '#type' => 'fieldset',
+    '#title' => $payment_methods['imprimo_pago'],
+    '#collapsible' => TRUE,
+    '#collapsed' => TRUE,
+  );
+  for ($i = 1; $i <= 31; ++$i) {
+    $days[$i] = format_plural($i, '@count day', '@count days');
+  }
+  $form['imprimo_pago_settings_container']['imprimo_pago_settings_fieldset']['uc_rccpagos_expiration'] = array(
+    '#type' => 'select',
+    '#title' => t('Valid time (in days)'),
+    '#description' => t('The time in days your customers can make the payment since finishing the order. Please verify the valid options with RCCPagos.'),
+    '#options' => $days,
+    '#default_value' => variable_get('uc_rccpagos_expiration', array(5)),
+  );
+
+  // Settings for the enabled credit cards.
+  unset($payment_methods['imprimo_pago']);
+  foreach ($payment_methods as $m => $name) {
+    $form[$m . '_settings_container'] = array(
+      '#type' => 'container',
+      '#states' => array(
+        'visible' => array(
+          ':input[name="uc_rccpagos_payment_methods[' . $m . ']"]' => array('checked' => TRUE),
+        ),
+      ),
+    );
+    $form[$m . '_settings_container'][$m . 'settings_fieldset'] = array(
+      '#type' => 'fieldset',
+      '#title' => $name,
+      '#collapsible' => TRUE,
+      '#collapsed' => TRUE,
+    );
+    $options = array(
+      '1' => '1',
+      '3' => '3',
+      '6' => '6',
+      '12' => '12',
+      '18' => '18',
+      '24' => '24',
+    );
+    $form[$m . '_settings_container'][$m . 'settings_fieldset']['uc_rccpagos_installments_' . $m] = array(
+      '#type' => 'checkboxes',
+      '#title' => t('!card Installments', array('!card' => $name)),
+      '#description' => t('Select available installments for !card. For each enabled option you must set the interest below. This value will be informed by !card, and should be between 1.0 and 2.0. The amount of the sale will be multiplied by that value to get the final amount of the transaction.', array('!card' => $name)),
+      '#options' => $options,
+      '#default_value' => variable_get('uc_rccpagos_installments_' . $m, array()),
+    );
+    foreach ($options as $o) {
+      $form[$m . '_settings_container'][$m . 'settings_fieldset']['interest_container_' . $m . '_' . $o] = array(
+        '#type' => 'container',
+        '#states' => array(
+          'visible' => array(
+            ':input[name="uc_rccpagos_installments_' . $m . '[' . $o . ']"]' => array('checked' => TRUE),
+          ),
+        ),
+      );
+      $form[$m . '_settings_container'][$m . 'settings_fieldset']['interest_container_' . $m . '_' . $o]['uc_rccpagos_installments_interest_' . $m . '_' . $o] = array(
+        '#type' => 'textfield',
+        '#title' => format_plural($o, 'Interest for !card in @count installment', 'Interest for !card in @count installments', array('!card' => $name)),
+        '#default_value' => variable_get('uc_rccpagos_installments_interest_' . $m . '_' . $o, '1.0'),
+        '#size' => 4,
+      );
+    }
+  }
+
+  $form['uc_rccpagos_button_text'] = array(
+    '#type' => 'textfield',
+    '#title' => t('RCCPagos button text'),
+    '#description' => t('The text for the button used to redirect the user to RCCPagos.'),
+    '#default_value' => variable_get('uc_rccpagos_button_text', t('Continue')),
+    '#required' => TRUE,
+  );
+
+  return $form;
+}
+
+/**
+ * Returns the form with payment method options for the checkout pane.
+ *
+ * This form allows the user to select the RCCPagos payment method and number of
+ * installments in the checkout page when selecting RCCPagos.
+ */
+function _uc_rccpagos_payment_form($order) {
+  $enabled_methods = _uc_rccpagos_enabled_methods();
+  $form['rccpagos_payment_method'] = array(
+    '#type' => 'select',
+    '#title' => t('Payment method'),
+    '#description' => t('Select payment method for RCCPagos.'),
+    '#options' => $enabled_methods,
+    '#default_value' => (!empty($order->rcc_payment_method)) ? $order->rcc_payment_method : 'imprimo_pago',
+  );
+
+  unset($enabled_methods['imprimo_pago']);
+  foreach ($enabled_methods as $m => $name) {
+    $form['rcc_pagos_' . $m . '_container'] = array(
+      '#type' => 'container',
+      '#states' => array(
+        'visible' => array(
+          ':input[name="panes[payment][details][rccpagos_payment_method]"]' => array('value' => $m),
+        ),
+      ),
+    );
+    $installments = array();
+    $subtotal = _uc_rccpagos_get_subtotal($order);
+    foreach (variable_get('uc_rccpagos_installments_' . $m, array('1' => '1')) as $i => $v) {
+      if ($v) {
+        $subtotal = _uc_rccpagos_get_subtotal($order);
+        $total = _uc_rccpagos_get_total($subtotal, $m, $i);
+        $installments[$i] = t('!installments - !total', array('!installments' => $i, '!total' => uc_currency_format($total)));
+      }
+    }
+    $form['rcc_pagos_' . $m . '_container']['uc_rccpagos_installments_' . $m] = array(
+      '#type' => 'select',
+      '#title' => t('Installments'),
+      '#options' => $installments,
+      '#default_value' => (!empty($order->rcc_installments)) ? $order->rcc_installments : '1',
+    );
+  }
+  return $form;
+}
+
+/**
+ * Validates the options for the payment method entered in checkout.
+ *
+ * The selected number of installments must be enabled for the selected payment
+ * method.
+ */
+function _uc_rccpagos_valid_options($payment_method, $installments) {
+  // Check if the method is valid.
+  if (!in_array($payment_method, array_keys(_uc_rccpagos_methods()))) {
+    return FALSE;
+  }
+  // For imprimoYpago there are no installments.
+  if ($payment_method == 'imprimo_pago') {
+    return TRUE;
+  }
+  // Validate number of installments.
+  $valid_installments = variable_get('uc_rccpagos_installments_' . $payment_method);
+  if ($valid_installments[$installments]) {
+    return TRUE;
+  }
+  return FALSE;
+}
+
+/**
+ * Saves the options for the payment method entered in checkout.
+ *
+ * @return bool
+ *   returns TRUE if the options were valid and FALSE otherwise
+ */
+function _uc_rccpagos_save_options($payment_method, $installments, $order) {
+  if (!_uc_rccpagos_valid_options($payment_method, $installments)) {
+    return FALSE;
+  }
+  // Save the method and installments selected for the order.
+  $cant = db_select('uc_rccpagos_payment_options', 'rcc')
+    ->fields('rcc', array('order_id'))
+    ->condition('order_id', $order->order_id)
+    ->countQuery()
+    ->execute()
+    ->fetchField();
+  if (intval($cant) >= 1) {
+    $update = 'order_id';
+  }
+  else {
+    $update = array();
+  }
+  $record->order_id = $order->order_id;
+  $record->rcc_payment_method = $payment_method;
+  $record->rcc_installments = $installments;
+  $result = drupal_write_record('uc_rccpagos_payment_options', $record, $update);
+  if ($result === FALSE) {
+    return FALSE;
+  }
+  return TRUE;
+}
+
+/**
+ * Returns the payment amount for the order.
+ *
+ * It depends on the selected RCCPagos payment method and its interest.
+ */
+function _uc_rccpagos_get_total($amount, $payment_method, $installments) {
+  // Don't calculate interest for imprimoYpago payment method.
+  if ($payment_method == 'imprimo_pago') {
+    return $amount;
+  }
+
+  $interest = floatval(variable_get('uc_rccpagos_installments_interest_' . $payment_method . '_' . $installments, '1'));
+  // Interest should be between 1 (0%) and 2 (100%).
+  if ($interest < 1.0 || $interest >= 2.0) {
+    $interest = 1;
+  }
+
+  return floatval($amount) * $interest;
+}
+
+/**
+ * Returns the RCCPagos code for the payment method selected in the order.
+ */
+function _uc_rccpagos_get_payment_method($order) {
+  $rcc_payment_methods = array(
+    'imprimo_pago' => '0',
+    'cabal' => '1',
+    'cabal_bcc' => '1',
+    'visa' => '2',
+    'visa_bcc' => '2',
+    'mastercard' => '3',
+    'mastercard_bcc' => '3',
+    'amex' => '4',
+    'nativa' => '5',
+    'naranja' => '6',
+  );
+  return $rcc_payment_methods[$order->rcc_payment_method];
+}
+
+/**
+ * Returns the checksum for the request.
+ *
+ * The checksum is calculated and saved to the database before returning it.
+ */
+function _uc_rccpagos_checksum($data, $order_id) {
+  // The verification string is obtained by concatenating al the fields in
+  // alphabetical order with the secret key at the end, and applying an md5
+  // sum to the result.
+  ksort($data);
+  $data[] = variable_get('uc_rccpagos_secret_key', '');
+  $checksum = strtolower(md5(implode('', $data)));
+  _uc_rccpagos_save_checksum($checksum, $order_id);
+  return $checksum;
+}
+
+/**
+ * Returns the order total without our interest.
+ */
+function _uc_rccpagos_get_subtotal($order) {
+  $subtotal = $order->order_total;
+  foreach ($order->line_items as $item) {
+    if ($item['type'] == 'rccpagos_interest') {
+      $subtotal -= floatval($item['amount']);
+    }
+  }
+  return $subtotal;
+}
+
+/**
+ * Saves the checksum to the database.
+ */
+function _uc_rccpagos_save_checksum($checksum, $order_id) {
+  $exists = _uc_rccpagos_get_checksum($order_id);
+  $primary_keys = ($exists) ? 'order_id' : array();
+
+  $record->order_id = $order_id;
+  $record->rcc_order_checksum = $checksum;
+
+  drupal_write_record('uc_rccpagos_order_checksum', $record, $primary_keys);
+}
+
+/**
+ * Returns the saved checksum for the order id, or false if not found.
+ */
+function _uc_rccpagos_get_checksum($order_id) {
+  $query = db_select('uc_rccpagos_order_checksum', 'c');
+  $query->condition('c.order_id', $order_id, '=')->fields('c', array('rcc_order_checksum'));
+  if (intval($query->countQuery()->execute()->fetchField()) == 0) {
+    return FALSE;
+  }
+  return $query->execute()->fetchField();
+}

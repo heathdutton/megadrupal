@@ -1,0 +1,463 @@
+<?php
+/**
+ * Implement hook_menu().
+ */
+function mailhandler_singlemailbox_menu() {
+  $items = array();
+  $items['admin/config/content/singlemailbox'] = array(
+    'title' => 'Mailhandler Single Mailbox',
+    'description' => 'Administer settings for the mailbox used for emailing content to your site.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('mailhandler_singlemailbox_admin_form'),
+    'access arguments' => array('configure singlemailbox'),
+    'file' => 'mailhandler_singlemailbox.admin.inc',
+  );
+  $items['user/%/generate_email/%'] = array(
+    'description' => 'AJAX callback for geneting new email addresses for mailing content',
+    'page callback' => 'mailhandler_singlemailbox_ajax',
+    'page arguments' => array(1, 2, 3),
+    'access callback' => TRUE,
+  );
+
+  $items['user/%/confirm_generate_email/%'] = $items['user/%/generate_email/%'];
+
+  return $items;
+}
+
+/**
+ * A tiny form for providing a 'confirm' button.
+ */
+function mailhandler_singlemailbox_modal_confirm_form($form, $form_state, $uid = ''){
+  $form['#action'] = '/user/' . $uid . '/generate_email/ajax';
+  $form['confirm'] = array(
+    '#type' => 'submit',
+    '#value' => t('Continue'),
+    '#attributes' => array (
+        'class' => array('use-ajax-submit')
+    ),
+    '#attached' => array(
+      'css' => array(drupal_get_path('module', 'mailhandler_singlemailbox') . '/mailhandler_singlemailbox.css'),
+    ),
+  );
+  return $form;
+}
+
+/**
+ * Ajax callback for regenerating a mailhandler_singlemailbox email addresses
+ */
+function mailhandler_singlemailbox_ajax($uid, $action, $js){
+  global $user;
+  // We're using the ajax callback for two things.  One to prompt for confirmation
+  // and the other is to actually generate the email address.  For confirmation
+  // we will use a dialog if dialog module exists otherwise we'll fall back to
+  // dsming a message to the screen.  If all else fails we just send the use
+  // to the user/edit page for the regeneration of email.
+  if ($js == 'ajax') {
+    // If we don't have a user id, we're likely on a page like /user.
+    // WSCCI can't come soon enough.
+    if ($uid == '') {
+      $uid = $user->uid;
+      $acted_on_user = $user;
+    }
+    else {
+      $acted_on_user = user_load($uid);
+    }
+    if ($action == 'confirm_generate_email'){
+      $are_you_sure = t('Are you sure you want to generate a new address? You won\'t be able to undo this action.');
+      // Check for dialog module
+      if (module_exists('dialog')) {
+        // Set some options for the modal dialog we want to show.
+        $options = array('modal' => TRUE, 'resizable' => FALSE, 'dragable' => FALSE);
+        dialog_display($options);
+        // Get and render a tiny form with a confirm button.
+        $form = drupal_get_form('mailhandler_singlemailbox_modal_confirm_form', $acted_on_user->uid);
+        $form = drupal_render($form);
+        // Prepare content for delivery to dialog.
+        $output[] = dialog_command_display($are_you_sure . $form, array('title' => t('Are you sure?')));
+        ajax_deliver(array('#type' => 'ajax', '#commands' => $output));
+      }
+      else {
+        $ajax_renew_link = l(t('Continue?'), 'user/' . $account->uid . '/generate_email/ajax', array('attributes'=>array('class' => 'use-ajax')));
+        drupal_set_message($are_you_sure . ' ' . $ajax_renew_link, 'warning');
+        $commands[] = ajax_command_html('#generated-mail-wrapper', theme('status_messages'));
+        return ajax_deliver(array('#type' => 'ajax', '#commands' => $commands));
+      }
+    }
+    elseif($action == 'generate_email') {
+      if (user_access('submit content by mail via singlemailbox', $user) && ($user->uid == $uid || user_access('administer users', $user))){
+        // We generate the new address with the user name as a base.
+        $generated_mail = mailhandler_singlemailbox_generate_email($acted_on_user->name);
+        if ($generated_mail && mailhandler_singlemailbox_save_generated_address($uid, $generated_mail)){
+          drupal_set_message(t('A new address has been generated.'));
+          $commands[] = ajax_command_html('#generated-mail-wrapper', theme('status_messages') . $generated_mail);
+          if (module_exists('dialog')) {
+            $commands[] = dialog_command_dismiss();
+          }
+          return ajax_deliver(array('#type' => 'ajax', '#commands' => $commands));
+        }
+        else {
+          drupal_set_message(t('Address could not be regenerated'), 'error');
+          $commands[] = ajax_command_before('#generated-mail-wrapper',theme('status_messages'));
+          if (module_exists('dialog')) {
+            $commands[] = dialog_command_dismiss();
+          }
+          return ajax_deliver(array('#type' => 'ajax', '#commands' => $commands));
+        }
+      }
+      else {
+        // This case should never happen via UI, but it could happen via direct call.
+        drupal_set_message(t('Permission denied.'), 'error');
+        $commands[] = ajax_command_before('#generated-mail-wrapper',theme('status_messages'));
+        return ajax_deliver(array('#type' => 'ajax', '#commands' => $commands));
+      }
+    }
+  }
+  else {
+    drupal_goto('/user/' . $uid . '/edit');
+  }
+}
+
+function mailhandler_singlemailbox_form_user_admin_permissions_alter(&$form, &$form_state, $form_id) {
+  // Add a way to garbage collect when permissions are saved.
+  $form['#submit'][] = 'mailhandler_singlemailbox_garbage_collection';
+}
+
+/**
+ * Helper function to clear out addresses that no longer have permissions.
+ * This should not be called directly. It gets called with the saving of permissions.
+ */
+function mailhandler_singlemailbox_garbage_collection() {
+  $addresses = mailhandler_singlemailbox_get_valid_addresses();
+  $user = new stdClass();
+  foreach ($addresses as $address => $uid) {
+    // Build little fake user with a uid so we can check his permissions.
+    $user->uid = $uid;
+    //see if each user still has permission to send media by mail
+    if (!user_access('submit content by mail via singlemailbox', $user)) {
+      db_delete('mailhandler_singlemailbox_addresses')
+        ->condition('uid', $uid)
+        ->execute();
+    }
+  }
+  // Invalidate our own cache.  Permission saving does clear all caches just
+  // before this function but our get address function rebuilt ours.
+  cache_clear_all('mailhandler_singlemailbox_valid_addresses', 'cache');
+}
+
+// Function to generate some UI for regenerating addresses for either the user
+// view or edit page.  Kind of strange to do it this way. The module may be changed
+// in the future, but for now this meets requirements.
+function mailhandler_singlemailbox_regenerate_ui($actedon_user) {
+  global $user;
+  // Check that the user has permission to generate a new address for themselves
+  // or for the user they are acting on.
+  if (user_access('submit content by mail via singlemailbox', $actedon_user) && (($user->uid == $actedon_user->uid) || user_access('administer users', $user))) {
+    // Ensure that the site is configured to allow email address generation.
+    if (!variable_get('mailhandler_singlemailbox_default_mailbox_name', NULL)) {
+      // Provide admins a message and link to fix the problem.
+      if (user_access('configure singlemailbox')) {
+        drupal_set_message(t('This account can email content to the site. You must define a !adminlink before you can generate a new address.', array('!adminlink' => l(t('default mailbox'), 'admin/config/content/singlemailbox', array('query' => array('destination' => 'user/' . arg(1) . '/edit'))))), 'warning');
+      }
+      else {
+        // Everyone else gets a 'contact admin' message.
+        drupal_set_message(t('Unable to generate a new address. Please contact your site administrator.'), 'warning');
+      }
+    }
+    else {
+      drupal_add_js('misc/ajax.js');
+      // If dialog module exists we want to load the libarary
+      // for a confirmation message on both the view and edit pages.
+      if (module_exists('dialog')) {
+        // Load the dialog library.
+        drupal_add_library('dialog', 'dialog');
+      }
+      $ajax_renew_link = l(t('Generate new'), 'user/'. $actedon_user->uid . '/confirm_generate_email/nojs', array('attributes'=>array('class' => 'use-ajax')));
+      // Get the currently configured email address for this user.
+      $addresses = mailhandler_singlemailbox_get_valid_addresses();
+      if ($key = array_search($actedon_user->uid, $addresses)) {
+        $generated_mail = $key;
+      }
+      else {
+        // Show a default that isn't actually stored or valid, but provides feedback to the user.
+        $generated_mail = 'email@' . mailhandler_singlemailbox_get_default_mailbox_domain();
+      }
+      $markup = '<div id="generated-mail-wrapper">' . $generated_mail . '</div>' . $ajax_renew_link;
+    }
+  }
+  //generate the right markup
+  return $markup;
+}
+
+
+/**
+ *  Implements hook_form_FORM_ID_alter().
+ */
+function mailhandler_singlemailbox_form_user_profile_form_alter(&$form, &$form_state, $form_id) {
+  if (!isset($form_state['input']['op']) && $markup = mailhandler_singlemailbox_regenerate_ui($form['#user'])) {
+    $form['mailhandler_singlemailbox'] = array(
+      '#type' => 'fieldset',
+      '#collapsible' => TRUE,
+      '#collapsed' => FALSE, //@TODO change to true when done debug
+      '#title' => t('Post content by e-mail'),
+      '#description' => t('Use the following e-mail address to submit content to the site.'),
+    );
+    $form['mailhandler_singlemailbox']['regenerate'] = array(
+      '#type' => 'markup',
+      '#markup' =>  $markup,
+    );
+  }
+}
+
+
+/**
+ * Implements hook_user_view().
+ */
+function mailhandler_singlemailbox_user_view($account, $view_mode, $langcode) {
+  if ($markup = mailhandler_singlemailbox_regenerate_ui($account)) {
+    $account->content['foo']['bar'] =  array(
+      '#type' => 'user_profile_item',
+      '#title' => t('E-mail address to submit content.'),
+      '#markup' => $markup,
+      '#attributes' => array('class' => array('mail-media')),
+    );
+  }
+}
+
+/**
+ * Submit handler for mailhandler_singlemailbox alteration to the user profile form
+ * Saves the generated email address for the user.  These addresses can be
+ * used as a TO validator in mailhandler.
+ */
+function mailhandler_singlemailbox_profile_form_submit(&$form, &$form_state) {
+  $address = $form_state['values']['generated_mail'];
+  mailhandler_singlemailbox_save_generated_address($form['#user']->uid, $address);
+}
+
+/**
+ * Function to actually store mailhandler_singlemailbox addresses in the database
+ * Called from altered profile form submit and possibly an ajax callback
+ */
+function mailhandler_singlemailbox_save_generated_address($uid, $address) {
+  if ($address != 'email@' . mailhandler_singlemailbox_get_default_mailbox_domain()) {
+    db_delete('mailhandler_singlemailbox_addresses')
+      ->condition('uid', $uid)
+      ->execute();
+
+    $fields = array('uid' => $uid, 'mail' => strtolower($address));
+    db_insert('mailhandler_singlemailbox_addresses')
+      ->fields($fields)
+      ->execute();
+
+    // Invalidate cache of valid addresses.
+    cache_clear_all('mailhandler_singlemailbox_valid_addresses', 'cache');
+    return TRUE;
+  }
+  else {
+    return FALSE;
+  }
+}
+
+///**
+// @TODO - I'm 99% sure I don't need this now.
+// * A field showing the generated email address to the user and letting them
+// * know that they must still save their user profile in order for the change
+// * to be saved.
+// */
+//function mailhandler_singlemailbox_generate_email_field(&$form, &$form_state) {
+//  $generated_mail = mailhandler_singlemailbox_generate_email($form['#user']->name);
+//  $form['mailhandler_singlemailbox']['generated_mail']['#default_value'] = $generated_mail;
+//  $form['mailhandler_singlemailbox']['generated_mail']['#value'] = $generated_mail;
+//  drupal_set_message(t('A new address has been generated. You must save your profile in order to keep these changes'), 'warning');
+//  $markup = theme('status_messages');
+//  $markup .= '<span class="updated">' . check_plain($generated_mail) . '</span>';
+//  $form['mailhandler_singlemailbox']['generated_mail_text']['#markup'] = $markup;
+//  return $form['mailhandler_singlemailbox'];
+//}
+
+/**
+ * Helper/Wrapper function to generate a new mailhandler_singlemailbox address.
+ * The work of actually generating addresses is handed off to a ctools plugin.
+ */
+function mailhandler_singlemailbox_generate_email($base) {
+  // Load the plugin responsible for generating email addresses.
+  // This module provides two plugins by default (for now) See plugins directory:
+  //   1) A catch all mailbox is used and we create an address in the format username-RANDOMNESS@example.com
+  //   2) A plus addressing scheme is used and we create an address in the format baseaddress+username-RANDOMNESS@example.com
+  $plugin_id = variable_get('mailhandler_singlemailbox_addressing_scheme', '');
+  ctools_include('plugins');
+  if ($class = ctools_plugin_load_class('mailhandler_singlemailbox', 'mailhandler_singlemailbox_address_generator', $plugin_id, 'handler')){
+    $generator = new $class();
+    $new_address = $generator->generate($base);
+    return $new_address;
+  }
+  else {
+    // Give admins a link to fix the problem
+    if (user_access('configure singlemailbox')) {
+      drupal_set_message(t('You must specify the !adminlink before you can generate a new address.', array('!adminlink' => l(t('address format'), 'admin/config/media/singlemailbox', array('query' => array('destination' => 'user/' . arg(1) . '/edit'))))), 'error');
+    }
+    else {
+      // Everyone else gets a 'contact admin' message.
+      drupal_set_message(t('Unable to generate a new address. Please contact your site administrator.'), 'warning');
+    }
+    return FALSE;
+  }
+}
+
+/**
+ * Helper function to return the domain portion of the default mailbox.
+ */
+function mailhandler_singlemailbox_get_default_mailbox_domain() {
+  // Get the name of the mailhandler mailbox that has been set to be the default for this site.
+  // Use that to determine the domain for generated account names
+  static $domain;
+  if ($domain) {
+    return $domain;
+  }
+  else {
+    if ($default_mailbox_name = variable_get('mailhandler_singlemailbox_default_mailbox_name', NULL)) {
+      $mailbox =  mailhandler_mailbox_load($default_mailbox_name);
+      //$address = variable_get($mailbox->mail . '_mailhandler_singlemailbox_mailbox_address');
+      $domain = substr($mailbox->settings['mailbox_address'], strpos($mailbox->settings['mailbox_address'], '@')+1);
+    }
+    else {
+      $domain = 'example.com';
+    }
+    return $domain;
+  }
+}
+
+/**
+ * A function to return all valid email addresses that can be used to send media to.
+ * Email address is forced to lower case for comparison.
+ *
+ * @return An array of email addresses => uid mappings
+ */
+function mailhandler_singlemailbox_get_valid_addresses() {
+  $addresses = &drupal_static(__FUNCTION__);
+  if (is_array($addresses)) {
+    return $addresses;
+  }
+  else {
+    $address_cache = cache_get('mailhandler_singlemailbox_valid_addresses');
+    if (is_object($address_cache)) {
+      $addresses = $address_cache->data;
+      return $addresses;
+    }
+    else {
+      // Fetch a keyed array uid => mailhandler_singlemailbox_address
+      $addresses = db_select('mailhandler_singlemailbox_addresses')->fields('mailhandler_singlemailbox_addresses')->execute()->fetchAllKeyed();
+      // Flip the array.  We're going to be looking up the email address far more often than the uid.
+      $addresses = array_flip($addresses);
+      // Cache the results.  Cache is explicity expired if new addresses are added or updated.
+      cache_set('mailhandler_singlemailbox_valid_addresses', $addresses);
+      return $addresses;
+    }
+  }
+}
+
+/**
+ * Implements hook_mailhandler_sendto_addresses().
+ *
+ * @return array of valid addresses.
+ */
+function mailhandler_singlemailbox_mailhandler_sendto_addresses() {
+  return mailhandler_singlemailbox_get_valid_addresses();
+}
+
+/**
+ * Implements hook_permission().
+ */
+function mailhandler_singlemailbox_permission() {
+  return array(
+    'submit content by mail via singlemailbox' => array(
+      'title' => t('Submit content by mail'),
+      'description' => t('Users who can generate an e-mail address to which they can send content to be published on the site.'),
+    ),
+    'configure singlemailbox' => array(
+      'title' => t('Configure single mailbox settings'),
+      'description' => t('Users who can select the default mailbox and email format.'),
+    ),
+  );
+}
+
+/**
+ * implement hook_FORMID_alter
+ * We want to be able to check if a mailhandler mailbox is deleted.
+ * If it is, there is a chance that the mailhandler singlebox was using
+ * this mailbox and we should make the user to reconfigure the settings for
+ * mailhanlder singlebox at some point.  (most likely when they attempt to
+ * generate new addresses for users)
+ */
+function mailhandler_singlemailbox_form_alter(&$form, &$form_state, $form_id) {
+  if ($form_id == 'ctools_export_ui_delete_confirm_form') {
+    if ($form_state['plugin']['name'] == 'mailhandler') {
+      $form['#submit'][] = 'mailhandler_singlemailbox_remove_old_vars';
+    }
+  }
+  if ($form_id == 'ctools_export_ui_edit_item_form') {
+    if ($form_state['plugin']['name'] == 'mailhandler') {
+      //$mailbox_machine_name = $form_state['values']['mail'];
+      $form['connection']['settings']['mailbox_address'] = array(
+        '#type' => 'textfield',
+        '#required' => TRUE,
+        '#default_value' => $form_state['item']->settings['mailbox_address'] ? $form_state['item']->settings['mailbox_address'] : '',
+        '#title' => t('Mailbox address'),
+        '#description' => t('The e-mail address associated with this mailbox'),
+        '#weight' => -10,
+      );
+      $form['#validate'][] = 'mailhandler_singlemailbox_validate_mailhandler_address';
+    }
+  }
+}
+
+/**
+ * Custom validate callback for mailhandler mailbox form
+ */
+function mailhandler_singlemailbox_validate_mailhandler_address(&$form, &$form_state) {
+  if ($form_state['values']['settings']['mailbox_address']) {
+    if (!valid_email_address($form_state['values']['settings']['mailbox_address'])) {
+      form_set_error('mailbox_address', t('Mailbox address must be a valid e-mail address'));
+    }
+  }
+}
+
+/**
+ * Custom submit callback for when deleting a mailhandler mailbox.
+ */
+function mailhandler_singlemailbox_remove_old_vars(&$form, &$form_state) {
+  $default_mailbox_name = variable_get('mailhandler_singlemailbox_default_mailbox_name');
+  $mailbox_being_deleted = $form_state['item']->mail;
+  if ($default_mailbox_name == $mailbox_being_deleted) {
+    variable_del('mailhandler_singlemailbox_default_mailbox_name');
+  }
+}
+
+/**
+ * Implements hook_ctools_plugin_type().
+ */
+function mailhandler_singlemailbox_ctools_plugin_type() {
+  return array(
+    'mailhandler_singlemailbox_address_generator' => array(
+      'use hooks' => FALSE,
+    ),
+  );
+}
+
+/**
+ * Implements hook_ctools_plugin_directory().
+ */
+function mailhandler_singlemailbox_ctools_plugin_directory($module, $plugin){
+  if ($module == 'mailhandler_singlemailbox' && $plugin == 'mailhandler_singlemailbox_address_generator') {
+    return 'plugins/address_generator';
+  }
+}
+
+/**
+ * Implements hook_help()
+ */
+function mailhandler_singlemailbox_help($path, $arg) {
+  if ($path == 'admin/help#mailhandler_singlemailbox') {
+    return t("Choose the address format that applies to your mail server configuration.  The default format is username-XXXXXXXX@domain.com, where username is the site's username and XXXXXXXX are randomly generated characters (lowercase, a-z, and 1-9).<br/><br/>
+              Plus addressing format is mailboxaddress+username-XXXXXXXX@domain.com, where the mailboxaddress is the user's email username that is pulled from their e-mail service. For example: admin-98az37978@gmail.com and joe+admin-98az37978@gmail.com.");
+  }
+}

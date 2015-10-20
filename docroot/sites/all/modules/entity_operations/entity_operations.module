@@ -1,0 +1,693 @@
+<?php
+/**
+ * @file entity_operations.module
+ * Contains API functions and core hooks for the Entity Operations module.
+ */
+
+/**
+ * Get the content for an entity's operation.
+ *
+ * This allows, for instance, a particular operation form to be embedded in
+ * another context.
+ *
+ * @param $entity_type
+ *  The entity type.
+ * @param $entity
+ *  The entity to return the operation for.
+ * @param $operation_name
+ *  The name of the operation. This should be the key of an item in the entity
+ *  type's operation array.
+ *
+ * @return
+ *  The content for the operation (page content or a form), or NULL if access
+ *  to the operation is denied.
+ */
+function entity_operations_get_operation($entity_type, $entity, $operation_name) {
+  $entity_operations_info = entity_operations_get_operation_info($entity_type);
+
+  if (isset($entity_operations_info[$operation_name])) {
+    $handler_class = $entity_operations_info[$operation_name]['handler'];
+
+    $operation_handler = new $handler_class($entity_type, $operation_name);
+
+    // Check access for the operation.
+    if ($operation_handler->access($entity_type, $entity) === FALSE) {
+      return;
+    }
+
+    $operation_info = $operation_handler->operationInfo();
+    if ($operation_info['uses form']) {
+      $form_id = $operation_handler->getFormID($entity_type, $operation_name);
+      return drupal_get_form($form_id, $entity_type, $handler_class, $operation_name, $entity);
+    }
+    else {
+      return $operation_handler->build();
+    }
+  }
+}
+
+/**
+ * Get the operation handler for a given entity type and operation name.
+ *
+ * @param $entity_type
+ *  The entity type.
+ * @param $operation_name
+ *  The path component for the operation.
+ *
+ * @return
+ *  An operation handler object.
+ */
+function entity_operations_get_entity_operation_handler($entity_type, $operation_name) {
+  $entity_operation_info = entity_operations_get_operation_info($entity_type);
+  $handler_class = $entity_operation_info[$operation_name]['handler'];
+  $operation_handler = new $handler_class($entity_type, $operation_name);
+
+  return $operation_handler;
+}
+
+/**
+ * Output a fieldset of operations to show in an entity's content.
+ *
+ * This can be used in an entity class's buildContent() thus:
+ * @code
+ *  $build['operations'] = entity_operations_get_entity_operations_fieldset($this, array('publish', 'unpublish'));
+ * @code
+ *
+ * @param $entity
+ *  The entity to get operations for. This must be a subclass of Entity.
+ * @param $operations
+ *  (Optional) An array of operation names. These are the keys defined in the
+ *  operations array in the entity's hook_entity_info(). If omitted, the
+ *  operations used are those with 'entity view' set to TRUE in their
+ *  hook_entity_operation_info() 'provision' settings.
+ * @param $form_states
+ *  (Optional) An array of form states to pass to drupal_build_form(). Each
+ *  should be keyed by the operation name, and any or all may be present. These
+ *  allow, among other things, the redirect to be set on each operation.
+ *
+ * @return
+ *  A build array containing all the requested operations for the entity, or an
+ * empty array if no operations are available.
+ */
+function entity_operations_get_entity_operations_fieldset($entity, $operations = array(), $form_states = array()) {
+  $entity_type = $entity->entityType();
+  $entity_info = $entity->entityInfo();
+  $operation_info = entity_operations_get_operation_info($entity->entityType());
+
+  // Build up operations array if it's empty.
+  if (empty($operations)) {
+    foreach ($operation_info as $operation_name => $operation_definition) {
+      if (isset($operation_definition['provision']['entity view'])) {
+        $operations[] = $operation_name;
+      }
+    }
+  }
+
+  $build = array(
+    '#type' => 'fieldset',
+    '#title' => t('Operations'),
+  );
+
+  $build['operations'] = drupal_get_form('entity_operations_multiple_operation_form', $entity->entityType(), $entity, $operations);
+
+  return $build;
+}
+
+/**
+ * Get the operations for all entities that define them.
+ *
+ * @param $requested_entity_type
+ *  (Optional) The entity type to return operation info for.
+ *
+ * @return
+ *  An array of entity operation info, keyed by entity type, or just the info
+ *  for a single entity type if $requested_entity_type is specified. The array
+ *  values are the same as returned by hook_entity_info(). If an entity type
+ *  does not define operations, and all are requested, it is not present in the
+ *  array. If operations are requested specifically for an entity type that does
+ *  not define any, an empty array is returned.
+ *
+ * @see entity_operations_hook_entity_info()
+ */
+function entity_operations_get_operation_info($requested_entity_type = NULL) {
+  // No need for static caching: we probably won't call this mutiple times per
+  // request. Most calls to this only take place during a cache clear, but we
+  // use our own database caching for the ones that don't.
+  if ($cache = cache_get("entity_operation_info")) {
+    $entity_operation_info = $cache->data;
+  }
+  else {
+    $entity_operation_info = module_invoke_all('entity_operation_info');
+
+    // Let other modules alter the entity operation info.
+    drupal_alter('entity_operation_info', $entity_operation_info);
+
+    cache_set("entity_operation_info", $entity_operation_info);
+  }
+
+  if (empty($requested_entity_type)) {
+    return $entity_operation_info;
+  }
+  elseif (isset($entity_operation_info[$requested_entity_type])) {
+    return $entity_operation_info[$requested_entity_type];
+  }
+  return array();
+}
+
+/**
+ * Implements hook_menu().
+ */
+function entity_operations_menu() {
+  $items = array();
+  // Get menu items from each entity type that declares operations.
+  foreach (entity_get_info() as $entity_type => $entity_info) {
+    // Only act for entities request the Entity Operations UI.
+    if (isset($entity_info['operations ui'])) {
+      // Instantiate the operations UI controller.
+      $class = isset($entity_info['operations ui']['controller class']) ? $entity_info['operations ui']['controller class'] : 'EntityOperationsDefaultUIController';
+      $controller = new $class($entity_type);
+      // Get menu items from the controller.
+      $items += $controller->hook_menu();
+    }
+  }
+
+  return $items;
+}
+
+// ========================================== Helpers for custom entities.
+
+/**
+ * Helper to generate permissions from entity operations.
+ *
+ * This produces an array suitable for hook_permission() based on the given
+ * entity type's defined operations, producing a permission 'op entity type'
+ * for each operation. It is intended as a helper to be used by a custom entity
+ * type module's hook_permission() (and hook_og_permission()).
+ *
+ * @TODO: Add support for per-bundle permissions.
+ *
+ * @param $entity_type
+ *  The entity type to get permissions for.
+ * @param $own
+ *  (optional) An array of access verbs which require both an 'op any entity'
+ *  and also an 'op own entity' permission.
+ *
+ * @return
+ *  An array of permission suitable for hook_permission().
+ */
+function entity_operations_get_entity_permissions($entity_type, $own = array()) {
+  $entity_info = entity_get_info($entity_type);
+  $entity_operation_info = entity_operations_get_operation_info($entity_type);
+
+  if (isset($own)) {
+    $own = array_fill_keys($own, TRUE);
+  }
+
+  $permissions = array();
+  foreach ($entity_operation_info as $operation_name => $operation_definition) {
+    $handler_class = $operation_definition['handler'];
+    $operation_handler = new $handler_class($entity_type, $operation_name);
+
+    // Take the access verb from the handler class if it defines it. Otherwise,
+    // use the operation name.
+    $verb = $operation_handler->getAccessVerb();
+
+    $permission_string = "{$verb} {$entity_type}s";
+    // Urgh this is going to be a bit grim for translation. You'd probably want
+    // to turn it into something like:
+    //   'Operer l'action !action sur les entités de type !type'.
+    $permission_label = t('!action !type entities', array(
+      '!action' => ucfirst($verb),
+      '!type' => $entity_info['label'],
+    ));
+
+    $permissions[$permission_string] = array(
+      'title' => $permission_label,
+    );
+
+    if (isset($own[$verb])) {
+      $permission_string = "{$verb} own {$entity_type}s";
+      $permission_label = t('!action own !type entities', array(
+        '!action' => ucfirst($verb),
+        '!type' => $entity_info['label'],
+      ));
+
+      $permissions[$permission_string] = array(
+        'title' => $permission_label,
+      );
+    }
+  }
+
+  return $permissions;
+}
+
+/**
+ * Generic entity URI callback.
+ *
+ * This can be used for any entity that uses Entity Operations. It will return
+ * the path to the default entity operation, consisting of entity base path
+ * defined in $entity_info['operations ui']['path'] with the entity ID appended.
+ */
+function entity_operations_entity_uri($entity) {
+  // Rely on our entity classes being at least Entity, which means we can
+  // get a type out of them. Haha!
+  $entity_info = $entity->entityInfo();
+  $path = $entity_info['operations ui']['path'] . '/' . $entity->identifier();
+  return array('path' => $path);
+}
+
+// ========================================== Page callbacks and form builders.
+
+/**
+ * Generic page callback for an operation handler.
+ *
+ * This hands over to the handler's build() method for the output, and calls the
+ * handler's setTitle() to allow setting of the page title.
+ *
+ * @param $entity_type
+ *  The entity type.
+ * @param $handler_class
+ *  The name of the handler class for the current operation.
+ * @param $operation_path
+ *  The path component of the operation.
+ * @param $entity
+ *  The entity.
+ * @param $params
+ *  (optional) An array of further parameters which is passed to the operation
+ *  handler's build() method.
+ *
+ * @return
+ *  Either output text or a render array.
+ */
+function entity_operations_operation_page_callback($entity_type, $handler_class, $operation_path, $entity, $params = array()) {
+  $operation_handler = new $handler_class($entity_type, $operation_path);
+
+  $operation_handler->setTitle($entity_type, $entity, $params);
+
+  return $operation_handler->build($entity_type, $entity, $params);
+}
+
+/**
+ * Implements hook_forms().
+ */
+function entity_operations_forms($form_id, $args) {
+  // We only care about the first piece of the form ID here.
+  $length = strlen('entity_operations_operation_form');
+  if (substr($form_id, 0, $length) == 'entity_operations_operation_form') {
+    $forms[$form_id] = array(
+      'callback' => 'entity_operations_operation_form',
+    );
+    return $forms;
+  }
+}
+
+/**
+ * Operation form callback. Hands over to the handler's form() method.
+ */
+function entity_operations_operation_form($form, &$form_state, $entity_type, $handler_class, $operation_path, $entity) {
+  $operation_handler = new $handler_class($entity_type, $operation_path);
+
+  // Specify the elements we want, unless our caller already requested some.
+  if (!isset($form_state['entity_operation_form_elements'])) {
+    $form_state['entity_operation_form_elements'] = array(
+      'page title' => TRUE,
+      'confirmation message' => TRUE,
+      'form elements' => TRUE,
+      'action button' => TRUE,
+      'cancel link' => TRUE,
+    );
+  }
+  return $operation_handler->getForm($form, $form_state, $entity_type, $entity, $operation_path);
+}
+
+/**
+ * Implements callback_form_after_build().
+ *
+ * This sets the form parent data for an operation form in the form state, thus
+ * allowing validate and submit code to find the original form if it's being
+ * embedded within a compound form.
+ *
+ * This is the same pattern as field_form_element_after_build().
+ */
+function entity_operations_operation_form_after_build($element, &$form_state) {
+  $operation_name = $element['#entity_operation_name'];
+  $form_state['entity_operations_form'][$operation_name]['#array_parents'] = $element['#array_parents'];
+  return $element;
+}
+
+/**
+ * Operation form validate callback. Hands over to the handler's formValidate().
+ */
+function entity_operations_operation_form_validate($form, &$form_state) {
+  list($entity_type, $handler_class, $operation_path, $entity) = $form_state['build_info']['args'];
+
+  $operation_handler = new $handler_class($entity_type, $operation_path);
+
+  $operation_handler->formValidate($form, $form_state, $entity_type, $entity, $operation_path);
+}
+
+/**
+ * Operation form submit callback. Hands over to the handler's formSubmit().
+ */
+function entity_operations_operation_form_submit($form, &$form_state) {
+  list($entity_type, $handler_class, $operation_path, $entity) = $form_state['build_info']['args'];
+
+  $operation_handler = new $handler_class($entity_type, $operation_path);
+
+  $operation_handler->formSubmit($form, $form_state, $entity_type, $entity, $operation_path);
+}
+
+/**
+ * Form callback for a form containing multiple operations.
+ *
+ * This is provided for the benefit of extension modules.
+ *
+ * @param $entity_type
+ *  The entity type.
+ * @param $entity
+ *  The entity.
+ * @param $operation_names
+ *  An array of operation names. These are the keys defined in the operations
+ *  array in the entity's hook_entity_operation_info().
+ */
+function entity_operations_multiple_operation_form($form, &$form_state, $entity_type, $entity, $operation_names) {
+  // Store the parameters for the form handlers to use.
+  $form_state['entity_operations_multiple_operation_form']['entity_type'] = $entity_type;
+  $form_state['entity_operations_multiple_operation_form']['entity'] = $entity;
+
+  $operation_info = entity_operations_get_operation_info($entity_type);
+
+  foreach ($operation_names as $operation_name) {
+    $handler_class = $operation_info[$operation_name]['handler'];
+    $operation_handler = new $handler_class($entity_type, $operation_name);
+
+    // Store the handler class to save the validate and submit handlers legwork.
+    $form_state['entity_operation_handlers'][$operation_name] = $handler_class;
+
+    // Check access for the operation.
+    if ($operation_handler->access($entity_type, $entity) === FALSE) {
+      continue;
+    }
+
+    // Make a copy of the form state for each operation handler.
+    $operation_form_state = $form_state;
+
+    // Specify the elements we want in each form.
+    $operation_form_state['entity_operation_form_elements'] = array(
+      'page title' => FALSE,
+      'confirmation message' => FALSE,
+      'form elements' => TRUE,
+      'action button' => TRUE,
+      'cancel link' => FALSE,
+    );
+
+    $form[$operation_name] = array();
+    $form[$operation_name] = $operation_handler->getForm($form[$operation_name], $operation_form_state, $entity_type, $entity, $operation_name);
+  }
+
+  return $form;
+}
+
+/**
+ * Validate handler for multiple operation form.
+ */
+function entity_operations_multiple_operation_form_validate($form, &$form_state) {
+  $entity_type = $form_state['entity_operations_multiple_operation_form']['entity_type'];
+  $entity = $form_state['entity_operations_multiple_operation_form']['entity'];
+
+  // The triggering element's top ancestor in the form array is the name/path of
+  // the operation.
+  $triggering_element_array_parents = $form_state['triggering_element']['#array_parents'];
+  $operation_path = array_shift($triggering_element_array_parents);
+  $handler_class = $form_state['entity_operation_handlers'][$operation_path];
+
+  // Extract the subform for the operation, so the operation handler gets the
+  // same $form parameter as if it were a single form.
+  $operation_form = $form[$operation_path];
+
+  $operation_handler = new $handler_class($entity_type, $operation_path);
+
+  $operation_handler->formValidate($operation_form, $form_state, $entity_type, $entity, $operation_path);
+}
+
+/**
+ * Submit handler for multiple operation form.
+ */
+function entity_operations_multiple_operation_form_submit($form, &$form_state) {
+  // Unless told otherwise, redirect back to where this form is, rather than
+  // what the operation says.
+  if (empty($form_state['redirect'])) {
+    $form_state['redirect'] = current_path();
+  }
+
+  $entity_type = $form_state['entity_operations_multiple_operation_form']['entity_type'];
+  $entity = $form_state['entity_operations_multiple_operation_form']['entity'];
+
+  // The triggering element's top ancestor in the form array is the name/path of
+  // the operation.
+  $triggering_element_array_parents = $form_state['triggering_element']['#array_parents'];
+  $operation_path = array_shift($triggering_element_array_parents);
+  $handler_class = $form_state['entity_operation_handlers'][$operation_path];
+
+  $operation_handler = new $handler_class($entity_type, $operation_path);
+
+  $operation_handler->formSubmit($form, $form_state, $entity_type, $entity, $operation_path);
+}
+
+/**
+ * Menu access callback for an operation.
+ *
+ * This checks the handler's access() method.
+ *
+ * Note that entity_operations_get_entity_permissions() can be used as a helper
+ * for declaring the permissions expected here by the handler's userAccess().
+ *
+ * @param $entity_type
+ *  The entity type.
+ * @param $handler_class
+ *  The name of the class for the operation handler.
+ * @param $operation_path
+ *  The path the operation is on, i.e. the key in the hook_entity_info() array.
+ * @param $entity
+ *  The entity.
+ * @param $params
+ *  (optional) An array of further parameters which is passed to the operation
+ *  handler's build() method.
+ *
+ * @return
+ *  A boolean indicating whether access should be granted.
+ *
+ * @see EntityOperationsOperationBase::access()
+ */
+function entity_operations_operation_access_callback($entity_type, $handler_class, $operation_path, $entity, $params = array()) {
+  // Use a static cache here, as menu access is often required repeatedly for
+  // the same menu items, for things such as tab parentage and breadcrumbs.
+  // This is better than caching the handler object itself, as a) we might not
+  // in fact need this for some operations and b) if we do need the handler
+  // several times, it'll be for access; only one use of the handler is for its
+  // actual content. This way we are only caching booleans, which is very light.
+  // Access to handlers will not normally change in the lifetime of a request.
+  // A handler that needs to consider access after it has made some sort of
+  // change (for example, when figuring out where to redirect the user to after
+  // the operation has been executed) should clear this static cache.
+  $cache = &drupal_static(__FUNCTION__);
+
+  // Make a key for the access cache.
+  // This is not available for those operations that cheat and use the $entity
+  // parameter for something else: these are the 'add' operations.
+  if (is_object($entity)) {
+    list($id) = entity_extract_ids($entity_type, $entity);
+    $cache_key = $entity_type . '::' . $operation_path . '::' . $id;
+  }
+
+  if (isset($cache_key) && isset($cache[$cache_key])) {
+    return $cache[$cache_key];
+  }
+
+  $operation_handler = new $handler_class($entity_type, $operation_path);
+
+  $operation_access = $operation_handler->access($entity_type, $entity, $params);
+
+  if (isset($cache_key)) {
+    $cache[$cache_key] = $operation_access;
+  }
+
+  return $operation_access;
+}
+
+// ========================================== Batch API integration.
+
+/**
+ * Implements callback_batch_operation().
+ *
+ * Entity operations using subclasses of EntityOperationsOperationFormBatch
+ * set this as their batch operation callback.
+ *
+ * Hands over to batchOperation() in the operation handler.
+ */
+function entity_operations_operation_batch_operation($entity_type, $entity, $operation_name, $parameters, &$context) {
+  if (!isset($context['results']['entity_operations'])) {
+    // We can't give extra parameters to callback_batch_finished() to let our
+    // implementation know which operation to use, so we have to put that data
+    // in here.
+    $context['results']['entity_operations'] = array(
+      'entity_type' => $entity_type,
+      'operation_name' => $operation_name,
+    );
+  }
+
+  $operation_handler = entity_operations_get_entity_operation_handler($entity_type, $operation_name);
+
+  $operation_handler->batchOperation($entity_type, $entity, $parameters, $context);
+}
+
+/**
+ * Implements callback_batch_finished().
+ *
+ * Entity operations using subclasses of EntityOperationsOperationFormBatch
+ * set this as their batch operation callback.
+ *
+ * Hands over to batchFinished() in the operation handler.
+ */
+function entity_operations_operation_batch_finished($success, $results, $operations) {
+  $operation_handler = entity_operations_get_entity_operation_handler($results['entity_operations']['entity_type'], $results['entity_operations']['operation_name']);
+  $operation_handler->batchFinished($success, $results, $operations);
+}
+
+// ========================================== Other contrib integration.
+
+/**
+ * Implements hook_ctools_plugin_directory().
+ */
+function entity_operations_ctools_plugin_directory($owner, $plugin_type) {
+  if ($owner == 'views_bulk_operations') {
+    return 'plugins/' . $plugin_type;
+  }
+}
+
+/**
+ * Implements hook_views_api().
+ */
+function entity_operations_views_api() {
+  return array(
+    'api' => '3',
+    'path' => drupal_get_path('module', 'entity_operations') . '/includes/views',
+  );
+}
+
+/**
+ * Implements hook_entity_operation_info_alter() for views module.
+ */
+function views_entity_operation_info_alter(&$operation_info) {
+  // Get the views with tabs for this entity.
+  $views_info = entity_operations_get_views();
+  foreach (array_keys($views_info) as $entity_type) {
+    foreach ($views_info[$entity_type] as $operation_name => $view_info) {
+      // Views clobber existing operations. Desirable or not? TODO.
+      $operation_info[$entity_type][$operation_name] = array(
+        'handler' => 'EntityOperationsOperationPageViews',
+        'provision' => array(
+          'menu' => $view_info['menu'],
+          // By default, we provide a Views field for this... view. Which just
+          // means you can link to it from another view.
+          'views field' => TRUE,
+        ),
+        // Extend the array with info Views needs.
+        'views info' => $view_info['views info'],
+      );
+    }
+  }
+}
+
+/**
+ * Get a list of views and displays attached to specific entities.
+ *
+ * This function will cache its results into the views cache, so it gets
+ * cleared by Views appropriately.
+ *
+ * Cribbed from eva_get_views().
+ *
+ * @todo: could this be moved to the views.inc file?
+ *
+ * @param $type
+ *   The entity type we want to retrieve views for. If NULL is
+ *   specified, views for all entity types will be returned.
+ * @param $reset
+ *   Force a rebuild of the data.
+ *
+ * @return
+ *   An array of data about Views-provided entity operation tabs. This is keyed
+ *   first by entity type, then by operation name. Each value is then an array
+ *   containing:
+ *    - 'views info': An array about this View providing this tab, which is
+ *      needed by Views when the tab is rendered.
+ *    - 'menu': The array of settings to go in the 'provision' array in the
+ *      operation info.
+ */
+function entity_operations_get_views($type = NULL, $reset = FALSE) {
+  $used_views = &drupal_static(__FUNCTION__);
+
+  if (!isset($used_views) || $reset) {
+    views_include('cache');
+
+    // If we're not resetting, check the Views cache.
+    if (!$reset) {
+      $cache = views_cache_get("entity_operations");
+      if (isset($cache->data)) {
+        $used_views = $cache->data;
+      }
+    }
+
+    // If it's still empty rebuild it.
+    if (!isset($used_views)) {
+      // Trigger a rebuild of the views object cache, which may not be fully
+      // loaded.
+      ctools_include('export');
+      ctools_export_load_object_reset('views_view');
+
+      // Build and cache the data, both in the DB and statically.
+      $views = views_get_applicable_views('provides entity operation');
+      foreach ($views as $data) {
+        list($view, $display_id) = $data;
+        $entity_type = $view->display_handler->get_option('entity_type');
+        $operation_name = $view->display_handler->get_option('path');
+        // Initialize handlers, to determine if the view uses exposed filters.
+        $view->init_handlers();
+
+        // Get the access parameters out of our plugin.
+        // This is the same pattern as views_menu_alter().
+        $access = $view->display_handler->get_access_parameters();
+
+        $used_views[$entity_type][$operation_name] = array(
+          // Data for Views that we'll stash in the operation info.
+          'views info' => array(
+            'name' => $view->name,
+            'title' => $view->get_human_name() . ' - ' . $view->display[$display_id]->display_title,
+            'display' => $display_id,
+            'operation_name' => $operation_name,
+            'title' => $view->display_handler->get_option('title'),
+            'access' => $access,
+          ),
+          // Data for the menu provision settings.
+          'menu' => array(
+            'menu item' => $view->display_handler->menu_item(),
+            'default' => $view->display_handler->get_option('menu_default'),
+            'default secondary' => $view->display_handler->get_option('menu_default_secondary'),
+            'parent tab title' => $view->display_handler->get_option('menu_parent_tab_title'),
+            'parent weight' => $view->display_handler->get_option('menu_parent_weight'),
+          ),
+        );
+        $view->destroy();
+      }
+      views_cache_set("entity_operations", $used_views);
+    }
+  }
+
+  // Now spit back the data.
+  if (isset($type) & isset($used_views)) {
+    return isset($used_views[$type]) ? $used_views[$type] : array();
+  }
+  else {
+    return isset($used_views) ? $used_views : array();
+  }
+}

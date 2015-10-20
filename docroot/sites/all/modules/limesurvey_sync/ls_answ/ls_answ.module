@@ -1,0 +1,1534 @@
+<?php
+/**
+ * @file
+ * Main functions for the ls_answ module.
+ */
+
+define('LS_STATUS_COMPLETED', 1);
+define('LS_STATUS_EDITING', 2);
+define('LS_STATUS_VIRGIN', 3);
+define('LS_STATUS_EMPTY', 4);
+
+define('LS_SYNC_UNSYNCHRONIZED', 1);
+define('LS_SYNC_SYNCHRONIZED', 2);
+define('LS_SYNC_SYNCHRONIZED_REVISION', 3);
+define('LS_SYNC_DESYNCHRONIZED_LS_LANG', 4);
+define('LS_SYNC_DESYNCHRONIZED_LANG', 5);
+define('LS_SYNC_DESYNCHRONIZED_LS_SID', 6);
+define('LS_SYNC_DESYNCHRONIZED_NODE', 7);
+define('LS_SYNC_DESYNCHRONIZED_TYPE', 8);
+define('LS_SYNC_DESYNCHRONIZED_TOKEN', 9);
+define('LS_SYNC_DESYNCHRONIZED_ANSWER', 10);
+define('LS_SYNC_DESYNCHRONIZED_SURVEY', 11);
+define('LS_SYNC_DESYNCHRONIZED_SID', 12);
+define('LS_SYNC_DESYNCHRONIZED_SERVER', 13);
+
+/**
+ * Implements hook_node_info().
+ *
+ * Declare the "Answers" content type, each content type is associated a
+ * specific node from the content type "survey". "Answers" content types are
+ * create and delete outside the ls_answ module : into the ls_survey module.
+ * Update is handle by the node module.
+ * The ls_survey table stores the "orig_type" value of the associated answers
+ * content type.
+ */
+function ls_answ_node_info() {
+  $ls_answ_node_types = array();
+  $query = db_query("SELECT nt.type, nt.* FROM {node_type} nt WHERE module = :module ORDER BY nt.type ASC", array(':module' => 'ls_answ'));
+  while ($answ_types = $query->fetchAssoc()) {
+    $ls_answ_node_types[$answ_types['type']] =  $answ_types;
+  }
+  return $ls_answ_node_types;
+}
+
+/**
+ * Implements hook_permission().
+ *
+ * Create specific permissions for each answers content type. This is an
+ * adapted version of the node_list_permissions() core function.
+ */
+function ls_answ_permission() {
+  $perms = array();
+  foreach (node_type_get_types() as $type) {
+    if ($type->module == 'ls_answ' && !empty($type->type)) {
+      $type_val = $type->type;
+      // Entries for create, edit own/any, delete own/any answer content are
+      // handled by the node_list_permissions() function.
+      $perms = array_merge($perms, node_list_permissions($type_val));
+      // Add descriptions.
+      $perms["create $type_val content"]['description'] = t('Allow a user to fill the corresponding survey from your LimeSurvey site.');
+      $name = check_plain($type->name);
+      // Add view permissions.
+      $perms["view own $type_val content"] = array(
+        'title' => t('%type_name: View own content', array('%type_name' => $name)),
+        // set wrap for displaying the message : 'Warning: Give to trusted
+        // roles only; this permission has security implications'.
+        'description' => t('Allow a user to view its own submission') . '<br />' . t('This permission should not be fired for anonymous users.') . '<br />',
+        'restrict access' => TRUE,
+      );
+      $perms["view any $type_val content"] = array(
+        'title' => t('%type_name: View any content', array('%type_name' => $name)),
+        'description' => t('This permission exposes datas from your LimeSurvey site users.') . '<br />',
+        'restrict access' => TRUE,
+      );
+    }
+  }
+  return $perms;
+}
+
+/**
+ * Implements hook_node_access().
+ *
+ * Handle specific access to the answer nodes.
+ * Adapted version of the node_content_access() function.
+ */
+function ls_answ_node_access($node, $op, $account) {
+
+  $type = is_string($node) ? $node : (is_array($node) ? $node['type'] : $node->type);
+  $name = check_plain($type);
+
+  if ($op == 'create') {
+    if (user_access('create ' . $name . ' content', $account)) {
+      return NODE_ACCESS_ALLOW;
+    }
+  }
+
+  if ($op == 'update') {
+    if (user_access('edit any ' . $name . ' content', $account) || (user_access('edit own ' . $name . ' content', $account) && ($account->uid == $node->uid))) {
+      return NODE_ACCESS_ALLOW;
+    }
+  }
+
+  if ($op == 'delete') {
+    if (user_access('delete any ' . $name . ' content', $account) || (user_access('delete own ' . $name . ' content', $account) && ($account->uid == $node->uid))) {
+      return NODE_ACCESS_ALLOW;
+    }
+  }
+
+  if ($op == 'view') {
+    if (ls_answ_type_is_answer($type)) {
+      if (user_access('view any ' . $name . ' content', $account) || (user_access('view own ' . $name . ' content', $account) && ($account->uid == $node->uid))) {
+        return NODE_ACCESS_IGNORE; // Allowed by access content permission.
+      }
+      else {
+        // As we set the 'view' entry, we return a deny access here.
+        return NODE_ACCESS_DENY;
+      }
+    }
+    else {
+      return NODE_ACCESS_IGNORE;
+    }
+  }
+}
+
+/**
+ * Implements hook_menu().
+ *
+ * Create a new tabs for the Answers content type, links to the associated
+ * survey, for the LimeSurvey website display page, etc...
+ */
+function ls_answ_menu() {
+  $items = array();
+
+  // Link to force synchronization for a specific answer. For admin purpose.
+  $items['node/%node/sync'] = array(
+    'title' => 'Synchronization',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('ls_answ_sync_datas', 1),
+    'access callback' => 'ls_answ_force_sync_access',
+    'access arguments' => array(1),
+    'type' => MENU_LOCAL_TASK,
+    'weight' => 15,
+    'file' => 'ls_answ.sync.inc',
+  );
+
+  // Link to the 'Responses' page from the associated survey, printing all
+  // responses to this survey.
+  $items['node/%node/tosurvey'] = array(
+    'title' => 'All answers',
+    'page callback' => 'ls_answ_tosurvey',
+    'page arguments' => array(1),
+    'access callback' => 'ls_answ_tosurvey_access',
+    'access arguments' => array(1),
+    'type' => MENU_LOCAL_TASK,
+    'weight' => 15,
+  );
+
+  // Page opening the LimeSurvey answering form.
+  // The wildcard is the type answer value.
+  $items['form/%'] = array(
+    'title' => 'Form',
+    'page callback' => 'ls_answ_fill_survey',
+    'page arguments' => array(1),
+    'access callback' => 'ls_answ_fill_survey_access',
+    'access arguments' => array(1),
+    'type' => MENU_CALLBACK,
+    'file' => 'ls_answ.form.inc',
+  );
+  $items['form/%/%node'] = array(
+    'title' => 'Form',
+    'page callback' => 'ls_answ_fill_survey',
+    'page arguments' => array(1, 2),
+    'access callback' => 'ls_answ_fill_survey_access',
+    'access arguments' => array(1, 2),
+    'type' => MENU_CALLBACK,
+    'file' => 'ls_answ.form.inc',
+  );
+
+  $items['toform/%'] = array(
+    'title' => 'Form',
+    'page callback' => 'ls_answ_to_fill_survey',
+    'page arguments' => array(1),
+    'access callback' => 'ls_answ_fill_survey_access',
+    'access arguments' => array(1, FALSE, TRUE),
+    'type' => MENU_CALLBACK,
+    'file' => 'ls_answ.toform.inc',
+  );
+  $items['toform/%/%node'] = array(
+    'title' => 'Form',
+    'page callback' => 'ls_answ_to_fill_survey',
+    'page arguments' => array(1, 2),
+    'access callback' => 'ls_answ_fill_survey_access',
+    'access arguments' => array(1, 2, TRUE),
+    'type' => MENU_CALLBACK,
+    'file' => 'ls_answ.toform.inc',
+  );
+
+  // Page for importing an fresh edited answer, the LimeSurvey site should
+  // redirect to this page after final submission (it must be set as
+  // 'back url'). The wilcard is the answers content type machine name.
+  $items['backfromsurvey/%'] = array(
+    'title' => 'End of survey',
+    'page callback' => 'ls_answ_back_from_ls',
+    'page arguments' => array(1),
+    'access callback' => 'ls_answ_back_from_ls_access',
+    'access arguments' => array(1),
+    'type' => MENU_CALLBACK,
+    'weight' => 15,
+    'file' => 'ls_answ.back.inc',
+  );
+
+  // Page for iframes, redirect to the 'backfromsurvey/%' page.
+  $items['backfromsurvey/%/back'] = array(
+    'title' => 'End of survey',
+    'page callback' => 'ls_answ_close_frames',
+    'page arguments' => array(1),
+    'access callback' => 'ls_answ_back_from_ls_access',
+    'access arguments' => array(1, '1'),
+    'type' => MENU_CALLBACK,
+    'file' => 'ls_answ.form.inc',
+  );
+
+  $items['node/%node/answ'] = array(
+    'title' => 'Responses',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('ls_answ_answ_list', 1),
+    'access callback' => 'ls_answ_answ_access',
+    'access arguments' => array(1),
+    'type' => MENU_LOCAL_TASK,
+    'weight' => 0,
+    'file' => 'ls_answ.answers.inc',
+  );
+
+  $items['node/compare/%/%'] = array(
+    'title' => 'Compare answers',
+    'page callback' => 'ls_answ_compare',
+    'page arguments' => array(2, 3),
+    'access callback' => 'ls_answ_compare_access',
+    'access arguments' => array(2, 3),
+    'type' => MENU_CALLBACK,
+    'weight' => 0,
+    'file' => 'ls_answ.answers.inc',
+  );
+
+  return $items;
+}
+
+/**
+ * Manage access to answer synchronization informations page.
+ *
+ * This page displays system informations datas about the LimeSurvey
+ * references stored into the drupal site and allow to resynchronize the node.
+ *
+ * @param $node
+ *   The answer node object. Default is FALSE, corresponding to a new node.
+ *
+ * @return
+ *   A boolean. TRUE if access is granted.
+ */
+function ls_answ_force_sync_access($node) {
+  return (!empty($node) && ls_answ_type_is_answer($node->type) && user_access('force answers synchronization'));
+}
+
+/**
+ * Manage access to the answers list page.
+ *
+ * Allow access depending on permissions and if the survey node exists.
+ *
+ * @param $node
+ *   The answer node object.
+ *
+ * @return
+ *   A boolean. TRUE if access is granted.
+ */
+function ls_answ_tosurvey_access($node) {
+  if (empty($node)) {
+    return FALSE;
+  }
+  $type = node_type_get_type($node->type);
+  if (!$type || $type->module != 'ls_answ') {
+    return FALSE;
+  }
+  else {
+    module_load_include('inc', 'ls_survey', 'ls_survey');
+    $node_survey = ls_survey_find_survey($type->orig_type);
+    module_load_include('module', 'ls_survey', 'ls_survey');
+    return ls_answ_answ_access($node_survey);
+  }
+}
+
+/**
+ * Manage access to the answers fill page.
+ *
+ * @param $type
+ *   A string. The answer content type.
+ * @param $node
+ *   The answer node object. Default is FALSE, corresponding to a new node.
+ * @param $submit_page
+ *   A Boolean. Set to TRUE if the previous page was the submit page for the
+ *   LimeSurvey form. Default is FALSE.
+ *
+ * @return
+ *   A boolean. TRUE if access is granted.
+ */
+function ls_answ_fill_survey_access($type, $node = FALSE, $submit_page = FALSE) {
+
+  if (empty($type) || !ls_answ_type_is_answer($type)) {
+    return FALSE;
+  }
+
+  module_load_include('inc', 'ls_answ', 'ls_answ');
+  if (empty($node)) {
+    $node = ls_answ_new_node($type);
+  }
+  elseif ($node->type != $type || $node->ls_status != LS_STATUS_EDITING) {
+    return FALSE;
+  }
+
+  $node->edit_answer = TRUE;
+  module_load_include('inc', 'limesurvey_sync', 'ls_api/limesurvey_sync_api_survey');
+  $survey_properties = limesurvey_sync_survey_properties($node->ls_sid);
+  // Check is the answer can be edited or updated.
+  $empty_body = empty($node->body[ls_answ_body_language($node)][0]['value']);
+  if ($survey_properties['tokenanswerspersistence']) {
+    if (empty($node->nid) || ($empty_body && !node_access('create', $type)) || (!$empty_body && (!$survey_properties['can_edit_answer'] || !node_access('update', $node)))) {
+      return FALSE;
+    }
+  }
+  else {
+    if (!empty($node->nid) || !node_access('create', $type)) {
+      return FALSE;
+    }
+  }
+
+  // On token persistence surveys, $node is required, and redirection is
+  // handled by the node edit form.
+  module_load_include('inc', 'ls_survey', 'ls_survey.type');
+  $options = variable_get('ls_answ_options_' . $node->type, ls_survey_answ_default_options());
+  if (($options['ls_redirect'] == 'form' && !$submit_page) || ($survey_properties['tokenanswerspersistence'] && (empty($node->nid) || $options['ls_redirect'] == 'redirect')) || (!$survey_properties['tokenanswerspersistence'] && !empty($node->nid))) {
+    return FALSE;
+  }
+
+  // check if the previous page was the node edit form : this control avoid to
+  // create invitations for bots.
+  $frames = array('iframe', 'colorbox', 'lightbox2', 'modalframe', 'link');
+  $path = FALSE;
+  $new_node = (empty($node->nid) || $node->changed == $node->created);
+  $node_form_page = ($new_node) ? 'node/add/' . str_replace('_', '-', $type) : 'node/' . $node->nid . '/edit';
+  //$toform_page = (empty($node->nid)) ? 'toform/' . $type : 'toform/' . $type . '/' . $node->nid;
+  if (!empty($node->nid)) {
+    // On token persistence.
+    if ($submit_page && $options['ls_redirect'] != 'form') {
+      return FALSE;
+    }
+    elseif (!$submit_page) {
+      $path = $node_form_page;
+    }
+  }
+  else {
+    // On non persistence, empty nodes.
+    if (!$submit_page && !in_array($options['ls_redirect'], $frames)) {
+      return FALSE;
+    }
+    elseif (!$submit_page) {
+      $path = 'toform/' . $type;
+    }
+  }
+  $http_referer = drupal_strtolower($_SERVER['HTTP_REFERER']);
+  $node_form_url = drupal_strtolower(url($path, array('absolute' => TRUE)));
+  if (!$submit_page && (!$path || empty($http_referer) || $http_referer != $node_form_url)) {
+    return FALSE;
+  }
+
+  // Check for specific control on LS;
+  $form['#node'] = $node;
+  ls_answ_validate($node, $form);
+  // Look for errors :
+  $messages = form_get_errors();
+  // Don't display messages.
+  //form_set_error('', '', TRUE); // Break the form process!
+  return (empty($messages));
+  // @TODO : minor bug : The ls_answ_validate() seems to be called again after
+  // the execution of the ls_answ_fill_survey_access() function : access is
+  // still denied (no security break) but the error message is displayed.
+}
+
+/**
+ * Manage access to the back form LS page.
+ *
+ * No specific control, they will be don into the page callback function.
+ *
+ * @param $type
+ *   A string. The answer content type.
+ * @param $back
+ *   A Boolean. Set to TRUE if the previous page was the iframe page. Default
+ *   is FALSE.
+ *
+ * @return
+ *   A boolean. TRUE if access is granted.
+ */
+function ls_answ_back_from_ls_access($type, $back = FALSE) {
+  if (empty($type) || !ls_answ_type_is_answer($type) || !user_access('access content')) {
+    return FALSE;
+  }
+
+  $frames = array('iframe', 'colorbox', 'lightbox2', 'modalframe');
+  $options = variable_get('ls_answ_options_' . $type, FALSE);
+  if (!$back && $options && in_array($options['ls_redirect'], $frames)) {
+    // Check if the previous page was the iframe page.
+    $iframe_url = url('form/' . $type, array('absolute' => TRUE));
+    // Ignore the nid if exist, it will be check later.
+    $http_referer = $_SERVER['HTTP_REFERER'];
+    return (strrpos(drupal_strtolower($iframe_url), drupal_strtolower($http_referer)) === 0);
+  }
+  else {
+    // Check if the previous page was the LimeSurvey form.
+    module_load_include('inc', 'limesurvey_sync', 'ls_api/limesurvey_sync_api_answ');
+    $extract = limesurvey_sync_answ_extract_referer();
+    module_load_include('inc', 'ls_answ', 'ls_answ');
+    $node_survey = ls_answ_find_survey($type);
+    module_load_include('inc', 'limesurvey_sync', 'ls_api/limesurvey_sync_api_survey');
+    $survey_properties = limesurvey_sync_survey_properties($node_survey->ls_sid);
+    return ($survey_properties['http_referer']) ? (is_array($extract)) : $extract;
+  }
+}
+
+/**
+ * Manage access to the answers tab of a survey node
+ *
+ * Allow to select several answers to compare.
+ *
+ * @param $node_survey
+ *   The survey node object.
+ *
+ * @return
+ *   A boolean. TRUE if access is granted.
+ */
+function ls_answ_answ_access($node_survey) {
+  if (!empty($node_survey) && $node_survey->type == 'survey') {
+    module_load_include('inc', 'ls_survey', 'ls_survey');
+    $answ_type = (!empty($node_survey->ls_orig_type)) ? ls_survey_find_answ_type($node_survey->ls_orig_type) : FALSE;
+    if ($answ_type && node_access('view', $node_survey)) {
+      return TRUE;
+    }
+  }
+  return FALSE;
+}
+
+/**
+ * Manage access to the answers comparision page
+ *
+ * Allow to compare answers node from disctinct answers content types,
+ * languages, even for desynchronized languages. They only need to share the
+ * same ls_sid and a valid ls_aid.
+ *
+ * @param $type
+ *   The survey node object.
+ * @param $nids
+ *   A string. The list of answer nodes to compare. Glue is '-'.
+ *
+ * @return
+ *   A boolean. TRUE if access is granted.
+ */
+function ls_answ_compare_access($type, $nids) {
+  if (empty($type) || empty($nids) || !strpos($nids, '-') || !ls_answ_type_is_answer($type) || !user_access('access content')) {
+    return FALSE;
+  }
+  $all_nids = explode('-', $nids);
+  module_load_include('inc', 'ls_answ', 'ls_answ.answers');
+  if (count($all_nids) < 2 || ls_answ_compare_check_max_url($all_nids, 'node/compare/' . $type . '/') < 0) {
+    return FALSE;
+  }
+  foreach ($all_nids as $nid) {
+    if (!is_numeric($nid) || $nid <= 0) {
+      return FALSE;
+    }
+  }
+
+  $nodes = node_load_multiple($all_nids);
+  $disallow_compare = array(
+    LS_SYNC_SYNCHRONIZED_REVISION,
+    LS_SYNC_DESYNCHRONIZED_ANSWER,
+    LS_SYNC_DESYNCHRONIZED_SURVEY,
+    LS_SYNC_DESYNCHRONIZED_SID,
+    LS_SYNC_DESYNCHRONIZED_SERVER,
+  );
+  foreach ($nodes as $node) {
+    if (!$node || !ls_answ_type_is_answer($node->type) || (isset($first_node) && $node->ls_sid != $first_node->ls_sid) || in_array($node->ls_sync, $disallow_compare) || !node_access('view', $node)) {
+      if (!isset($first_node)) {
+        $first_node = $node;
+      }
+      return FALSE;
+    }
+  }
+  return TRUE;
+}
+
+/**
+ * Implements hook_theme().
+ *
+ * Display your LimeSurvey website into an iframe.
+ */
+function ls_answ_theme($existing, $type, $theme, $path) {
+  return array(
+    'ls_answ_iframe.tpl' => array(
+      'template' => 'ls_answ_iframe',
+      'variables' => array(
+        'url' => '',
+        'width' => '100%',
+        'height' => '700',
+      ),
+    ),
+    'ls_answ_iframe_end.tpl' => array(
+      'template' => 'ls_answ_iframe_end',
+      'variables' => array('text' => ''),
+    ),
+  );
+}
+
+/**
+ * Implements hook_load().
+ *
+ * Load specific datas from the {ls_answ} table.
+ */
+function ls_answ_load($nodes) {
+  foreach ($nodes as $nid => $record) {
+    $additions = db_query('SELECT ls_status, ls_sync, ls_last_import, ls_sid, ls_lang, ls_aid, ls_token FROM {ls_answ} WHERE vid = :vid', array(':vid' => $record->vid))->fetchAssoc();
+    foreach ($additions as $property => $value) {
+      $nodes[$nid]->$property = $value;
+    }
+  }
+}
+
+/**
+ * Implements hook_prepare().
+ *
+ * Load specific datas from the {ls_answ} table if the node is new.
+ */
+function ls_answ_prepare(&$node) {
+  // This is a new node, set default values.
+  // Handle title :
+  module_load_include('inc', 'ls_answ', 'ls_answ');
+  if (empty($node->title)) {
+    $node->title = ls_answ_create_title($node->type);
+  }
+  // Handle specific datas from the {ls_answ} table :
+  if (empty($node->ls_sid) || empty($node->ls_lang)) {
+    $node_survey = ls_answ_find_survey($node->type);
+    if (empty($node->ls_sid)) {
+      $node->ls_sid = $node_survey->ls_sid;
+    }
+    if (empty($node->ls_lang)) {
+      $node->ls_lang = $node_survey->ls_lang;
+    }
+  }
+  if (empty($node->ls_status)) {
+    $node->ls_status = LS_STATUS_VIRGIN;
+  }
+  if (empty($node->ls_token)) {
+    $node->ls_token = '';
+  }
+  if (empty($node->ls_aid)) {
+    $node->ls_aid = 0;
+  }
+  // Check the ls_sync value :
+  if (empty($node->ls_sync)) {
+    $node->ls_sync = ls_answ_check_sync($node);
+  }
+  if (empty($node->ls_last_import)) {
+    $node->ls_last_import = 0;
+  }
+}
+
+/**
+ * Implements hook_insert().
+ *
+ * Insert specific datas to the {ls_answ} table.
+ */
+function ls_answ_insert($node) {
+  $id = db_insert('ls_answ')
+  ->fields(array(
+    'vid' => $node->vid,
+    'nid' => $node->nid,
+    'ls_status' => $node->ls_status,
+    'ls_sync' => $node->ls_sync,
+    'ls_last_import' => $node->ls_last_import,
+    'ls_sid' => $node->ls_sid,
+    'ls_lang' => $node->ls_lang,
+    'ls_aid' => $node->ls_aid,
+    'ls_token' => $node->ls_token,
+  ))
+  ->execute();
+}
+
+/**
+ * Implements hook_update().
+ *
+ * Update specific datas to the {ls_answ} table.
+ */
+function ls_answ_update($node) {
+  // If this is a new node or we're adding a new revision,
+  if ($node->revision) {
+    // If we are adding a new revision
+    ls_answ_insert($node);
+  }
+  else {
+    db_update('ls_answ')
+  ->fields(array(
+      'nid' => $node->nid,
+      'ls_status' => $node->ls_status,
+      'ls_sync' => $node->ls_sync,
+      'ls_last_import' => $node->ls_last_import,
+      'ls_sid' => $node->ls_sid,
+      'ls_lang' => $node->ls_lang,
+      'ls_aid' => $node->ls_aid,
+      'ls_token' => $node->ls_token,
+    ))
+  ->condition('vid', $node->vid)
+  ->execute();
+  }
+}
+
+/**
+ * Implements hook_delete().
+ *
+ * When a node is deleted, we need to remove all related records from the
+ * {ls_answ} table and on the LimeSurvey database.
+ */
+function ls_answ_delete($node) {
+  // Notice that we're matching all revision, by using the node's nid.
+  // Synchronize the LimeSurvey database.
+
+  // Deleting the corresponding answer entries.
+  module_load_include('inc', 'ls_answ', 'ls_answ');
+  ls_answ_clean_delete_answer($node, 'nid');
+
+
+  // And deleting the actual token entry.
+  if (!empty($node->ls_sid) && !empty($node->ls_token)) {
+    // Load the survey properties.
+    module_load_include('inc', 'limesurvey_sync', 'ls_api/limesurvey_sync_api_survey');
+    $survey_properties = limesurvey_sync_survey_properties($node->ls_sid);
+    if ($survey_properties['tokens_table']) {
+      module_load_include('inc', 'limesurvey_sync', 'ls_api/limesurvey_sync_api_answ');
+      limesurvey_sync_answ_delete_token($node->ls_sid, $node->ls_token);
+    }
+  }
+
+  // Update the {ls_answ} table.
+  db_delete('ls_answ')
+  ->condition('nid', $node->nid)
+  ->execute();
+}
+
+/**
+ * Implements hook_node_revision_delete().
+ */
+function ls_answ_node_revision_delete($node) {
+  // Synchronize the LimeSurvey database, deleting answers.
+  // Deleting the corresponding answer entries.
+  module_load_include('inc', 'ls_survey', 'ls_survey.type');
+  $options = variable_get('ls_answ_options_' . $node->type, ls_survey_answ_default_options());
+  if (!$options['ls_keep_revisions']) {
+    module_load_include('inc', 'ls_answ', 'ls_answ');
+    ls_answ_clean_delete_answer($node, 'vid');
+  }
+
+  // Notice that we're matching a single revision based on the node's vid.
+  db_delete('ls_answ')
+  ->condition('vid', $node->vid)
+  ->execute();
+}
+
+/**
+ * Implements hook_node_presave().
+ */
+function ls_answ_node_presave($node) {
+  module_load_include('inc', 'ls_survey', 'ls_survey.type');
+  $options = variable_get('ls_answ_options_' . $node->type, ls_survey_answ_default_options());
+
+  // Try first to recycle a virgin answer from the same user :
+  if (empty($node->nid) && $options['ls_recycling'] && $node->ls_sync == LS_SYNC_UNSYNCHRONIZED) {
+    // This is a new node :
+    // We check if there is a recyclable virgin answer available for that
+    // user.
+
+    // Search for an available old node to be recycled.
+    $time = REQUEST_TIME;
+    $expire_date = $time - $options['ls_validuntil'];
+    $recyclable_query = db_query("SELECT n.nid AS node_nid FROM {node} n
+      JOIN {node_revision} node_revision ON n.nid = node_revision.nid AND n.vid = node_revision.vid
+      JOIN {ls_answ} lsa ON lsa.nid = node_revision.nid AND lsa.vid = node_revision.vid
+      WHERE n.type = :ntype AND ls_status = :ls_status AND ls_sync = :ls_sync AND ls_last_import < :ls_last_import
+      ORDER BY ls_last_import ASC", array(':ntype' => $node->type, ':ls_status' => LS_STATUS_VIRGIN, ':ls_sync' => LS_SYNC_UNSYNCHRONIZED, ':ls_last_import' => $expire_date));
+    while ($recyclable_row = $recyclable_query->fetchAssoc()) {
+      // There is at least one recyclable virgin answer.
+      $node_recyclable = node_load($recyclable_row['node_nid']);
+      // Check condition for recycling :
+      $no_revision_yet = ($node_recyclable->created == $node_recyclable->changed);
+      $body_lang = ls_answ_body_language($node_recyclable);
+      $empty_body = (empty($node_recyclable->body[$body_lang][0]['value']));
+      if ($no_revision_yet && $empty_body) {
+        // Recycling in progress.
+        $node->nid = $node_recyclable->nid;
+        $node->vid = $node_recyclable->vid;
+        // Set references from current associated survey node.
+        module_load_include('inc', 'ls_answ', 'ls_answ');
+        $node_survey = ls_answ_find_survey($node->type);
+        $node->ls_sid = $node_survey->ls_sid;
+        $node->ls_lang = $node_survey->ls_lang;
+        // Load the survey properties.
+        module_load_include('inc', 'limesurvey_sync', 'ls_api/limesurvey_sync_api_survey');
+        $survey_properties = limesurvey_sync_survey_properties($node->ls_sid);
+        if ($survey_properties['tokens_table']) {
+          $node->ls_token = (!empty($node_recyclable->ls_token)) ? $node_recyclable->ls_token : limesurvey_sync_answ_create_token($node->ls_sid);
+        }
+        else {
+          $node->ls_token = '';
+        }
+        // Overwrite the creation date to makeup the recycling :
+        // Overwrite the changed date is necessary to bypass control into
+        // the node_last_changed() core function.
+        $node->created = $node->changed = $time;
+
+        if ($options['ls_export_token'] && !empty($node->ls_token) && $survey_properties['tokens_table']) {
+          // To update name and emails stored into the LimeSurvey database,
+          // if they have been edited in the meanwhile from the Drupal
+          // site.
+          limesurvey_sync_answ_delete_token($node->ls_sid, $node->ls_token);
+        }
+        // We need only one node. Stop the loop.
+        break;
+      }
+    }
+  }
+
+}
+
+/**
+ * Implements hook_node_update().
+ */
+function ls_answ_node_update($node) {
+  // Use the hook_node_update() instead of the hook_update() function, thanks
+  // to this comment : http://api.drupal.org/node/19142#comment-14649.
+
+  if (!ls_answ_type_is_answer($node->type)) {
+    return;
+  }
+  // Set the desync/sync revision status for the previous revision.
+  module_load_include('inc', 'ls_survey', 'ls_survey.type');
+  $options = variable_get('ls_answ_options_' . $node->type, ls_survey_answ_default_options());
+  // The old_vid value is needed, provided by the node_save() function,
+  // that why this stuff must be called just after the node_save() without
+  // reloading the node.
+  if ($options['ls_keep_revisions'] && !empty($node->old_vid)) {
+    // If reverting back to an answer node, the old_vid provided is the revert
+    // revision, we need the previous current revision to.
+    $prev_node = node_load($node->nid, $node->old_vid);
+    module_load_include('inc', 'ls_answ', 'ls_answ');
+    if ($prev_node && $node->log == t('Copy of the revision from %date.', array('%date' => format_date($prev_node->revision_timestamp)))) {
+      // It is a revert from an old revision.
+      $old_curr_vid = db_query_range('SELECT vid FROM {node_revision} WHERE nid = :nid ORDER BY vid DESC', 1, 1, array(':nid' => $node->nid))->fetchField();
+      $prev_cur_node = (!empty($old_curr_vid)) ? node_load($node->nid, $old_curr_vid) : FALSE;
+      ls_answ_sync_node($prev_cur_node);
+    }
+    if ($prev_node && $prev_node->ls_sid == $node->ls_sid) {
+      // Reset the protected list.
+      $list = ls_answ_list_protected_ref($prev_node->ls_sid, $prev_node->ls_aid, $prev_node->ls_token, TRUE);
+      ls_answ_sync_node($prev_node);
+    }
+  }
+}
+
+/**
+ * Implements hook_form_BASE_FORM_ID_alter().
+ *
+ * Display options on the node editing form for answers content types.
+ */
+function ls_answ_form_node_form_alter(&$form, &$form_state, $form_id) {
+
+  if (isset($form['type']['#value']) && $form_id == $form['type']['#value'] . '_node_form' && ls_answ_type_is_answer($form['type']['#value'])) {
+    // Disable the overlay.
+    // The overlay core module doesn't like external urls (issue :
+    // http://drupal.org/node/1152314). The LimeSurvey sync module checks the
+    // http_referrer in order to allow to access to the LimeSurvey form page.
+    // Overlay is not compatible with such feature. Disable it for the answers
+    // node_edit pages.
+    module_load_include('inc', 'limesurvey_sync', 'limesurvey_sync');
+    limesurvey_sync_disable_overlay();
+
+    $node = $form['#node'];
+    module_load_include('inc', 'limesurvey_sync', 'ls_api/limesurvey_sync_api_survey');
+    $survey_properties = limesurvey_sync_survey_properties($node->ls_sid);
+    // Load survey options for redirection.
+    module_load_include('inc', 'ls_survey', 'ls_survey.type');
+    // If the node does not use tokens persistence: don't create the node.
+    if (empty($node->nid) && !$survey_properties['tokenanswerspersistence']) {
+      // Delete all stuff.
+      $form = array();
+      // Redirect to intermediate submit form page.
+      drupal_goto('toform/' . $node->type);
+    }
+    else {
+      // Call a function at an early stage of the submit process.
+      array_unshift($form['actions']['submit']['#submit'], 'ls_answ_node_form_submit_handler');
+
+      // Add an ultimate submit function for specific redirection
+      $form['actions']['submit']['#submit'][] = 'ls_answ_node_form_submit_redirect';
+
+      // Customise buttons.
+      $form['actions']['preview']['#access'] = FALSE;
+
+      // Handle the Language setting of the answer node.
+      // This code should be called after the locale_form_node_type_form_alter()
+      // function.
+      $import_language = FALSE;
+      //$default_language = limesurvey_sync_lang_convert($node->ls_lang);
+      $type = $form['type']['#value'];
+      module_load_include('inc', 'ls_answ', 'ls_answ');
+      $import_language = ls_answ_validlang_dp_nodelanguage($node);
+      if (!empty($import_language)) {
+        // Make sure this language is enabled.
+        if (isset($form['language']['#options'][$import_language])) {
+          $form['language']['#default_value'] = $import_language;
+        }
+      }
+      if (module_exists('locale') && variable_get("language_content_type_$type", 0) && isset($form['language'])) {
+        // Hide the language select box.
+        module_load_include('inc', 'ls_survey', 'ls_survey.type');
+        $options = variable_get("ls_answ_options_$type", ls_survey_answ_default_options());
+        if ($options['ls_hide_lang']) {
+          $form['language']['#type'] = 'hidden';
+          $form['language']['#value'] = $form['language']['#default_value'];
+          unset($form['language']['#default_value']);
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_enable().
+ *
+ * Display message on enabling the ls_answ module
+ */
+function ls_answ_enable() {
+  drupal_set_message(t('LimeSurvey Sync Responses module enabled'));
+  // When enabling, automatic reassociate survey with their associated answers
+  // content type.
+  $bt_query = db_query("SELECT nt.type AS broken_type, n.nid AS survey_nid, n.title AS survey_title
+  FROM {ls_survey} lss
+  JOIN {node} n ON n.nid = lss.nid AND n.vid = lss.vid
+  JOIN {node_type} nt ON nt.orig_type = lss.ls_orig_type
+  WHERE module = :module", array(':module' => 'node'));
+  while ($bt = $bt_query->fetchAssoc()) {
+    $type = node_type_get_type($bt['broken_type']);
+    if ($type) {
+      $type->module = 'ls_answ';
+      $type->base = 'ls_answ';
+      $type->locked = FALSE;
+      $type->custom = FALSE;
+      $status = node_type_save($type);
+      if ($status == SAVED_UPDATED) {
+        // Switch back to the ls_answ module for managing permissions.
+        variable_set('node_permissions_' . $type->type, 0);
+        $content_type_link = l($type->name, 'admin/structure/types/manage/' . $type->type);
+        $variable = array(
+          '!name' => $content_type_link,
+          '!survey' => l($bt['survey_title'], 'node/' . $bt['survey_nid']),
+        );
+        $variable_wd = array(
+          '%name' => $type->name,
+          '%survey' => $bt['survey_title'],
+        );
+        drupal_set_message(t('The responses content type !name has been associated again to the survey !survey.', $variable));
+        watchdog('ls_answ', 'The responses content type %name has been associated again to the survey %survey.', $variable_wd, WATCHDOG_NOTICE, $content_type_link);
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_disable().
+ *
+ * Display messages on disabling the ls_survey module
+ */
+function ls_answ_disable() {
+  drupal_set_message(t('LimeSurvey Sync Responses module disabled'));
+}
+
+/**
+ * Implements hook_view().
+ *
+ * The node answer page will be displayed answers datas and suggest to fill
+ * or completed the answer if needed.
+ */
+function ls_answ_view($node, $view_mode) {
+  module_load_include('inc', 'ls_answ', 'ls_answ');
+  // Synchronize the node first.
+  $sync_node = ls_answ_sync_node($node);
+  // Reload the node if it has been updated.
+  if (!is_string($sync_node) && $sync_node != $node) {
+    $node = $sync_node;
+    // Node body as been updated, the node needs to be prepare again. If note :
+    // an error occure during the node_build_content() function. Hook weight
+    // won't help.
+    // hook_view can be called from 'node/'.$node->nid' or for revisions
+    // 'node/'.$node->nid.'/revisions/'.$node->vid'/view'.
+    drupal_goto(check_plain($_GET['q']));
+  }
+
+  if (in_array($node->ls_sync, array(LS_SYNC_UNSYNCHRONIZED, LS_SYNC_SYNCHRONIZED))) {
+    module_load_include('inc', 'ls_survey', 'ls_survey');
+    switch ($node->ls_status) {
+      case LS_STATUS_VIRGIN:
+        // The answer is virgin, it has not be filled : suggest to fill it.
+        $node->content['ls_answ'] = array(
+          '#markup' => ls_survey_theme_box(t('Respond to the survey'), l(t('Respond to the survey'), 'node/' . $node->nid . '/edit')),
+          '#weight' => -1,
+        );
+        break;
+      case LS_STATUS_EDITING:
+        // The answer statut is editing, suggest to complete it.
+        $node->content['ls_answ'] = array(
+          '#markup' => ls_survey_theme_box(t('Complete the answer'), l(t('Respond to the survey'), 'node/' . $node->nid . '/edit')),
+          '#weight' => -1,
+        );
+        break;
+    }
+  }
+  return $node;
+}
+
+/**
+ * Implements hook_form().
+ *
+ * The answer node form allows to ask for editing the survey answer on the
+ * LimeSurvey site and manage specific fields from the {ls_answ} drupal table.
+ *
+ * @see ls_answ_node_form_submit_handler()
+ * @see ls_answ_node_form_submit_redirect()
+ */
+function ls_answ_form(&$node) {
+
+  // Load file for the ls_answ_sync_node() and the ls_answ_sync_message()
+  // functions.
+  module_load_include('inc', 'ls_answ', 'ls_answ');
+  // Synchronize the node first.
+  if (!empty($node->nid)) {
+    $sync_node = ls_answ_sync_node($node);
+    // Reload the node if it has been updated.
+    if (!is_string($sync_node) && $sync_node != $node) {
+      // Reload the page to update the $form['#node'] variable (it can't be
+      // updated from here).
+      drupal_goto('node/' . $sync_node->nid . '/edit');
+    }
+  }
+  elseif (module_exists('rules')) {
+    // Ask to create a new node answer.
+    rules_invoke_event('ls_answ_ask_new_answer', $node);
+    rules_invoke_event('ls_answ_ask_new_answer--' . $node->type, $node);
+  }
+
+  module_load_include('inc', 'limesurvey_sync', 'ls_api/limesurvey_sync_api_survey');
+  $survey_properties = limesurvey_sync_survey_properties($node->ls_sid);
+  // Load survey options for redirection.
+  module_load_include('inc', 'ls_survey', 'ls_survey.type');
+  $options = variable_get('ls_answ_options_' . $node->type, ls_survey_answ_default_options());
+  // If the node does not use tokens persisitence: don't create the node.
+  if (empty($node->nid) && !$survey_properties['tokenanswerspersistence']) {
+    // The hook_form_alter() fonction will clean the form and take care of the
+    // redirection to a new submit page.
+    return array();
+  }
+  // The site admin can decide if this node type has a title and body, and how
+  // the fields should be labeled. We need to load these settings so we can
+  // build the node form correctly.
+  $type = node_type_get_type($node);
+
+  if ($type->has_title) {
+    $form['title'] = array(
+      '#type' => 'textfield',
+      '#title' => check_plain($type->title_label),
+      '#required' => TRUE,
+      '#default_value' => check_plain($node->title),
+      '#weight' => -5,
+    );
+  }
+
+  // The node does have a body but only the module can edit it.
+  $form['body']['#access'] = FALSE;
+  // In order to avoid a notice error from the locale_field_node_form_submit()
+  // core function when the body access is FALSE, define the
+  // $form['body']['#language'] value.
+  if (module_exists('locale')) {
+    $form['body']['#language'] = ls_answ_body_language($node);
+  }
+
+  $disabled_title = ($options['ls_disabled_title']) ? TRUE : FALSE;
+  if ($disabled_title) {
+    $form['title']['#value'] = $form['title']['#default_value'];
+    unset($form['title']['#default_value']);
+    $form['title']['#disabled'] = 1;
+    $form['title']['#description'] = t('The title can not be changed');
+  }
+
+  // Initialisation for desynchronization stuff.
+  $edition_forbiden = array(
+    LS_SYNC_SYNCHRONIZED_REVISION,
+    LS_SYNC_DESYNCHRONIZED_TOKEN,
+    LS_SYNC_DESYNCHRONIZED_ANSWER,
+    LS_SYNC_DESYNCHRONIZED_SURVEY,
+    LS_SYNC_DESYNCHRONIZED_SID,
+    LS_SYNC_DESYNCHRONIZED_SERVER,
+  );
+  $edition_discouraged = array(
+    LS_SYNC_DESYNCHRONIZED_NODE,
+    LS_SYNC_DESYNCHRONIZED_TYPE,
+    LS_SYNC_DESYNCHRONIZED_LS_LANG,
+    LS_SYNC_DESYNCHRONIZED_LANG,
+    LS_SYNC_DESYNCHRONIZED_LS_SID,
+  );
+  $answer_disabled = $answer_discouraged = FALSE;
+
+  // Check for disabled answer.
+  $empty_body = empty($node->body[ls_answ_body_language($node)][0]['value']);
+  $disallow_edit = ((!empty($node->nid) && !$survey_properties['tokenanswerspersistence']) || (!$empty_body && $node->ls_status == LS_STATUS_COMPLETED && !$survey_properties['can_edit_answer']));
+  if (in_array($node->ls_sync, $edition_forbiden) || $disallow_edit) {
+    $answer_disabled = TRUE;
+  }
+  elseif (in_array($node->ls_sync, $edition_discouraged)) {
+    $answer_discouraged = TRUE;
+  }
+
+  $disabled_survey = !$survey_properties['is_available'];
+  if ($answer_disabled) {
+    $edit_description = t('The answer is not available for edition');
+    $disabled_edition = TRUE;
+    $check_edition = FALSE;
+  }
+  elseif ($disabled_survey) {
+    $edit_description = t('The survey is not currently available');
+    $disabled_edition = TRUE;
+    $check_edition = FALSE;
+  }
+  elseif ($answer_discouraged) {
+    $edit_description = t('You should not edit the answer');
+    $disabled_edition = FALSE;
+    $check_edition = FALSE;
+  }
+  else {
+    $edit_description = t('To edit the respond, check here and submit you will be then redirected to the survey form');
+    // Automatic access to the LimeSurvey form if the node is new or into
+    // the editing stage.
+    $disabled_edition = FALSE;
+    $check_edition = ($node->ls_status == LS_STATUS_EDITING) ? TRUE : ((empty($node->nid)) ? TRUE : FALSE);
+  }
+
+  $form['edit_answer'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Edit the survey respond'),
+    '#description' => $edit_description,
+    '#default_value' => $check_edition,
+    '#return_value' => 1,
+    '#disabled' => $disabled_edition,
+    // Displayed at the top of the node edit form.
+    '#weight' => -5,
+  );
+
+  // Change on the 1.2 version : hide the checkbox for new answers.
+  if (empty($node->nid)) {
+    $form['edit_answer']['#type'] = 'hidden';
+    $form['edit_answer']['#value'] = $form['edit_answer']['#default_value'];
+    $form['ls_message'] = array(
+      '#type' => 'markup',
+      '#markup' => '<strong>' . t('Submit this page in order to access to the survey form.') . '</strong>',
+      '#weight' => -2,
+    );
+  }
+
+  // These elements are just values so they are not even sent to the client.
+  foreach (array('ls_status', 'ls_sync', 'ls_last_import', 'ls_sid', 'ls_lang', 'ls_aid', 'ls_token') as $key) {
+    $form[$key] = array(
+      '#type' => 'value',
+      '#value' => isset($node->$key) ? $node->$key : '',
+    );
+  }
+
+  // Check for desynchronizations, but display messages only (no error
+  // messages).
+  if ($node->ls_sync >= LS_SYNC_SYNCHRONIZED_REVISION) {
+    $message = ls_answ_sync_message($node);
+    if ($message) {
+      // Translation strings are declared into the $extract_t variable.
+      drupal_set_message(t($message['message'], $message['arguments']), 'warning');
+    }
+  }
+
+  return $form;
+}
+
+/**
+ * Implements hook_validate().
+ *
+ * Manage validation for the specific fields from the {ls_answ} drupal table.
+ */
+function ls_answ_validate($node, &$form) {
+
+  // Handle the ls_status field
+  $ls_status_values = ls_answ_ls_values('ls_status');
+  if (!in_array($node->ls_status, $ls_status_values)) {
+    form_set_error('ls_status', t('The answer status is not valid'));
+  }
+
+  // Handle the ls_sync field
+  $ls_sync_values = ls_answ_ls_values('ls_sync');
+  if (!in_array($node->ls_sync, $ls_sync_values)) {
+    form_set_error('ls_sync', t('The answer synchronization status is not valid'));
+  }
+
+  // Handle the ls_last_import field
+  if (!is_numeric($node->ls_last_import)) {
+    form_set_error('ls_last_import', t('The answer last import date is not valid'));
+  }
+
+  // Handle the ls_token field
+  if (!is_string($node->ls_token)) {
+    form_set_error('ls_token', t('The answer token is not valid'));
+  }
+
+  // Handle the ls_sid and ls_lang field
+  module_load_include('inc', 'limesurvey_sync', 'ls_api/limesurvey_sync_api_survey');
+  $survey_properties = limesurvey_sync_survey_properties($node->ls_sid);
+  if (!is_numeric($node->ls_sid)) {
+    form_set_error('ls_sid', t('The survey ID is not valid.'));
+  }
+
+  // Check the ls_lang parameter.
+  if (!is_string($node->ls_lang) || empty($node->ls_lang)) {
+    form_set_error('ls_lang', t('The survey language is not valid.'));
+  }
+
+  // Make sure the there is only one user at time updating an answer.
+  // Find the most recent user editing the node :
+  $last_user = (isset($node->revision_uid)) ? $node->revision_uid : $node->uid;
+  // Check for expiration :
+  module_load_include('inc', 'ls_survey', 'ls_survey.type');
+  $options = variable_get('ls_answ_options_' . $node->type, ls_survey_answ_default_options());
+  $time = REQUEST_TIME;
+  $edition_has_expired = ($time > ($node->ls_last_import + $options['ls_validuntil']));
+  global $user;
+  if (!empty($node->nid) && $user->uid != $last_user && !$edition_has_expired) {
+    form_set_error('', t('Only one user at a time can edit an answer'));
+  }
+
+  // Check for parameters on LS settings.
+  if ($node->edit_answer) {
+    if (!$survey_properties['is_available']) {
+      form_set_error('edit_answer', t('The survey is not currently available'));
+    }
+    $edition_forbiden = array(
+      LS_SYNC_SYNCHRONIZED_REVISION,
+      LS_SYNC_DESYNCHRONIZED_TOKEN,
+      LS_SYNC_DESYNCHRONIZED_ANSWER,
+      LS_SYNC_DESYNCHRONIZED_SURVEY,
+      LS_SYNC_DESYNCHRONIZED_SID,
+      LS_SYNC_DESYNCHRONIZED_SERVER,
+    );
+    $desync = (in_array($node->ls_sync, $edition_forbiden));
+    module_load_include('inc', 'ls_answ', 'ls_answ');
+    $empty_body = empty($node->body[ls_answ_body_language($node)][0]['value']);
+    $disallow_edit = ((!empty($node->nid) && !$survey_properties['tokenanswerspersistence']) || (!$empty_body && $node->ls_status == LS_STATUS_COMPLETED && !$survey_properties['can_edit_answer']));
+    if ($disallow_edit || $desync) {
+      form_set_error('edit_answer', t('You are not allowed to edit this answer.'));
+    }
+  }
+}
+
+/**
+ * Early submit handler for the node edit form.
+ *
+ * This submit handler is called before the node saving process begins : it
+ * updates values if the user wants to create or modify the answers on the
+ * LimeSurvey site.
+ */
+function ls_answ_node_form_submit_handler($form, &$form_state) {
+  module_load_include('inc', 'limesurvey_sync', 'ls_api/limesurvey_sync_api_survey');
+  $survey_properties = limesurvey_sync_survey_properties($form_state['values']['ls_sid']);
+
+  if (!empty($form_state['values']['edit_answer'])) {
+
+    // Insert a new node.
+    $node_is_new = empty($form_state['values']['nid']);
+
+    module_load_include('inc', 'limesurvey_sync', 'ls_api/limesurvey_sync_api_answ');
+    // The answer node is going to be edited from the LimeSurvey interface :
+    $form_state['values']['ls_status'] = LS_STATUS_EDITING;
+    $form_state['values']['ls_sync'] = LS_SYNC_UNSYNCHRONIZED;
+    $time = REQUEST_TIME;
+    $form_state['values']['ls_last_import'] = $time;
+    $separator = (!empty($form_state['values']['log'])) ?  '; ' : '';
+    $form_state['values']['log'] .= $separator . t('The answer is being edited');
+    module_load_include('inc', 'ls_survey', 'ls_survey.type');
+    $options = variable_get('ls_answ_options_' . $form_state['values']['type'], ls_survey_answ_default_options());
+    if ($options['ls_standing_by_status']) {
+      $form_state['values']['status'] = NODE_NOT_PUBLISHED;
+    }
+
+    if ($node_is_new || empty($form_state['values']['revision'])) {
+      // Create or update the invitation, modifying ls_token id needed.
+      if ($survey_properties['tokens_table']) {
+        $form_state['values']['ls_token'] = limesurvey_sync_answ_set_invit($form_state['values']['type'], $form_state['values']['ls_sid'], $form_state['values']['ls_lang'], $form_state['values']['ls_token'], $form_state['values']['name']);
+      }
+      // Set submitdate = NULL for this answer into the LimeSurvey database to
+      // allow this answer to be edited, or do nothing if the answer does not
+      // exist yet.
+      // Update token value into the LimeSurvey answer table if needed.
+      limesurvey_sync_answ_reactivate_answer($form_state['values']['ls_sid'], $form_state['values']['ls_aid'], $form_state['values']['ls_token']);
+    }
+    else {
+      // Delete the old answer into the LimeSurvey database depending on survey
+      // options.
+      if ($options['ls_keep_revisions']) {
+        // If we are adding a new revision, copy the answer into the LimeSurevy
+        // database, and retrieve the corresponding ls_token and ls_aid.
+        $new_ls = limesurvey_sync_answ_duplicate_answer($form_state['values']['ls_sid'], $form_state['values']['ls_aid'], $form_state['values']['ls_token'], ($form_state['values']['ls_status'] == LS_STATUS_EDITING));
+        // Delete the old invitation.
+        if (!empty($form_state['values']['ls_token']) && $survey_properties['tokens_table']) {
+          limesurvey_sync_answ_delete_token($form_state['values']['ls_sid'], $form_state['values']['ls_token']);
+          // And create a new one including the new token, and save it.
+          $form_state['values']['ls_token'] = limesurvey_sync_answ_set_invit($form_state['values']['type'], $form_state['values']['ls_sid'], $form_state['values']['ls_lang'], $new_ls['ls_token'], $form_state['values']['name']);
+        }
+        // Save new value of ls_aid.
+        $form_state['values']['ls_aid'] = $new_ls['ls_aid'];
+      }
+      else {
+        if ($survey_properties['tokens_table']) {
+          $form_state['values']['ls_token'] = limesurvey_sync_answ_set_invit($form_state['values']['type'], $form_state['values']['ls_sid'], $form_state['values']['ls_lang'], $form_state['values']['ls_token'], $form_state['values']['name']);
+        }
+        limesurvey_sync_answ_reactivate_answer($form_state['values']['ls_sid'], $form_state['values']['ls_aid'], $form_state['values']['ls_token']);
+      }
+    }
+  }
+}
+
+/**
+ * Ultimate submit handler for the node edit form.
+ *
+ * This submit handler is called after the node saving process : it manage
+ * http redirection if the user wants to modify the answers on the LimeSurvey
+ * website. Options can alter the redirection url.
+ */
+function ls_answ_node_form_submit_redirect($form, &$form_state) {
+
+  if (!empty($form_state['values']['edit_answer'])) {
+    $node = node_load($form_state['nid'], NULL, TRUE);
+    module_load_include('inc', 'ls_survey', 'ls_survey.type');
+    $options = variable_get('ls_answ_options_' . $node->type, ls_survey_answ_default_options());
+    $formated_nid = (!empty($form_state['nid'])) ? '/' . $form_state['nid'] : '';
+    module_load_include('inc', 'limesurvey_sync', 'ls_api/limesurvey_sync_api_survey');
+    $survey_properties = limesurvey_sync_survey_properties($form_state['values']['ls_sid']);
+    $frames = array('iframe', 'colorbox', 'lightbox2', 'modalframe', 'link');
+    if (in_array($options['ls_redirect'], $frames)) {
+      $form_state['redirect'] = 'form/' . $form_state['values']['type'] . $formated_nid;
+    }
+    elseif ($options['ls_redirect'] == 'redirect') {
+      module_load_include('inc', 'limesurvey_sync', 'ls_api/limesurvey_sync_api_answ');
+      $form_state['redirect'] = limesurvey_sync_answ_surveyurl($node);
+    }
+    elseif ($options['ls_redirect'] == 'form') {
+      $form_state['redirect'] = 'toform/' . $form_state['values']['type'] . $formated_nid;
+    }
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * This code is fire when a user switch back to an answer node old revision.
+ */
+function ls_answ_form_node_revision_revert_confirm_alter(&$form, &$form_state, $form_id) {
+  $node_revision = $form['#node_revision'];
+  if (ls_answ_type_is_answer($node_revision->type)) {
+    // Add an ultimate submit handler, synchronizing the new revision.
+    $form['#submit'][] = 'ls_answ_node_revision_revert_confirm_resync';
+  }
+}
+
+/**
+ *  Submit limesurvey_sync module options.
+ *
+ * Synchronized the new current node.
+ */
+function ls_answ_node_revision_revert_confirm_resync($form, &$form_state) {
+  module_load_include('inc', 'ls_answ', 'ls_answ');
+  $node_revision = $form['#node_revision'];
+  // Reload the newly copyied current revision.
+  $node = node_load($node_revision->nid);
+  // Synchronize it.
+  $sync_node = ls_answ_sync_node($node);
+  // Don't Display resync message.
+}
+
+/**
+ * Redirect to the "all answers" page of the associated survey node.
+ *
+ * @param $node
+ *   An answer node object.
+ */
+function ls_answ_tosurvey($node) {
+  // $node_survey exists, it has been control into the
+  // ls_answ_tosurvey_access() function.
+  module_load_include('inc', 'ls_answ', 'ls_answ');
+  $node_survey = ls_answ_find_survey($node->type);
+  drupal_goto('node/' . $node_survey->nid . '/answ');
+}
+
+/**
+ * Return TRUE if the provided type value is a LimeSurvey answer type.
+ *
+ * @param $type
+ *   A node object or string that indicates the node type to evaluate.
+ *
+ * @return
+ *   An Boolean.
+ */
+function ls_answ_type_is_answer($type) {
+  return (node_type_get_base($type) == 'ls_answ');
+}
+
+/**
+ * Implements hook_views_api().
+ *
+ * Make the synchronization fields available for the Views module.
+ */
+function ls_answ_views_api() {
+  return array(
+    'api' => 3,
+    'path' => drupal_get_path('module', 'ls_answ') . '/views',
+  );
+}
+
+/**
+ * Implements  MODULE_process_HOOK().
+ *
+ * Delete sidebar, footer, etc.. for the page showed into the iframe in
+ * order to avoid a 'mise en abyme' visual effect (a Drupal page into a Drupal
+ * page). The system/page.tpl.php file is used to render thoses variables.
+ */
+function ls_answ_process_page(&$variables) {
+  $arg = arg();
+  if (count($arg) == 3 && $arg[0] == 'backfromsurvey' && $arg[2] == 'back' && ls_answ_type_is_answer($arg[1])) {
+    //Overwrite template_preprocess_page() region settings.
+    global $theme;
+    // Retrieve all block regions.
+    $regions = system_region_list($theme);
+    // Remove all region content assigned via blocks.
+    foreach (array_keys($regions) as $region) {
+      if ($region != 'content') {
+        $variables['page'][$region] = NULL;
+      }
+    }
+    // Delete all stuff except content.
+    $variables['logo']           = NULL;
+    $variables['site_name']      = NULL;
+    $variables['site_slogan']    = NULL;
+    $variables['main_menu']      = NULL;
+    $variables['secondary_menu'] = NULL;
+    $variables['action_links']   = NULL;
+    $variables['tabs']           = NULL;
+    $variables['breadcrumb']     = NULL;
+    $variables['title_prefix']   = NULL;
+    $variables['title']          = NULL;
+    $variables['help']           = NULL;
+    $variables['feed_icons']     = NULL;
+    $variables['site_slogan']    = NULL;
+    $variables['messages']       = NULL;
+  }
+  // @TODO: The id#footer-wrapper div still persists, throwing an ugly footer
+  // background. The only way to prevent this is to create an alternative
+  // page.tpl.php file from scratch, storing it into the ls_answ module folder.
+  // That a minor issue, this ugly page is shown during only 0.1s, the
+  // time to close the frame by javascript.
+}
+
+/**
+ * Implements hook_preprocess_maintenance_page().
+ *
+ * Keep all variables consistent. The system/maintenance-page.tpl.php file is
+ * used to render thoses variables.
+ */
+function ls_answ_process_maintenance_page(&$variables) {
+  ls_answ_process_page($variables);
+}
+
+/**
+ * Implements hook_admin_paths().
+ *
+ * Display survey options page, synchronization page, all responses page as
+ * admin theme.
+ */
+function ls_answ_admin_paths() {
+  // Code from book_admin_paths().
+  if (variable_get('node_admin_theme')) {
+    $paths = array(
+      'node/*/options' => TRUE,
+      'node/*/ls-import' => TRUE,
+      'node/*/answ' => TRUE,
+    );
+    return $paths;
+  }
+}
+
+/**
+ * Implements hook_options_list().
+ *
+ * Return the options lists for the node ls_status property.
+ */
+function ls_answ_metadata_ls_status_options_list() {
+  $ls_status_list = ls_answ_ls_values('ls_status');
+  $list = array();
+  module_load_include('inc', 'ls_answ', 'ls_answ');
+  foreach ($ls_status_list as $ls_status) {
+    $list[$ls_status] = ls_answ_display_sync_fields('ls_status', $ls_status);
+  }
+  return $list;
+}
+
+/**
+ * Implements hook_options_list().
+ *
+ * Return the options lists for the node ls_sync property.
+ */
+function ls_answ_metadata_ls_sync_options_list() {
+  $ls_sync_list = ls_answ_ls_values('ls_sync');
+  $list = array();
+  module_load_include('inc', 'ls_answ', 'ls_answ');
+  foreach ($ls_sync_list as $ls_sync) {
+    $desynchronized = $ls_sync > LS_SYNC_SYNCHRONIZED_REVISION;
+    if ($ls_sync <= LS_SYNC_UNSYNCHRONIZED) {
+      $list[t('Unsynchronized')][$ls_sync] = ls_answ_display_sync_fields('ls_sync', $ls_sync);
+    }
+    else {
+      $level = ($ls_sync > LS_SYNC_SYNCHRONIZED_REVISION) ? t('Desynchronized') : t('Synchronized');
+      $list[$level][$ls_sync] = ls_answ_display_sync_fields('ls_sync', $ls_sync);
+    }
+  }
+  return $list;
+}
+
+/**
+ * Implements hook_options_list().
+ *
+ * Return the options lists for the node ls_sid property.
+ */
+function ls_answ_metadata_ls_sid_options_list() {
+  // Load the survey properties.
+  module_load_include('inc', 'limesurvey_sync', 'ls_api/limesurvey_sync_api_survey');
+  $survey_properties = limesurvey_sync_survey_properties('all');
+  $list = array();
+  module_load_include('inc', 'ls_answ', 'ls_answ');
+  foreach ($survey_properties as $ls_sid => $properties) {
+    $level = $properties['active'] ? t('Activated') : t('Inactivated');
+    $list[$level][$ls_sid] = ls_answ_display_sync_fields('ls_sid', $ls_sid);
+  }
+  return $list;
+}
+
+/**
+ * Implements hook_options_list().
+ *
+ * Return the options lists for the node ls_lang property.
+ */
+function ls_answ_metadata_ls_lang_options_list() {
+  // Load the survey properties.
+  module_load_include('inc', 'limesurvey_sync', 'ls_api/limesurvey_sync_api_survey');
+  $survey_properties = limesurvey_sync_survey_properties('all');
+  $list = array();
+  module_load_include('inc', 'ls_answ', 'ls_answ');
+  foreach ($survey_properties as $ls_sid => $properties) {
+    foreach ($properties['#lang'] as $ls_lang => $lg_properties) {
+      $level = t('Survey @sid', array('@sid' => ls_answ_display_sync_fields('ls_sid', $ls_sid)));
+      $list[$level][$ls_lang] = ls_answ_display_sync_fields('ls_lang', $ls_lang);
+    }
+  }
+  return $list;
+}
+
+/**
+ * Implements hook_options_list().
+ *
+ */
+function ls_answ_types_options_list() {
+  $options = array();
+  $types = node_type_get_types();
+  foreach ($types as $type => $info) {
+    if ($info->module == 'ls_answ') {
+      $options[$type] = $info->name;
+    }
+  }
+  return $options;
+}
+
+/**
+ * Return the ls_sync and ls_status allowed values.
+ */
+function ls_answ_ls_values($field) {
+  if ($field == 'ls_status') {
+    return array(
+      LS_STATUS_EMPTY,
+      LS_STATUS_VIRGIN,
+      LS_STATUS_EDITING,
+      LS_STATUS_COMPLETED,
+    );
+  }
+  elseif ($field == 'ls_sync') {
+    return array(
+      LS_SYNC_UNSYNCHRONIZED,
+      LS_SYNC_SYNCHRONIZED,
+      LS_SYNC_SYNCHRONIZED_REVISION,
+      LS_SYNC_DESYNCHRONIZED_LS_LANG,
+      LS_SYNC_DESYNCHRONIZED_LANG,
+      LS_SYNC_DESYNCHRONIZED_LS_SID,
+      LS_SYNC_DESYNCHRONIZED_NODE,
+      LS_SYNC_DESYNCHRONIZED_TYPE,
+      LS_SYNC_DESYNCHRONIZED_TOKEN,
+      LS_SYNC_DESYNCHRONIZED_ANSWER,
+      LS_SYNC_DESYNCHRONIZED_SURVEY,
+      LS_SYNC_DESYNCHRONIZED_SID,
+      LS_SYNC_DESYNCHRONIZED_SERVER,
+    );
+  }
+  return array();
+}

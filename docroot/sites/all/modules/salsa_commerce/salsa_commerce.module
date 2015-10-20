@@ -1,0 +1,942 @@
+<?php
+
+/**
+ * @file
+ * Module which is a connection between Salsa API module and Drupal commerce.
+ */
+
+function salsa_commerce_alter_donate_form(&$form, $form_state) {
+  unset($form['#action']);
+  unset($form['donate']['#suffix']);
+
+  $form['credit_card']['#access'] = FALSE;
+  $form['flash_message_js']['#access'] = FALSE;
+
+  // Add ajax handling to frequency selection.
+ if (isset($form['Donation']['recurring'])) {
+    $form['Donation']['recurring']['#ajax'] = array(
+      'callback' => 'salsa_commerce_ajax_payment_selection',
+      'wrapper' => 'salsa-commerce-payment-form',
+    );
+    $form['Donation']['payperiod']['#ajax'] = $form['Donation']['recurring']['#ajax'];
+ }
+
+  // Change amount options, append currency.
+  $currency_code = commerce_currency_get_code();
+  $currency_code = $currency_code[commerce_default_currency()];
+  $other_amount_key = isset($form['Donation']['other_amount']) ? 'other_amount' : 'amountOther';
+  $form['Donation'][$other_amount_key]['#field_suffix'] = '<span class="currency-suffix">' . $currency_code . '</span>';
+  foreach ($form['Donation']['amount']['#options'] as $key => &$option) {
+    if (!empty($key)) {
+      $option = t('@amount @currency_code', array('@amount' => $option, '@currency_code' => $currency_code));
+    }
+  }
+
+  $form['commerce_payment'] = salsa_commerce_payment_form($form, $form_state);
+  $form['commerce_payment']['#prefix'] = '<div id="salsa-commerce-payment-form">';
+  $form['commerce_payment']['#suffix'] = '</div>';
+
+  unset($form['actions']['donate']['#suffix']);
+}
+
+/**
+ * Implements hook_form_BASE_FORM_ID_alter().
+ */
+function salsa_commerce_form_salsa_donate_page_form_alter(&$form, $form_state, $form_id) {
+  salsa_commerce_alter_donate_form($form, $form_state);
+  $form['#validate'][] = 'salsa_commerce_donate_order_create_validate';
+  $form['#submit'][] = 'salsa_commerce_donate_order_create';
+}
+
+/**
+ * Implements hook_form_BASE_FORM_ID_alter().
+ */
+function salsa_commerce_form_salsa_my_donate_page_form_alter(&$form, &$form_state) {
+  salsa_commerce_alter_donate_form($form, $form_state);
+  // Peer to peer pages use a different field name for the other amount,
+  // provide that for the validate function.
+  $form_state['salsa_commerce_other_amount_field_name'] = 'amountOther';
+  $form['#validate'][] = 'salsa_commerce_donate_order_create_validate';
+  $form['#submit'][] = 'salsa_commerce_my_donate_order_create';
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function salsa_commerce_form_salsa_my_donate_page_create_form_alter(&$form, &$form_state) {
+  $currency_code = commerce_currency_get_code();
+  $currency_code = $currency_code[commerce_default_currency()];
+  unset($form['Donation_Goal']['#field_prefix']);
+  $form['Donation_Goal']['#field_suffix'] = $currency_code;
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function salsa_commerce_form_salsa_my_donate_page_edit_form_alter(&$form, &$form_state) {
+  $currency_code = commerce_currency_get_code();
+  $currency_code = $currency_code[commerce_default_currency()];
+  unset($form['Donation_Goal']['#field_prefix']);
+  $form['Donation_Goal']['#field_suffix'] = $currency_code;
+}
+
+/**
+ * Ajax callback to update the payment methods.
+ */
+function salsa_commerce_ajax_payment_selection($form, &$form_state) {
+  return $form['commerce_payment'];
+}
+
+/**
+ * Display payment selection form.
+ */
+function salsa_commerce_payment_form($form, &$form_state) {
+  // Load the checkout pane.
+  $payment_pane = commerce_checkout_pane_load('commerce_payment');
+  if ($payment_pane) {
+    if ($callback = commerce_checkout_pane_callback($payment_pane, 'checkout_form')) {
+      // Generate the pane form.
+      $order = salsa_commerce_create_order($form, $form_state);
+      $payment_form = $callback($form, $form_state, $payment_pane, $order);
+
+      if (!empty($payment_form)) {
+        $payment_form['payment_method']['#title'] = t('Payment method');
+        $payment_form['#tree'] = TRUE;
+
+        // Call the form alter hook from commerce_cardonfile, so that it
+        // can add it's payment methods.
+        if (module_exists('commerce_cardonfile')) {
+          $temp_form = array('commerce_payment' => &$payment_form);
+          if (empty($form_state['account'])) {
+            $form_state['account'] = $GLOBALS['user'];
+          }
+          commerce_cardonfile_form_alter($temp_form, $form_state, 'commerce_checkout_form_checkout');
+        }
+      }
+      return $payment_form;
+    }
+  }
+
+  return array();
+}
+
+/**
+ * Custom validate handler.
+ */
+function salsa_commerce_donate_order_create_validate($form, &$form_state) {
+  // Amount validation.
+
+  $other_amount_fieldname = isset($form_state['salsa_commerce_other_amount_field_name']) ? $form_state['salsa_commerce_other_amount_field_name'] : 'other_amount';
+
+  if (empty($form_state['values'][$other_amount_fieldname]) && empty($form_state['values']['amount'])) {
+    form_set_error($other_amount_fieldname, t('Select or provide a donation amount.'));
+  }
+  if (!empty($form_state['values'][$other_amount_fieldname])) {
+    // Convert, to a ., remove ' and round to two decimal places.
+    $other_amount = (float)str_replace(array("'", ','), array('', '.'), $form_state['values'][$other_amount_fieldname]);
+    $other_amount = round($other_amount, 2);
+    $yearly_amount = $other_amount;
+
+    if (!empty($form_state['values']['recurring']) && !empty($form_state['values']['payperiod'])) {
+      switch ($form_state['values']['payperiod']) {
+        case 'QTER':
+          $yearly_amount *= 4;
+          break;
+        case 'SMYR':
+          $yearly_amount *= 2;
+          break;
+        case 'MONT':
+          $yearly_amount *= 12;
+          break;
+      }
+    }
+
+    // Peer to peer donation pages have no configuration for the donation
+    // minimum or limit, allow to set a default value instead.
+    if (isset($form_state['salsa_object']->Donation_Minimum)) {
+      $minimium_amount = $form_state['salsa_object']->Donation_Minimum;
+    }
+    else {
+      $minimium_amount = variable_get('salsa_commerce_default_minimum_amount', 0);
+    }
+
+    if (isset($form_state['salsa_object']->Donation_Limit)) {
+      $donation_limit = $form_state['salsa_object']->Donation_Limit;
+    }
+    else {
+      $donation_limit = variable_get('salsa_commerce_default_donation_limit', 0);
+    }
+
+    $currency_code = commerce_currency_get_code();
+    $currency_code = $currency_code[commerce_default_currency()];
+    if ($minimium_amount > 0 && $yearly_amount < $minimium_amount) {
+      form_set_error($other_amount_fieldname, t('The donation can not be less than @code @minimum.', array('@minimum' => $minimium_amount, '@code' => $currency_code)));
+    }
+    else if ($donation_limit > 0 && $yearly_amount > $donation_limit) {
+      form_set_error($other_amount_fieldname, t('The donation can not be more than @code @limit.', array('@limit' => $donation_limit, '@code' => $currency_code)));
+    }
+    else if (!((int)$form_state['values'][$other_amount_fieldname] > 0)) {
+      form_set_error($other_amount_fieldname, t('Invalid donation amount'));
+    }
+    else {
+      // Valid amount, update it in case we converted it somehow.
+      form_set_value($form['Donation'][$other_amount_fieldname], $other_amount, $form_state);
+    }
+  }
+}
+
+/**
+ * Creates an order object based on a form.
+ */
+function salsa_commerce_create_order($form, &$form_state) {
+  // Create a new order.
+  if (!isset($form_state['order'])) {
+    $order = commerce_order_new($GLOBALS['user']->uid);
+    commerce_order_save($order);
+    $form_state['order'] = $order;
+  }
+  else {
+    $order = $form_state['order'];
+  }
+
+  // Add redirect link of the donate page.
+  if (variable_get('salsa_commerce_donate_page_redirect', FALSE) && !empty($form_state['salsa_object']->redirect_path)) {
+    $order->data['redirect_path'] = url($form_state['salsa_object']->redirect_path, array('absolute' => TRUE));
+  }
+  // Allow to enable the redirect by donation page.
+  if (isset($form_state['salsa_object']->donate_page_KEY) && variable_get('salsa_commerce_donate_page_redirect_' . $form_state['salsa_object']->donate_page_KEY, FALSE) && !empty($form_state['salsa_object']->redirect_path)) {
+    $order->data['redirect_path'] = url($form_state['salsa_object']->redirect_path, array('absolute' => TRUE));
+  }
+
+
+  if (isset($form_state['supporter']->Email)) {
+    $order->mail = $form_state['supporter']->Email;
+    // Necessary to load supporter on payment completion requests of some
+    // payment providers because there is no session on those requests.
+    $order->data['supporter_KEY'] = $form_state['supporter']->supporter_KEY;
+  }
+
+  // Support both creation from default values and on submit.
+  // @todo: my donate page uses upper case form elements.
+  if (empty($form_state['values'])) {
+    $values = array(
+      'recurring' => isset($form['Donation']['recurring']['#default_value']) ? $form['Donation']['recurring']['#default_value'] : FALSE,
+      'other_amount' => 0,
+      'amount' => isset($form['Donation']['amount']['#options']) ? key($form['Donation']['amount']['#options']) : 0,
+      'payperiod' => isset($form['Donation']['payperiod']['#default_value']) ? $form['Donation']['payperiod']['#default_value'] : 'ONCE',
+      'term' => isset($form['Donation']['term']['#default_value']) ? $form['Donation']['term']['#default_value'] : 9999,
+    );
+  }
+  else {
+    $values = $form_state['values'];
+    // Add data of custom fields.
+    $custom_fields = array(
+      'salsa_donations_message_field',
+      'salsa_donations_public_donation_field',
+      'salsa_my_donate_page_anonymous_field'
+    );
+    foreach ($custom_fields as $variable_name) {
+      $field_name = variable_get($variable_name, NULL);
+      if (!empty($field_name) && isset($values[$field_name])) {
+        $order->data['custom_fields'][$field_name] = $values[$field_name];
+      }
+    }
+  }
+
+  // Allow other modules to alter the used values.
+  drupal_alter('salsa_commerce_order_values', $values, $form, $form_state);
+
+  // Do not create a line item if we have no amount.
+  $other_amount_key = isset($values['other_amount']) ? 'other_amount' : 'amountOther';
+  if (empty($values['amount']) && empty($values[$other_amount_key])) {
+    return $order;
+  }
+
+  // Create a line item.
+  $line_item_type = !empty($values['recurring']) ? "recurring_donation" : "donation";
+  $line_item = commerce_line_item_new($line_item_type, $order->order_id);
+  if (isset($form_state['salsa_object']->donate_page_KEY)) {
+    $line_item->salsa_donate_page[LANGUAGE_NONE][0]['target_id'] = $form_state['salsa_object']->donate_page_KEY;
+    // @todo: Why is this necessary.
+    $line_item->salsa_supporter_my_donate_page[LANGUAGE_NONE][0]['target_id'] = 0;
+  }
+  else {
+    $line_item->salsa_supporter_my_donate_page[LANGUAGE_NONE][0]['target_id'] = $form_state['supporter_my_donate_page']->supporter_my_donate_page_KEY;
+    $line_item->salsa_donate_page[LANGUAGE_NONE][0]['target_id'] = 0;
+  }
+
+  // Add payperiod and term.
+  if ($line_item->type == 'recurring_donation') {
+    $line_item->salsa_commerce_payperiod[LANGUAGE_NONE][0]['value'] = $values['payperiod'];
+    $line_item->salsa_commerce_term[LANGUAGE_NONE][0]['value'] = $values['term'];
+  }
+
+  // Add the line item price.
+  $amount = $values[$other_amount_key] ? $values[$other_amount_key] : $values['amount'];
+  $line_item->commerce_unit_price = array(
+    LANGUAGE_NONE => array(
+      '0' => array(
+        'amount' => commerce_currency_decimal_to_amount($amount, commerce_default_currency()),
+        'currency_code' => commerce_default_currency(),
+      ),
+    ),
+  );
+  $wrapper = entity_metadata_wrapper('commerce_line_item', $line_item);
+  if (($value = $wrapper->commerce_unit_price->value()) !== NULL) {
+    // Add the base price to the components array.
+    if (!commerce_price_component_load($value, 'base_price')) {
+      $wrapper->commerce_unit_price->data = commerce_price_component_add($value, 'base_price', $value, TRUE);
+    }
+  }
+
+  commerce_line_item_save($line_item);
+
+  // Add the line item to the cart order of the user.
+  $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+  $order_wrapper->commerce_line_items[] = $line_item;
+
+  // Add a billing profile based on supporter values.
+  salsa_commerce_supporter_billing_profile($form_state['supporter'], $order);
+
+  drupal_alter('salsa_commerce_order', $order, $form_state, $values);
+  return $order;
+}
+
+/**
+ * Custom submit handler.
+ */
+function salsa_commerce_donate_order_create($form, &$form_state) {
+  // Set flag that prevents sending of emails for now.
+  $form_state['delay_mail_triggers'] = TRUE;
+  // Create/update the supporter.
+  salsa_entity_supporter_fieldset_submit($form, $form_state);
+  $order = salsa_commerce_create_order($form, $form_state);
+
+  // Add this order to completed cart orders to fake this being a cart order
+  // without showing it as a cart on the site.
+  if (empty($_SESSION['commerce_cart_completed_orders'])) {
+    $_SESSION['commerce_cart_completed_orders'] = array();
+  }
+
+  if (!in_array($order->order_id, $_SESSION['commerce_cart_completed_orders'])) {
+    $_SESSION['commerce_cart_completed_orders'][] = $order->order_id;
+  }
+
+  salsa_commerce_process_payment($order, $form, $form_state);
+  // Save the order.
+  commerce_order_save($order);
+  $form_state['redirect'] = commerce_checkout_order_uri($order);
+}
+
+/**
+ * Process the payment selection of a donation.
+ */
+function salsa_commerce_process_payment($order, $form, &$form_state) {
+    // Make sure the order is in the correct state, set and call the selected
+  // payment method.
+  $order->status = 'checkout_payment';
+  $order->data['payment_method'] = $form_state['values']['commerce_payment']['payment_method'];
+  $order->data['payment_redirect_key'] = drupal_hash_base64(time() . uniqid());
+  // Allows other modules to add something to the order data.
+  if (isset($form_state['salsa_commerce'])) {
+    $order->data['salsa_commerce'] = $form_state['salsa_commerce'];
+  }
+
+  // Process the payment method.
+  // If we can calculate a single order total for the order...
+  if ($balance = commerce_payment_order_balance($order)) {
+    // Delegate submit to the payment method callback.
+    $payment_method = commerce_payment_method_instance_load($order->data['payment_method']);
+
+    if ($callback = commerce_payment_method_callback($payment_method, 'submit_form_submit')) {
+      $values_payment_details = !empty($form_state['values']['commerce_payment']['payment_details']) ? $form_state['values']['commerce_payment']['payment_details']: array();
+      // If payment fails, rebuild the checkout form without progressing.
+      if ($callback($payment_method, $form['commerce_payment']['payment_details'], $values_payment_details, $order, $balance) === FALSE) {
+        $form_state['rebuild'] = TRUE;
+      }
+    }
+  }
+}
+
+/**
+ * Custom submit handler.
+ */
+function salsa_commerce_my_donate_order_create($form, &$form_state) {
+  // Set flag that prevents sending of emails for now.
+  $form_state['delay_mail_triggers'] = TRUE;
+  // Create/update the supporter.
+  salsa_entity_supporter_fieldset_submit($form, $form_state);
+  $order = salsa_commerce_create_order($form, $form_state);
+
+  // Add this order to completed cart orders to fake this being a cart order
+  // without showing it as a cart on the site.
+  if (empty($_SESSION['commerce_cart_completed_orders'])) {
+    $_SESSION['commerce_cart_completed_orders'] = array();
+  }
+
+  if (!in_array($order->order_id, $_SESSION['commerce_cart_completed_orders'])) {
+    $_SESSION['commerce_cart_completed_orders'][] = $order->order_id;
+  }
+  salsa_commerce_process_payment($order, $form, $form_state);
+
+  // Save the order.
+  commerce_order_save($order);
+
+  $form_state['redirect'] = commerce_checkout_order_uri($order);
+}
+
+/**
+ * Adds a billing profile to the order.
+ *
+ * @param object $supporter
+ *   The salsa supporter object.
+ * @param object $order
+ *   The commerce order object.
+ */
+function salsa_commerce_supporter_billing_profile($supporter, $order) {
+  if (!empty($supporter)) {
+    // Check if orders have a billing profile.
+    list( , , $bundle) = entity_extract_ids('commerce_order', $order);
+    $field_instances = field_info_instances('commerce_order', $bundle);
+    if (!empty($field_instances['commerce_customer_billing'])) {
+
+      // Check if that billing profile has an addressfield instance.
+      $field = field_info_field('commerce_customer_address');
+      if ($field['type'] == 'addressfield' && field_info_instance('commerce_customer_profile', 'commerce_customer_address', 'billing')) {
+
+        // Create the billing profile.
+        $profile = commerce_customer_profile_new('billing', $order->uid);
+        $profile_wrapper = entity_metadata_wrapper('commerce_customer_profile', $profile);
+
+        // Loop the value mapping and set values on the billing profile.
+        $address_values = array();
+        foreach (salsa_commerce_supporter_profile_map() as $key => $property) {
+          if (is_array($property)) {
+            $values = array();
+            foreach ($property as $property_name) {
+              if (property_exists($supporter, $property_name)) {
+                $values[] = $supporter->{$property_name};
+              }
+            }
+            $address_values[$key] = implode(' ', $values);
+          }
+          else {
+            if (property_exists($supporter, $property)) {
+              $address_values[$key] = $supporter->{$property};
+            }
+          }
+        }
+        $profile_wrapper->commerce_customer_address = $address_values;
+        // Save the values.
+        $profile_wrapper->save();
+        // Add the created customer profile to the order.
+        $order->commerce_customer_billing[LANGUAGE_NONE][0]['profile_id'] = $profile_wrapper->profile_id->value();
+      }
+    }
+  }
+}
+
+/**
+ * Getter for the field to property map.
+ *
+ * @return array
+ *   Returns the mapping of addressfield values to supporter properties.
+ */
+function salsa_commerce_supporter_profile_map() {
+  return variable_get('salsa_commerce_default_profile_map', array(
+    'first_name' => 'First_Name',
+    'last_name' => 'Last_Name',
+    'thoroughfare' => 'Street',
+    'premise' => 'Street_2',
+    'sub_premise' => 'Street_3',
+    'postal_code' => 'Zip',
+    'locality' => 'City',
+    'organisation_name' => 'Organization',
+    'country' => 'Country',
+    'administrative_area' => 'State',
+    'sub_administrative_area' => 'County',
+    'name_line' => array('First_Name', 'Last_Name'),
+    'dependent_locality' => 'District',
+  ));
+}
+
+/**
+ * Implements hook_commerce_checkout_complete().
+ *
+ * @param object $order
+ *   The commerce order object.
+ */
+function salsa_commerce_commerce_checkout_complete($order) {
+
+  // Collect the donation line items.
+  $commerce_line_items = field_get_items('commerce_order', $order, 'commerce_line_items');
+  $donation_line_items = array();
+  if ($commerce_line_items) {
+    foreach ($commerce_line_items as $commerce_line_item) {
+      // @todo: Load multiple, maybe use wrapper.
+      $line_item = commerce_line_item_load($commerce_line_item['line_item_id']);
+      if ($line_item->type == 'donation' || $line_item->type == 'recurring_donation') {
+        $donation_line_items[] = $line_item;
+      }
+    }
+  }
+
+  foreach ($donation_line_items as $donation_line_item) {
+    salsa_commerce_save_donation($order, $donation_line_item);
+  }
+}
+
+/**
+ * Creates a salsa donation based on a line item.
+ *
+ * @param object $order
+ *   The commerce order object.
+ * @param object $donation_line_item
+ *   The commerce line item.
+ */
+function salsa_commerce_save_donation($order, $donation_line_item) {
+  $supporter_entity = entity_load_single('salsa_supporter', $order->data['supporter_KEY']);
+  $items = field_get_items('commerce_line_item', $donation_line_item, 'salsa_donate_page');
+
+  $my_donate_page_items = field_get_items('commerce_line_item', $donation_line_item, 'salsa_supporter_my_donate_page');
+  $supporter_my_donate_page = NULL;
+  if (!empty($my_donate_page_items[0]['target_id'])) {
+    $supporter_my_donate_page = entity_load_single('salsa_supporter_my_donate_page', $my_donate_page_items[0]['target_id']);
+  }
+
+  // Create donation (one-time or recurring).
+  $donation_entity = entity_create('salsa_' . $donation_line_item->type, array());
+  if (!empty($items[0]['target_id'])) {
+    $donation_entity->donate_page_KEY = $items[0]['target_id'];
+    $salsa_object = entity_load_single('salsa_donate_page', $items[0]['target_id']);
+    // Add email trigger keys.
+    $supporter_entity->additional['email_trigger_KEYS'] = $salsa_object->email_trigger_KEYS;
+    if (variable_get('salsa_donations_goal_field', FALSE)) {
+      // Clear the cached donations total for this donate page.
+      cache_clear_all('salsa_donate_page:donations_total:' . $salsa_object->donate_page_KEY, 'cache');
+      cache_clear_all('salsa_donate_page:donors_list_values:' . $salsa_object->donate_page_KEY, 'cache');
+    }
+    $supporter_entity->additional['Reference_Name'] = $salsa_object->Reference_Name;
+  }
+  elseif ($supporter_my_donate_page) {
+    $salsa_object = $supporter_my_donate_page;
+
+    // The XML output is missing properties with a $, load it manually using
+    // JSON.
+    $key = 'donor$email_trigger_KEYS';
+    $response = json_decode(salsa_api()->query('/api/getObjects.sjs', 'json&object=my_donate_page&condition=my_donate_page_KEY=' . $supporter_my_donate_page->my_donate_page_KEY . '&include=' . urlencode($key)));
+    $donor_info = (array)$response[0];
+    if (!empty($donor_info[$key])) {
+      $supporter_entity->additional['email_trigger_KEYS'] = $donor_info[$key];
+    }
+    $supporter_entity->additional['Page_Title'] = $salsa_object->Page_Title;
+  }
+
+  // Fill the donation if we have the necessary information, otherwise abort.
+  if (!empty($salsa_object)) {
+    salsa_commerce_set_donation_values($order, $donation_line_item, $donation_entity, $salsa_object, $supporter_entity);
+  }
+  else {
+    $text = 'The salsa donation entity will not be created due to a missing salsa_donate_page property in the line item with ID @lid';
+    $args = array(
+      '@lid' => $donation_line_item->line_item_id
+    );
+    watchdog('salsa_commerce', $text, $args, WATCHDOG_CRITICAL, l('Commerce order', 'admin/commerce/orders/' . $order->order_id, array('absolute' => TRUE)));
+    return;
+  }
+
+  // Add groups keys referenced by this donate page..
+  if (!empty($salsa_object->groups_KEYS)) {
+    // Assign supporter to the groups if there are any.
+    $groups_keys = salsa_entity_string_explode($salsa_object->groups_KEYS);
+    if (!empty($groups_keys)) {
+      salsa_entity_add_supporter_groups($supporter_entity, $groups_keys);
+    }
+  }
+
+  // @todo:
+  // In_Honor_Name
+  // In_Honor_Email
+  // In_Honor_Address
+
+  // Additional recurring donation fields.
+  if ($donation_line_item->type == 'recurring_donation') {
+    $donation_entity->PAYPERIOD = $donation_line_item->salsa_commerce_payperiod[LANGUAGE_NONE][0]['value'];
+    $donation_entity->TERM = $donation_line_item->salsa_commerce_term[LANGUAGE_NONE][0]['value'];
+    $donation_entity->Start_Date = date(SALSA_ENTITY_DATE_FORMAT);
+  }
+
+  // Add data of custom fields.
+  $field_name = variable_get('salsa_donations_message_field', NULL);
+  if (!empty($field_name) && isset($order->data['custom_fields'][$field_name])) {
+    $donation_entity->{$field_name} = $order->data['custom_fields'][$field_name];
+  }
+  $field_name = variable_get('salsa_donations_public_donation_field', NULL);
+  if (!empty($field_name) && isset($order->data['custom_fields'][$field_name])) {
+    $custom_value = !empty($order->data['custom_fields'][$field_name]) ? TRUE : FALSE;
+    $donation_entity->{$field_name} = $custom_value;
+  }
+
+  // Allow other modules to alter the donation.
+  drupal_alter('salsa_commerce_donation', $donation_entity, $donation_line_item, $order);
+  $donation_entity->save();
+
+  $supporter_entity->additional['amount'] = $donation_entity->amount;
+  $supporter_entity->additional['Currency_Code'] = $donation_entity->Currency_Code;
+  $supporter_entity->additional['Transaction_Date'] = format_date(REQUEST_TIME, 'salsa_entity_token_date');
+  $supporter_entity->save();
+
+  // Handle peer to peer donations.
+  if ($supporter_my_donate_page) {
+    $supporter_my_donate_page_donation = entity_create('salsa_supporter_my_donate_page_donation', array());
+    $supporter_my_donate_page_donation->supporter_KEY = $supporter_entity->supporter_KEY;
+    $supporter_my_donate_page_donation->donation_KEY = $donation_entity->key;
+    $supporter_my_donate_page_donation->supporter_my_donate_page_KEY = $supporter_my_donate_page->identifier();
+    try {
+      // This currently fails due to an error in Salsa. Catch the exception
+      // and log it.
+      $supporter_my_donate_page_donation->save();
+    } catch (Exception $e) {
+      watchdog_exception('salsa_commerce', $e);
+    }
+  }
+}
+
+/**
+ * Creates a new salsa donation object according to a given commerce order and line item.
+ *
+ * @param object $order
+ *   The commerce order object.
+ * @param $line_item
+ *   The commerce line item object.
+ * @return SalsaEntity
+ *   The salsa donation entity object.
+ */
+function salsa_commerce_set_donation_values($order, $line_item, $donation_entity, $salsa_entity, $supporter_entity) {
+  $total = field_get_items('commerce_line_item', $line_item, 'commerce_unit_price');
+  $amount = commerce_currency_amount_to_decimal($total[0]['amount'], $total[0]['currency_code']);
+
+  if (!empty($salsa_entity)) {
+    // Add tags if there are any assigned.
+    if ($tags = $salsa_entity->getTags()) {
+      $donation_entity->additional['tag'] = implode(',', $tags);
+    }
+  }
+
+  $donation_entity->supporter_KEY = $supporter_entity->supporter_KEY;
+  $donation_entity->amount = $amount;
+  $donation_entity->Currency_Code = $total[0]['currency_code'];
+  $donation_entity->Status = 'Donation Only';
+  $donation_entity->First_Name = $supporter_entity->First_Name;
+  $donation_entity->Last_Name = $supporter_entity->Last_Name;
+  $donation_entity->Email = $supporter_entity->Email;
+  $donation_entity->Transaction_Type = 'Donation';
+  $donation_entity->Form_Of_Payment = 'Other';
+  $donation_entity->PNREF = $order->order_id;
+  $donation_entity->RESPMSG = t('Payed with Commerce');
+  $donation_entity->Transaction_Date = salsa_entity_convert_date('NOW', variable_get('salsa_api_server_timezone', 'GMT'));
+  if (isset($line_item->salsa_donation_note[LANGUAGE_NONE][0]['value'])) {
+    $donation_entity->Note = $line_item->salsa_donation_note[LANGUAGE_NONE][0]['value'];
+  }
+
+  // Store the payment method in a given field.
+  if ($field = variable_get('salsa_commerce_payment_method_field', '')) {
+    $transaction = commerce_payment_transaction_load_multiple(array(), array('order_id' => $order->order_id));
+    $transaction = reset($transaction);
+    $donation_entity->{$field} = $transaction->payment_method;
+    $supporter_entity->additional[$field] = $transaction->payment_method;
+  }
+
+  if (($anonymous_field = variable_get('salsa_my_donate_page_anonymous_field')) && isset($order->data['custom_fields'][$anonymous_field])) {
+    $donation_entity->$anonymous_field = $order->data['custom_fields'][$anonymous_field];
+  }
+}
+
+/**
+ * Implements hook_commerce_line_item_type_info().
+ */
+function salsa_commerce_commerce_line_item_type_info() {
+  $line_item_types = array();
+
+  $line_item_types['donation'] = array(
+    'name' => t('Donation'),
+    'description' => '',
+    // @todo Set to FALSE when http://drupal.org/node/1458766 has been committed
+    'product' => TRUE,
+    'add_form_submit_value' => t('Add Donation'),
+    'base' => 'salsa_commerce_donation',
+  );
+  $line_item_types['recurring_donation'] = array(
+    'name' => t('Recurring Donation'),
+    'description' => '',
+    'product' => TRUE,
+    'add_form_submit_value' => t('Add Recurring Donation'),
+    'base' => 'salsa_commerce_recurring_donation',
+  );
+  return $line_item_types;
+}
+
+/**
+ * Implements hook_commerce_cart_line_item_refresh().
+ */
+function salsa_commerce_commerce_cart_line_item_refresh($line_item, $order_wrapper) {
+  // Do not recalculate donation line items. Relies on the patch in
+  // https://drupal.org/comment/8171553#comment-8171553.
+  if ($line_item->type == 'donation' || $line_item->type == 'recurring_donation') {
+    return FALSE;
+  }
+}
+
+/**
+ * Title callback: Return the title of a donation line item.
+ */
+function salsa_commerce_donation_title($line_item) {
+  if ($items = field_get_items('commerce_line_item', $line_item, 'salsa_donate_page')) {
+    if ($donate_page = entity_load_single('salsa_donate_page', $items[0]['target_id'])) {
+      return t('Donation for @title', array('@title' => $donate_page->Reference_Name));
+    }
+  }
+  return t('Donation');
+}
+
+/**
+ * Title callback: Return the title of a recurring donation line item.
+ */
+function salsa_commerce_recurring_donation_title($line_item) {
+  if ($items = field_get_items('commerce_line_item', $line_item, 'salsa_donate_page')) {
+    if ($donate_page = entity_load_single('salsa_donate_page', $items[0]['target_id'])) {
+      return t('Recurring Donation for @title', array('@title' => $donate_page->Reference_Name));
+    }
+  }
+  return t('Recurring Donation / Pledge');
+}
+
+/**
+ * Configuration callback when line item is created.
+ */
+function salsa_commerce_donation_configuration($line_item_type) {
+  salsa_commerce_add_salsa_donate_fields($line_item_type);
+}
+
+function salsa_commerce_recurring_donation_configuration($line_item_type) {
+  salsa_commerce_add_salsa_donate_fields($line_item_type);
+
+  $type = $line_item_type['type'];
+  if (!field_info_field('salsa_commerce_payperiod')) {
+    $field = array(
+      'field_name' => 'salsa_commerce_payperiod',
+      'type' => 'text',
+      'cardinality' => 1,
+      'entity_types' => array('commerce_line_item'),
+      'translatable' => FALSE,
+      'settings' => array(
+      ),
+    );
+    $field = field_create_field($field);
+  }
+  if (!field_info_instance('commerce_line_item', 'salsa_commerce_payperiod', $type)) {
+    $instance = array(
+      'label' => t('Pay Period'),
+      'field_name' => 'salsa_commerce_payperiod',
+      'bundle' => $type,
+      'entity_type' => 'commerce_line_item',
+      'required' => TRUE,
+      'default_value' => array(array()),
+      'widget' => array(
+        'type' => 'textfield',
+      ),
+    );
+    field_create_instance($instance);
+  }
+
+  if (!field_info_field('salsa_commerce_term')) {
+    $field = array(
+      'field_name' => 'salsa_commerce_term',
+      'type' => 'text',
+      'cardinality' => 1,
+      'entity_types' => array('commerce_line_item'),
+      'translatable' => FALSE,
+      'settings' => array(
+      ),
+    );
+    $field = field_create_field($field);
+  }
+
+  if (!field_info_instance('commerce_line_item', 'salsa_commerce_term', $type)) {
+    $instance = array(
+      'label' => t('Term'),
+      'field_name' => 'salsa_commerce_term',
+      'bundle' => $type,
+      'entity_type' => 'commerce_line_item',
+      'required' => TRUE,
+      'default_value' => array(array()),
+      'widget' => array(
+        'type' => 'textfield',
+      ),
+    );
+    field_create_instance($instance);
+  }
+}
+
+/**
+ * Adds the salsa_donate_page field to the given line item type.
+ */
+function salsa_commerce_add_salsa_donate_fields($line_item_type) {
+  $type = $line_item_type['type'];
+  if (!field_info_field('salsa_donate_page')) {
+    $field = array(
+      'field_name' => 'salsa_donate_page',
+      'type' => 'entityreference',
+      'cardinality' => 1,
+      'entity_types' => array('commerce_line_item'),
+      'translatable' => FALSE,
+      'settings' => array(
+        'target_type' => 'salsa_donate_page',
+        'handler' => 'salsa',
+        'handler_submit' => 'Change handler',
+        'handler_settings' => array(
+          'sort' => array(
+            'type' => 'property',
+            'property' => 'weight',
+            'direction' => 'ASC',
+          ),
+          'behaviors' => array(
+            'views-select-list' => array(
+              'status' => 1,
+            ),
+          ),
+        ),
+      ),
+    );
+    $field = field_create_field($field);
+  }
+  if (!field_info_instance('commerce_line_item', 'salsa_donate_page', $type)) {
+      $instance = array(
+      'label' => t('Salsa Donate Page'),
+      'field_name' => 'salsa_donate_page',
+      'bundle' => $type,
+      'entity_type' => 'commerce_line_item',
+      'required' => FALSE,
+      'default_value' => array(array()),
+      'widget' => array(
+        'type' => 'autocomplete',
+      ),
+    );
+    field_create_instance($instance);
+  }
+  if (!field_info_field('salsa_supporter_my_donate_page')) {
+    $field = array(
+      'field_name' => 'salsa_supporter_my_donate_page',
+      'type' => 'entityreference',
+      'cardinality' => 1,
+      'entity_types' => array('commerce_line_item'),
+      'translatable' => FALSE,
+      'settings' => array(
+        'target_type' => 'salsa_supporter_my_donate_page',
+        'handler' => 'salsa',
+        'handler_submit' => 'Change handler',
+        'handler_settings' => array(
+          'sort' => array(
+            'type' => 'property',
+            'property' => 'weight',
+            'direction' => 'ASC',
+          ),
+          'behaviors' => array(
+            'views-select-list' => array(
+              'status' => 1,
+            ),
+          ),
+        ),
+      ),
+    );
+    $field = field_create_field($field);
+  }
+  if (!field_info_instance('commerce_line_item', 'salsa_supporter_my_donate_page', $type)) {
+      $instance = array(
+      'label' => t('Salsa Supporter My Donate Page'),
+      'field_name' => 'salsa_supporter_my_donate_page',
+      'bundle' => $type,
+      'entity_type' => 'commerce_line_item',
+      'required' => FALSE,
+      'default_value' => array(array()),
+      'widget' => array(
+        'type' => 'autocomplete',
+      ),
+    );
+    field_create_instance($instance);
+  }
+  if (!field_info_field('salsa_donation_note')) {
+    $field = array(
+      'field_name' => 'salsa_donation_note',
+      'type' => 'text',
+      'cardinality' => 1,
+      'entity_types' => array('commerce_line_item'),
+      'translatable' => FALSE,
+      'settings' => array(
+      ),
+    );
+    $field = field_create_field($field);
+  }
+  if (!field_info_instance('commerce_line_item', 'salsa_donation_note', $type)) {
+    $instance = array(
+      'label' => t('Donation Note'),
+      'field_name' => 'salsa_donation_note',
+      'bundle' => $type,
+      'entity_type' => 'commerce_line_item',
+      'required' => TRUE,
+      'default_value' => array(array()),
+      'widget' => array(
+        'type' => 'textfield',
+      ),
+    );
+    field_create_instance($instance);
+  }
+}
+
+/**
+ * Implements hook_salsa_entity_amount_alter().
+ */
+function salsa_commerce_salsa_entity_amount_alter(&$amount, $formatted) {
+  if ($formatted) {
+    // Use the commerce functions to format as float with default currency.
+    $amount = commerce_currency_decimal_to_amount($amount, commerce_default_currency());
+    $amount = commerce_currency_format($amount, commerce_default_currency());
+  }
+  else {
+    // Make sure empty amount is always displayed as 0.
+    if (empty($amount)) {
+      $amount = '0';
+    }
+    $amount = t('@amount @currency', array('@amount' => $amount, '@currency' => commerce_default_currency()));
+  }
+}
+
+/**
+ * Implements hook_commerce_checkout_pane_info().
+ */
+function salsa_commerce_commerce_checkout_pane_info() {
+  $checkout_panes = array();
+  $checkout_panes['checkout_salsa_commerce_redirect'] = array(
+    'title' => t('Salsa commerce redirect'),
+    'file' => 'salsa_commerce.checkout_pane.inc',
+    'base' => 'salsa_commerce_redirect_pane',
+    'page' => 'complete',
+    'fieldset' => FALSE,
+  );
+  return $checkout_panes;
+}
+
+
+/**
+ * Implements hook_commerce_checkout_order_can_checkout().
+ *
+ * @see https://drupal.org/node/1458766
+ */
+function salsa_commerce_commerce_checkout_order_can_checkout($order) {
+  // Allow orders with salsa commerce line items to proceed to checkout.
+  $wrapper = entity_metadata_wrapper('commerce_order', $order);
+
+  if (commerce_line_items_quantity($wrapper->commerce_line_items, array('donation', 'recurring_donation')) > 0) {
+    return TRUE;
+  }
+}

@@ -1,0 +1,536 @@
+<?php
+/**
+ * @file
+ * Implements credit card payment services on Hungarian OTP bank interface.
+ *
+ * Payment method for Drupal Commerce.
+ */
+
+/**
+ * Transactions statuses.
+ *
+ * We store only chars for remote statuses - easier to filter, no translations.
+ * I - initialized/created on webshop side.
+ * B - sent to bank
+ * P - processed on bank side - after transactionID generation
+ */
+define('COMMERCE_OTP_TR_STATUS_CREATED', 'I');
+define('COMMERCE_OTP_TR_STATUS_SENT', 'B');
+define('COMMERCE_OTP_TR_STATUS_PROCESSED', 'P');
+define('COMMERCE_OTP_TR_STATUS_SUCCESS', 'S');
+define('COMMERCE_OTP_TR_STATUS_CANCELLED', 'C');
+define('COMMERCE_OTP_TR_STATUS_FAILED', 'F');
+define('COMMERCE_OTP_TR_STATUS_UNKNOWN_ERROR', 'U');
+
+/**
+ * Implements hook_commerce_payment_method_info().
+ *
+ * Define the OTP credit card payment method.
+ */
+function commerce_otp_commerce_payment_method_info() {
+  $payment_methods['otp'] = array(
+    'base' => 'commerce_otp',
+    'title' => t('OTP credit card payment'),
+    'description' => t('Credit card payment on secure OTP bank surface.'),
+    'terminal' => FALSE,
+    'offsite' => TRUE,
+    'offsite_autoredirect' => FALSE,
+  );
+  return $payment_methods;
+}
+
+/**
+ * Implements hook_menu().
+ */
+function commerce_otp_menu() {
+  $items['commerce_otp_response'] = array(
+    'title' => 'Payment response page',
+    'page callback' => 'commerce_otp_response_page',
+    'access callback' => TRUE,
+    'type' => MENU_CALLBACK,
+    'file' => 'commerce_otp.pages.inc',
+  );
+  $items['admin/commerce/commerce_otp_transactions_list'] = array(
+    'title' => 'OTP Transaction revisions',
+    'page callback' => 'commerce_otp_transactions_list',
+    'access arguments' => array('access otp_transactions'),
+    'type' => MENU_NORMAL_ITEM,
+    'file' => 'commerce_otp.admin.inc',
+  );
+  return $items;
+}
+
+/**
+ * Implements hook_block_info().
+ */
+function commerce_otp_block_info() {
+  $blocks = array();
+  $blocks['commerce_otp_cards'] = array(
+    'info' => t('OTP Cards'),
+  );
+  return $blocks;
+}
+
+/**
+ * Implements hook_block_configure().
+ */
+function commerce_otp_block_configure($delta = '') {
+  $form = array();
+  switch ($delta) {
+    case 'commerce_otp_cards':
+      // Text field form element.
+      $form['image_style'] = array(
+        '#type' => 'select',
+        '#title' => t('Image style'),
+        '#options' => image_style_options(),
+        '#description' => t('Select image style to display OTP Cards image.'),
+        '#default_value' => variable_get('commerce_otp_image_style', ''),
+      );
+      break;
+  }
+  return $form;
+}
+
+/**
+ * Implements hook_block_save().
+ */
+function commerce_otp_block_save($delta = '', $edit = array()) {
+  if ($delta == 'commerce_otp_cards') {
+    variable_set('commerce_otp_image_style', $edit['image_style']);
+  }
+}
+
+/**
+ * Implements hook_block_view().
+ */
+function commerce_otp_block_view($delta = '') {
+  $block = array();
+  switch ($delta) {
+    case 'commerce_otp_cards':
+      $block['subject'] = NULL;
+      $image_uri = drupal_get_path('module', 'commerce_otp') . '/images/otp-cards.png';
+      if ($style_name = variable_get('commerce_otp_image_style', '')) {
+        $style = image_style_load($style_name);
+        $derivative_uri = image_style_path($style['name'], 'commerce_otp/images/otp-cards.png');
+        file_exists($derivative_uri) || image_style_create_derivative($style, $image_uri, $derivative_uri);
+        $image_path = image_style_url(variable_get('commerce_otp_image_style', ''), $derivative_uri);
+      }
+      else {
+        $image_path = $image_uri;
+      }
+      $block['content'] = theme('image',
+        array(
+          'path' => $image_path,
+          'attributes' => array('class' => 'cards'),
+        )
+      );
+      break;
+  }
+  return $block;
+}
+
+/**
+ * Implements hook_theme().
+ */
+function commerce_otp_theme() {
+  return array(
+    'commerce_otp_label_icons' => array(
+      'variables' => array('icons' => NULL),
+      'template' => 'theme/commerce_otp-label-icons',
+    ),
+  );
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * Alter payment method display - custom label (depend on settings), icons.
+ */
+function commerce_otp_form_commerce_checkout_form_alter(&$form, &$form_state) {
+  // If this checkout form contains the payment method radios...
+  if (!empty($form['commerce_payment']['payment_method']['#options'])) {
+    // Loop over its options array looking for an OTP option.
+    foreach ($form['commerce_payment']['payment_method']['#options'] as $key => &$value) {
+      list($method_id) = explode('|', $key);
+      // OTP payment.
+      if ($method_id == 'otp') {
+        $payment_method = commerce_payment_method_instance_load($key);
+        $value = $payment_method['settings']['preset']['display_title'];
+        $icons = commerce_otp_payment_icons();
+        $value .= theme('commerce_otp_label_icons', array('icons' => $icons));
+        $form['commerce_payment']['payment_method']['#attached']['css'][] = drupal_get_path('module', 'commerce_otp') . '/commerce_otp.css';
+      }
+    }
+  }
+}
+
+/**
+ * Payment method callback: settings form.
+ *
+ * Returns form elements for the payment method's settings form included
+ * as part of the payment method's enabling action in Rules.
+ */
+function commerce_otp_settings_form($settings = array()) {
+  $form = array();
+  $default = !empty($settings);
+  $form['preset']['display_title'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Display title'),
+    '#description' => t('Label text on checkout page - payment select.'),
+    '#default_value' => ($default && $settings['preset']['display_title'] ? $settings['preset']['display_title'] : t('OTP credit card payment')),
+    '#required' => TRUE,
+  );
+  $form['preset']['pos_id'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Shop ID'),
+    '#description' => t('The shop ID received from OTP.'),
+    '#default_value' => $default ? $settings['preset']['pos_id'] : '',
+    '#required' => TRUE,
+  );
+  $form['preset']['languagecode'] = array(
+    '#type' => 'radios',
+    '#title' => t('OTP interface language'),
+    '#options' => array(
+      'hu' => t('Hungarian'),
+      'en' => t('English'),
+      'de' => t('German'),
+    ),
+    // TODO: if not set, add site default/current lang.
+    '#default_value' => $default ? $settings['preset']['languagecode'] : '',
+    '#required' => TRUE,
+  );
+  $form['private_key_file'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Private keyfile path'),
+    '#description' => t('The absolute path to the keyfile. Private or outside of the webroot.'),
+    '#default_value' => $default ? $settings['private_key_file'] : '',
+    '#required' => TRUE,
+  );
+  $form['transaction_log_dir'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Transaction log directory'),
+    '#description' => t('E.g.: sites/default/files/private/otp'),
+    '#default_value' => $default ? $settings['transaction_log_dir'] : '',
+    '#required' => TRUE,
+  );
+  $form['success_dir'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Transaction log directory - on success'),
+    '#description' => t('E.g.: sites/default/files/private/otp/ok'),
+    '#default_value' => $default ? $settings['success_dir'] : '',
+    '#required' => TRUE,
+  );
+  $form['failed_dir'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Transaction log directory - on fail'),
+    '#description' => t('E.g.: sites/default/files/private/otp/fail'),
+    '#default_value' => $default ? $settings['failed_dir'] : '',
+    '#required' => TRUE,
+  );
+  $form['#validation'][] = 'commerce_otp_settings_form_validate';
+  return $form;
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * Add custom validation and submit callback to payment method settings form.
+ */
+function commerce_otp_form_rules_ui_edit_element_alter(&$form, &$form_state) {
+  $payment_method = '';
+  if (isset($form_state['element_settings']['payment_method'])) {
+    $payment_method = $form_state['element_settings']['payment_method'];
+  }
+  if ((is_string($payment_method) && $payment_method == 'otp') || (isset($payment_method['method_id']) && $payment_method['method_id'] == 'otp')) {
+    $form['#validate'][] = 'commerce_otp_settings_form_validate';
+    $form['#submit'][] = 'commerce_otp_settings_form_submit';
+  }
+}
+
+/**
+ * Payment method settings form validate.
+ *
+ * Check if Shop ID is in used in another OTP payment method.
+ */
+function commerce_otp_settings_form_validate($form, &$form_state) {
+  $settings = $form_state['values']['parameter']['payment_method']['settings']['payment_method']['settings'];
+  $instance_id = $form_state['build_info']['args'][0]->name;
+  $pos_id = $settings['preset']['pos_id'];
+
+  // Remove rest data (after rules config delete).
+  $query = db_select('commerce_otp_posid', 'cp');
+  $query->leftJoin('rules_config', 'rc', 'rc.name = cp.instance_id');
+  $query->fields('cp', array('instance_id'));
+  $query->condition('rc.name', NULL);
+  foreach ($query->execute()->fetchAll() as $rest) {
+    db_delete('commerce_otp_posid')->condition('instance_id', $rest->instance_id, '=')->execute();
+  }
+
+  $query = db_select('commerce_otp_posid', 'cp')
+    ->fields('cp', array('instance_id'))
+    ->condition('cp.pos_id', $pos_id, '=')
+    ->condition('cp.instance_id', $instance_id, '!=');
+  $result = $query->execute()->fetchAssoc();
+  $form_tree = 'parameter][payment_method][settings][payment_method][settings][';
+  if ($result['instance_id']) {
+    form_set_error($form_tree . 'preset][pos_id', t('Shop ID is already in used in another OTP payment config: @rule.', array('@rule' => $result['instance_id'])));
+  }
+  if (!file_exists($settings['private_key_file'])) {
+    form_set_error($form_tree . 'private_key_file', t('Private keyfile does not exist.'));
+  }
+  elseif (!file_get_contents($settings['private_key_file'])) {
+    form_set_error($form_tree . 'private_key_file', t('Private keyfile - can not read via file_get_contents.'));
+  }
+  else {
+    $response = drupal_http_request(url($settings['private_key_file'], array('absolute' => TRUE)));
+    if ($response->code == '200') {
+      drupal_set_message(t('Private keyfile is accessible via browser.'), 'error');
+    }
+  }
+  if (!file_exists($settings['transaction_log_dir'])) {
+    form_set_error($form_tree . 'transaction_log_dir', t('Transaction log directory does not exist.'));
+  }
+  if (!file_exists($settings['success_dir'])) {
+    form_set_error($form_tree . 'success_dir', t('Transaction log directory - on success does not exist.'));
+  }
+  if (!file_exists($settings['failed_dir'])) {
+    form_set_error($form_tree . 'failed_dir', t('Transaction log directory - on fail does not exist.'));
+  }
+}
+
+/**
+ * Payment settings form submit.
+ *
+ * Store pos_id, instance_id pair.
+ */
+function commerce_otp_settings_form_submit($form, &$form_state) {
+  $pos_id = $form_state['values']['parameter']['payment_method']['settings']['payment_method']['settings']['preset']['pos_id'];
+  $instance_id = $form_state['build_info']['args'][0]->name;
+  db_merge('commerce_otp_posid')
+    ->key(array('instance_id' => $instance_id))
+    ->fields(array(
+      'pos_id' => $pos_id,
+      'instance_id' => $instance_id,
+    ))
+    ->execute();
+}
+
+/**
+ * Payment method callback: redirect form.
+ */
+function commerce_otp_redirect_form($form, &$form_state, $order, $payment_method) {
+  // Return an error if shop ID is not configured.
+  if (empty($payment_method['settings']['preset']['pos_id'])) {
+    drupal_set_message(t('OTP payment method is not configured for use. PosID has not been specified.'), 'error');
+    return array();
+  }
+  $data = commerce_otp_payment_initialize($order, $payment_method);
+  $transaction_id = $data['transactionid'];
+  $pos_id = $data['pos_id'];
+  $amount = $data['amount'];
+  $currency_code = $data['exchange'];
+
+  $transaction = commerce_payment_transaction_new('otp', $order->order_id);
+  $transaction->instance_id = $payment_method['instance_id'];
+  $transaction->data = array('pos_id' => $pos_id);
+  $transaction->remote_id = $transaction_id;
+  $transaction->currency_code = $currency_code;
+  $transaction->amount = $amount;
+  $transaction->remote_status = COMMERCE_OTP_TR_STATUS_CREATED;
+  $transaction->status = COMMERCE_PAYMENT_STATUS_PENDING;
+  $transaction->message = $transaction->log = commerce_otp_status_message(COMMERCE_OTP_TR_STATUS_CREATED);
+  commerce_payment_transaction_save($transaction);
+
+  $response = _commerce_otp_payment_process($data);
+  // Update order status to payment.
+  if ($response) {
+    $transaction->remote_status = COMMERCE_OTP_TR_STATUS_PROCESSED;
+    $transaction->message = $transaction->log = commerce_otp_status_message(COMMERCE_OTP_TR_STATUS_PROCESSED);
+    $transaction->revision = TRUE;
+    commerce_payment_transaction_save($transaction);
+  }
+  else {
+    $transaction->remote_status = COMMERCE_OTP_TR_STATUS_UNKNOWN_ERROR;
+    $transaction->status = COMMERCE_PAYMENT_STATUS_FAILURE;
+    $transaction->message = $transaction->log = commerce_otp_status_message(COMMERCE_OTP_TR_STATUS_UNKNOWN_ERROR);
+    $transaction->revision = TRUE;
+    commerce_payment_transaction_save($transaction);
+  }
+  drupal_exit();
+}
+
+/**
+ * Initialize OTP payment process.
+ *
+ * Get transaction ID from bank, set required data.
+ */
+function commerce_otp_payment_initialize($order, $payment_method) {
+  $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+  $amount = $order_wrapper->commerce_order_total->amount->value();
+  $currency_code = $order_wrapper->commerce_order_total->currency_code->value();
+  $pos_id = $payment_method['settings']['preset']['pos_id'];
+  // Include needed for OTP process init.
+  module_load_include('inc', 'commerce_otp', 'commerce_otp.fiz3_control.php');
+  $service = new CommerceOTPWebShopService($pos_id);
+  $response = $service->tranzakcioAzonositoGeneralas($pos_id);
+  if ($response->hasSuccessfulAnswer) {
+    $transaction_id = $response->answerModel->getAzonosito();
+  }
+  $data = array(
+    'posid' => $pos_id,
+    'transactionid' => $transaction_id,
+    'languagecode' => $payment_method['settings']['preset']['languagecode'],
+    'exchange' => $currency_code,
+    'amount' => $amount,
+    'shopcomment' => t('Order @order_id at @store', array(
+      '@order_id' => $order->order_id,
+      '@store' => variable_get('site_name', url('<front>', array('absolute' => TRUE))),
+    )),
+    'backurl' => url('commerce_otp_response', array('absolute' => TRUE)),
+  );
+  // Allow modules to add or alter the data before sent to OTP.
+  drupal_alter('commerce_otp_data', $data, $order, $payment_method['settings']);
+
+  return $data;
+}
+
+/**
+ * Implements hook_permission().
+ */
+function commerce_otp_permission() {
+  return array(
+    'access otp_transactions' => array(
+      'title' => t('Access OTP transactions list'),
+    ),
+  );
+}
+
+/**
+ * Implements hook_cron().
+ *
+ * Check (ask and update status) not processed transactions from OTP bank.
+ * Setting Drupal variable to FALSE will disable the process.
+ */
+function commerce_otp_cron() {
+  if (variable_get('commerce_otp_cron_enabled', TRUE)) {
+    module_load_include('inc', 'commerce_otp', 'commerce_otp.admin');
+    commerce_otp_process_transactions();
+  }
+}
+
+/**
+ * Get commerce payment transaction ID depend on remote OTP transaction ID.
+ */
+function commerce_otp_get_payment_transaction($remote_transaction_id) {
+  $query = new EntityFieldQuery();
+  $result = $query
+    ->entityCondition('entity_type', 'commerce_payment_transaction')
+    ->propertyCondition('payment_method', 'otp')
+    ->propertyCondition('remote_id', $remote_transaction_id)
+    ->execute();
+  if (isset($result['commerce_payment_transaction']) && !empty($result['commerce_payment_transaction'])) {
+    $transaction = array_pop($result['commerce_payment_transaction']);
+    return $transaction->transaction_id;
+  }
+  return FALSE;
+}
+
+/**
+ * Get transaction status message depend on remote status code.
+ *
+ * @param string $status_code
+ *   Remote status code.
+ *
+ * @return mixed
+ *   Status message, depend on status_code. If not set return array.
+ */
+function commerce_otp_status_message($status_code = NULL) {
+  $statuses = array(
+    COMMERCE_OTP_TR_STATUS_CREATED       => t('Initialized/created on webshop side'),
+    COMMERCE_OTP_TR_STATUS_SENT          => t('Sent to bank'),
+    COMMERCE_OTP_TR_STATUS_PROCESSED     => t('Processed on bank side'),
+    COMMERCE_OTP_TR_STATUS_SUCCESS       => t('Success'),
+    COMMERCE_OTP_TR_STATUS_CANCELLED     => t('Cancelled'),
+    COMMERCE_OTP_TR_STATUS_FAILED        => t('Failed'),
+    COMMERCE_OTP_TR_STATUS_UNKNOWN_ERROR => t('Unknown error'),
+  );
+  if (!$status_code) {
+    return $statuses;
+  }
+  return $statuses[$status_code];
+}
+/**
+ * Get OTP payment icons.
+ *
+ * @return array
+ *   'have to shown' icons
+ */
+function commerce_otp_payment_icons() {
+  $cards_type = commerce_otp_payment_cardtypes();
+  foreach ($cards_type as $type => $cards) {
+    foreach ($cards as $name => $title) {
+      $variables = array(
+        'path' => drupal_get_path('module', 'commerce_otp') . '/images/' . $name . '.gif',
+        'title' => $title,
+        'alt' => $title,
+        'attributes' => array(
+          'class' => array('commerce-otp-icon', $name),
+        ),
+      );
+      $icons[$type][$name] = theme('image', $variables);
+    }
+  }
+  return $icons;
+}
+
+/**
+ * Get OTP's card types.
+ *
+ * @return array
+ *   card types
+ */
+function commerce_otp_payment_cardtypes() {
+  return array(
+    'cards' => array(
+      'mastercard' => t('Mastercard'),
+      'maestro' => t('Maestro'),
+      'visa' => t('Visa'),
+      'visa-electron' => t('Visa Electron'),
+      'amexblue' => t('American Express'),
+    ),
+    'verifications' => array(
+      'mastercard-securecode' => t('Mastercard Securecode'),
+      'visa-verified' => t('Verified by Visa'),
+    ),
+  );
+}
+
+/**
+ * Implements hook_help().
+ */
+function commerce_otp_help($path, $arg) {
+  switch ($path) {
+    case 'admin/help#commerce_otp':
+      $file = dirname(__FILE__) . '/README.txt';
+      if (file_exists($file)) {
+        $readme = file_get_contents($file);
+      }
+      if (!isset($readme)) {
+        return NULL;
+      }
+      if (module_exists('markdown')) {
+        $filters = module_invoke('markdown', 'filter_info');
+        $info = $filters['filter_markdown'];
+        if (function_exists($info['process callback'])) {
+          $output = $info['process callback']($readme, NULL);
+        }
+        else {
+          $output = '<pre>' . $readme . '</pre>';
+        }
+      }
+      else {
+        $output = '<pre>' . $readme . '</pre>';
+      }
+      return $output;
+  }
+}

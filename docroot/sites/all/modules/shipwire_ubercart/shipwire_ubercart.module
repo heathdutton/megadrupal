@@ -1,0 +1,977 @@
+<?php
+
+/**
+ * @file
+ * Integration between Shipwire and Ubercart
+ */
+
+/**
+ * Exclude Shipwire quotes if order contains certain product SKUs.
+ *
+ * @param array $products
+ *   Array of products contained from an ubercart order.
+ *
+ * @return bool
+ *   TRUE indicates theat order should be excluded from quote.
+ */
+function shipwire_ubercart_exclude_quote($products) {
+  $ret = FALSE;
+  $exludes = variable_get('shipwire_ubercart_exclude', '');
+  if (!empty($exludes)) {
+    $skus = explode(',', $exludes);
+    if (count($skus)) {
+      foreach ($skus as $key => $sku) {
+        $skus[$key] = trim($sku);
+      }
+      foreach ($products as $product) {
+        if (in_array(trim($product->sku), $skus)) {
+          $ret = TRUE;
+          break;
+        }
+      }
+    }
+  }
+  return $ret;
+}
+
+/**
+ * Implements hook_cron().
+ */
+function shipwire_ubercart_cron() {
+  if (Shipwire::operational()) {
+    shipwire_ubercart_tracking_update();
+
+    $stock = variable_get('shipwire_ubercart_inventory_update', 0);
+    if ($stock) {
+      shipwire_ubercart_inventory_update();
+    }
+
+    $fulfill = variable_get('shipwire_ubercart_fulfill_type', 'now');
+    if ($fulfill == 'later') {
+      shipwire_ubercart_fulfill_cron();
+    }
+  }
+}
+
+/**
+ * Implements hook_menu().
+ */
+function shipwire_ubercart_menu() {
+  $items = array();
+
+  $items['admin/shipwire/settings/ubercart'] = array(
+    'title' => 'Ubercart',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('shipwire_ubercart_admin_settings'),
+    'access arguments' => array('edit shipwire settings'),
+    'type' => MENU_LOCAL_TASK,
+    'file' => 'shipwire_ubercart.admin.inc',
+  );
+
+  $items['admin/store/orders/%uc_order/shipwire'] = array(
+    'title' => 'Shipwire',
+    'page callback' => 'shipwire_ubercart_shipment_order',
+    'page arguments' => array(3),
+    'access arguments' => array('view all shipwire shipments'),
+    'weight' => 7,
+    'type' => MENU_LOCAL_TASK,
+    'file' => 'shipwire_ubercart.admin.inc',
+  );
+// Not fully implemented.
+//  $items['admin/store/orders/%uc_order/shipwire/new'] = array(
+//    'title' => 'New Shipwire shipment',
+//    'page callback' => 'drupal_get_form',
+//    'page arguments' => array('shipwire_ubercart_shipment_new', 3),
+//    'access arguments' => array('create shipwire shipments'),
+//    'type' => MENU_LOCAL_ACTION,
+//    'file' => 'shipwire_ubercart.admin.inc',
+//  );
+  $items['admin/store/orders/%uc_order/shipwire/%shipwire_shipment'] = array(
+    'title callback' => 'shipwire_ubercart_shipment_title',
+    'title arguments' => array(5),
+    'page callback' => 'shipwire_ubercart_shipment_view',
+    'page arguments' => array(3, 5),
+    'access arguments' => array('view all shipwire shipments'),
+    'file' => 'shipwire_ubercart.admin.inc',
+  );
+  $items['admin/store/orders/%uc_order/shipwire/%shipwire_shipment/view'] = array(
+    'title' => 'View',
+    'weight' => -5,
+    'type' => MENU_DEFAULT_LOCAL_TASK,
+  );
+  $items['admin/store/orders/%uc_order/shipwire/%shipwire_shipment/edit'] = array(
+    'title' => 'Edit Shipwire shipment',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('shipwire_ubercart_shipment_edit', 3, 5),
+    'access arguments' => array('edit all shipwire shipments'),
+    'weight' => -1,
+    'type' => MENU_LOCAL_TASK,
+    'file' => 'shipwire_ubercart.admin.inc',
+  );
+  $items['admin/store/orders/%uc_order/shipwire/%shipwire_shipment/delete'] = array(
+    'title' => 'Delete Shipwire shipment',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('shipwire_ubercart_shipment_delete_confirm', 3, 5),
+    'access arguments' => array('edit all shipwire shipments'),
+    'file' => 'shipwire_ubercart.admin.inc',
+  );
+
+  return $items;
+}
+
+/**
+ * Load rates for an ubercart order from the cache.
+ *
+ * @param ShipwireRateRequestOrder $rate_order
+ *   A fully populated Rate request order containing products and address.
+ * @param bool $throw_exception
+ *   TRUE to throw an error if cached rates do not exist.
+ *
+ * @return FALSE|array
+ *   FALSE on empty or array of cache information.
+ */
+function shipwire_ubercart_rates_cache_get(ShipwireRateRequestOrder $rate_order, $throw_exception = FALSE) {
+  $cache = shipwire_rates_cache_get($rate_order);
+  if (empty($cache) && $throw_exception) {
+    $message = 'The rates cache for order !order_id has expired. Please'
+      . ' request a new rate by adding a new shipping line item.';
+    $variables = array('!order_id' => $rate_order->order_id);
+    throw new Exception(t($message, $variables));
+  }
+  return $cache;
+}
+
+/**
+ * Quote callback for shipwire_ubercart_uc_shipping_method().
+ *
+ * @see shipwire_ubercart_uc_shipping_method()
+ * @see uc_quote_action_get_quote()
+ */
+function shipwire_ubercart_rates($products, $details, $method) {
+  if (($method['id'] != 'shipwire_ubercart') || empty($details['country']) || empty($details['city']) || empty($details['zone'])) {
+    return array();
+  }
+
+  $rates = &drupal_static(__FUNCTION__);
+  $product_key = FALSE;
+  if (count($products)) {
+    $product_key = key($products);
+  }
+
+  $order_id = FALSE;
+  if ($product_key && !empty($products[$product_key]->order_id)) {
+    $order_id = $products[$product_key]->order_id;
+  }
+  else {
+    return array();
+  }
+
+  if (!empty($rates[$order_id])) {
+    return $rates[$order_id];
+  }
+
+  try {
+    $order_prefix = variable_get('shipwire_ubercart_order_prefix', 'SU-');
+    $shipwire_order_id = $order_prefix . $order_id;
+    $currency = variable_get('uc_currency_code', 'USD');
+
+    $request_address = new ShipwireAddress();
+    $country = uc_get_country_data(array('country_id' => $details['country']));
+    $country_iso_2 = $country[0]['country_iso_code_2'];
+    $state = uc_get_zone_code($details['zone']);
+    $request_address->setName($details['first_name'] . ' ' . $details['last_name']);
+    $request_address->setAddress1($details['street1']);
+    $request_address->setAddress2($details['street2']);
+    $request_address->setCity($details['city']);
+    $request_address->setStateCountry($state, $country_iso_2);
+    $request_address->setPostal($details['postal_code']);
+    $request_address->setPhone($details['phone']);
+
+    $request_order = new ShipwireRateRequestOrder();
+    $request_order->setOrderId($shipwire_order_id);
+    $request_order->setAddress($request_address);
+
+    foreach ($products as $product) {
+      if ($product->data['shippable']) {
+        $request_product = new ShipwireProduct($product->model, $product->qty, $currency, $product->price);
+        $request_order->addProduct($request_product);
+      }
+    }
+
+    $exclude = shipwire_ubercart_exclude_quote($request_order->products);
+    if ($exclude) {
+      $rates[$order_id] = array();
+      return array();
+    }
+
+    $cache = shipwire_ubercart_rates_cache_get($request_order);
+    if (!empty($cache['rates'])) {
+      return $cache['rates'];
+    }
+
+    $request_rate = new ShipwireRateRequest();
+    $request_rate->setCurrency($currency);
+    $request_rate->addOrder($request_order);
+
+    $shipwire = Shipwire::getInstance();
+    $response = $shipwire->requestRate($request_rate);
+
+    $padding_quote = variable_get('shipwire_ubercart_padding_quote', 0);
+    $padding_days = variable_get('shipwire_ubercart_padding_days', 0);
+
+    $rates_order = array();
+    if (count($response['data_xml']->Order->Quotes->Quote)) {
+      foreach ($response['data_xml']->Order->Quotes->Quote as $quote) {
+        $key = check_plain((string) $quote['method']);
+
+        $shipwire_data = array();
+        $shipwire_data['method'] = $key;
+        $shipwire_data['carrier_code'] = check_plain((string) $quote->CarrierCode);
+        $shipwire_data['carrier_name'] = check_plain((string) $quote->Service);
+        $shipwire_data['warehouse_code'] = Shipwire::getWarehouseCode((string) $quote->Warehouse);
+        $shipwire_data['trackable'] = ((string) $quote->Service->attributes()->trackable == 'YES') ? 1 : 0;
+        $shipwire_data['currency'] = $currency;
+        $shipwire_data['cost_total'] = check_plain((float) $quote->Cost) + $padding_quote;
+
+        foreach ($quote->Subtotals->Subtotal as $sub_total) {
+          switch ($sub_total->attributes()->type) {
+            case 'Freight':
+              $shipwire_data['cost_freight'] = check_plain((float) $sub_total->Cost);
+              break;
+
+            case 'Insurance':
+              $shipwire_data['cost_insurance'] = check_plain((float) $sub_total->Cost);
+              break;
+
+            case 'Packaging':
+              $shipwire_data['cost_packaging'] = check_plain((float) $sub_total->Cost);
+              break;
+
+            case 'Handling':
+              $shipwire_data['cost_handling'] = check_plain((float) $sub_total->Cost);
+              break;
+          }
+        }
+
+        // For some reason Shipwire choose to include the packaging cost in
+        // the freight cost. Subtract it to get the actual shipping cost.
+        // Confirmed with Shipwire as SOP and not a bug.
+        if (!empty($shipwire_data['cost_freight']) && !empty($shipwire_data['cost_packaging'])) {
+          $shipwire_data['cost_freight'] = $shipwire_data['cost_freight'] - $shipwire_data['cost_packaging'];
+        }
+
+        $rates_order[$key]['shipwire_ubercart'] = $shipwire_data;
+
+        $rates_order[$key]['rate'] = $shipwire_data['cost_total'];
+        $rates_order[$key]['format'] = uc_currency_format($shipwire_data['cost_total']);
+        $label = array(
+          'DeliveryEstimate' => array(
+            'Minimum' => intval($quote->DeliveryEstimate->Minimum) + $padding_days,
+            'Maximum' => intval($quote->DeliveryEstimate->Maximum) + $padding_days,
+          ),
+          'Service' => $shipwire_data['carrier_name'],
+        );
+        $rates_order[$key]['option_label'] = theme('shipwire_ubercart_quote_label', $label);
+      }
+      $rates[$order_id] = $rates_order;
+    }
+    shipwire_rates_cache_set($request_order, $rates_order);
+
+    if (module_exists('rules')) {
+      if (!empty($products[$product_key]->order->line_items)) {
+        $order = $products[$product_key]->order;
+      }
+      else {
+        $order = uc_order_load($order_id);
+      }
+
+      rules_invoke_event('shipwire_ubercart_rules_quote_generated', $order, $rates_order, $request_order);
+      $cache = shipwire_ubercart_rates_cache_get($request_order);
+      $rates_order = $cache['rates'];
+      $rates[$order_id] = $rates_order;
+    }
+
+    return $rates_order;
+  }
+  catch (Exception $e) {
+    $message = 'Error getting quote for ubercart order !order_id.';
+    $message_vars = array('!order_id' => $order_id);
+    Shipwire::logError($message, $message_vars, WATCHDOG_ERROR, $e);
+  }
+
+  return array();
+}
+
+/**
+ * Fulfills a shipment immediately and saves the shipment entity.
+ *
+ * @param object $order
+ *   Fully loaded ubercart order.
+ * @param array $products
+ *   Optional array of product line items to restrict shipment to.
+ *
+ * @return bool
+ *   TRUE on sucessfull submition.
+ */
+function shipwire_ubercart_fulfill_now($order, $products = array()) {
+  if (Shipwire::operational() && $order->quote['method'] == 'shipwire_ubercart') {
+
+    $order_prefix = variable_get('shipwire_ubercart_order_prefix', 'SU-');
+    $shipwire_order_id = $order_prefix . $order->order_id;
+    $shipping_method = $order->quote['accessorials'];
+
+    try {
+      $rate_order = new ShipwireRateRequestOrder();
+      $rate_order->setOrderId($shipwire_order_id);
+
+      $country = uc_get_country_data(array('country_id' => $order->delivery_country));
+      $country_iso_2 = $country[0]['country_iso_code_2'];
+      $state = uc_get_zone_code($order->delivery_zone);
+      $address = new ShipwireAddress();
+      $address->setName($order->delivery_first_name . ' ' . $order->delivery_last_name);
+      $address->setAddress1($order->delivery_street1);
+      $address->setAddress2($order->delivery_street2);
+      $address->setCity($order->delivery_city);
+      $address->setStateCountry($state, $country_iso_2);
+      $address->setPostal($order->delivery_postal_code);
+      $address->setPhone($order->delivery_phone);
+      $rate_order->setAddress($address);
+
+      $request_products = array();
+
+      if (empty($products)) {
+        $products = $order->products;
+      }
+
+      foreach ($products as $op) {
+        if ($op->data['shippable']) {
+          $request_products[] = new ShipwireProduct($op->model, $op->qty, $order->currency, $op->price);
+        }
+      }
+      $rate_order->addProducts($request_products);
+
+      $cache = shipwire_ubercart_rates_cache_get($rate_order, TRUE);
+
+      // Set email address after cache request.
+      if (!empty($order->primary_email)) {
+        $address->setEmail($order->primary_email);
+        $rate_order->setAddress($address);
+      }
+
+      // For fulfillment request copy data from rate request.
+      $fulfill_order = new ShipwireFulfillRequestOrder();
+      $fulfill_order->setOrderId($rate_order->order_id);
+      $fulfill_order->setAddress($rate_order->address);
+      $fulfill_order->addProducts($rate_order->products);
+      $fulfill_order->setShipping($shipping_method);
+
+      $fulfill_request = new ShipwireFulfillRequest();
+      $fulfill_request->setModule('uc_order');
+      $fulfill_request->addOrder($fulfill_order);
+
+      $shipwire = Shipwire::getInstance();
+      $response = $shipwire->requestFulfillment($fulfill_request);
+
+      if (!empty($response['data_xml']->OrderInformation->Order)) {
+        $shipwire_data = $response['data_xml']->OrderInformation->Order;
+
+        $messages = array();
+        $shipment_status = 'submitted';
+        if (!empty($shipwire_data->WarningList)) {
+          foreach ($shipwire_data->WarningList as $warning) {
+            $messages[] = array(
+              'type' => 'warning',
+              'message' => check_plain((string) $warning),
+            );
+          }
+        }
+        if (!empty($shipwire_data->Holds->Hold)) {
+          foreach ($shipwire_data->Holds->Hold as $hold) {
+            $messages[] = array(
+              'type' => 'hold',
+              'hold_type' => check_plain((string) $hold->Type),
+              'message' => check_plain((string) $hold->Description),
+            );
+          }
+          $shipment_status = 'held';
+        }
+
+        $rate_data = $cache['rates'][$shipping_method]['shipwire_ubercart'];
+
+        $shipment = new ShipwireShipment(array('type' => 'uc_order'));
+        $shipment->messages = $messages;
+        $shipment->status = $shipment_status;
+        $shipment->shipping_method = $shipping_method;
+        $shipment->order_id = $order->order_id;
+        $shipment->order_prefix = $order_prefix;
+        $shipment->date_submitted = REQUEST_TIME;
+        $shipment->carrier_code = $rate_data['carrier_code'];
+        $shipment->warehouse_code = $rate_data['warehouse_code'];
+        $shipment->trackable = $rate_data['trackable'];
+        $shipment->currency = $rate_data['currency'];
+        $shipment->cost_total = $rate_data['cost_total'];
+        $shipment->cost_freight = $rate_data['cost_freight'];
+        $shipment->cost_handling = $rate_data['cost_handling'];
+        $shipment->cost_insurance = $rate_data['cost_insurance'];
+        $shipment->cost_packaging = $rate_data['cost_packaging'];
+
+        $shipment->data['products'] = $fulfill_order->products;
+        $shipment->data['address'] = $fulfill_order->address;
+
+        $shipment->shipwire_id = check_plain((string) $shipwire_data->attributes()->id);
+
+        $save = $shipment->save();
+        if ($save !== FALSE) {
+          if (variable_get('shipwire_ubercart_log_order')) {
+            $message = t('Order submitted to shipwire : @sid', array('@sid' => $shipment->shipwire_id));
+            uc_order_log_changes($order->order_id, array($message));
+          }
+
+          shipwire_rates_cache_clear($fulfill_order->order_id);
+          rules_invoke_event('shipwire_ubercart_rules_event_order_submitted', $order, $shipment);
+          return TRUE;
+        }
+      }
+    }
+    catch (Exception $e) {
+      $message = 'Error fulfilling ubercart order !order_id.';
+      $message_vars = array('!order_id' => $order->order_id);
+      Shipwire::logError($message, $message_vars, WATCHDOG_ERROR, $e);
+      return FALSE;
+    }
+  }
+  return FALSE;
+}
+
+/**
+ * Batch submits shipments for fulfillment.
+ */
+function shipwire_ubercart_fulfill_cron() {
+  if (Shipwire::operational()) {
+    $fulfill_max = variable_get('shipwire_fulfill_max', 200);
+    $fulfill_freq = variable_get('shipwire_fulfill_freq', 14400);
+
+    $last_changed = time() - $fulfill_freq;
+    $query = "SELECT shipwire_shipment_id
+            FROM {shipwire_shipments}
+            WHERE type = 'uc_order'
+              AND date_submitted = 0
+              AND status = 'pending'
+              AND changed <= :last_changed
+            ORDER BY changed ASC";
+
+    try {
+      $res = db_query_range($query, 0, $fulfill_max, array(':last_changed' => $last_changed));
+
+      $sids = array();
+      if ($res) {
+        while ($s = $res->fetchObject()) {
+          $sids[] = $s->shipwire_shipment_id;
+        }
+      }
+    }
+    catch (Exception $e) {
+      $message = 'Error querying database for ubercart shipments.';
+      Shipwire::logError($message, array(), WATCHDOG_ERROR, $e);
+      return;
+    }
+
+    if (empty($sids)) {
+      // No orders in shipments need checking.
+      return;
+    }
+
+    $fulfill_request = new ShipwireFulfillRequest();
+    $fulfill_request->setModule('uc_order');
+    $order_ship_ids = array();
+    $shipments = shipwire_shipment_load_multiple($sids);
+
+    foreach ($shipments as $shipment) {
+      try {
+        $ship_order_id = $shipment->order_prefix . $shipment->order_id;
+        $order_ship_ids[$ship_order_id] = $shipment->shipwire_shipment_id;
+        $fulfill_order = new ShipwireFulfillRequestOrder();
+        $fulfill_order->setOrderId($ship_order_id);
+        $fulfill_order->setShipping($shipment->shipping_method);
+        $fulfill_order->setAddress($shipment->data['address']);
+        $fulfill_order->addProducts($shipment->data['products']);
+        $fulfill_order->validate();
+        $fulfill_request->addOrder($fulfill_order);
+      }
+      catch (Exception $e) {
+        $message = 'Error preparing order !order_id shipment !shipment_id for batch fulfillment.';
+        $message_vars = array(
+          '!order_id' => $shipment->order_id,
+          '!shipment_id' => $shipment->shipwire_shipment_id,
+        );
+        Shipwire::logError($message, $message_vars, WATCHDOG_ERROR, $e);
+      }
+    }
+
+    try {
+      $shipwire = Shipwire::getInstance();
+      $response = $shipwire->requestFulfillment($fulfill_request);
+    }
+    catch (Exception $e) {
+      $message = 'Error in response for ubercart batch fulfillment';
+      Shipwire::logError($message, array(), WATCHDOG_ERROR, $e);
+      return;
+    }
+
+    if (!empty($response['data_xml']->OrderInformation->Order)) {
+      foreach ($response['data_xml']->OrderInformation->Order as $shipwire) {
+        $shipwire_attributes = $shipwire->attributes();
+        $shipwire_order_id = (string) $shipwire_attributes->number;
+
+        if (!empty($order_ship_ids[$shipwire_order_id])) {
+          $shipwire_shipment_id = $order_ship_ids[$shipwire_order_id];
+          $shipment = $shipments[$shipwire_shipment_id];
+
+          try {
+            $messages = array();
+            $shipment_status = 'submitted';
+            if (!empty($shipwire->WarningList)) {
+              foreach ($shipwire->WarningList as $warning) {
+                $messages[] = array(
+                  'type' => 'warning',
+                  'message' => check_plain((string) $warning),
+                );
+              }
+            }
+            if (!empty($shipwire->Holds->Hold)) {
+              foreach ($shipwire->Holds->Hold as $hold) {
+                $messages[] = array(
+                  'type' => 'hold',
+                  'hold_type' => check_plain((string) $hold->Type),
+                  'message' => check_plain((string) $hold->Description),
+                );
+              }
+              $shipment_status = 'held';
+            }
+            $shipment->messages = $messages;
+            $shipment->status = $shipment_status;
+            $shipment->date_submitted = REQUEST_TIME;
+            $shipment->shipwire_id = check_plain((string) $shipwire_attributes->id);
+
+            $save = $shipment->save();
+            if ($save !== FALSE) {
+              if (variable_get('shipwire_ubercart_log_order')) {
+                $message = t('Order submitted to shipwire : @sid', array('@sid' => $shipment->shipwire_id));
+                uc_order_log_changes($shipment->order_id, array($message));
+              }
+              $order = uc_order_load($shipment->order_id);
+              rules_invoke_event('shipwire_ubercart_rules_event_order_submitted', $order, $shipment);
+              return TRUE;
+            }
+          }
+          catch (Exception $e) {
+            $message = 'Error fulfilling ubercart order !order_id shipment !shipment_id';
+            $message_vars = array(
+              '!order_id' => $shipment->order_id,
+              '!shipment_id' => $shipment->shipwire_shipment_id,
+            );
+            Shipwire::logError($message, $message_vars, WATCHDOG_ERROR, $e);
+          }
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Saves a shipment entity for fulfillment later using batch submission.
+ *
+ * @param object $order
+ *   Fully loaded ubercart order.
+ * @param array $products
+ *   Optional array of product line items to restrict shipment to.
+ *
+ * @return bool
+ *   TRUE on sucessfull submition.
+ */
+function shipwire_ubercart_fulfill_later($order, $products = array(), $shipment_status = 'pending') {
+  if (Shipwire::operational() && $order->quote['method'] == 'shipwire_ubercart') {
+    try {
+      $order_prefix = variable_get('shipwire_ubercart_order_prefix', 'SU-');
+      $shipwire_order_id = $order_prefix . $order->order_id;
+      $shipping_method = $order->quote['accessorials'];
+
+      $rate_order = new ShipwireRateRequestOrder();
+      $rate_order->setOrderId($shipwire_order_id);
+
+      $country = uc_get_country_data(array('country_id' => $order->delivery_country));
+      $country_iso_2 = $country[0]['country_iso_code_2'];
+      $state = uc_get_zone_code($order->delivery_zone);
+      $address = new ShipwireAddress();
+      $address->setName($order->delivery_first_name . ' ' . $order->delivery_last_name);
+      $address->setAddress1($order->delivery_street1);
+      $address->setAddress2($order->delivery_street2);
+      $address->setCity($order->delivery_city);
+      $address->setStateCountry($state, $country_iso_2);
+      $address->setPostal($order->delivery_postal_code);
+      $address->setPhone($order->delivery_phone);
+      $rate_order->setAddress($address);
+
+      $request_products = array();
+
+      if (empty($products)) {
+        $products = $order->products;
+      }
+      foreach ($products as $op) {
+        if ($op->data['shippable']) {
+          $request_products[] = new ShipwireProduct($op->model, $op->qty, $order->currency, $op->price);
+        }
+      }
+      $rate_order->addProducts($request_products);
+
+      $cache = shipwire_rates_cache_get($rate_order, TRUE);
+      $rate_data = $cache['rates'][$shipping_method]['shipwire_ubercart'];
+
+      // Set email address after cache request.
+      if (!empty($order->primary_email)) {
+        $address->setEmail($order->primary_email);
+        $rate_order->setAddress($address);
+      }
+
+      $shipment = new ShipwireShipment(array('type' => 'uc_order'));
+
+      $shipment->order_id = $order->order_id;
+      $shipment->order_prefix = $order_prefix;
+      $shipment->shipping_method = $shipping_method;
+      $shipment->status = $shipment_status;
+
+      $shipment->carrier_code = $rate_data['carrier_code'];
+      $shipment->warehouse_code = $rate_data['warehouse_code'];
+      $shipment->trackable = $rate_data['trackable'];
+      $shipment->currency = $rate_data['currency'];
+      $shipment->cost_total = $rate_data['cost_total'];
+      $shipment->cost_freight = $rate_data['cost_freight'];
+      $shipment->cost_handling = $rate_data['cost_handling'];
+      $shipment->cost_insurance = $rate_data['cost_insurance'];
+      $shipment->cost_packaging = $rate_data['cost_packaging'];
+
+      $shipment->data['products'] = $rate_order->products;
+      $shipment->data['address'] = $rate_order->address;
+      $save = $shipment->save();
+
+      if ($save !== FALSE) {
+        if (variable_get('shipwire_ubercart_log_order')) {
+          $message = t('Shipwire shipment created: @sid', array('@sid' => $shipment->shipwire_shipment_id));
+          uc_order_log_changes($order->order_id, array($message));
+        }
+        shipwire_rates_cache_clear($shipwire_order_id);
+        return TRUE;
+      }
+    }
+    catch (Exception $e) {
+      $message = 'Error creating shipment for ubercart order !order_id.';
+      $message_vars = array('!order_id' => $order->order_id);
+      Shipwire::logError($message, $message_vars, WATCHDOG_ERROR, $e);
+      return FALSE;
+    }
+  }
+  return FALSE;
+}
+
+/**
+ * Fetch the stock levels for all products and update locally.
+ */
+function shipwire_ubercart_inventory_update() {
+  if (!module_exists('uc_stock') || !Shipwire::operational() || variable_get('shipwire_ubercart_inventory_update', 0) == 0) {
+    return FALSE;
+  }
+
+  $stock_max = variable_get('shipwire_stock_max', 200);
+  $stock_freq = variable_get('shipwire_stock_freq', 14400);
+  $stock_last = variable_get('shipwire_ubercart_stock_last', 0);
+  $stock_time = variable_get('shipwire_ubercart_stock_time', 0);
+
+  if ($stock_last != 0 || ($stock_last == 0 && $stock_time + $stock_freq < REQUEST_TIME)) {
+    $query = 'SELECT sku, nid
+     FROM {uc_product_stock}
+     WHERE active = 1
+     ORDER BY nid ASC';
+
+    $result = db_query_range($query, $stock_last, $stock_max);
+    $sku_id_map = array();
+
+    if ($result) {
+      while ($product = $result->fetchObject()) {
+        $sku_id_map[$product->sku] = $product->nid;
+      }
+    }
+
+    // No products to check. Reset variables for next processing run.
+    if (count($sku_id_map) == 0) {
+      variable_set('shipwire_ubercart_stock_last', 0);
+      variable_set('shipwire_ubercart_stock_time', REQUEST_TIME);
+      return;
+    }
+
+    try {
+      $request = new ShipwireInventoryRequest();
+      $request->setIncludeEmpty(TRUE);
+      foreach ($sku_id_map as $sku => $nid) {
+        $request->addProductSku($sku);
+      }
+      $shipwire = Shipwire::getInstance();
+      $response = $shipwire->requestInventory($request);
+
+      variable_set('shipwire_ubercart_stock_last', $stock_last + $stock_max);
+
+      if (count($response['data_xml']->Product)) {
+        // Set the stock quantities from the response for all found products.
+        foreach ($response['data_xml']->Product as $sw) {
+          $sw_attrib = $sw->attributes();
+
+          $sku = check_plain((string) $sw_attrib->code);
+          $qty = (int) $sw_attrib->quantity;
+          uc_stock_set($sku, $qty);
+        }
+      }
+    }
+    catch (Exception $e) {
+      $message = 'Error processing batch ubercart inventory update.';
+      Shipwire::logError($message, array(), WATCHDOG_ERROR, $e);
+      return;
+    }
+  }
+}
+
+/**
+ * Implements hook_theme().
+ */
+function shipwire_ubercart_theme() {
+  return array(
+    'shipwire_ubercart_quote_label' => array(
+      'variables' => array('quote' => NULL),
+      'file' => 'shipwire_ubercart.module',
+    ),
+  );
+}
+
+/**
+ * Process shipment tracking batch update.
+ *
+ * Get up to date tracking status for all shipments that have not yet been
+ * shipped from warehouse or have tracking and have not been delivered.
+ */
+function shipwire_ubercart_tracking_update() {
+  $track_max = variable_get('shipwire_track_max', 200);
+  $track_freq = variable_get('shipwire_track_freq', 14400);
+
+  $track_request = new ShipwireTrackingRequest();
+  $track_request->setIncludeHolds(TRUE);
+  $track_shipments = array();
+
+  $last_changed = REQUEST_TIME - $track_freq;
+  $sql = "SELECT shipwire_shipment_id, shipwire_id
+            FROM {shipwire_shipments}
+            WHERE ((trackable = 1 AND date_delivered = 0) OR (trackable = 0 AND date_shipped = 0))
+              AND type = 'uc_order'
+              AND changed <= :last_changed
+            ORDER BY changed ASC";
+  $res = db_query_range($sql, 0, $track_max, array(':last_changed' => $last_changed));
+  if ($res) {
+    while ($o = $res->fetchObject()) {
+      $track_request->addShipwireId($o->shipwire_id);
+      $track_shipments[$o->shipwire_shipment_id] = $o->shipwire_id;
+    }
+  }
+
+  if (empty($track_shipments)) {
+    // No orders in shipments need checking.
+    return;
+  }
+
+  try {
+    $shipwire = Shipwire::getInstance();
+    $response = $shipwire->requestTracking($track_request);
+
+    if (count($response['data_xml']->Order) == 0) {
+      // No orders in response to process.
+      return;
+    }
+
+    foreach ($response['data_xml']->Order as $shipwire_data) {
+      $shipwire_attrib = $shipwire_data->attributes();
+      $shipwire_id = (string) $shipwire_attrib->shipwireId;
+      $shipwire_shipment_id = array_search($shipwire_id, $track_shipments);
+      if ($shipwire_shipment_id) {
+        $shipment_org = shipwire_shipment_load($shipwire_shipment_id);
+        $shipment_new = clone $shipment_org;
+        $shipment_status = $shipment_org->status;
+        $messages = array();
+
+        if (!empty($shipwire_data->Holds->Hold)) {
+          foreach ($shipwire_data->Holds->Hold as $hold) {
+            $messages[] = array(
+              'type' => 'hold',
+              'hold_type' => check_plain((string) $hold->Type),
+              'message' => check_plain((string) $hold->Description),
+            );
+          }
+          $shipment_status = 'held';
+        }
+
+        if (empty($shipment_new->date_shipped) && !empty($shipwire_attrib->shipDate)) {
+          $shipment_new->date_shipped = strtotime((string) $shipwire_attrib->shipDate);
+          $shipment_status = 'shipped';
+        }
+        if (empty($shipment_new->date_shipped) && (string) $shipwire_attrib->shipped == 'YES') {
+          $shipment_new->date_shipped = REQUEST_TIME;
+          $shipment_status = 'shipped';
+        }
+
+        if (!empty($shipwire_attrib->expectedDeliveryDate)) {
+          $shipment_new->date_expected = strtotime((string) $shipwire_attrib->expectedDeliveryDate);
+        }
+
+        if (empty($shipment_new->date_deliviered) && (string) $shipwire_attrib->delivered == 'YES') {
+          $shipment_new->date_deliviered = REQUEST_TIME;
+          $shipment_status = 'delivered';
+        }
+
+        if (!empty($shipwire_attrib->manuallyEdited)) {
+          $shipment_new->manually_edited = ((string) $shipwire_attrib->manuallyEdited == 'YES') ? 1 : 0;
+        }
+
+        if (!empty($shipwire_data->TrackingNumber)) {
+          $tracking_attrib = $shipwire_data->TrackingNumber->attributes();
+          $shipment_new->tracking_number = check_plain((string) $shipwire_data->TrackingNumber);
+          if (!empty($tracking_attrib->deliveryDate)) {
+            $shipment_new->date_deliviered = strtotime((string) $tracking_attrib->deliveryDate);
+          }
+          if (!empty($tracking_attrib->href)) {
+            $shipment_new->tracking_uri = filter_xss((string) $tracking_attrib->href);
+          }
+        }
+
+        if (!empty($shipwire_attrib->href)) {
+          $shipment_new->shipwire_uri = filter_xss((string) $shipwire_attrib->href);
+        }
+        $shipment_new->status = $shipment_status;
+        $shipment_new->save();
+
+        $order = uc_order_load($shipment_new->order_id);
+        // Trigger rules.
+        if (empty($shipment_org->date_shipped) && !empty($shipment_new->date_shipped)) {
+          rules_invoke_event('shipwire_ubercart_rules_event_order_shipped', $order, $shipment_new);
+        }
+        if (empty($shipment_org->date_deliviered) && !empty($shipment_new->date_deliviered)) {
+          rules_invoke_event('shipwire_ubercart_rules_event_order_delivered', $order, $shipment_new);
+        }
+      }
+    }
+  }
+  catch (Exception $e) {
+    $message = 'Error processing batch tracking update.';
+    Shipwire::logError($message, array(), WATCHDOG_ERROR, $e);
+    return;
+  }
+}
+
+/**
+ * Implements hook_uc_shipping_method().
+ */
+function shipwire_ubercart_uc_shipping_method() {
+  return array(
+    'shipwire_ubercart' => array(
+      'id' => 'shipwire_ubercart',
+      'module' => 'shipwire_ubercart',
+      'title' => t('Shipwire'),
+      'operations' => array(
+        'configure' => array(
+          'title' => t('configure'),
+          'href' => 'admin/shipwire/settings/ubercart',
+        ),
+      ),
+      'quote' => array(
+        'type' => 'order',
+        'callback' => 'shipwire_ubercart_rates',
+        'accessorials' => Shipwire::getShippingMethods(),
+      ),
+    ),
+  );
+}
+
+/**
+ * Implements hook_uc_store_status().
+ */
+function shipwire_ubercart_uc_store_status() {
+  $messages = array();
+
+  if (Shipwire::operational()) {
+    $messages[] = array(
+      'status' => 'ok',
+      'title' => t('Shipwire Ubercart'),
+      'desc' => t('Shipwire is configured and operational.'),
+    );
+  }
+  else {
+    $messages[] = array(
+      'status' => 'error',
+      'title' => t('Shipwire Ubercart'),
+      'desc' => l(t('Please configure Shipwire'), 'admin/shipwire/settings'),
+    );
+  }
+
+  return $messages;
+}
+
+/**
+ * Theme shipping quote line visible to the customer adding estimated delivery.
+ */
+function theme_shipwire_ubercart_quote_label($quote) {
+  $service = $quote['Service'];
+  $delivery = $quote['DeliveryEstimate'];
+
+  $days = $delivery['Minimum'];
+  if ($delivery['Minimum'] != $delivery['Maximum']) {
+    $days = $delivery['Minimum'] . ' - ' . $delivery['Maximum'];
+  }
+
+  return t('@service (@days days)', array('@service' => $service, '@days' => $days));
+}
+
+/**
+ * Implements hook_ENTITY_insert().
+ *
+ * Used to create a field reference between ubercart order and shipment.
+ */
+function shipwire_ubercart_shipwire_shipment_insert(ShipwireShipment $shipment) {
+  if ($shipment->type == 'uc_order') {
+    $order = entity_load_single($shipment->type, $shipment->order_id);
+    if ($order) {
+      $ow = entity_metadata_wrapper($shipment->type, $order);
+      $shipments = $ow->shipwire_shipments->value();
+      $key = array_search($shipment->shipwire_shipment_id, $shipments);
+      if (!$key) {
+        $shipments[] = $shipment->shipwire_shipment_id;
+        $ow->shipwire_shipments->set($shipments);
+        $ow->save();
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_ENTITY_delete().
+ *
+ * Used to delete a field reference between ubercart order and shipment.
+ */
+function shipwire_ubercart_shipwire_shipment_delete(ShipwireShipment $shipment) {
+  if ($shipment->type == 'uc_order') {
+    $order = entity_load_single($shipment->type, $shipment->order_id);
+    if ($order) {
+      $ow = entity_metadata_wrapper($shipment->type, $order);
+      $shipments = $ow->shipwire_shipments->value();
+      $key = array_search($shipment->shipwire_shipment_id, $shipments);
+      if ($key) {
+        unset($shipments[$key]);
+        $ow->shipwire_shipments->set($shipments);
+        $ow->save();
+      }
+    }
+  }
+}

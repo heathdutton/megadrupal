@@ -1,0 +1,567 @@
+<?php
+/**
+ * @file
+ * Drupal Commerce Payment Gateway for Cybersource HOP.
+ *
+ * This is an offsite payment redirect for Hosted Order Pages.
+ */
+
+/**
+ * Implements hook_commerce_payment_method_info().
+ */
+function commerce_cybersource_hop_commerce_payment_method_info() {
+  $payment_methods = array();
+
+  $payment_methods['cybersource_hop'] = array(
+    'base' => 'commerce_cybersource_hop',
+    'title' => t('CyberSource Hosted Order Page (HOP)'),
+    'short_title' => t('CyberSource HOP'),
+    'display_title' => t('Secure Offsite Credit Card Processing'),
+    'description' => t('Integrates the CyberSource offsite Hosted Order Pages for card not present CC transactions.'),
+    'terminal' => FALSE,
+    'offsite' => TRUE,
+    'offsite_autoredirect' => TRUE,
+  );
+
+  return $payment_methods;
+}
+
+/**
+ * Returns the default settings for the CyberSource HOP payment method.
+ */
+function commerce_cybersource_hop_default_settings() {
+  $settings = array(
+    'cybersource_hop_server' => 'test',
+    'cybersource_hop_transaction_type' => 'sale',
+    'cybersource_hop_send_line_items' => '0',
+    'cybersource_hop_button_text' => 'Process Payment',
+  );
+  // Custom fields you can send along with the request 1 - 20
+  for ($x = 1; $x <= 20; $x++) {
+    $settings['cybersource_hop_merchantDefinedData' . $x] = '';
+  }
+  return $settings;
+}
+
+/**
+ * Payment method callback: settings form.
+ */
+function commerce_cybersource_hop_settings_form($settings = NULL) {
+  $settings += commerce_cybersource_hop_default_settings();
+  $form = array();
+  $form['cybersource_hop_server'] = array(
+    '#type' => 'radios',
+    '#title' => t('Cybersource server'),
+    '#options' => array(
+      'test' => ('Test - use for testing, requires a Cybersource account'),
+      'live' => ('Live - use for processing real transactions'),
+    ),
+    '#default_value' => $settings['cybersource_hop_server'],
+  );
+  $form['cybersource_hop_transaction_type'] = array(
+    '#type' => 'radios',
+    '#title' => t('Transaction type'),
+    '#options' => array(
+      'sale' => t('Sale - authorize and capture the funds at the time the payment is processed'),
+      'authorization' => t('Authorization - reserve funds on the card to be captured later through your Cybersource account'),
+    ),
+    '#default_value' => $settings['cybersource_hop_transaction_type'],
+  );
+  $form['cybersource_hop_send_line_items'] = array(
+    '#type' => 'radios',
+    '#title' => t('Send line items through to cybersource.'),
+    '#options' => array(
+      '1' => t('Yes'),
+      '0' => t('No'),
+    ),
+    '#default_value' => $settings['cybersource_hop_send_line_items'],
+  );
+  $form['cybersource_hop_avs'] = array(
+    '#type' => 'radios',
+    '#title' => t('Ensure address verification'),
+    '#options' => array(
+      'true' => t('Process transaction only if address passes verification.'),
+      'false' => t('Process transaction regardless of the result of address verification.'),
+    ),
+    '#default_value' => isset($settings['cybersource_hop_avs']) ? $settings['cybersource_hop_avs'] : 'true',
+  );
+  $form['cybersource_hop_button_text'] = array(
+    '#type' => 'textfield',
+    '#title' => t('CyberSource "Buy button" text'),
+    '#description' => t('This text appears on the button users press to process their payment on the Hosted Order Page.'),
+    '#default_value' => $settings['cybersource_hop_button_text'],
+  );
+
+  for ($x = 1; $x <= 20; $x++) {
+    // Custom fields you can send along with the request 1 - 20
+    $form['cybersource_hop_merchantDefinedData' . $x] = array(
+      '#type' => 'textfield',
+      '#title' => t('merchantDefinedData@id', array('@id' => $x)),
+      '#default_value' => $settings['cybersource_hop_merchantDefinedData' . $x],
+    );
+  }
+
+  return $form;
+}
+
+/**
+ * Payment method callback: adds a message and CSS to the submission form.
+ */
+function commerce_cybersource_hop_submit_form($payment_method, $pane_values, $checkout_pane, $order) {
+  if (!commerce_cybersource_hop_get_hop_file()) {
+    drupal_set_message(t('The file HOP.php was not found and is needed to process payments.'), 'error');
+  }
+  $form['cybersource_hop_information'] = array(
+    '#markup' => '<span class="commerce-cybersource-hop-info">' . t('(Continue with checkout to be redirected to the payment server.)') . '</span>',
+  );
+  return $form;
+}
+
+/**
+ * Payment method callback: redirect form, a wrapper around the module's general use function for building the HOP form.
+ */
+function commerce_cybersource_hop_redirect_form($form, &$form_state, $order, $payment_method) {
+  if (!commerce_cybersource_hop_get_hop_file()) {
+    return array();
+  }
+  return commerce_cybersource_hop_order_form($form, $form_state, $order, $payment_method['settings']);
+}
+
+/**
+ * Payment method callback: redirect form return validation.
+ */
+function commerce_cybersource_hop_redirect_form_validate($order, $payment_method) {
+  // The flood controls to hinder brute force attacks.
+  if (!flood_is_allowed('failed_transaction_signature', 10, 300)) {
+    return FALSE;
+  }
+
+  if (!commerce_cybersource_hop_verify_transaction_signature($_POST)) {
+    flood_register_event('failed_transaction_signature', 300);
+    return FALSE;
+  }
+
+  // This may be an unnecessary step, but if for some reason the user does end
+  // up returning at the success URL with a Failed payment, go back.
+  if (strtoupper($_POST['decision']) != 'ACCEPT') {
+    // Created failed payment transaction before returning false.
+    $transaction = commerce_payment_transaction_new('cybersource_hop', $order->order_id);
+    $transaction->instance_id = $payment_method['instance_id'];
+    $transaction->remote_id = $_POST['requestID'];
+    $transaction->amount = commerce_currency_decimal_to_amount($_POST['orderAmount'], $_POST['orderCurrency']);
+    $transaction->currency_code = $_POST['orderCurrency'];
+    $transaction->payload[REQUEST_TIME] = $_POST;
+    $transaction->remote_status = $_POST['decision'];
+    $transaction->status = COMMERCE_PAYMENT_STATUS_FAILURE;
+    $transaction->message = t("The payment has failed.");
+    commerce_payment_transaction_save($transaction);
+    watchdog(
+      'commerce_cybersource_hop',
+      'Order @order_number with remote id: @remote_id has failed with the following code @code:@code_message',
+      array(
+        '@order_number' => $order->order_id,
+        '@remote_id' => $_POST['requestID'],
+        '@code' => $_POST['reasonCode'],
+        '@code_message' => commerce_cybersource_hop_reason_code($_POST['reasonCode']),
+      )
+    );
+    // Returning FALSE sends error message to user and redirects back to previous checkout page.
+    return FALSE;
+  }
+}
+
+/**
+ * Payment method callback: redirect form return validation.
+ */
+function commerce_cybersource_hop_redirect_form_submit($order, $payment_method) {
+  $transaction = commerce_payment_transaction_new('cybersource_hop', $order->order_id);
+  $transaction->instance_id = $payment_method['instance_id'];
+  $transaction->remote_id = $_POST['requestID'];
+  $transaction->amount = commerce_currency_decimal_to_amount($_POST['orderAmount'], $_POST['orderCurrency']);
+  $transaction->currency_code = $_POST['orderCurrency'];
+  $transaction->payload[REQUEST_TIME] = $_POST;
+  $transaction->remote_status = $_POST['decision'];
+  switch (strtoupper($_POST['decision'])) {
+    case 'ACCEPT':
+      $transaction->status = COMMERCE_PAYMENT_STATUS_SUCCESS;
+      $transaction->message = t('The payment has completed.');
+      break;
+
+    case 'REJECT':
+      $transaction->status = COMMERCE_PAYMENT_STATUS_FAILURE;
+      $transaction->message = t("The payment has failed.");
+      break;
+
+  }
+
+  // Save the transaction information.
+  commerce_payment_transaction_save($transaction);
+  commerce_payment_redirect_pane_next_page($order);
+  watchdog(
+    'commerce_cybersource_hop',
+    'Order @order_number with remote id: @remote_id has been processed with the following code @code:@code_message',
+    array(
+      '@order_number' => $order->order_id,
+      '@remote_id' => $_POST['requestID'],
+      '@code' => $_POST['reasonCode'],
+      '@code_message' => commerce_cybersource_hop_reason_code($_POST['reasonCode']),
+    )
+  );
+}
+
+/**
+ * Builds a Hosted Order Page post to send along to cybersource.
+ */
+function commerce_cybersource_hop_order_form($form, &$form_state, $order, $settings) {
+  $path = commerce_cybersource_hop_get_hop_file();
+  require_once $path;
+  $wrapper = entity_metadata_wrapper('commerce_order', $order);
+  $currency_code = $wrapper->commerce_order_total->currency_code->value();
+  $amount = commerce_currency_amount_to_decimal($wrapper->commerce_order_total->amount->value(), $currency_code);
+  $settings += commerce_cybersource_hop_default_settings();
+
+
+  // Build the data array that will be translated into hidden form values.
+  $billing_address = $wrapper->commerce_customer_billing->commerce_customer_address->value();
+  $email = $wrapper->mail->value();
+  $order_number = $wrapper->order_number->value();
+  $receipt_url = url('checkout/' . $order_number . '/payment/return/' . $order->data['payment_redirect_key'], array('absolute' => TRUE));
+  // Either split the name or set that variables as found.
+  $name = commerce_cybersource_hop_check_names($billing_address);
+
+  $data = array(
+    'billTo_email' => $email,
+    'billTo_firstName' => $name['first_name'],
+    'billTo_lastName' => $name['last_name'],
+    'billTo_postalCode' => $billing_address['postal_code'],
+    'billTo_state' => $billing_address['administrative_area'],
+    'billTo_city' => $billing_address['locality'],
+    'billTo_street1' => $billing_address['thoroughfare'],
+    'billTo_country' => $billing_address['country'],
+    'orderPage_sendMerchantURLPost' => 'true',
+    'orderPage_merchantURLPostAddress' => $receipt_url,
+    'orderPage_receiptResponseURL' => $receipt_url,
+    'orderPage_ignoreAVS' => isset($settings['cybersource_hop_avs']) ? 'false' : 'true',
+  );
+
+  if (module_exists('commerce_shipping')) {
+    $shipping_address = $wrapper->commerce_customer_shipping->commerce_customer_address->value();
+    $name = commerce_cybersource_hop_check_names($shipping_address);
+    $data += array(
+      'shipTo_city' => $shipping_address['locality'],
+      'shipTo_country' => $shipping_address['country'],
+      'shipTo_firstName' => $name['first_name'],
+      'shipTo_lastName' => $name['last_name'],
+      'shipTo_postalCode' => $shipping_address['postal_code'],
+      'shipTo_state' => $shipping_address['administrative_area'],
+      'shipTo_street1' => $shipping_address['thoroughfare'],
+    );
+  }
+
+  if ($settings['cybersource_hop_send_line_items']) {
+    $line_items = $wrapper->commerce_line_items;
+    $item_num = 0;
+    foreach ($line_items as $line_item) {
+      if (isset($line_item->commerce_product)) {
+        $data['item_' . $item_num . '_productSKU'] = $line_item->commerce_product->sku->value();
+        // Quantity needs to be formatted as an integer or the HOP rejects it.
+        $data['item_' . $item_num . '_quantity'] = number_format($line_item->quantity->value(), 0, '', '');
+        $data['item_' . $item_num . '_productName'] = $line_item->commerce_product->title->value();
+        $data['item_' . $item_num . '_unitPrice'] = commerce_currency_amount_to_decimal($line_item->commerce_unit_price->amount->value(), $currency_code);
+        $data['item_' . $item_num . '_taxAmount'] = '0.00';
+        $item_num++;
+      }
+    }
+    $data['lineItemCount'] = count($line_items);
+  }
+
+  // Custom fields you can send along with the request 1 - 20
+  for ($x = 1; $x <= 20; $x++) {
+    $merchant_data_x = trim($settings['cybersource_hop_merchantDefinedData' . $x]);
+    if (empty($merchant_data_x)) {
+      $data['merchantDefinedData' . $x] = $settings['cybersource_hop_merchantDefinedData' . $x];
+    }
+  }
+
+
+  $form['#action'] = commerce_cybersource_hop_server_url($settings['cybersource_hop_server']);
+
+  foreach ($data as $name => $value) {
+    if (!empty($value)) {
+      $form[$name] = array('#type' => 'hidden', '#value' => $value);
+    }
+  }
+
+  $form['map_signature'] = array(
+    '#type' => 'markup',
+    '#markup' => commerce_cybersource_hop_insert_map_signature($amount, $currency_code, $settings['cybersource_hop_transaction_type'], $order_number),
+  );
+
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Proceed to Payment Form'),
+  );
+  return $form;
+}
+
+/**
+ * Returns the URL to the specified cybersource server.
+ *
+ * @param string $server
+ *   Either sandbox or live indicating which server to get the URL for.
+ *
+ * @return string
+ *   The URL to use to submit requests to the PayPal WPS server.
+ */
+function commerce_cybersource_hop_server_url($server) {
+  switch ($server) {
+    case 'test':
+      return 'https://orderpagetest.ic3.com/hop/orderform.jsp';
+    case 'live':
+      return 'https://orderpage.ic3.com/hop/orderform.jsp';
+  }
+}
+
+/**
+ * Function wrapper to return the information from the original function.
+ *
+ * @param decimal $amount
+ *   Total amount of the order being processed.
+ * @param string $currency
+ *   Currency code that was used on this order.
+ * @param string $transaction_type
+ *   Type of transaction (sale or auth).
+ * @param string $order_number
+ *   Order Number of the order being processed.
+ *
+ * @return string
+ *   Buffered output from the InsertMapSignature function
+ */
+function commerce_cybersource_hop_insert_map_signature($amount, $currency, $transaction_type, $order_number) {
+  $path = commerce_cybersource_hop_get_hop_file();
+  require_once $path;
+  ob_start();
+  $map = array();
+  $map['amount'] = $amount;
+  $map['currency'] = $currency;
+  $map['orderPage_transactionType'] = $transaction_type;
+  $map['orderNumber'] = $order_number;
+  HOP\InsertMapSignature($map);
+  $ob = ob_get_clean();
+  return $ob;
+}
+
+/**
+ * Function wrapper to return the information from the original function.
+ *
+ * @param decimal $amount
+ *   Total amount of the order being processed.
+ * @param string $currency
+ *   Currency code that was used on this order.
+ * @param string $transaction_type
+ *   Type of transaction (sale or auth).
+ *
+ * @return string
+ *   Buffered output from the InsertSignature3 function
+ */
+function commerce_cybersource_hop_insert_signature_3($amount, $currency, $transaction_type) {
+  if ($path = commerce_cybersource_hop_get_hop_file()) {
+    require_once $path;
+  }
+  else {
+
+  }
+  ob_start();
+  HOP\InsertSignature3($amount, $currency, $order_number);
+  $ob = ob_get_clean();
+  return $ob;
+}
+
+/**
+ * Function wrapper to return the information from the original function.
+ *
+ * @param decimal $subscription_amount
+ *   Total amount of the order being processed.
+ * @param string $subscription_start_date
+ *   Start date of the subscription.
+ * @param string $subscription_frequency
+ *   Frequency of renewal.
+ * @param string $subscription_number_of_payments
+ *   The number of subscription payments to be charged.
+ * @param string $subscription_automatic_renew
+ *   Automatically renewal of subscriptions.
+ *
+ * @return string
+ *   Buffered output from the InsertSubscriptionSignature function
+ */
+function commerce_cybersource_hop_insert_subscription_signature($subscription_amount, $subscription_start_date, $subscription_frequency, $subscription_number_of_payments, $subscription_automatic_renew) {
+  if ($path = commerce_cybersource_hop_get_hop_file()) {
+    require_once $path;
+  }
+  else {
+
+  }
+  ob_start();
+  HOP\InsertSubscriptionSignature($subscription_amount, $subscription_start_date, $subscription_frequency, $subscription_number_of_payments, $subscription_automatic_renew);
+  $ob = ob_get_clean();
+  return $ob;
+}
+
+/**
+ * Function wrapper to return the information from the original function.
+ *
+ * @param string $subscription_id
+ *   Id of the subscription.
+ *
+ * @return string
+ *   Buffered output from the InsertSubscriptionIDSignature function
+ */
+function commerce_cybersource_hop_insert_subscription_IDS_signature($subscription_id) {
+  if ($path = commerce_cybersource_hop_get_hop_file()) {
+    require_once $path;
+  }
+  else {
+
+  }
+  ob_start();
+  HOP\InsertSubscriptionIDSignature($subscription_id);
+  $ob = ob_get_clean();
+  return $ob;
+}
+
+/**
+ * Returns a description for the reason code input into it.
+ *
+ * @param string $code
+ *   Reason code returned from Cybersource.
+ *
+ * @return string
+ *   Reason code description.
+ */
+function commerce_cybersource_hop_reason_code($code) {
+  $codes = array(
+    '100' => t('Successful transaction.'),
+    '102' => t('One or more fields in the request are missing or invalid.'),
+    '110' => t('Authorization was partially approved.'),
+    '150' => t('Error: General system failure.'),
+    '151' => t('Error: The request was received, but a server time-out occurred. This error does not include time-outs between the client and the server.'),
+    '152' => t('Error: The request was received, but a service did not finish running in time.'),
+    '200' => t('The authorization request was approved by the issuing bank but declined by CyberSource because it'),
+    '201' => t('The issuing bank has questions about the request. You cannot receive an authorization code in the API reply, but you may receive one verbally by calling the processor.'),
+    '202' => t('The card is expired.'),
+    '203' => t('The card was declined. No other information was provided by the issuing bank.'),
+    '204' => t('The account has insufficient funds.'),
+    '205' => t('The card was stolen or lost.'),
+    '207' => t('The issuing bank was unavailable.'),
+    '208' => t('The card is inactive or not authorized for card-not-present transactions.'),
+    '210' => t('The credit limit for the card has been reached.'),
+    '211' => t('The card verification number is invalid.'),
+    '221' => t('The customer matched an entry on the processor’s negative file.'),
+    '222' => t('The customer’s bank account is frozen.'),
+    '230' => t('The authorization request was approved by the issuing bank but declined by CyberSource because it did not pass the card verification number check.'),
+    '231' => t('The account number is invalid.'),
+    '232' => t('The card type is not accepted by the payment processor.'),
+    '233' => t('The processor declined the request based on an issue with the request itself.'),
+    '234' => t('There is a problem with your CyberSource merchant configuration.'),
+    '236' => t('A processor failure occurred.'),
+    '240' => t('The card type sent is invalid or does not correlate with the credit card number.'),
+    '250' => t('Error: The request was received, but a time-out occurred with the payment processor.'),
+    '475' => t('The customer is enrolled in payer authentication.'),
+    '476' => t('The customer cannot be authenticated.'),
+    '520' => t('The authorization request was approved by the issuing bank but declined by CyberSource based on your Smart Authorization settings.'),
+  );
+  return $codes[$code];
+}
+
+/**
+ * Replacement function for verifyTransactionSignature in the HOP.php file.
+ *
+ * @param string $message
+ *   Message to be verified.
+ *
+ * @return bool
+ *   Returns verification of return post from Cybersource.
+ */
+function commerce_cybersource_hop_verify_transaction_signature($message) {
+  if ($path = commerce_cybersource_hop_get_hop_file()) {
+    require_once $path;
+  }
+  else {
+
+  }
+
+  $fields = explode(',', $message['signedFields']);
+  $data = '';
+  foreach ($fields as $field) {
+    $data .= $field . "=" . $message[$field] . ",";
+  }
+
+  $pub = HOP\getSharedSecret();
+  $signed_fields_public_signature = HOP\hopHash($message['signedFields'], $pub);
+
+  $data .= 'signedFieldsPublicSignature=' . $signed_fields_public_signature;
+  return HOP\VerifySignature($data, $message['signedDataPublicSignature']);
+}
+
+/**
+ * Check for the HOP.php file in various locations.
+ *
+ * @return mixed
+ *   Either returns the path of the HOP.php file or FALSE.
+ */
+function commerce_cybersource_hop_get_hop_file() {
+  $filepath = &drupal_static(__FUNCTION__);
+  if (!isset($filepath)) {
+    $paths_to_search = array(
+      'sites/all/libraries/commerce_cybersource_hop/',
+      drupal_get_path('module', 'commerce_cybersource_hop') . '/includes/',
+      conf_path() . '/libraries/commerce_cybersource_hop',
+    );
+    foreach ($paths_to_search as $path) {
+      if (file_exists($path . 'HOP.php')) {
+        $filepath = $path . 'HOP.php';
+        break;
+
+      }
+      watchdog(
+        'commerce_cybersource_hop',
+        'HOP.php file was not found. Please download the file from the cybersource business center using the instructions found in the README.txt file in the root of this module',
+        array(),
+        WATCHDOG_EMERGENCY
+      );
+      $filepath = FALSE;
+    }
+  }
+
+  return $filepath;
+}
+
+
+/**
+ * Splits name if needed for submission to cybersource.
+ */
+function commerce_cybersource_hop_check_names($addressfield = array()) {
+  if (!empty($addressfield)) {
+    if (empty($addressfield['first_name']) || empty($addressfield['last_name'])) {
+      $namearr = explode(' ', $addressfield['name_line']);
+
+      if (count($namearr) > 2) {
+        $last_name = array_pop($namearr);
+        $first_name = implode(' ', $namearr);
+      }
+      elseif (count($namearr) > 1) {
+        $last_name = $namearr[1];
+        $first_name = $namearr[0];
+      }
+      else {
+        $first_name = $namearr[0];
+        $last_name = '';
+      }
+    }
+    else {
+      $first_name = $addressfield['first_name'];
+      $last_name = $addressfield['last_name'];
+    }
+    return array('first_name' => $first_name, 'last_name' => $last_name);
+  }
+}

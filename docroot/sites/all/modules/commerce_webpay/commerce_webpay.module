@@ -1,0 +1,390 @@
+<?php
+
+/**
+ * @file
+ * This file implements the main functions to have Commerce Module with Webpay
+ * as Gateway.
+ *
+ * This module implements most functions that are defined on the main module.
+ * For more information:
+ * @see webpay.module
+ */
+
+
+/**
+ * Implements hook_webpay_commerce_system().
+ */
+function commerce_webpay_webpay_commerce_system() {
+  $info = array();
+  $info['drupal_commerce'] = array(
+    'title' => 'Drupal Commerce',
+    'description' => t('Use this for Drupal Commerce'),
+    'success' => 'commerce_webpay_success',
+    'failure' => 'commerce_webpay_failure',
+    'close validate' => 'commerce_webpay_validate_close',
+    'order load' => 'commerce_webpay_order_load',
+    'save transaction' => 'commerce_webpay_save_transaction',
+    'accept transaction' => 'commerce_webpay_accept_transaction',
+  );
+  return $info;
+}
+
+
+/**
+ * Callback for failure case.
+ *
+ * @param int $order_id
+ *   order identifier
+ *
+ * @return string
+ *   a themed page of failure.
+ */
+function commerce_webpay_failure($order_id) {
+  $order = commerce_order_load($order_id);
+  if ($id = commerce_webpay_get_transaction_id($order_id)) {
+    $commerce_transaction = commerce_payment_transaction_load($id);
+    $commerce_transaction->message = t('Payment Failed');
+    $commerce_transaction->status = COMMERCE_PAYMENT_STATUS_FAILURE;
+    commerce_payment_transaction_save($commerce_transaction);
+    $log = t('Customer canceled payment at the payment gateway.');
+    commerce_payment_redirect_pane_previous_page($order, $log);
+  }
+  $params = array('order_id' => $order_id, 'redirection' => commerce_checkout_order_uri($order));
+  $output = theme('webpay_failure', $params);
+
+  return $output;
+}
+
+
+/**
+ * Callback for success case.
+ *
+ * @param int $order_id
+ *   order identifier
+ *
+ * @return string
+ *   a themed page of success.
+ */
+function commerce_webpay_success($order_id) {
+  $order = commerce_order_load($order_id);
+  // First see if the order is actually completed.
+  if ($order->status != 'completed') {
+
+    return FALSE;
+  }
+  $data = variable_get('commerce_checkout_completion_message', commerce_checkout_completion_message_default());
+
+  $message = $data['value'];
+  $text_format = $data['format'];
+
+  $data_token = array('commerce-order' => $order);
+  $options = array('clear' => TRUE, 'sanitize' => FALSE);
+  $message = token_replace($message, $data_token, $options);
+
+  // Apply the proper text format.
+  $message = check_markup($message, $text_format);
+  return $message;
+}
+
+
+/**
+ * Prepares the voucher.
+ *
+ * @param mixed $order
+ *   Order from commerce
+ *
+ * @return string
+ *   themed voucher
+ */
+function commerce_webpay_prepare_voucher($order) {
+  $webpay_transaction = webpay_get_transaction_by_order($order->order_id, 'drupal_commerce');
+  $account = user_load($order->uid);
+
+  $client = $account->name;
+  $panes = commerce_checkout_panes(array('enabled' => TRUE));
+
+  $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+  foreach ($panes as $checkout_pane) {
+    $pane_var = 'commerce_' . $checkout_pane['pane_id'] . '_field';
+    if ($field_name = variable_get($pane_var, '')) {
+      $infocustomer = $order_wrapper->{$field_name}->commerce_customer_address->value();
+      $client = $infocustomer['name_line'];
+      if ($infocustomer['first_name']) {
+        $client = $infocustomer['first_name'];
+      }
+      $client .= ' ' . $infocustomer['last_name'];
+      break;
+    }
+  }
+
+  $view = views_get_view('commerce_cart_summary');
+
+  $products = $view->preview('default', array($order->order_id));
+
+  $voucher = webpay_prepare_for_voucher(array(
+    'order_id' => $order->order_id,
+    'webpay_transaction' => $webpay_transaction,
+    'client_name' => $client,
+    'products' => $products,
+  ));
+  return theme('webpay_voucher', $voucher);
+}
+
+
+/**
+ * Callback for order load.
+ *
+ * @see hook_webpay_webpay_commerce_system
+ *
+ * @param array $order
+ *   Generic Webpay's order.
+ */
+function commerce_webpay_order_load(&$order) {
+  $order_commerce = commerce_order_load($order['order_id']);
+  $order_wrapper = entity_metadata_wrapper('commerce_order', $order_commerce);
+  $currency = $order_wrapper->commerce_order_total->currency_code->value();
+  $amount_value = $order_wrapper->commerce_order_total->amount->value();
+  $amount = commerce_currency_amount_to_decimal($amount_value, $currency);
+  $order['order_total'] = $amount;
+  $order['status'] = $order_commerce->status;
+}
+
+
+/**
+ * Callback for save transaction.
+ *
+ * @see hook_webpay_webpay_commerce_system
+ *
+ * @param mixed $webpay_transaction
+ *   Transaction object as Webpay response to commerce request.
+ * @param int $uid
+ *   User identifier
+ */
+function commerce_webpay_save_transaction($webpay_transaction, $uid) {
+  $order_id = $webpay_transaction['tbk_orden_compra'];
+  $order = commerce_order_load($order_id);
+  $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+  $amount = $order_wrapper->commerce_order_total->amount->value();
+  $currency = $order_wrapper->commerce_order_total->currency_code->value();
+  $transaction = commerce_payment_transaction_new('webpay', $order->order_id);
+  $transaction->instance_id   = 'webpay|commerce_payment_webpay';
+  $transaction->amount        = $amount;
+  $transaction->uid           = $uid;
+  $transaction->remote_id     = $webpay_transaction['tbk_id_transaccion'];
+  $transaction->currency_code = $currency;
+  $transaction->status        = COMMERCE_PAYMENT_STATUS_PENDING;
+  // Save the transaction information.
+  commerce_payment_transaction_save($transaction);
+
+}
+
+
+/**
+ * Callback for close validate.
+ *
+ * @see hook_webpay_webpay_commerce_system
+ *
+ * @param array $order
+ *   Generic Webpay's order.
+ *
+ * @return bool
+ *   true if status is "checkout_paymet", false otherwise
+ */
+function commerce_webpay_validate_close($order) {
+  if ($order['status'] != 'checkout_payment') {
+    return FALSE;
+  }
+
+  return TRUE;
+}
+
+
+/**
+ * Callback for accept transaction.
+ *
+ * @see hook_webpay_webpay_commerce_system
+ *
+ * @param array $order
+ *   Generic Webpay's order.
+ */
+function commerce_webpay_accept_transaction($order) {
+  // As the transaction is accepted, the order status shall be "completed".
+  if ($id = commerce_webpay_get_transaction_id($order['order_id'])) {
+    $commerce_transaction = commerce_payment_transaction_load($id);
+    if ($commerce_transaction->status == COMMERCE_PAYMENT_STATUS_SUCCESS) {
+      return '';
+    }
+    $commerce_transaction->message = t('Transaction Completed');
+    $commerce_transaction->status = COMMERCE_PAYMENT_STATUS_SUCCESS;
+    commerce_payment_transaction_save($commerce_transaction);
+  }
+  $order_commerce = commerce_order_load($order['order_id']);
+
+  commerce_checkout_complete($order_commerce);
+  commerce_order_status_update($order_commerce, 'completed');
+}
+
+
+/**
+ * Implements hook_commerce_payment_method_info().
+ */
+function commerce_webpay_commerce_payment_method_info() {
+  $path_webpay = drupal_get_path('module', 'webpay');
+  $path = drupal_get_path('module', 'commerce_webpay');
+  drupal_add_css($path . '/css/commerce_webpay.css');
+  /*
+   * The logo is mandatory by Webpay's rules (deal with it)
+   */
+  $title = t('Payment through WebPay');
+  $title .= theme('image', array(
+    'path' => $path_webpay . '/images/logo.png',
+    'alt' => t('Webpay logo'),
+    'attributes' => array(
+      'class' => array('commerce-webpay-logo'),
+    ),
+  ));
+
+  $payment_methods['webpay'] = array(
+    'base'          => 'commerce_webpay',
+    'title'         => t('Webpay'),
+    'short_title'   => t('Webpay'),
+    'display_title' => $title,
+    'description'   => t('Redirects to Webpay to pay'),
+    'terminal'      => FALSE,
+    'offsite'       => TRUE,
+    'offsite_autoredirect' => TRUE,
+  );
+
+  return $payment_methods;
+}
+
+
+/**
+ * Form with just 1 field.
+ *
+ * @return array
+ *   form element
+ */
+function commerce_webpay_settings_form() {
+  $params = array('!here' => l(t('here'), 'admin/config/webpay/configure'));
+  $form = array(
+    '#markup' => t('To settings Webpay, go !here', $params),
+  );
+
+  return $form;
+}
+
+
+/**
+ * Payment method callback: submit_form.
+ *
+ * The unused parameters is because the callback requires them($payment_method,
+ * $checkout_pane).
+ */
+function commerce_webpay_submit_form($payment_method, $pane_values, $checkout_pane, $order) {
+  $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+  $currency = $order_wrapper->commerce_order_total->currency_code->value();
+
+  // Merge in default values.
+  $pane_values += array(
+    'currency' => $currency,
+  );
+  if (webpay_validate_currency($pane_values['currency'])) {
+    $txt = t('Proceed to checkout for secure payment with your credit/debit card via Webpay');
+    $markup = '<span class="commerce-webpay-info">' . $txt . '</span>';
+
+    $form['commerce_webpay_information'] = array(
+      '#markup' => $markup,
+    );
+  }
+
+  $form['currency'] = array(
+    '#type' => 'value',
+    '#value' => $pane_values['currency'],
+  );
+
+  return $form;
+}
+
+
+/**
+ * Payment method callback: submit_form_validate.
+ *
+ * The unused parameters is because the the callback needs them($payment_method,
+ * $pane_form).
+ */
+function commerce_webpay_submit_form_validate($payment_method, $pane_form, $pane_values, $order, $form_parents = array()) {
+  // Validates if the currency is allowed.
+  if (!webpay_validate_currency($pane_values['currency'])) {
+    $message = t('Webpay is not configured o does not support currency @currency', array('@currency' => $pane_values['currency']));
+    form_set_error('commerce_payment', $message);
+
+    return FALSE;
+  }
+}
+
+
+/**
+ * Payment method callback: redirect_form.
+ */
+function commerce_webpay_redirect_form($form, &$form_state, $order) {
+  $wrapper = entity_metadata_wrapper('commerce_order', $order);
+  $currency = $wrapper->commerce_order_total->currency_code->value();
+  if (!webpay_validate_currency($currency)) {
+    drupal_set_message(t('Not permitted'), 'error');
+    return array();
+  }
+  $amount_value = $wrapper->commerce_order_total->amount->value();
+
+  $amount = commerce_currency_amount_to_decimal($amount_value, $currency);
+  $params = webpay_get_params(array(
+    'amount' => $amount,
+    'order_number' => $order->order_id,
+    'session' => $order->uid,
+    'commerce' => 'drupal_commerce',
+    'currency' => $currency,
+  ));
+  $msg = t('Click to be redirected manually to Webpay');
+  $form = webpay_redirect_form($form, $form_state, $params, $msg, $currency);
+
+  return $form;
+}
+
+
+/**
+ * Implements hook_entity_view_alter().
+ */
+function commerce_webpay_entity_view_alter(&$build, $type) {
+  if ($type == 'commerce_order') {
+    $order = $build['#entity'];
+
+    $method = 'webpay|commerce_payment_webpay';
+    $order_pay_meth = $order->data['payment_method'] == $method;
+    $order_status_completed = $order->status == 'completed';
+
+    if ($order_pay_meth && $order_status_completed) {
+      $build['webpay'] = array(
+        '#markup' => commerce_webpay_prepare_voucher($order),
+      );
+    }
+  }
+}
+
+
+/**
+ * Gets transaction id.
+ *
+ * @param int $order_id
+ *   order identifier
+ *
+ * @return mixed
+ *   The transaction id if it was found, false otherwise.
+ */
+function commerce_webpay_get_transaction_id($order_id) {
+  $result = db_select('commerce_payment_transaction', 'c')
+    ->fields('c')
+    ->condition('order_id', $order_id)
+    ->execute()
+    ->fetchObject();
+  return isset($result->transaction_id) ? $result->transaction_id : FALSE;
+}
