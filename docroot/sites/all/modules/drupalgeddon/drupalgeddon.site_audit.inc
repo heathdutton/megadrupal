@@ -1,0 +1,296 @@
+<?php
+/**
+ * @file
+ * Drupal site_audit integration.
+ */
+
+class SiteAuditCheckSecurityDrupalgeddonUsers extends SiteAuditCheckAbstract {
+  /**
+   * Implements \SiteAudit\Check\Abstract\getLabel().
+   */
+  public function getLabel() {
+    return dt('Drupalgeddon users');
+  }
+
+  /**
+   * Implements \SiteAudit\Check\Abstract\getDescription().
+   */
+  public function getDescription() {
+    return dt('Check for known Drupalgeddon users in the user table.');
+  }
+
+  /**
+   * Implements \SiteAudit\Check\Abstract\getResultFail().
+   */
+  public function getResultFail() {
+    $user_list = array();
+    foreach ($this->registry['drupalgeddon_users'] as $uid => $name) {
+      $user_list[] = '#' . $uid . ': ' . $name;
+    }
+    return dt('The following users have been detected: @drupalgeddon_users', array(
+      '@drupalgeddon_users' => implode(', ', $user_list),
+    ));
+  }
+
+  /**
+   * Implements \SiteAudit\Check\Abstract\getResultInfo().
+   */
+  public function getResultInfo() {}
+
+  /**
+   * Implements \SiteAudit\Check\Abstract\getResultPass().
+   */
+  public function getResultPass() {
+    return dt('No known Drupalgeddon users were detected.');
+  }
+
+  /**
+   * Implements \SiteAudit\Check\Abstract\getResultWarn().
+   */
+  public function getResultWarn() {}
+
+  /**
+   * Implements \SiteAudit\Check\Abstract\getAction().
+   */
+  public function getAction() {
+    if ($this->score == SiteAuditCheckAbstract::AUDIT_CHECK_SCORE_FAIL) {
+      return dt('Delete the offending users from your site and check for other malicious activity.');
+    }
+  }
+
+  /**
+   * Implements \SiteAudit\Check\Abstract\calculateScore().
+   */
+  public function calculateScore() {
+    require_once DRUPALGEDDON_BASE_PATH . '/checks/bad_users_check.inc';
+    $this->registry['drupalgeddon_users'] = bad_users_check_for_names();
+    if (count($this->registry['drupalgeddon_users']) > 0) {
+      return SiteAuditCheckAbstract::AUDIT_CHECK_SCORE_FAIL;
+    }
+    return SiteAuditCheckAbstract::AUDIT_CHECK_SCORE_PASS;
+  }
+}
+
+class SiteAuditCheckSecurityDrupalgeddonRoles extends SiteAuditCheckAbstract {
+  /**
+   * Implements \SiteAudit\Check\Abstract\getLabel().
+   */
+  public function getLabel() {
+    return dt('Drupalgeddon roles');
+  }
+
+  /**
+   * Implements \SiteAudit\Check\Abstract\getDescription().
+   */
+  public function getDescription() {
+    return dt('Check for known Drupalgeddon roles in the role table.');
+  }
+
+  /**
+   * Implements \SiteAudit\Check\Abstract\getResultFail().
+   */
+  public function getResultFail() {
+    $role_list = array();
+    foreach ($this->registry['drupalgeddon_roles'] as $uid => $name) {
+      $role_list[] = '#' . $uid . ': ' . $name;
+    }
+    return dt('The following roles have been detected: @drupalgeddon_roles', array(
+      '@drupalgeddon_roles' => implode(', ', $role_list),
+    ));
+  }
+
+  /**
+   * Implements \SiteAudit\Check\Abstract\getResultInfo().
+   */
+  public function getResultInfo() {}
+
+  /**
+   * Implements \SiteAudit\Check\Abstract\getResultPass().
+   */
+  public function getResultPass() {
+    return dt('No known Drupalgeddon roles were detected.');
+  }
+
+  /**
+   * Implements \SiteAudit\Check\Abstract\getResultWarn().
+   */
+  public function getResultWarn() {}
+
+  /**
+   * Implements \SiteAudit\Check\Abstract\getAction().
+   */
+  public function getAction() {
+    if ($this->score == SiteAuditCheckAbstract::AUDIT_CHECK_SCORE_FAIL) {
+      return dt('Delete the offending roles from your site and check for other malicious activity.');
+    }
+  }
+
+  /**
+   * Implements \SiteAudit\Check\Abstract\calculateScore().
+   */
+  public function calculateScore() {
+    require_once DRUPALGEDDON_BASE_PATH . '/checks/bad_roles_check.inc';
+    $this->registry['drupalgeddon_roles'] = bad_roles_check_query();
+    if (count($this->registry['drupalgeddon_roles']) > 0) {
+      return SiteAuditCheckAbstract::AUDIT_CHECK_SCORE_FAIL;
+    }
+    return SiteAuditCheckAbstract::AUDIT_CHECK_SCORE_PASS;
+  }
+}
+
+class SiteAuditCheckSecurityDrupalgeddonUserConcurrency extends SiteAuditCheckAbstract {
+  /**
+   * Implements \SiteAudit\Check\Abstract\getLabel().
+   */
+  public function getLabel() {
+    return dt('Drupalgeddon users concurrency');
+  }
+
+  /**
+   * Implements \SiteAudit\Check\Abstract\getDescription().
+   */
+  public function getDescription() {
+    return dt('Check users with odd uid or created dates in the user table.');
+  }
+
+  /**
+   * Implements \SiteAudit\Check\Abstract\getResultFail().
+   */
+  public function getResultFail() {}
+
+  /**
+   * Implements \SiteAudit\Check\Abstract\getResultInfo().
+   */
+  public function getResultInfo() {}
+
+  /**
+   * Implements \SiteAudit\Check\Abstract\getResultPass().
+   */
+  public function getResultPass() {
+    return dt('No suspicious users were detected.');
+  }
+
+  /**
+   * Implements \SiteAudit\Check\Abstract\getResultWarn().
+   */
+  public function getResultWarn() {
+    $ret_val = dt('The following suspicious users have been detected:');
+    if (drush_get_option('html')) {
+      $ret_val = '<p>' . $ret_val . '</p>';
+      $ret_val .= '<ol>';
+      foreach ($this->registry['drupalgeddon_user_concurrency'] as $entry) {
+        $ret_val .= '<li>' . check_plain($entry) . '</li>';
+      }
+      $ret_val .= '</ol>';
+    }
+    else {
+      foreach ($this->registry['drupalgeddon_user_concurrency'] as $entry) {
+        if (!drush_get_option('json')) {
+          $ret_val .= PHP_EOL . str_repeat(' ', 6);
+        }
+        $ret_val .= '- ' . check_plain($entry);
+      }
+    }
+
+    return $ret_val;
+  }
+
+  /**
+   * Implements \SiteAudit\Check\Abstract\getAction().
+   */
+  public function getAction() {
+    if ($this->score == SiteAuditCheckAbstract::AUDIT_CHECK_SCORE_WARN) {
+      return dt('Examine the suspicious users from your site and check for other malicious activity.');
+    }
+  }
+
+  /**
+   * Implements \SiteAudit\Check\Abstract\calculateScore().
+   */
+  public function calculateScore() {
+    require_once DRUPALGEDDON_BASE_PATH . '/checks/bad_users_check.inc';
+    $this->registry['drupalgeddon_user_concurrency'] = bad_users_check_order();
+    if (count($this->registry['drupalgeddon_user_concurrency']) > 0) {
+      return SiteAuditCheckAbstract::AUDIT_CHECK_SCORE_WARN;
+    }
+    return SiteAuditCheckAbstract::AUDIT_CHECK_SCORE_PASS;
+  }
+}
+
+class SiteAuditCheckSecurityDrupalgeddonSuspiciousFiles extends SiteAuditCheckAbstract {
+  /**
+   * Implements \SiteAudit\Check\Abstract\getLabel().
+   */
+  public function getLabel() {
+    return dt('Drupalgeddon suspicious files');
+  }
+
+  /**
+   * Implements \SiteAudit\Check\Abstract\getDescription().
+   */
+  public function getDescription() {
+    return dt('Check for suspicious files in the Drupal codebase.');
+  }
+
+  /**
+   * Implements \SiteAudit\Check\Abstract\getResultFail().
+   */
+  public function getResultFail() {
+    $ret_val = dt('The following suspicious files have been detected:');
+    if (drush_get_option('html')) {
+      $ret_val = '<p>' . $ret_val . '</p>';
+      $ret_val .= '<ol>';
+      foreach ($this->registry['drupalgeddon_suspicious_files'] as $name) {
+        $ret_val .= '<li>' . check_plain($name) . '</li>';
+      }
+      $ret_val .= '</ol>';
+    }
+    else {
+      foreach ($this->registry['drupalgeddon_suspicious_files'] as $name) {
+        if (!drush_get_option('json')) {
+          $ret_val .= PHP_EOL . str_repeat(' ', 6);
+        }
+        $ret_val .= '- ' . check_plain($name);
+      }
+    }
+    return $ret_val;
+  }
+
+  /**
+   * Implements \SiteAudit\Check\Abstract\getResultInfo().
+   */
+  public function getResultInfo() {}
+
+  /**
+   * Implements \SiteAudit\Check\Abstract\getResultPass().
+   */
+  public function getResultPass() {
+    return dt('No suspicious files were detected.');
+  }
+
+  /**
+   * Implements \SiteAudit\Check\Abstract\getResultWarn().
+   */
+  public function getResultWarn() {}
+
+  /**
+   * Implements \SiteAudit\Check\Abstract\getAction().
+   */
+  public function getAction() {
+    if ($this->score == SiteAuditCheckAbstract::AUDIT_CHECK_SCORE_FAIL) {
+      return dt('Restore your codebase from a backup if possible. If not, delete the offending files from your site and check for other malicious activity.');
+    }
+  }
+
+  /**
+   * Implements \SiteAudit\Check\Abstract\calculateScore().
+   */
+  public function calculateScore() {
+    require_once DRUPALGEDDON_BASE_PATH . '/checks/suspicious_files_check.inc';
+    $this->registry['drupalgeddon_suspicious_files'] = suspicious_files_check_query();
+    if (count($this->registry['drupalgeddon_suspicious_files']) > 0) {
+      return SiteAuditCheckAbstract::AUDIT_CHECK_SCORE_FAIL;
+    }
+    return SiteAuditCheckAbstract::AUDIT_CHECK_SCORE_PASS;
+  }
+}

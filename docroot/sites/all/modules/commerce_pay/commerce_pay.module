@@ -1,0 +1,838 @@
+<?php
+/**
+ * @file
+ * Implements Commerce Pay payment services for use in Drupal Commerce.
+ */
+
+/**
+ * Implements hook_menu().
+ */
+function commerce_pay_menu() {
+  $items = array();
+
+  // Add a menu item for capturing authorizations.
+  $items['admin/commerce/orders/%commerce_order/payment/%commerce_payment_transaction/commerce-pay-capture'] = array(
+    'title' => 'Capture',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('commerce_pay_capture_form', 3, 5),
+    'access callback' => 'commerce_pay_capture_access',
+    'access arguments' => array(3, 5),
+    'type' => MENU_DEFAULT_LOCAL_TASK,
+    'context' => MENU_CONTEXT_INLINE,
+    'weight' => 2,
+    'file' => 'includes/commerce_pay.admin.inc',
+  );
+
+  // Add a menu item for cancelling the payment.
+  $items['admin/commerce/orders/%commerce_order/payment/%commerce_payment_transaction/commerce-pay-void'] = array(
+    'title' => 'Cancel',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('commerce_pay_void_form', 3, 5),
+    'access callback' => 'commerce_pay_void_access',
+    'access arguments' => array(3, 5),
+    'type' => MENU_DEFAULT_LOCAL_TASK,
+    'context' => MENU_CONTEXT_INLINE,
+    'weight' => 2,
+    'file' => 'includes/commerce_pay.admin.inc',
+  );
+
+  // Add a menu item for refunding the payment.
+  $items['admin/commerce/orders/%commerce_order/payment/%commerce_payment_transaction/commerce-pay-refund'] = array(
+    'title' => 'Refund',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('commerce_pay_refund_form', 3, 5),
+    'access callback' => 'commerce_pay_refund_access',
+    'access arguments' => array(3, 5),
+    'type' => MENU_DEFAULT_LOCAL_TASK,
+    'context' => MENU_CONTEXT_INLINE,
+    'weight' => 2,
+    'file' => 'includes/commerce_pay.admin.inc',
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_permission().
+ */
+function commerce_pay_permission() {
+  $permissions = array(
+    'access commerce pay debug' => array(
+      'title' => t('Access the Commerce Pay debug log'),
+    ),
+  );
+
+  return $permissions;
+}
+
+/**
+ * Determines access to the prior authorization capture form for credit card
+ * transactions.
+ *
+ * @param $order
+ *   The order the transaction is on.
+ * @param $transaction
+ *   The payment transaction object to be captured.
+ *
+ * @return
+ *   TRUE or FALSE indicating capture access.
+ */
+function commerce_pay_capture_access($order, $transaction) {
+  // Return FALSE if the transaction is not for Commerce Pay or is not
+  // awaiting capture.
+  if ($transaction->payment_method != 'commerce_pay' || $transaction->remote_status != 'authonly' || $transaction->amount <= 0) {
+    return FALSE;
+  }
+
+  // Return FALSE if it is more than 29 days past the original authorization.
+  if (REQUEST_TIME - $transaction->created > 86400 * 29) {
+    return FALSE;
+  }
+
+  // Allow access if the user can update payments on this transaction.
+  return commerce_payment_transaction_access('update', $transaction);
+}
+
+/**
+ * Determines access to the prior authorization capture form for credit card
+ * transactions.
+ *
+ * @param $order
+ *   The order the transaction is on.
+ * @param $transaction
+ *   The payment transaction object to be captured.
+ *
+ * @return
+ *   TRUE or FALSE indicating capture access.
+ */
+function commerce_pay_void_access($order, $transaction) {
+  // Return FALSE if the transaction is not for Commerce Pay or is not
+  // awaiting capture.
+  if ($transaction->payment_method != 'commerce_pay' || $transaction->remote_status != 'authonly') {
+    return FALSE;
+  }
+
+  // Return FALSE if the transaction is not pending.
+  if ($transaction->status != COMMERCE_PAYMENT_STATUS_PENDING) {
+    return FALSE;
+  }
+
+  // Return FALSE if it is more than 29 days past the original authorization.
+  if (REQUEST_TIME - $transaction->created > 86400 * 29) {
+    return FALSE;
+  }
+
+  // Allow access if the user can update payments on this transaction.
+  return commerce_payment_transaction_access('update', $transaction);
+}
+
+/**
+ * Determines access to the prior authorization capture form for credit card
+ * transactions.
+ *
+ * @param $order
+ *   The order the transaction is on.
+ * @param $transaction
+ *   The payment transaction object to be captured.
+ *
+ * @return
+ *   TRUE or FALSE indicating capture access.
+ */
+function commerce_pay_refund_access($order, $transaction) {
+  // Return FALSE if the transaction is not for Commerce Pay, does not have a
+  // success status or has an amount of 0 or less.
+  if ($transaction->payment_method != 'commerce_pay'  || $transaction->status != 'success' || $transaction->amount <= 0) {
+    return FALSE;
+  }
+
+  // Check the order balance to see if the Refund is complete.
+  $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+  $order_total = $order_wrapper->commerce_order_total->value();
+  $order_balance = commerce_payment_order_balance($order);
+  if ($order_balance && $order_balance['amount']  >= $order_total['amount']) {
+    return FALSE;
+  }
+
+  // Return FALSE if it is more than 29 days past the original authorization.
+  if (REQUEST_TIME - $transaction->created > 86400 * 29) {
+    return FALSE;
+  }
+
+  // Allow access if the user can update payments on this transaction.
+  return commerce_payment_transaction_access('update', $transaction);
+}
+
+/**
+ * Implements hook_libraries_info().
+ *
+ * For defining external libraries.
+ */
+function commerce_pay_libraries_info() {
+  // Expected to be extracted into 'sites/all/libraries/usaepay-php'.
+  $libraries['usaepay-php'] = array(
+    'name' => 'USAePay PHP Library',
+    'vendor url' => 'http://www.usaepay.com',
+    'download url' => 'https://github.com/usaepay/usaepay-php/archive/master.zip',
+    // Force a version value for the Libraries API.
+    'version' => TRUE,
+    'files' => array(
+      'php' => array(
+        'usaepay.php',
+      ),
+    ),
+  );
+
+  return $libraries;
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function commerce_pay_form_commerce_checkout_form_alter(&$form, &$form_state) {
+  // If this checkout form contains the payment method radios...
+  if (!empty($form['commerce_payment']['payment_method']['#options'])) {
+    // Loop over its options array looking for a PayPal WPS option.
+    foreach ($form['commerce_payment']['payment_method']['#options'] as $key => &$value) {
+      list($method_id, $rule_name) = explode('|', $key);
+
+      // If we find PayPal WPS...
+      if ($method_id == 'commerce_pay') {
+        if (!empty($form['commerce_payment']['payment_methods']['#value'][$key]['settings']['display_title'])) {
+          $form['commerce_payment']['payment_method']['#options'][$key] = $form['commerce_payment']['payment_methods']['#value'][$key]['settings']['display_title'];
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_commerce_payment_method_info().
+ */
+function commerce_pay_commerce_payment_method_info() {
+  $payment_methods = array();
+
+  $payment_methods['commerce_pay'] = array(
+    'title' => t('Payment via Commerce Pay'),
+    'description' => t('Payment solution to Drupal Commerce Merchants.'),
+    'callbacks' => array(),
+    'cardonfile' => array(
+      'charge callback' => 'commerce_pay_cardonfile_charge',
+      'update callback' => 'commerce_pay_cardonfile_update',
+      'delete callback' => 'commerce_pay_cardonfile_delete',
+    ),
+  );
+
+  return $payment_methods;
+}
+
+/**
+ * Returns the default settings for the Commerce Pay payment method.
+ */
+function commerce_pay_default_settings() {
+  // Return the default settings array for  the Commerce Pay payment method.
+  return array(
+    'source_key' => '',
+    'source_pin' => '',
+    'usesandbox' => TRUE,
+    'testmode' => TRUE,
+    'txn_type' => COMMERCE_CREDIT_AUTH_CAPTURE,
+    'billing_profile' => 'commerce_customer_billing',
+    'shipping_profile' => '',
+    'line_item_data' => FALSE,
+    'cardonfile' => FALSE,
+    'debug' => array(
+      'log' => FALSE,
+      'message' => FALSE,
+    ),
+  );
+}
+
+/**
+ * Settings form for Commerce Pay payment method.
+ *
+ * Used to set the API credentials within Rules settings.
+ */
+function commerce_pay_settings_form($settings = array()) {
+  $form = array();
+
+  // Check if USAePay PHP Library exists.
+  $library = libraries_load('usaepay-php');
+  if (!$library['installed'] || !class_exists('umTransaction')) {
+    $error_message = t('You need to download the !usaepay_php and extract the entire contents of the archive into the %path directory within %library_folder subfolder on your server.', array('!usaepay_php' => l(t('USAePay PHP Library'), $library['download url']), '%path' => 'sites/all/libraries', '%library_folder' => 'usaepay-php'));
+    $form['error-messages'] = array(
+      '#markup' => $error_message,
+      '#prefix' => '<div class="messages error">',
+      '#suffix' => '<div>',
+    );
+    return $form;
+  }
+
+  // Merge default settings into the stored settings array.
+  $settings = (array) $settings + commerce_pay_default_settings();
+
+  $form['display_title'] = array(
+    '#type' => 'textarea',
+    '#title' => t('Display title'),
+    '#description' => t('Title of the payment method when displayed in the payment selection. Leave empty to use the default.'),
+    '#default_value' => !empty($settings['display_title']) ? $settings['display_title'] : '',
+    '#rows' => 1,
+  );
+
+  $form['source_key'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Source Key'),
+    '#description' => t('Source Key generated by the Merchant Console at www.usaepay.com.'),
+    '#required' => TRUE,
+    '#default_value' => $settings['source_key'],
+  );
+  $form['source_pin'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Pin for Source Key'),
+    '#description' => t('This field is required only if the merchant has set a Pin in the merchant console.'),
+    '#default_value' => $settings['source_pin'],
+  );
+  $form['usesandbox'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Use Sandbox server?'),
+    '#description' => t('If set to true will use the sandbox server. Overrides the gatewayurl parameter.'),
+    '#default_value' => $settings['usesandbox'],
+  );
+  $form['testmode'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Use testmode?'),
+    '#description' => t('If set to yes then the transaction will be simulated but not actually processed.'),
+    '#default_value' => $settings['usesandbox'],
+  );
+
+  $form['txn_type'] = array(
+    '#type' => 'radios',
+    '#title' => t('Transaction type'),
+    '#description' => t('The transaction type will be used to process transactions during checkout.'),
+    '#options' => array(
+      COMMERCE_CREDIT_AUTH_CAPTURE => t('Capture'),
+      COMMERCE_CREDIT_AUTH_ONLY => t('Pre-authorize only'),
+    ),
+    '#default_value' => $settings['txn_type'],
+  );
+
+  // Generate an options list of customer profile reference fields attached
+  // to orders.
+  $options = array();
+
+  foreach (commerce_info_fields('commerce_customer_profile_reference', 'commerce_order') as $field_name => $field) {
+    $options[$field_name] = check_plain($field_name);
+  }
+
+  $form['billing_profile'] = array(
+    '#type' => 'select',
+    '#title' => t('Customer billing profile (reference field)'),
+    '#description' => t("Select a customer profile reference field attached to your order that contains the customer's billing address."),
+    '#options' => $options,
+    '#default_value' => $settings['billing_profile'],
+    '#required' => TRUE,
+  );
+
+  $form['shipping_profile'] = array(
+    '#type' => 'select',
+    '#title' => t('Customer shipping profile (reference field)'),
+    '#description' => t("Select a customer profile reference field attached to your order that contains the customer's shipping address."),
+    '#options' => $options,
+    '#default_value' => $settings['shipping_profile'],
+    '#empty_value' => '',
+  );
+
+  $form['line_item_data'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Send line item data?'),
+    '#description' => t('If set to true the order line items data will be sent for the transaction.'),
+    '#default_value' => $settings['line_item_data'],
+  );
+
+  // Card on File support if available.
+  if (commerce_pay_has_cardonfile()) {
+    $form['cardonfile'] = array(
+      '#type' => 'checkbox',
+      '#title' => t('Enable Card on File functionality with this payment method.'),
+      '#description' => t('Save card data on file.'),
+      '#default_value' => $settings['cardonfile'],
+    );
+  }
+
+  $form['debug'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Debugging'),
+    '#collapsible' => TRUE,
+    '#collapsed' => !($settings['debug']['log'] || $settings['debug']['message']),
+  );
+  $form['debug']['log'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Log debug information to the system log'),
+    '#default_value' => $settings['debug']['log'],
+  );
+  $form['debug']['message'] = array(
+    '#type' => 'radios',
+    '#title' => t('Show debug information'),
+    '#default_value' => $settings['debug']['message'],
+    '#options' => array(
+      0 => t('Never'),
+      2 => t('In case of errors'),
+      1 => t('Always'),
+    ),
+    '#description' => t('Debug information is only shown for Commerce Pay requests and is visible for users having the permission <a href="!url">%link</a>.', array('%link' => t('Access the Commerce Pay debug log'), '!url' => url('admin/people/permissions', array('fragment' => 'module-commerce_pay')))),
+  );
+
+  return $form;
+}
+
+/**
+ * Payment method callback: form validation
+ */
+function _commerce_pay_validate_api_credentials($element, &$form_state, $form) {
+  // SAPI credentials validation if possible.
+  /*
+  $element_parents = $element['#array_parents'];
+  $api_values = drupal_array_get_nested_value($form_state['values'], $element_parents);
+  if (!empty($api_values['source_key'])) {
+    $api_form_element_id = implode('][', $element_parents);
+    form_set_error($api_form_element_id . '][source_key', '');
+    form_set_error($api_form_element_id . '][source_pin', t('The Source Key and Pin are incorect!'));
+    // to do - real validation using the Payment Service API.
+  }
+  */
+}
+
+/**
+ * Payment method callback: submit form.
+ */
+function commerce_pay_submit_form($payment_method, $pane_values, $checkout_pane, $order) {
+  module_load_include('inc', 'commerce_payment', 'includes/commerce_payment.credit_card');
+  $fields = array(
+    'owner' => '',
+    'code' => '',
+  );
+  $default = array();
+
+  return commerce_payment_credit_card_form($fields, $default);
+}
+
+/**
+ * Payment method callback: checkout form validation.
+ */
+function commerce_pay_submit_form_validate($payment_method, $pane_form, $pane_values, $order, $form_parents = array()) {
+  // If the customer specified a card on file, skip the normal validation.
+  if (commerce_pay_has_cardonfile() && !empty($payment_method['settings']['cardonfile']) &&
+  !empty($pane_values['cardonfile']) && $pane_values['cardonfile'] !== 'new') {
+    return;
+  }
+
+  module_load_include('inc', 'commerce_payment', 'includes/commerce_payment.credit_card');
+
+  // Validate the credit card fields.
+  $settings = array(
+    'form_parents' => array_merge($form_parents, array('credit_card')),
+  );
+
+  if (!commerce_payment_credit_card_validate($pane_values['credit_card'], $settings)) {
+    return FALSE;
+  }
+}
+
+/**
+ * Payment method callback: checkout form submission.
+ */
+function commerce_pay_submit_form_submit($payment_method, $pane_form, $pane_values, $order, $charge) {
+  // Display an error and prevent the payment attempt if Commerce Pay has not
+  // been configured yet.
+  if (empty($payment_method['settings'])) {
+    drupal_set_message(t('This payment method must be configured by an administrator before it can be used.'), 'error');
+    return FALSE;
+  }
+
+  // If the customer specified payment using a card on file, use thee remote
+  // card data for the USAePay API transaction request.
+  if (commerce_pay_has_cardonfile() && $payment_method['settings']['cardonfile'] &&
+  !empty($pane_values['cardonfile']) && $pane_values['cardonfile'] !== 'new') {
+    // Rebuild the credit card data with card on file data.
+    $cardonfile = commerce_cardonfile_load($pane_values['cardonfile']);
+    $pane_values['credit_card'] = array();
+    $pane_values['credit_card']['number'] = $cardonfile->remote_id;
+    $pane_values['credit_card']['exp_year'] = '00';
+    $pane_values['credit_card']['exp_month'] = '00';
+    $pane_values['credit_card']['code'] = NULL;
+    $pane_values['credit_card']['owner'] = $cardonfile->card_name;
+  }
+
+  // Prepare data for USAePay API transaction request.
+  // API credentials data - payment settings.
+  $payment_settings = $payment_method['settings'];
+
+  // Build order data.
+  $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+  $order_data = array();
+  $order_data['invoice'] = $order->order_number;
+  $order_data['currency'] = $charge['currency_code'];
+  $order_data['amount'] = commerce_currency_amount_to_decimal($charge['amount'], $charge['currency_code']);
+  $order_data['lineitems'] = array();
+  if ($payment_settings['line_item_data']) {
+    foreach ($order_wrapper->commerce_line_items as $delta => $line_item_wrapper) {
+      if (in_array($line_item_wrapper->type->value(), commerce_product_line_item_types())) {
+        // If the line item is a product line item.
+        $order_data['lineitems'][$delta]['sku'] = $line_item_wrapper->commerce_product->sku->value();
+        $order_data['lineitems'][$delta]['name'] = $line_item_wrapper->commerce_product->title->value();
+        $order_data['lineitems'][$delta]['cost'] = commerce_currency_amount_to_decimal($line_item_wrapper->commerce_unit_price->amount->value(), $line_item_wrapper->commerce_unit_price->currency_code->value());
+        $order_data['lineitems'][$delta]['qty'] = (int)$line_item_wrapper->quantity->value();
+      }
+    }
+  }
+  // Allow modules to alter the order data.
+  drupal_alter('commerce_pay_order_data', $order_data, $order);
+
+  // todo : Tax, shipping, discount data.
+
+  // Build card data.
+  $credit_card = $pane_values['credit_card'];
+  $card_data = array();
+  $card_data['cardholder'] = $credit_card['owner'];
+  $card_data['card'] = $credit_card['number'];
+  $card_data['cvv2'] = $credit_card['code'];
+  $card_data['exp'] = $credit_card['exp_month'] . $credit_card['exp_year'];
+  // If Card on File storage is enabled and the form says to store data...
+  $save_cardonfile = commerce_pay_has_cardonfile() && !empty($payment_method['settings']['cardonfile']) &&
+  !empty($pane_values['credit_card']['cardonfile_store']);
+  if ($save_cardonfile) {
+    $card_data['savecard'] = TRUE;
+  }
+
+  // Billing address, contact data.
+  $billing_profile_field = $payment_settings['billing_profile'];
+  $billing_data = _commerce_pay_order_customer_data($billing_profile_field, $order);
+  $billing_data['email'] = $order->mail;
+  $billing_data['fax'] = '';
+  $billing_data['website'] = '';
+  // Allow modules to alter the billing data.
+  drupal_alter('commerce_pay_billing_data', $billing_data, $order);
+
+  // Shipping contact data.
+  $shipping_data = array();
+  if ($shipping_profile_field = $payment_settings['shipping_profile']) {
+    $shipping_data = _commerce_pay_order_customer_data($shipping_profile_field, $order);
+    // Allow modules to alter the shipping data.
+    drupal_alter('commerce_pay_shipping_data', $shipping_data, $order);
+  }
+
+  // Set the transaction status based on the type of transaction this was.
+  switch ($payment_settings['txn_type']) {
+    case COMMERCE_CREDIT_AUTH_ONLY:
+      $payment_settings['command'] = 'authonly';
+      $transaction_status = COMMERCE_PAYMENT_STATUS_PENDING;
+      break;
+
+    case COMMERCE_CREDIT_AUTH_CAPTURE:
+      $transaction_status = COMMERCE_PAYMENT_STATUS_SUCCESS;
+      break;
+  }
+
+  // Call USAePay API transaction helper function.
+  $usaepay_transaction = commerce_pay_usaepay_api_transaction($payment_settings, $order_data, $card_data, $billing_data, $shipping_data);
+
+  // Build transaction entity.
+  $transaction = commerce_payment_transaction_new('commerce_pay', $order->order_id);
+  $transaction->instance_id = $payment_method['instance_id'];
+  $transaction->amount = $charge['amount'];
+  $transaction->currency_code = $charge['currency_code'];
+  $transaction->payload[REQUEST_TIME] = $usaepay_transaction;
+
+  if ($usaepay_transaction->success) {
+    $transaction->status = $transaction_status;
+    $transaction->message = $usaepay_transaction->error;
+    $transaction->remote_id = $usaepay_transaction->refnum;
+    // Store the type of transaction in the remote status.
+    $transaction->remote_status = commerce_pay_payment_action($payment_settings['txn_type']);
+  }
+  else {
+    // Display a general error to the customer if we can not find the address.
+    drupal_set_message($usaepay_transaction->error, 'error');
+
+    // Provide a more descriptive error message in the failed transaction and
+    // the watchdog.
+    $transaction->payload[REQUEST_TIME] = array();
+    $transaction->status = COMMERCE_PAYMENT_STATUS_FAILURE;
+    $transaction->message = $usaepay_transaction->error;
+
+    watchdog('commerce_pay', $usaepay_transaction->error, NULL, WATCHDOG_ERROR);
+
+    // Save the transaction information.
+    commerce_payment_transaction_save($transaction);
+    return FALSE;
+  }
+
+  // Save the transaction information.
+  commerce_payment_transaction_save($transaction);
+
+  // If Card on File storage is enabled and the form says to store the card data.
+  if ($save_cardonfile) {
+    // to do : check card duplicate? BCS API request?
+    // Build the card on file object.
+    $card_data = commerce_cardonfile_new();
+    $card_data->uid = $order->uid;
+    $card_data->payment_method = $payment_method['method_id'];
+    $card_data->instance_id = $payment_method['instance_id'];
+    $card_data->remote_id = $usaepay_transaction->cardref;
+    $card_data->card_type = !empty($card_type) ? $card_type : 'card';
+    $card_data->card_name = $pane_values['credit_card']['owner'];
+    $card_data->card_number = drupal_substr($pane_values['credit_card']['number'], -4);
+    $card_data->card_exp_month = $pane_values['credit_card']['exp_month'];
+    $card_data->card_exp_year = $pane_values['credit_card']['exp_year'];
+    $card_data->status = 1;
+    if (!empty($pane_values['payment_details']['cardonfile_instance_default'])) {
+      $card_data->instance_default = 1;
+    }
+
+    // Save and log the creation of the new card on file.
+    commerce_cardonfile_save($card_data);
+    watchdog('commerce_pay', 'New card on file created for the user @uid.', array('@uid' => $order->uid));
+  }
+}
+
+/**
+ * Returns the relevant Commerce Pay payment action for a given transaction type.
+ *
+ * @param $txn_type
+ *   The type of transaction whose payment action should be returned; currently
+ *   supports COMMERCE_CREDIT_AUTH_ONLY and COMMERCE_CREDIT_AUTH_CAPTURE.
+ */
+function commerce_pay_payment_action($txn_type) {
+  switch ($txn_type) {
+    case COMMERCE_CREDIT_AUTH_ONLY:
+      return 'authonly';
+    case COMMERCE_CREDIT_AUTH_CAPTURE:
+      return 'sale';
+  }
+}
+
+/**
+ * Card on file callback: background charge payment
+ *
+ * @param object $payment_method
+ *  The payment method instance definition array.
+ * @param object $card_data
+ *   The stored credit card data array to be processed
+ * @param object $order
+ *   The order object that is being processed
+ * @param array $charge
+ *   The price array for the charge amount with keys of 'amount' and 'currency'
+ *   If null the total value of the order is used.
+ *
+ * @return
+ *   TRUE if the transaction was successful
+ */
+function commerce_pay_cardonfile_charge($payment_method, $card_data, $order, $charge = NULL) {
+  // USAePay API request if any ???.
+}
+
+/**
+ * Card on file callback: updates the associated customer payment profile.
+ */
+function commerce_pay_cardonfile_update($form, &$form_state, $payment_method, $card_data) {
+  // USAePay API request - nothing to do for now.
+}
+
+/**
+ * Card on file callback: deletes the associated customer payment profile.
+ */
+function commerce_pay_cardonfile_delete($form, &$form_state, $payment_method, $card_data) {
+  // USAePay API request - nothing to do for now.
+  // Return TRUE requested for card deletion.
+  $return = TRUE;
+  return $return;
+}
+
+/**
+ * USAePay PHP Library API integration - helper functions.
+ */
+
+/**
+ * Build the USAePay PHP Library API object.
+ *
+ * @return object $usaepay_api
+ *   The USAePay PHP Library API object used for the Payment transactions API.
+ */
+function commerce_pay_usaepay_api() {
+  $usaepay_api = &drupal_static(__FUNCTION__);
+  if (empty($usaepay_api)) {
+    libraries_load('usaepay-php');
+    $usaepay_api = new umTransaction();
+  }
+  return $usaepay_api;
+}
+
+/**
+ * Make a transaction request to USAePay payment service.
+ *
+ * @param array $payment_settings
+ *   An array of USAePay API settings and credentials set in the payment method.
+ * @param array $order_data
+ *   An array order data prepared for USAePay API transaction needs.
+ * @param array $card_data
+ *   An array card data from paymnet card form prepared for USAePay API transaction needs.
+ * @param array $billing_data (optional)
+ *   An array billing data prepared for USAePay API transaction needs.
+ * @param array $shipping_data (optional)
+ *   An array billing data prepared for USAePay API transaction needs.
+ *
+ * @return USAePay API transaction processed object.
+ */
+function commerce_pay_usaepay_api_transaction($payment_settings, $order_data, $card_data = array(), $billing_data = array(), $shipping_data = array()) {
+  // Build the USAePay API object.
+  $usaepay_transaction = commerce_pay_usaepay_api();
+
+  // Set API credentials.
+  $usaepay_transaction->key = $payment_settings['source_key'];
+  $usaepay_transaction->pin = $payment_settings['source_pin'];
+  $usaepay_transaction->usesandbox = $payment_settings['usesandbox'];
+  $usaepay_transaction->testmode = $payment_settings['testmode'];
+  if (!empty($payment_settings['command'])) {
+    $usaepay_transaction->command = $payment_settings['command'];
+  }
+
+  // Set Order data.
+  foreach ($order_data as $key => $value) {
+    $usaepay_transaction->{$key} = $value;
+  }
+
+  // Set Card data.
+  foreach ($card_data as $key => $value) {
+    $usaepay_transaction->{$key} = $value;
+  }
+
+  // Set Billing data.
+  if (!empty($billing_data)) {
+    $usaepay_transaction->billfname = $billing_data['first_name'];
+    $usaepay_transaction->billlname = $billing_data['last_name'];
+    $usaepay_transaction->billcompany = $billing_data['company'];
+    $usaepay_transaction->billstreet = $billing_data['address1'];
+    $usaepay_transaction->billstreet2 = $billing_data['address2'];
+    $usaepay_transaction->billcity = $billing_data['city'];
+    $usaepay_transaction->billstate = $billing_data['state'];
+    $usaepay_transaction->billzip = $billing_data['zip'];
+    $usaepay_transaction->billcountry = $billing_data['country'];
+    $usaepay_transaction->billphone = $billing_data['phone'];
+    $usaepay_transaction->email = $billing_data['email'];
+    $usaepay_transaction->fax = $billing_data['fax'];
+    $usaepay_transaction->website = $billing_data['website'];
+  }
+
+  // Set Shipping data.
+  if (!empty($shipping_data)) {
+    $usaepay_transaction->shipfname = $shipping_data['first_name'];
+    $usaepay_transaction->shiplname = $shipping_data['last_name'];
+    $usaepay_transaction->shipcompany = $shipping_data['company'];
+    $usaepay_transaction->shipstreet = $shipping_data['address1'];
+    $usaepay_transaction->shipstreet2 = $shipping_data['address2'];
+    $usaepay_transaction->shipcity = $shipping_data['city'];
+    $usaepay_transaction->shipstate = $shipping_data['state'];
+    $usaepay_transaction->shipzip = $shipping_data['zip'];
+    $usaepay_transaction->shipcountry = $shipping_data['country'];
+    $usaepay_transaction->shipphone = $shipping_data['phone'];
+  }
+
+  // Debugging messages and logs.
+  $debug_log = !empty($payment_settings['debug']['log']) ? $payment_settings['debug']['log'] : FALSE;
+  $debug = !empty($payment_settings['debug']['message']) ? $payment_settings['debug']['message'] : FALSE;
+  $debug_activated = ((boolean) $debug_log || ($debug_log && user_access('access commerce pay debug')));
+
+  if ($usaepay_transaction->process()) {
+    $usaepay_transaction->success = TRUE;
+    // For debugging.
+    if ($debug_activated) {
+      $debug_message = t('Commerce Pay USAePay transaction request successfully processed.');
+      $message_type = 'status';
+    }
+  }
+  else {
+    $usaepay_transaction->success = FALSE;
+    // For debugging.
+    if ($debug_activated) {
+      $debug_message = t('Error on Commerce Pay USAePay transaction request: %error.', array('%error' => $usaepay_transaction->error));
+      $message_type = 'error';
+    }
+  }
+
+  // Debugging messages and logs.
+  if ($debug_activated) {
+    $debug_message .= '<br />';
+    $debug_message .= '<pre>' . print_r($usaepay_transaction, TRUE) . '</pre>';
+    // Logs a system message.
+    if ($debug_log) {
+      watchdog('commerce_pay', $debug_message, array(), WATCHDOG_DEBUG);
+    }
+    if ($message_type == 'status' && $debug == 2) {
+      $debug = FALSE;
+    }
+    // Set a debugging message.
+    if (($debug && user_access('access commerce pay debug'))) {
+      drupal_set_message($debug_message, $message_type);
+    }
+  }
+
+  // Use only the last 4 digits of the card number for transaction data.
+  if (!empty($usaepay_transaction->card)) {
+    $usaepay_transaction->card = drupal_substr($usaepay_transaction->card, -4);
+  }
+
+  return $usaepay_transaction;
+}
+
+/**
+ * Helper function - Build a given order customer data for transaction.
+ *
+ * @param string $profile_field
+ *   The customer profile field name.
+ * @param object $order
+ *   The order with the customer field.
+ *
+ * @return array $data
+ *   The customer data array with address data.
+ */
+function _commerce_pay_order_customer_data($profile_field, $order) {
+  $customer_data = array();
+  $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+  if ($order_wrapper->{$profile_field} && $order_wrapper->{$profile_field}->commerce_customer_address) {
+    $customer_address = $order_wrapper->{$profile_field}->commerce_customer_address;
+    // Get the data array of addresses wrappers.
+    $customer_address_data = $customer_address->value();
+    $customer_data['first_name'] = $customer_address_data['first_name'];
+    $customer_data['last_name'] = $customer_address_data['last_name'];
+    $customer_data['company'] = $customer_address_data['organisation_name'];
+    $customer_data['address1'] = $customer_address_data['thoroughfare'];
+    $customer_data['address2'] = $customer_address_data['premise'];
+    $customer_data['city'] = $customer_address_data['locality'];
+    $customer_data['state'] = $customer_address_data['administrative_area'];
+    $customer_data['zip'] = $customer_address_data['postal_code'];
+    $customer_data['country'] = $customer_address_data['country'];
+    $customer_data['phone'] = '';
+  }
+
+  return $customer_data;
+}
+
+/**
+ * Predicate for testing if the commerce_cardonfile module is enabled and is
+ * the version 2.x.
+ *
+ * @param boolean $extra_condition
+ *   Additional condition. Used if we're checking a form field.
+ *
+ * @return boolean
+ *   TRUE if it does FALSE if not.
+ */
+function commerce_pay_has_cardonfile($extra_condition = TRUE) {
+  // The commerce_cardonfile_commerce_checkout_form_submit function exists
+  // only on the 2.x branch.
+  return
+    module_exists('commerce_cardonfile')
+    &&
+    function_exists('commerce_cardonfile_commerce_checkout_form_submit')
+    &&
+    $extra_condition;
+}

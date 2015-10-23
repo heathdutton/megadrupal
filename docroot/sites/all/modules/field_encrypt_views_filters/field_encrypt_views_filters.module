@@ -1,0 +1,282 @@
+<?php
+
+define('FIELD_ENCRYPT_VIEWS_FILTER_TABLE_PREFIX', 'field_encrypt_decrypted_');
+define('FIELD_ENCRYPT_VIEWS_FILTER_REGEX', '/([^a-zA-Z0-9_])?***COLUMN***([^a-zA-Z0-9_])?/');
+
+/**
+ * Implements hook_views_query_alter().
+ *
+ * Insert decrypted field values into temporary tables, and alter the filter
+ * query to use them instead.
+ *
+ * The temporary tables are filled with the results of a copy of the current
+ * view, without the encrypted field filters.
+ */
+function field_encrypt_views_filters_views_query_alter(&$view, &$query) {
+  $encrypted_field_columns = _field_encrypt_views_filters_get_encrypted_columns($view);
+
+  // If the view doesn't have our tag, we're in the first phase.
+  if (isset($view->field_encrypt_temporary_view)) {
+
+    // Change the query so that no encrypted fields are in the filters.
+    foreach ($query->where as $group => $where) {
+      foreach ($where['conditions'] as $index => $condition) {
+        if (isset($condition['field'])) {
+          if (is_string($condition['field']) && in_array($condition['field'], $encrypted_field_columns)) {
+            unset($query->where[$group]['conditions'][$index]);
+          }
+          elseif (is_string($condition['field']) && _field_encrypt_views_filters_combined_field_query($view, $condition['field'], 'match')) {
+            unset($query->where[$group]['conditions'][$index]);
+          }
+          elseif ($condition['field'] instanceof DatabaseCondition && _field_encrypt_views_filters_combined_field_database_condition($view, $condition['field'], 'match')) {
+            unset($query->where[$group]['conditions'][$index]);
+          }
+        }
+      }
+    }
+  }
+  else {
+
+    // Check for encrypted fields in the filters.
+    $encrypted_filters = _field_encrypt_views_filters_get_encrypted_filters($view, $query);
+    if (empty($encrypted_filters)) {
+      return;
+    }
+
+    // Prepare a copy of the view for fetching all encrypted values.
+    $temp_view = views_get_view($view->name);
+    $temp_view->field_encrypt_temporary_view = TRUE; // @TODO: tag the view another way?
+    $temp_view->set_display($view->current_display);
+    $temp_view->set_items_per_page(0);
+
+    // Build the view and it's query. @TODO: call more views hooks?
+    $temp_view->build();
+
+    // Execute the query to get all entity_id's.
+    $temp_query = $temp_view->build_info['query'];
+    $result = $temp_query->execute();
+    $entity_ids = array();
+    foreach ($result as $row) {
+      $entity_ids[] = $row->{$temp_view->base_field};
+    }
+
+    // If nothing passes the regular filters, quit processing this.
+    if (empty($entity_ids)) {
+      return;
+    }
+
+    // Get the entity type for our base table.
+    $entity_type = _field_encrypt_get_entity_type($temp_view->base_table);
+
+    // Create and fill our temporary tables. @TODO: convert to single table with multiple columns.
+    foreach ($encrypted_filters as $field_name) {
+      $table = FIELD_ENCRYPT_VIEWS_FILTER_TABLE_PREFIX . $field_name;
+      db_query("CREATE TEMPORARY TABLE {" . $table . "} (value text, entity_id integer) ENGINE=InnoDB DEFAULT CHARACTER SET=utf8;"); // @TODO: add index?
+
+      // Join the temporary table to the views query.
+      $join = new views_join();
+      $join->left_table = $temp_view->base_table;
+      $join->left_field = $temp_view->base_field;
+      $join->table = $table;
+      $join->field = 'entity_id';
+      $join->type = 'LEFT';
+      $query->table_queue[$table] = array(
+        'alias' => $table,
+        'table' => $table,
+        'relationship' => 'node',
+        'join' => $join,
+      );
+
+      // $query->add_field('field_body_data', 'body_value'); // @TODO: use this instead of entity_load() below?
+
+      // Insert the decrypted values in the temporary table.
+      foreach ($entity_ids as $entity_id) {
+        $entity = entity_load($entity_type, array($entity_id));
+        $field_items = field_get_items($entity_type, $entity[$entity_id], $field_name);
+
+        db_insert($table)
+          ->fields(array(
+            'value' => isset($field_items[0]['value']) ? $field_items[0]['value'] : '', // @TODO: hardcoded 'value' and delta?
+            'entity_id' => $entity_id,
+          ))
+          ->execute();
+      }
+
+      // Alter the query to use the temporary table.
+      foreach ($query->where as $group => &$where) {
+        foreach ($where['conditions'] as $index => &$condition) {
+          if (isset($condition['field'])) {
+            if (is_string($condition['field']) && $condition['field'] == $encrypted_field_columns[$field_name]) {
+              $query->where[$group]['conditions'][$index]['field'] = $table . '.value';
+              break 2;
+            }
+            elseif (is_string($condition['field'])) {
+              _field_encrypt_views_filters_combined_field_query($view, $condition['field'], 'replace');
+            }
+            elseif ($condition['field'] instanceof DatabaseCondition) {
+              _field_encrypt_views_filters_combined_field_database_condition($view, $condition['field'], 'replace');
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Fetch table.column for all encrypted fields.
+ */
+function _field_encrypt_views_filters_get_encrypted_columns($view) {
+
+  // Static caching.
+  $encrypted_columns = &drupal_static(__FUNCTION__);
+  $id = $view->name . '|' . $view->current_display;
+  if (isset($encrypted_columns[$id])) {
+    return $encrypted_columns[$id];
+  }
+
+  $encrypted_fields = _field_encrypt_views_filters_get_encrypted_fields();
+  $encrypted_columns[$id] = array();
+  foreach ($encrypted_fields as $field_name) {
+    $info = field_info_field($field_name);
+    $table = key($info['storage']['details']['sql']['FIELD_LOAD_CURRENT']);
+    $column = $info['storage']['details']['sql']['FIELD_LOAD_CURRENT'][$table]['value'];
+    $encrypted_columns[$id][$field_name] = $table . '.' . $column;
+  }
+
+  return $encrypted_columns[$id];
+}
+
+/**
+ * Get all encrypted field names.
+ */
+function _field_encrypt_views_filters_get_encrypted_fields() {
+  $encrypted_fields = array();
+  foreach (field_info_fields() as $field_info) {
+    if (isset($field_info['settings']['field_encrypt']['encrypt']) && $field_info['settings']['field_encrypt']['encrypt']) {
+      $encrypted_fields[] = $field_info['field_name'];
+    }
+  }
+
+  return $encrypted_fields;
+}
+
+/**
+ * Check the current query for the use of encrypted fields in the filters.
+ */
+function _field_encrypt_views_filters_get_encrypted_filters($view, $query) {
+  $encrypted_field_columns = _field_encrypt_views_filters_get_encrypted_columns($view);
+  $encrypted_field_columns_flipped = array_flip($encrypted_field_columns);
+
+  $encrypted_filters = array();
+  foreach ($query->where as $group => $where) {
+    foreach ($where['conditions'] as $index => $condition) {
+      if (isset($condition['field'])) {
+
+        // Single field filter.
+        if (is_string($condition['field']) && isset($encrypted_field_columns_flipped[$condition['field']])) {
+          $encrypted_filters[$encrypted_field_columns_flipped[$condition['field']]] = $encrypted_field_columns_flipped[$condition['field']];
+        }
+
+        // Combined field filter.
+        elseif (is_string($condition['field'])) {
+          foreach (_field_encrypt_views_filters_combined_field_query($view, $condition['field']) as $encrypted_column) {
+            $encrypted_filters[$encrypted_column] = $encrypted_field_columns_flipped[$encrypted_column];
+          }
+        }
+
+        // Combined field filter with a database connection object.
+        elseif ($condition['field'] instanceof DatabaseCondition) {
+          foreach (_field_encrypt_views_filters_combined_field_database_condition($view, $condition['field']) as $encrypted_column) {
+            $encrypted_filters[$encrypted_column] = $encrypted_field_columns_flipped[$encrypted_column];
+          }
+        }
+      }
+    }
+  }
+
+  return $encrypted_filters;
+}
+
+/**
+ * Helper function to 'gather' or 'replace' all encrypted fields in a database
+ * connection. Use 'match' as operation to stop at the first match.
+ */
+function _field_encrypt_views_filters_combined_field_database_condition($view, &$database_condition, $op = 'gather') {
+  $conditions = &$database_condition->conditions();
+  $encrypted_filters = array();
+
+  foreach (element_children($conditions) as $index) {
+    $query = &$conditions[$index]['field'];
+    if (_field_encrypt_views_filters_combined_field($view, $query, $encrypted_filters, $op) === TRUE) {
+      return TRUE;
+    }
+  }
+
+  return $encrypted_filters;
+}
+
+/**
+ * Helper function to 'gather' or 'replace' all encrypted fields in a query.
+ * Use 'match' as operation to stop at the first match.
+ */
+function _field_encrypt_views_filters_combined_field_query($view, &$query, $op = 'gather') {
+  $encrypted_filters = array();
+
+  if (_field_encrypt_views_filters_combined_field($view, $query, $encrypted_filters, $op) === TRUE) {
+    return TRUE;
+  }
+
+  return $encrypted_filters;
+}
+
+/**
+ * Centralized helper function for helper functions.
+ *
+ * @see _field_encrypt_views_filters_combined_field_database_condition()
+ * @see _field_encrypt_views_filters_combined_field_query()
+ */
+function _field_encrypt_views_filters_combined_field($view, &$query, &$encrypted_filters, $op) {
+  $encrypted_columns = _field_encrypt_views_filters_get_encrypted_columns($view);
+  foreach ($encrypted_columns as $field_name => $encrypted_column) { // @TODO: only iterate used filters.
+    $regex = str_replace('***COLUMN***', preg_quote($encrypted_column), FIELD_ENCRYPT_VIEWS_FILTER_REGEX);
+    switch ($op) {
+      case 'replace':
+        $query = preg_replace(
+          $regex,
+          '$1' . FIELD_ENCRYPT_VIEWS_FILTER_TABLE_PREFIX . $field_name . '.value$2',
+          $query
+        );
+        break;
+
+      case 'match':
+      default:
+        if (preg_match($regex, $query)) {
+          if ($op == 'match') {
+            return TRUE;
+          }
+
+          $encrypted_filters[] = $encrypted_column;
+        }
+    }
+  }
+}
+
+/**
+ * Convert a base_table into an entity_type.
+ *
+ * @see: views_bulk_operations_handler_field_operations::get_entity_type()
+ */
+function _field_encrypt_get_entity_type($base_table) {
+  foreach (entity_get_info() as $entity_type => $info) {
+    if (isset($info['base table']) && $info['base table'] == $base_table) {
+      return $entity_type;
+    }
+    elseif (isset($info['revision table']) && $info['revision table'] == $base_table) {
+      $this->revision = TRUE;
+      return $entity_type;
+    }
+  }
+
+  return FALSE;
+}

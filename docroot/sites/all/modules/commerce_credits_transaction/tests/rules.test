@@ -1,0 +1,239 @@
+<?php
+/**
+ * @file
+ * Commerce Credits Transaction Rules Test Class.
+ */
+
+
+/**
+ * Base test class for rules integration.
+ */
+class CommerceCreditsTransactionRulesTestCase extends CommerceCreditsTransactionTestCase {
+
+  /**
+   * Implements setUp().
+   */
+  public function setUp() {
+    parent::setUp(array('rules_admin'));
+
+    // SimpleTest has a different Queue processor that does not create queues
+    // automagically. DrupalWTF.
+    $queue = DrupalQueue::get('commerce_credits_transaction_reverse');
+    $queue->createQueue();
+    $this->assertQueueQuantity('commerce_credits_transaction_reverse', 0);
+
+    // Enable Rules debug so that it's possible to see what happened.
+    variable_set('rules_debug', 1);
+
+    // Create an admin. user for mucking about in rules and nodes, if necessary.
+    $this->admin_user = $this->drupalCreateUser(array('bypass node access', 'administer site configuration', 'access rules debug', 'administer nodes', 'administer rules', 'access administration pages'));
+  }
+
+  /**
+   * Assert that there is a queue item for commerce_credits_transaction_reverse.
+   *
+   * @param $name
+   *   The name of the queue to check. Defaults to commerce_credits_transaction_reverse.
+   * @param $quantity
+   *   The number of items to expect the queue to have.
+   * @param $message
+   *   An optional message to set.
+   * @param $group
+   *   An optional group to set.
+   */
+  public function assertQueueQuantity($name = 'commerce_credits_transaction_reverse', $quantity = 1, $message = '', $group = 'Commerce Credits') {
+    $message = $message ? $message : t('Found a DrupalQueue for %name', array('%name' => $name));
+
+    try {
+      $queue = DrupalQueue::get($name);
+      
+      $this->assertEqual($quantity, $queue->numberOfItems(), $message, $group);
+    }
+    catch (Exception $e) {
+      debug($e->getMessage());
+      $this->assert(FALSE, $e->getMessage());
+    }
+  }
+
+  /**
+   * Create reverse rule for nodes.
+   */
+  public function createTransactionReverseRule() {
+    // Create a rule to test reversals.
+    $this->rule_name = strtolower($this->randomName(10));
+    $rule = rules_reaction_rule();
+    $rule
+      ->event('node_update')
+      ->condition(rules_condition('node_is_of_type', array('node:select' => 'node', 'type' => array($this->transferNodeType->type))))
+      ->condition(rules_condition('node_is_published', array('node:select' => 'node'))->negate())
+      ->condition(rules_condition('node_is_published', array('node:select' => 'node_unchanged')))
+      ->action('commerce_credits_transaction_entity_reverse', array(
+        'entity:select' => 'node',
+        'direction' => 'has',
+        'type' => 'credit',
+      ))
+      ->integrityCheck()
+      ->save($this->rule_name);
+    $this->assertTrue(isset($rule->id), t('Successfully created rule %name with id, %id.', array('%name' => $rule->name, '%id' => $rule->id)));
+
+    return $rule;
+  }
+
+}
+
+/**
+ * Tests Rules integration with Commerce Credits Transaction for transaction
+ * reversals.
+ */
+class CommerceCreditsTransactionRulesReverseTestCase extends CommerceCreditsTransactionRulesTestCase {
+
+  static public function getInfo() {
+    return array(
+      'name' => 'Transaction Reverse Rule',
+      'description' => 'Assert that commerce credits transaction reverse rule action works.',
+      'group' => 'Commerce credits',
+    );
+  }
+
+  /**
+   * Implements setUp().
+   */
+  public function setUp() {
+    parent::setUp();
+
+    // Create transaction reverse rule.
+    $this->rule = $this->createTransactionReverseRule();
+  }
+
+  /**
+   * Assert that reverse action works.
+   */
+  public function testReverseRule() {
+    $controller = entity_get_controller('commerce_credits');
+
+    // Add credits and assert credits and transaction.
+    $user_wrapper = entity_metadata_wrapper('user', $this->web_user);
+    commerce_credits_add_credits($user_wrapper, 'credit', 10);
+    $this->assertEntityHasCredits('user', $this->web_user, 'credit', 10);
+    $this->assertCreditTransaction('user', $this->web_user, 10, 'in');
+
+    // Create credits entity for node.
+    $node_wrapper = entity_metadata_wrapper('node', $this->transferNode);
+    $to_credits = $controller->createByEntity($node_wrapper->getIdentifier(), $node_wrapper->type(), 'credit');
+    $this->assertEntityHasCredits('node', $this->transferNode, 'credit', 0);
+
+    // Get the user credits entity.
+    $from_credits = $controller->loadByEntity($user_wrapper->getIdentifier(), $user_wrapper->type(), 'credit');
+    $from_credits = array_shift($from_credits);
+
+    // Transfer credits in pending state to node.
+    $controller->transferCreditWithTransaction($from_credits, $to_credits, 3, 'pending');
+    $this->assertEntityHasCredits('user', $this->web_user, 'credit', 7); 
+    $this->assertEntityHasCredits('node', $this->transferNode, 'credit', 3); 
+    $this->assertCreditTransaction('node', $this->transferNode, 3, 'transfer');
+
+    // Login as an admin user and unpublish the transferNode.
+    $this->drupalLogin($this->admin_user);
+
+    $edit = array(
+      'status' => FALSE,
+    );
+    $this->drupalPost('node/' . $this->transferNode->nid . '/edit', $edit, 'Save');
+    $this->assertRaw('node-unpublished', 'Node was unpublished');
+
+    // Assert that a queue was created for the reversal.
+    $this->assertQueueQuantity('commerce_credits_transaction_reverse', 1);
+
+    // Run cron, and assert that the node does not have any credits, which is
+    // the result of the Queue processor.
+    $this->cronRun();
+    $this->assertEntityHasCredits('node', $this->transferNode, 'credit', 0);
+  }
+
+}
+
+/**
+ * Test that multiple entities have their transactions reversed.
+ */
+class CommerceCreditsTransactionRulesMultipleReverseTestCase extends CommerceCreditsTransactionRulesTestCase {
+
+  static public function getInfo() {
+    return array(
+      'name' => 'Transaction Reverse Rule - Multiple',
+      'description' => 'Assert that multiple entities had their transactions reversed correctly.',
+      'group' => 'Commerce credits',
+    );
+  }
+
+  /**
+   * Implements setUp().
+   */
+  public function setUp() {
+    parent::setUp();
+
+    // Create transaction reverse rule.
+    $this->rule = $this->createTransactionReverseRule();
+
+    // Create another user.
+    $this->second_user = $this->drupalCreateUser(array('access content'));
+
+    // Create a third user.
+    $this->third_user = $this->drupalCreateUser(array('access content'));
+
+    // Load entity wrapper for node in setUp().
+    $this->node_wrapper = entity_metadata_wrapper('node', $this->transferNode);
+  }
+
+  public function testMultipleReverse() {
+    $controller = entity_get_controller('commerce_credits');
+
+    // Create credits entity for node that has no credits entity yet.
+    $to_credits = $controller->createByEntity($this->node_wrapper->getIdentifier(), $this->node_wrapper->type(), 'credit');
+    $this->assertEntityHasCredits('node', $this->transferNode, 'credit', 0);
+
+    // Give web user credits and transfer to node.
+    $web_user = entity_metadata_wrapper('user', $this->web_user);
+    commerce_credits_add_credits($web_user, 'credit', 10);
+    $this->assertEntityHasCredits('user', $this->web_user, 'credit', 10);
+
+    $from_credits = $controller->loadByEntity($web_user->getIdentifier(), $web_user->type(), 'credit');
+    $from_credits = array_shift($from_credits);
+    $controller->transferCreditWithTransaction($from_credits, $to_credits, 3, 'pending');
+    $this->assertEntityHasCredits('node', $this->transferNode, 'credit', 3); 
+
+    // Give second user credits and transfer to node.
+    $second_user = entity_metadata_wrapper('user', $this->second_user);
+    commerce_credits_add_credits($second_user, 'credit', 10);
+    $this->assertEntityHasCredits('user', $this->second_user, 'credit', 10);
+
+    $from_credits = $controller->loadByEntity($second_user->getIdentifier(), $second_user->type(), 'credit');
+    $from_credits = array_shift($from_credits);
+    $controller->transferCreditWithTransaction($from_credits, $to_credits, 10, 'pending');
+    $this->assertEntityHasCredits('node', $this->transferNode, 'credit', 13);
+
+    // Give third user credits and transfer to node a completed transaction.
+    $third_user = entity_metadata_wrapper('user', $this->third_user);
+    commerce_credits_add_credits($third_user, 'credit', 10);
+    $this->assertEntityHasCredits('user', $this->third_user, 'credit', 10);
+ 
+    $from_credits = $controller->loadByEntity($third_user->getIdentifier(), $third_user->type(), 'credit');
+    $from_credits = array_shift($from_credits);
+    $controller->transferCreditWithTransaction($from_credits, $to_credits, 10);
+    $this->assertEntityHasCredits('node', $this->transferNode, 'credit', 23);
+
+    // Unpublish the node to fire the rule, and Queue quantity should be one.
+    $this->drupalLogin($this->admin_user);
+    
+    $edit = array(
+      'status' => FALSE,
+    );
+    $this->drupalPost('node/' . $this->transferNode->nid . '/edit', $edit, 'Save');
+    $this->assertQueueQuantity('commerce_credits_transaction_reverse', 1);
+
+    // Run cron, and assert that the node only has 10 credits from the
+    // transaction that was completed.
+    $this->cronRun();
+    $this->assertEntityHasCredits('node', $this->transferNode, 'credit', 10);
+  }
+
+}

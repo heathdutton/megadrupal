@@ -1,0 +1,574 @@
+<?php
+/**
+ * @file
+ */
+
+/**
+ * Implements hook_permission().
+ */
+function party_commerce_booking_permission() {
+  $permissions = array(
+    'use ticket quick add' => array(
+      'title' => t('Use ticket quick add'),
+      'description' => t('Use the quick add to add tickets from previous bookings in bulk.'),
+    ),
+  );
+
+  // Generate per project type permissions.
+  foreach (entity_load('commerce_booking_ticket_type') as $type) {
+    $type_name = check_plain($type->type);
+    $type_label = entity_label('commerce_booking_ticket_type', $type);
+    $permissions += array(
+      "edit own party $type_name ticket" => array(
+        'title' => t("%type_name: Edit own party's ticket", array('%type_name' => $type_label)),
+      ),
+      "delete own party $type_name ticket" => array(
+        'title' => t("%type_name: Delete party's ticket", array('%type_name' => $type_label)),
+      ),
+      "view own party $type_name ticket" => array(
+        'title' => t("%type_name: View own party's ticket", array('%type_name' => $type_label)),
+      ),
+    );
+  }
+
+  return $permissions;
+}
+
+/**
+ * Implements hook_hook_info().
+ */
+function party_commerce_booking_hook_info() {
+  $hooks['party_commerce_booking_party_acquisition'] = array('group' => 'party_commerce_booking');
+  $hooks['party_commerce_booking_party_add_ticket_alter'] = array('group' => 'party_commerce_booking');
+  return $hooks;
+}
+
+/**
+ * Implements hook_ctools_plugin_directory().
+ */
+function party_commerce_booking_ctools_plugin_directory($owner, $plugin_type) {
+  if ($owner == 'ctools' && $plugin_type == 'relationships') {
+    return 'plugins/relationships';
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_presave() for commerce_booking_ticket.
+ */
+function party_commerce_booking_commerce_booking_ticket_presave($ticket) {
+  // If the email has changed, we need to re-acquire.
+  if (!empty($ticket->party[LANGUAGE_NONE][0]['target_id']) && isset($ticket->original)) {
+    // Compare the new email with the original.
+    $new_email = !empty($ticket->ticket_holder_email[LANGUAGE_NONE][0]['email']) ?
+      $ticket->ticket_holder_email[LANGUAGE_NONE][0]['email']: NULL;
+    $original_email = !empty($ticket->original->ticket_holder_email[LANGUAGE_NONE][0]['email']) ?
+      $ticket->original->ticket_holder_email[LANGUAGE_NONE][0]['email']: NULL;
+
+    if (($new_email xor $original_email) || $new_email != $original_email) {
+      unset($ticket->party);
+    }
+  }
+
+  party_commerce_booking_ticket_acquisition($ticket);
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_presave() for commerce_order.
+ *
+ * Sync booking manager field with the uid field.
+ */
+function party_commerce_booking_commerce_order_presave($order) {
+  if (empty($order->booking_manager)) {
+    return;
+  }
+
+  $wrapper = entity_metadata_wrapper('commerce_order', $order);
+  if ($wrapper->booking_manager->value() && $wrapper->booking_manager->user->raw()) {
+    $order->uid = $wrapper->booking_manager->user->getIdentifier();
+  }
+}
+
+/**
+ * Accquire a party for the ticket.
+ */
+function party_commerce_booking_ticket_acquisition($ticket) {
+  if (!empty($ticket->party[LANGUAGE_NONE][0]['target_id'])) {
+    $acquisition_method = 'update';
+    $party = party_load($ticket->party[LANGUAGE_NONE][0]['target_id']);
+    if (!$party) {
+      unset($ticket->party);
+    }
+  }
+
+  if (empty($ticket->party[LANGUAGE_NONE][0]['target_id'])) {
+    // Set up our acquisition.
+    $values = array();
+    if (!empty($ticket->ticket_holder_email[LANGUAGE_NONE][0]['email'])) {
+      $values['email'] = $ticket->ticket_holder_email[LANGUAGE_NONE][0]['email'];
+    }
+    $context = array(
+      'name' => 'party_commerce_booking_ticket',
+      'ticket' => $ticket,
+      'party_hat' => array(
+        'data_set' => array('user'),
+      ),
+      'party_user' => array(
+        'values_reference' => TRUE,
+        'values' => array('mail' => 'email'),
+        'fallback' => TRUE,
+      ),
+    );
+
+    // Run our acquisition.
+    $party = party_acquire($values, $context, $acquisition_method);
+  }
+
+  // Set the email address on the party.
+  if ($acquisition_method == 'create' && !empty($ticket->ticket_holder_email[LANGUAGE_NONE][0]['email'])) {
+    $party->email = $ticket->ticket_holder_email[LANGUAGE_NONE][0]['email'];
+  }
+
+  // Allow other modules to respond to the acquisition, for example setting
+  // additional values on the party.
+  $data_sets = module_invoke_all('party_commerce_booking_party_acquisition', $party, $acquisition_method, $ticket);
+
+  // Save the party.
+  $party->save();
+
+  // Implementations may request a save.
+  foreach (array_unique($data_sets) as $data_set) {
+    $controller = $party->getDataSetController($data_set);
+    $controller->save(TRUE);
+  }
+
+  // Make sure primary fields get set.
+  entity_get_controller('party')->setPrimaryFields($party, TRUE);
+
+  // Fill out the party reference
+  $ticket->party[LANGUAGE_NONE][0]['target_id'] = $party->pid;
+}
+
+/**
+ * Implements hook_field_attach_bundle_create().
+ *
+ * Add a party reference field to to the ticket bundles. Also, add a required
+ * email field.
+ */
+function party_commerce_booking_field_attach_create_bundle($entity_type, $bundle) {
+  if ($entity_type != 'commerce_booking_ticket') {
+    return;
+  }
+
+  // Create a party reference field if one doesn't exist.
+  if (!field_info_field('party')) {
+    $field = array(
+      'field_name' => 'party',
+      'type' => 'entityreference',
+      'settings' => array(
+        'target_type' => 'party',
+      ),
+      'cardinality' => 1,
+    );
+    field_create_field($field);
+  }
+
+  if (!field_info_instance($entity_type, 'party', $bundle)) {
+    $instance = array(
+      'field_name' => 'party',
+      'entity_type' => $entity_type,
+      'bundle' => $bundle,
+      'label' => t('Party'),
+      'widget' => array(
+        'type' => 'entityreference_autocomplete',
+      ),
+    );
+    field_create_instance($instance);
+  }
+
+  // Create an email field if one doesn't exist.
+  if (!field_info_field('ticket_holder_email')) {
+    $field = array(
+      'field_name' => 'ticket_holder_email',
+      'type' => 'email',
+      'cardinality' => 1,
+    );
+    field_create_field($field);
+  }
+
+  if (!field_info_instance($entity_type, 'ticket_holder_email', $bundle)) {
+    $instance = array(
+      'field_name' => 'ticket_holder_email',
+      'entity_type' => $entity_type,
+      'bundle' => $bundle,
+      'label' => t('Email'),
+    );
+    field_create_instance($instance);
+  }
+}
+
+/**
+ * Find a tickets belonging a party for a particular event.
+ *
+ * @param int|Party|array $party
+ *   Either a loaded party, a party id or an array of party ids that we are
+ *   looking for tickets for.
+ * @param string $entity_type
+ *   The entity type of the event.
+ * @param int $entity_id
+ *   The entity id of the event.
+ * @param string|array|FALSE $status
+ *   A single or an array of statuses to filter the tickets by. If FALSE, no
+ *   status filter will be used. If NULL, cancelled tickets will be ignored.
+ *
+ * @return array
+ *   An array of stud ticket entities.
+ */
+function party_commerce_booking_party_tickets($party, $entity_type, $entity_id, $status = NULL) {
+  if (is_object($party)) {
+    $party = $party->pid;
+  }
+
+  $query = new EntityFieldQuery();
+  $query->entityCondition('entity_type', 'commerce_booking_ticket');
+  $query->fieldCondition('commerce_booking_event', 'entity_type', $entity_type);
+  $query->fieldCondition('commerce_booking_event', 'entity_id', $entity_id);
+  $query->fieldCondition('party', 'target_id', $party);
+
+  // If not provided or NULL, filter out cancelled tickets.
+  if (!isset($status)) {
+    $query->propertyCondition('status', 'cancelled', '!=');
+  }
+  // Otherwise if not FALSE we'll apply the filter.
+  elseif ($status) {
+    $query->propertyCondition('status', $status);
+  }
+
+  $result = $query->execute();
+
+  return isset($result['commerce_booking_ticket']) ? $result['commerce_booking_ticket']: array();
+}
+
+/**
+ * Callback for getting the booking references for a booking manager party.
+ *
+ * @see entity_property_verbatim_get().
+ */
+function party_commerce_booking_property_booking_reference_manager_get($data, array $options, $name, $type, $info) {
+  $controller = $data->getDataSetController('user');
+  $user_ids = $controller->getEntityIds();
+
+  if (empty($user_ids)) {
+    return array();
+  }
+
+  $query = new EntityFieldQuery();
+  $result = $query->entityCondition('entity_type', 'commerce_order')
+    ->propertyCondition('type', 'commerce_booking')
+    ->propertyCondition('uid', $user_ids)
+    ->execute();
+
+  $references = array();
+
+  if (!empty($result['commerce_order'])) {
+    $orders = entity_load('commerce_order', array_keys($result['commerce_order']));
+    entity_get_controller('commerce_order')->resetCache(array_keys($result['commerce_order']));
+
+    foreach ($orders as $order) {
+      $wrapper = entity_metadata_wrapper('commerce_order', $order);
+      $references[] = $wrapper->booking_reference->value();
+    }
+  }
+
+  return array_filter($references);
+}
+
+/**
+ * Callback for getting the booking reference for a ticket holder party.
+ *
+ * @see entity_property_verbatim_get().
+ */
+function party_commerce_booking_property_booking_reference_tickets_get($data, array $options, $name, $type, $info) {
+  // Start with all bookings.
+  $query = db_select('commerce_order', 'co');
+  $query->fields('co', array('order_id'));
+  $query->condition('co.type', 'commerce_booking');
+
+  // Join to ticket line items.
+  $query->join('commerce_line_item', 'cli',
+    'cli.order_id = co.order_id AND cli.type = :cli_type',
+    array(':cli_type' => 'commerce_booking_ticket'));
+
+  // Join to the ticket entity reference.
+  $query->join('field_data_commerce_booking_ticket', 'cbt',
+    'cbt.entity_type = :cbt_type AND cbt.entity_id = cli.line_item_id',
+    array(':cbt_type' => 'commerce_line_item'));
+
+  // Exclude cancelled tickets.
+  $query->join('commerce_booking_ticket', 'ticket',
+    'ticket.ticket_id = cbt.commerce_booking_ticket_target_id AND ticket.status != :cancelled',
+    array(':cancelled' => 'cancelled'));
+
+  // Join to our ticket party reference.
+  $query->join('field_data_party', 'p',
+    'p.entity_type = :p_type AND p.entity_id = cbt.commerce_booking_ticket_target_id',
+    array(':p_type' => 'commerce_booking_ticket'));
+
+  // Add our condition for the party.
+  $query->condition('p.party_target_id', $data->pid);
+
+  $order_ids = $query->execute()->fetchCol();
+
+  $references = array();
+
+  if (!empty($order_ids)) {
+    $orders = entity_load('commerce_order', $order_ids);
+    entity_get_controller('commerce_order')->resetCache($order_ids);
+
+    foreach ($orders as $order) {
+      $wrapper = entity_metadata_wrapper('commerce_order', $order);
+      $references[] = $wrapper->booking_reference->value();
+    }
+  }
+
+  return array_filter($references);
+}
+
+/**
+ * Callback for getting the events for a ticket holder party.
+ *
+ * @see entity_property_verbatim_get().
+ */
+function party_commerce_booking_property_event_tickets_get($data, array $options, $name, $type, $info) {
+  // Deal with the statuses.
+  $ignore_statuses = array('cancelled');
+  foreach (commerce_booking_ticket_status_info() as $status) {
+    if (isset($status['confirm to'])) {
+      $ignore_statuses[] = $status['name'];
+    }
+  }
+
+  // Get hold of all this party's tickets.
+  $query = new EntityFieldQuery();
+  $query->entityCondition('entity_type', 'commerce_booking_ticket');
+  $query->propertyCondition('status', $ignore_statuses, 'NOT IN');
+  $query->fieldCondition('party', 'target_id', $data->pid);
+  $results = $query->execute();
+
+  // If there are no tickets, return an empty array.
+  if (empty($results['commerce_booking_ticket'])) {
+    return array();
+  }
+
+  // Get hold of the events that these tickets are on.
+  $query = db_select('field_data_commerce_booking_event', 'e');
+  $query->distinct();
+  $query->condition('e.entity_type', 'commerce_booking_ticket');
+  $query->condition('e.entity_id', array_keys($results['commerce_booking_ticket']));
+  $query->condition('e.commerce_booking_event_entity_type', 'node');
+  $query->fields('e', array('commerce_booking_event_entity_id'));
+  return $query->execute()->fetchCol();
+}
+
+/**
+ * Implements hook_field_access().
+ */
+function party_commerce_booking_field_access($op, $field, $entity_type, $entity, $account) {
+  if ($op == 'edit' && $entity_type == 'commerce_booking_ticket') {
+    switch ($field['field_name']) {
+      case 'party':
+        return user_access('administer tickets', $account);
+    }
+  }
+}
+
+/**
+ * Implements hook_party_user_acquisition().
+ *
+ * Ensure any anonymous bookings get assigned to the user on acquisition.
+ */
+function party_commerce_booking_party_user_acquisition($party, $user, $method) {
+  if ($method == 'acquire') {
+    // Look for any existing anonymous bookings for this party.
+    $query = new EntityFieldQuery();
+    $query->entityCondition('entity_type', 'commerce_order');
+    $query->propertyCondition('uid', 0);
+    $query->fieldCondition('booking_manager', 'target_id', $party->pid);
+    $results = $query->execute();
+
+    // If we have results, load and update them.
+    if (!empty($results['commerce_order'])) {
+      foreach (entity_load('commerce_order', array_keys($results['commerce_order'])) as $order) {
+        $order->uid = $user->uid;
+        commerce_order_save($order);
+      }
+    }
+  }
+}
+
+/**
+ * Retrieve the party's ticket from an booking.
+ *
+ * @param stdClass|int $booking
+ *   Either a commerce order or an order id.
+ * @param Party|int $party
+ *   Either a party or a party id.
+ * @param boolean $cancelled
+ *   Whether to include cancelled tickets in the search. Defaults to FALSE.
+ *
+ * @return NULL|CommerceBookingTicket
+ *   If the party has a ticket on the booking, it is returned; otherwise NULL.
+ */
+function party_commerce_booking_get_ticket_from_booking($booking, $party, $cancelled = FALSE) {
+  // Unify our arguments.
+  if (is_object($party)) {
+    $party = $party->pid;
+  }
+
+  // Get our wrapper and start iterating over the tickets.
+  $booking_wrapper = entity_metadata_wrapper('commerce_order', $booking);
+  foreach ($booking_wrapper->commerce_line_items as $line_item_wrapper) {
+    // Skip non ticket line items.
+    if ($line_item_wrapper->getBundle() != 'commerce_booking_ticket') {
+      continue;
+    }
+
+    foreach ($line_item_wrapper->commerce_booking_ticket as $ticket_wrapper) {
+      // Ignore cancelled tickets unless instructed otherwise.
+      if (!$cancelled && $ticket_wrapper->status->value() == 'cancelled') {
+        continue;
+      }
+
+      // See if the ticket belongs to the party.
+      if ($ticket_wrapper->party->value() && $ticket_wrapper->party->pid->value() == $party) {
+        return $ticket_wrapper->value();
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_action_info().
+ */
+function party_commerce_booking_action_info() {
+  return array(
+    'party_commerce_booking_party_add_to_booking_action' => array(
+      'type' => 'party',
+      'label' => t('Add party to booking'),
+      'configurable' => FALSE,
+      'pass rows' => TRUE,
+      'permissions' => array('use ticket quick add'),
+    ),
+  );
+}
+
+/**
+ * VBO action configuration form.
+ */
+function party_commerce_booking_party_add_to_booking_action_views_bulk_operations_form($settings, $entity_type, $settings_dom_id) {
+  $form['order_id_field'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Order ID field'),
+    '#description' => t('The field containing the order id to add to.'),
+    '#required' => TRUE,
+    '#default_value' => isset($settings['order_id_field']) ? $settings['order_id_field']: NULL,
+  );
+
+  return $form;
+}
+
+/**
+ * Action callback for adding a party to a booking.
+ */
+function party_commerce_booking_party_add_to_booking_action($party, $context = array()) {
+  // Check we have an order id.
+  if (empty($context['rows']->{$context['settings']['order_id_field']})) {
+    watchdog('party_commerce_booking', 'Quick add: order id field %field does not have a value.', array('%field' => $context['settings']['order_id_field']), WATCHDOG_ERROR);
+    return FALSE;
+  }
+
+  $booking = entity_metadata_wrapper('commerce_order', $context['rows']->{$context['settings']['order_id_field']});
+
+  // Make sure we only act on bookings.
+  if ($booking->getBundle() != 'commerce_booking') {
+    watchdog('party_commerce_booking', 'Quick add: attempt to run on booking order (@order).', array('@order' => $booking->getIdentifier()), WATCHDOG_WARNING);
+    return FALSE;
+  }
+
+  // Look for an existing ticket, we don't want to add a second!
+  if (party_commerce_booking_get_ticket_from_booking($booking->value(), $party)) {
+    drupal_set_message(t('%name already has a ticket on this booking.', array('%name' => $party->label)), 'warning');
+    return FALSE;
+  }
+
+  // Create our ticket.
+  $ticket = commerce_booking_ticket_create($booking->value());
+  if (isset($context['status'])) {
+    $ticket->status = $context['status'];
+  }
+  $ticket_wrapper = entity_metadata_wrapper('commerce_booking_ticket', $ticket);
+  $ticket_wrapper->party = $party;
+
+  // Allow modules to fill our fields on the ticket and save it.
+  drupal_alter('party_commerce_booking_party_add_ticket', $ticket, $party, $booking->value());
+  $ticket->save();
+
+  // Add our ticket to the booking.
+  module_load_include('inc', 'commerce_booking', 'commerce_booking.commerce');
+
+  // Look for an existing line item.
+  foreach ($booking->commerce_line_items as $wrapper) {
+    if ($wrapper->getBundle() == 'commerce_booking_ticket') {
+      $line_item_wrapper = $wrapper;
+      break;
+    }
+  }
+
+  // Otherwise create one.
+  if (!isset($line_item_wrapper)) {
+    $line_item = commerce_line_item_new('commerce_booking_ticket', $booking->getIdentifier());
+    $line_item_wrapper = entity_metadata_wrapper('commerce_line_item', $line_item);
+    $line_item_wrapper->save();
+
+    // Add the line item to the booking.
+    $booking->commerce_line_items[] = $line_item;
+  }
+
+  // Add our ticket to the line item.
+  $line_item_wrapper->commerce_booking_ticket[] = $ticket;
+  commerce_booking_ticket_process($ticket);
+  commerce_booking_line_item_ticket_process($line_item_wrapper->value(), $booking->value());
+  $line_item_wrapper->save();
+
+  // Make sure the order gets updated.
+  $booking->save();
+}
+
+/**
+ * Get hold of a booking from a party.
+ *
+ * @param Party $party
+ *   The booking manager's party.
+ * @param string $event_type
+ *   The entity type of the event entity
+ * @param object $event
+ *   The event entity to find a booking for.
+ *
+ * @return stdClass|FALSE
+ *   The loaded booking or FALSE if there is none.
+ */
+function party_commerce_booking_get_booking(Party $party, $event_type, $event) {
+  $query = new EntityFieldQuery();
+  $query->entityCondition('entity_type', 'commerce_order')
+    ->entityCondition('bundle', 'commerce_booking')
+    ->fieldCondition('booking_manager', 'target_id', $party->pid)
+    ->fieldCondition('commerce_booking_event', 'entity_id', entity_id($event_type, $event))
+    ->fieldCondition('commerce_booking_event', 'entity_type', $event_type);
+  $entities = $query->execute();
+
+  if (empty($entities['commerce_order'])) {
+    return FALSE;
+  }
+
+  $order_ids = array_keys($entities['commerce_order']);
+  return entity_load_single('commerce_order', reset($order_ids));
+}
