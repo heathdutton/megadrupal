@@ -1,0 +1,376 @@
+<?php
+
+/**
+ * @file
+ * The main file of the module.
+ */
+
+define('OPENAM_LOGIN_URL',      '/UI/Login');
+define('OPENAM_LOGOUT_URL',     '/UI/Logout');
+define('OPENAM_IS_TOKEN_VALID', '/identity/isTokenValid');
+define('OPENAM_ATTRIBUTES',     '/identity/attributes');
+
+define('OPENAM_TOKEN_ACCESS_ERROR', -1);
+define('OPENAM_TOKEN_ACCESS_EXPIRED', 0);
+define('OPENAM_TOKEN_ACCESS_SUCCESS', 1);
+
+/**
+ * Implements hook_permission().
+ */
+function openam_permission() {
+  return array(
+    'administer openam module' => array(
+      'title' => t('Administer OpenAM Module'),
+      'description' => t('Access to OpenAM configuration and allows to administer access.'),
+    )
+  );
+}
+
+/**
+ * Implements hook_menu().
+ */
+function openam_menu() {
+
+  $items = array();
+
+  $items['admin/config/services/openam'] = array(
+    'title' => 'OpenAM',
+    'description' => 'Settings for OpenAM Module',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('openam_admin_form'),
+    'access arguments' => array('administer openam module'),
+    'file' => 'openam.admin.inc',
+    'type' => MENU_NORMAL_ITEM,
+  );
+
+  $items['openam/connect'] = array(
+    'page callback' => 'openam_connect',
+    'access callback' => TRUE,
+    'type' => MENU_CALLBACK,
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_block_view_alter().
+ */
+function openam_block_view_user_login_alter(&$data, $block) {
+
+  if (!variable_get('openam_enabled', 0)) {
+    return;
+  }
+
+  // Suppress the connection block.
+  $data = null;
+}
+
+/**
+ * Implements hook_init().
+ */
+function openam_init() {
+  global $user;
+
+  if (!variable_get('openam_enabled')) {
+    return;
+  }
+
+  // If the user must be auto connected.
+  if (variable_get('openam_auto_connect')) {
+
+    // If the user is not connected and if an OpenAM session has been found, connect user.
+    if (user_is_anonymous() && openam_get_token()) {
+      openam_connect();
+    }
+
+    // User is logged-in but no valid token.
+    if (user_is_logged_in() && !openam_get_token()) {
+      if (array_key_exists('openam', user_get_authmaps($user->name))) {
+        user_logout();
+      }
+    }
+
+    // @todo: handle case where token is present but is no longer valid.
+  }
+}
+
+/**
+ * Retrieve the token value from the browser's cookie.
+ */
+function openam_get_token() {
+  // Ensure the cookie name is configured.
+  if (!$token_name = variable_get('openam_cookie_name')) {
+    return;
+  }
+
+  // Ensure the cookie contains the token.
+  if (empty($_COOKIE[$token_name])) {
+    return;
+  }
+
+  return $_COOKIE[$token_name];
+}
+
+/**
+ * Implements hook_user_logout().
+ */
+function openam_user_logout($account) {
+
+  // Logout from OpenAM if needed.
+  if (variable_get('openam_logout_from_openam', 0)) {
+
+    // Disconnect the user from OpenAM.
+    setcookie(
+      variable_get('openam_cookie_name', ''),
+      '',
+      REQUEST_TIME - 3600,
+      variable_get('openam_cookie_path', '/'),
+      variable_get('openam_cookie_domain', '')
+    );
+    unset($_COOKIE[variable_get('openam_cookie_name', '')]);
+  }
+}
+
+/**
+ * Implements hook_menu_alter().
+ */
+function openam_menu_alter(&$items) {
+  // Switch the user to the OpenAM server.
+  $items['user']['page callback'] = 'openam_user_page';
+  $items['user']['module'] = 'openam';
+  $items['user']['file'] = 'openam.pages.inc';
+}
+
+/**
+ * Connect the user to the OpenAM server.
+ */
+function openam_connect() {
+
+  // Check for valid token.
+  $token = openam_get_token();
+  $is_valid = _openam_is_token_valid($token);
+
+  switch ($is_valid) {
+    case OPENAM_TOKEN_ACCESS_ERROR:
+
+      // Display an error message.
+      drupal_set_message(t('An error has occured when connecting to the OpenAM'), 'error');
+      break;
+
+    case OPENAM_TOKEN_ACCESS_EXPIRED:
+
+      // If the session is expired, redirect user to the OpenAM server.
+      openam_redirect_user();
+      break;
+
+    case OPENAM_TOKEN_ACCESS_SUCCESS:
+
+      // Get user attributes.
+      $informations = _openam_get_informations($token);
+
+      // Get username.
+      $username = $informations['attributes'][variable_get('openam_username_attribute', 'uid')];
+
+      if (empty($username)) {
+        watchdog('openam', 'Error parsing name from attribute data. Name attribute is %name, attributes are %attributes, ssotoken is %token', array(
+          '%name' => variable_get('openam_username_attribute', 'uid'),
+          '%attributes' => $informations['attributes'],
+          '%token' => $token
+        ), WATCHDOG_ERROR);
+        drupal_set_message(t('No username has been associated to this account. Contact your system administrator.'), 'error');
+        return;
+      }
+
+      // Connect or create user.
+      user_external_login_register($username, 'openam');
+
+      // Load the user to update its information.
+      $user = user_external_load($username);
+
+      // Update user information.
+      $user->mail = $informations['attributes'][variable_get('openam_mail_attribute', '')];
+
+      // Add value for each field.
+      $fields = field_info_instances('user', 'user');
+      foreach ($fields as $field_name => $field_data) {
+        $user->$field_name = array(
+          LANGUAGE_NONE => array(
+            array(
+              'value' => $informations['attributes'][variable_get('openam_' . $field_name . '_attribute', '')],
+            ),
+          )
+        );
+      }
+
+      // Check each role.
+      foreach ($informations['roles'] as $role_name) {
+
+        // Try to get the role.
+        $role = user_role_load_by_name($role_name);
+
+        // If the role exists, associate it to the user.
+        if ($role) {
+          $user->roles[$role->rid] = $role->name;
+        }
+      }
+
+      // Save the user.
+      user_save($user);
+
+      // Redirect to the default page configured.
+      drupal_goto(variable_get('openam_default_page', ''));
+
+      break;
+  }
+
+}
+
+/**
+ * Redirect the user to the OpenAM server.
+ */
+function openam_redirect_user() {
+
+  // Prepare URL.
+  $url = url(variable_get('openam_server_url', '') . OPENAM_LOGIN_URL, array(
+      'external' => TRUE,
+      'query' => array(
+        'goto' => url('openam/connect', array('absolute' => TRUE)),
+      ),
+    ));
+
+  // Add the additional parameters to the URL.
+  // @TODO: Add these parameters to the url() function above.
+  $url .= '&' . variable_get('openam_parameters', '');
+
+  // Redirect user to the OpenAM server.
+  drupal_goto($url);
+}
+
+/*
+ * Validate token. Returns 1 for valid token, 0 for invalid token, -1 for error
+ */
+function _openam_is_token_valid($token = NULL) {
+
+  if (!$token) {
+    $token = openam_get_token();
+  }
+
+  // Prepare headers and data to send.
+  $options = array(
+    'headers' => array(
+      'Content-Type' => 'application/x-www-form-urlencoded',
+    ),
+    'method' => 'POST',
+    'data' => 'tokenid=' . $token
+  );
+
+  // Prepare URL for validation.
+  $url = url(variable_get('openam_server_url', '') . OPENAM_IS_TOKEN_VALID, array(
+    'external' => TRUE,
+  ));
+
+  // Send data to check token.
+  $response = drupal_http_request($url, $options);
+
+  if ($response->code != 200) {
+
+    // Log error.
+    watchdog('openam', 'Error validating token. URL is %url, response code is %code, error text is %text, token is %token', array('%url' => OPENAM_IS_TOKEN_VALID, '%code' => $response->code, '%text' => $response->error, '%token' => $token), WATCHDOG_ERROR);
+
+    return OPENAM_TOKEN_ACCESS_ERROR;
+  }
+
+  // Check the value of the response.
+  $is_connected = explode('=', trim($response->data));
+
+  if ($is_connected[1] === 'true') {
+    return OPENAM_TOKEN_ACCESS_SUCCESS;
+  }
+
+  return OPENAM_TOKEN_ACCESS_EXPIRED;
+}
+
+/*
+ * Get all user informations according to the token.
+ *
+ * @param $token The token of the current user.
+ *
+ * @return All user informations found.
+ */
+function _openam_get_informations($token) {
+
+  // Prepare headers and data to send.
+  $options = array(
+    'headers' => array(
+      'Content-Type' => 'application/x-www-form-urlencoded',
+    ),
+    'method' => 'POST',
+    'data' => 'subjectid=' . $token
+  );
+
+  // Prepare URL for getting additional information.
+  $url = url(variable_get('openam_server_url', '') . OPENAM_ATTRIBUTES, array(
+    'external' => TRUE,
+  ));
+
+  // Send data to check token.
+  $response = drupal_http_request($url, $options);
+
+  if ($response->code != 200) {
+    watchdog('openam', 'Error getting attributes. URL is %url, response code is %code, error text is %text, token is %token', array('%url' => OPENAM_IS_TOKEN_VALID, '%code' => $response->code, '%text' => $response->error, '%token' => $token), WATCHDOG_ERROR);
+    return null;
+  }
+
+  // Prepare the list of informations (attributes + roles).
+  $informations = array(
+    'attributes' => array(),
+    'roles' => array()
+  );
+
+  // Need to parse name/value pairs, to get value for all attributes.
+  $lines = explode("\n", $response->data);
+  reset($lines);
+
+  // Algorithm will store the current attribute.
+  $current_attribute = '';
+
+  foreach ($lines as $line) {
+
+    // Parse the line.
+    $parts = explode('=', $line);
+
+    if ($parts[0] === 'userdetails.attribute.name') {
+      $current_attribute = $parts[1];
+    }
+    elseif ($parts[0] === 'userdetails.attribute.value') {
+
+      // If no name has be found for the attribute, pass to the next.
+      if (!$current_attribute) {
+        continue;
+      }
+
+      // Add attribute to the list.
+      $informations['attributes'][$current_attribute] = str_replace('userdetails.attribute.value=', '', $line);
+      $current_attribute = '';
+    }
+    elseif ($parts[0] === 'userdetails.role') {
+
+      // Get the all chain value.
+      $value = str_replace('userdetails.role=', '', $line);
+
+      // Retrieve the role id.
+      $role_tokens = explode(',', $value);
+      foreach ($role_tokens as $role_token) {
+        $role_data = explode('=', $role_token);
+        if ($role_data[0] == 'id') {
+
+          // Add the role id to the list.
+          $informations['roles'][] = $role_data[1];
+          break;
+        }
+      }
+    }
+  }
+  
+  return $informations;
+}

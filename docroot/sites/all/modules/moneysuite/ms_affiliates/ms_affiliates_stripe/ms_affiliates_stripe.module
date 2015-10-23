@@ -1,0 +1,533 @@
+<?php
+
+/**
+ * @file
+ * Allows affiliates to link their bank account for receiving payouts via Stripe.
+ *
+ * Original author: Leighton Whiting - Released under GENERAL PUBLIC LICENSE 
+ * Current maintenance by multiple MoneySuite users.
+ * Re: new initiative: https://www.drupal.org/node/2315653
+ */
+
+/**
+ * Implements hook_permission().
+ */
+function ms_affiliates_stripe_permission() {
+  $perms = array(
+    'connect stripe bank account' => array(
+      'title' => t('Connect a Stripe bank account'),
+      'description' => t('Allows the user to connect their Stripe bank account to received payouts.'),
+    ),
+  );
+
+  return $perms;
+}
+
+/**
+ * Access test to see if the user can access the seller dashboard
+ *
+ * @param $account
+ *   The account of the seller
+ * @return
+ *   Returns TRUE if the user has access, FALSE otherwise
+ */
+function ms_affiliates_stripe_access_test($account) {
+  global $user;
+  return (user_access('access administration pages') OR (user_access('connect stripe bank account') && ($account->uid == $user->uid)));
+}
+
+/**
+ * Implements hook_menu().
+ */
+function ms_affiliates_stripe_menu() {
+  $items = array();
+
+  $items['admin/moneysuite/ms_affiliates_stripe'] = array(
+    'title' => 'Stripe Transfer Settings',
+    'description' => 'Configure Stripe Transfer settings',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('ms_affiliates_stripe_admin'),
+    'access arguments' => array('administer moneysuite settings'),
+    'type' => MENU_NORMAL_ITEM,
+  );
+  $items['ms_affiliates_stripe/webhook'] = array(
+    'page callback' => 'ms_affiliates_stripe_webhook_callback',
+    'page arguments' => array(1),
+    'type' => MENU_CALLBACK,
+    'access callback' => TRUE,
+  );
+  $items['user/%user/ms_affiliate/ms_affiliates_stripe'] = array(
+    'title' => 'Bank Account',
+    'page callback' => 'ms_affiliates_stripe_dashboard_page',
+    'page arguments' => array(1),
+    'access callback' => 'ms_affiliates_stripe_access_test',
+    'access arguments' => array(1),
+    'type' => MENU_LOCAL_TASK,
+    'weight' => 5
+  );
+  $items['user/%user/ms_affiliate/ms_affiliates_stripe/delete/%'] = array(
+    'title' => 'Bank Account',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('ms_affiliates_stripe_delete_account_confirm', 1, 5),
+    'access callback' => 'ms_affiliates_stripe_access_test',
+    'access arguments' => array(1),
+    'type' => MENU_VISIBLE_IN_BREADCRUMB,
+    'weight' => 5
+  );
+  $items['admin/people/pay_affiliates/stripe'] = array(
+    'title' => 'Stripe Transfer',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('ms_affiliates_stripe_payout_form'),
+    'access arguments' => array('administer affiliates'),
+    'type' => MENU_VISIBLE_IN_BREADCRUMB,
+  );
+
+  return $items;
+}
+
+/**
+ * Form constructor for delete linked account page.
+ *
+ * @param $account
+ *   The user account.
+ * @param int $id
+ *   The id of the linked account record.
+ */
+function ms_affiliates_stripe_delete_account_confirm($form, &$form_state, $account, $id) {
+  $form['#linked_account_id'] = $id;
+  return confirm_form($form, t('Are you sure you want to delete this account?'), 'user/' . $account->uid . '/ms_affiliate/ms_affiliates_stripe', t('This action cannot be undone.'), t('Delete'));
+}
+
+/**
+ * Form submission handler for ms_affiliates_stripe_delete_account_confirm().
+ */
+function ms_affiliates_stripe_delete_account_confirm_submit($form, &$form_state) {
+  $linked_account = ms_affiliates_stripe_load_account_by_id($form['#linked_account_id']);
+
+  // Delete the account on Stripe.
+  try {
+    ms_affiliates_stripe_delete_account($linked_account);
+    // Require needed Stripe library.
+    require_once libraries_get_path('stripe-php') . '/lib/Stripe.php';
+    Stripe::setApiKey(variable_get('ms_stripe_secret_key', ''));
+    $recipient = Stripe_Recipient::retrieve($linked_account->recipient_id);
+    $recipient->delete();
+
+    drupal_set_message(t('Account %name has been deleted.', array('%name' => $linked_account->bank_name)));
+  } catch (Exception $e) {
+    drupal_set_message($e->getMessage(), 'error');
+  }
+  $form_state['redirect'] = 'user/' . $linked_account->uid . '/ms_affiliate/ms_affiliates_stripe';
+}
+
+// ======================================
+// Administration Page:
+// ======================================
+
+/**
+ * Show the admin form options
+ */
+function ms_affiliates_stripe_admin($form, &$form_state) {
+  $form['notes'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Setup Notes'),
+    '#collapsible' => FALSE,
+    '#collapsed' => FALSE,
+  );
+  $form['notes']['ms_affiliates_stripe_notes_setup'] = array(
+    '#type' => 'item',
+    '#title' => t('Turn on Transfers API'),
+    '#markup' => t("You will need to Switch to API Transfers from your Stripe account: <a href='https://manage.stripe.com/account/transfers'>here</a>.
+    This means that you will no longer automatically receive payouts from Stripe. You need to instead initiate those payouts manually from your Stripe Dashboard."),
+  );
+  $form['notes']['ms_affiliates_stripe_notes_webhook_url'] = array(
+    '#type' => 'item',
+    '#title' => t('Webhook URL'),
+    '#description' => t("Copy and paste this URL to add a new Webhook in your Stripe Account Settings -> Webhooks page."),
+    '#markup' => url('ms_affiliates_stripe/webhook', array('absolute' => TRUE, 'https' => TRUE)),
+  );
+  $form['notes']['ms_affiliates_stripe_notes_payout'] = array(
+    '#type' => 'item',
+    '#title' => t('Pay your Affiliates'),
+    '#markup' => t("You can pay your affiliates from this page: !url", array('!url' => l(t('Pay Affiliates'), 'admin/people/pay_affiliates'))),
+  );
+
+  return system_settings_form($form);
+}
+
+/**
+ * Loads account information for a user.
+ *
+ * @param int $uid
+ *   The Drupal user id.
+ *
+ * @return
+ *   The account information, or FALSE if no account linked yet.
+ */
+function ms_affiliates_stripe_load_account($uid) {
+  $result = db_query("SELECT * FROM {ms_affiliates_stripe_accounts} WHERE uid = :uid", array(':uid' => $uid));
+  foreach ($result as $row) {
+    return $row;
+  }
+  return FALSE;
+}
+
+/**
+ * Loads account information.
+ *
+ * @param int $id
+ *   The record id.
+ *
+ * @return
+ *   The account information, or FALSE if no record found.
+ */
+function ms_affiliates_stripe_load_account_by_id($id) {
+  $result = db_query("SELECT * FROM {ms_affiliates_stripe_accounts} WHERE id = :id", array(':id' => $id));
+  foreach ($result as $row) {
+    return $row;
+  }
+  return FALSE;
+}
+
+/**
+ * Delete a linked account.
+ *
+ * @param $linked_account
+ *   The linked account object.
+ */
+function ms_affiliates_stripe_delete_account($linked_account) {
+  ms_core_log('ms_affiliates_stripe', 'Deleting linked account because of deauthorization: !account', array('!account' => ms_core_print_r($linked_account)));
+  db_delete('ms_affiliates_stripe_accounts')
+    ->condition('id', $linked_account->id)
+    ->execute();
+}
+
+/**
+ * Page callback: Shows information about the linked bank account, or a form to add one.
+ *
+ * @param $account
+ *   The user account.
+ *
+ * @see ms_affiliates_stripe_menu().
+ */
+function ms_affiliates_stripe_dashboard_page($account) {
+  $build = array();
+  $linked_account = ms_affiliates_stripe_load_account($account->uid);
+
+  if ($linked_account) {
+    // Show information about the linked account.
+    $headers = array(t('Name'), t('Bank'), t('Account Number'), t('Country'), t('Status'), t('Actions'));
+    $countries = ms_core_get_countries();
+    $rows = array();
+    $rows[] = array(
+      $linked_account->recipient_name,
+      $linked_account->bank_name,
+      '*****' . $linked_account->last4,
+      $countries[$linked_account->country],
+      $linked_account->verified ? t('Verified') : t('Unverified'),
+      l(t('Delete'), 'user/' . $account->uid . '/ms_affiliate/ms_affiliates_stripe/delete/' . $linked_account->id),
+    );
+    $build['content']['stripe_account_info'] = array(
+      '#theme' => 'table',
+      '#header' => $headers,
+      '#caption' => t('Bank accounts'),
+      '#rows' => $rows,
+      '#empty' => t('N/A'),
+    );
+  } else {
+    // Show a form to let the user add an account.
+    $build['content']['stripe_account_info'] = drupal_get_form('ms_affiliates_stripe_add_account_form');
+  }
+  return $build;
+}
+
+/**
+ * Form constructor for the add account form.
+ *
+ * @see ms_affiliates_stripe_add_account_form_validate()
+ *
+ * @ingroup forms
+ */
+function ms_affiliates_stripe_add_account_form($form, &$form_state) {
+  $form['type'] = array(
+    '#type' => 'select',
+    '#title' => t('Type'),
+    '#options' => array(
+      'individual' => t("Individual"),
+      'corporation' => t("Corporation"),
+    ),
+    '#default_value' => 'individual',
+    '#required' => TRUE,
+  );
+  $form['name'] = array(
+    '#type' => 'textfield',
+    '#title' => t("Account holder name"),
+    '#description' => t("The recipient's full, legal name. For type individual, should be in the format 'First Last', 'First Middle Last', or 'First M Last' (no prefixes or suffixes). For corporation, the full incorporated name."),
+  );
+  $form['country'] = array(
+    '#type' => 'select',
+    '#title' => t('Country'),
+    '#options' => ms_core_get_countries(),
+    '#default_value' => variable_get('ms_core_default_country', 'US'),
+    '#required' => TRUE,
+  );
+  $form['routing_number'] = array(
+    '#type' => 'textfield',
+    '#title' => t("Routing number"),
+  );
+  $form['account_number'] = array(
+    '#type' => 'textfield',
+    '#title' => t("Account number"),
+  );
+
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Add'),
+  );
+  return $form;
+}
+
+/**
+ * Form validation handler for ms_affiliates_stripe_add_account_form().
+ */
+function ms_affiliates_stripe_add_account_form_validate($form, &$form_state) {
+  $v = $form_state['values'];
+  try {
+    // Require needed Stripe library.
+    require_once libraries_get_path('stripe-php') . '/lib/Stripe.php';
+    Stripe::setApiKey(variable_get('ms_stripe_secret_key', ''));
+    $recipient = Stripe_Recipient::create(array(
+      'name' => $v['name'],
+      'type' => $v['type'],
+      'bank_account' => array(
+        'country' => $v['country'],
+        'routing_number' => $v['routing_number'],
+        'account_number' => $v['account_number'],
+      ),
+    ));
+
+    // Save the recipient to the database.
+    $account = user_load(arg(1));
+    $recipient_record = (object)array(
+      'uid' => $account->uid,
+      'recipient_id' => $recipient->id,
+      'recipient_name' => $recipient->name,
+      'country' => $recipient->active_account->country,
+      'bank_name' => $recipient->active_account->bank_name,
+      'last4' => $recipient->active_account->last4,
+      'validated' => (int)$recipient->active_account->validated,
+      'created' => $recipient->created,
+      'verified' => (int)$recipient->verified,
+      'livemode' => (int)$recipient->livemode,
+      'type' => $recipient->type,
+      'fingerprint' => $recipient->active_account->fingerprint,
+    );
+
+    drupal_write_record('ms_affiliates_stripe_accounts', $recipient_record);
+  } catch (Exception $e) {
+    form_set_error('routing_number', $e->getMessage());
+  }
+}
+
+/**
+ * Page callback: Handle all Webhooks for all linked accounts.
+ *
+ * @see ms_affiliates_stripe_menu().
+ */
+function ms_affiliates_stripe_webhook_callback() {
+  // Retrieve the request's body and parse it as JSON
+  $body = @file_get_contents('php://input');
+  $event_json = json_decode($body);
+  $event = FALSE;
+
+  // To ensure we aren't being spoofed, let's get the event straight from Stripe
+  try {
+    require_once libraries_get_path('stripe-php') . '/lib/Stripe.php';
+    Stripe::setApiKey(variable_get('ms_stripe_secret_key', ''));
+    $event = Stripe_Event::retrieve($event_json->id);
+
+    ms_core_log('ms_affiliates_stripe', 'Received a webhook event: !webhook', array('!webhook' => ms_core_print_r($event)));
+
+    switch ($event->type) {
+      case 'transfer.failed':
+        $transfer = $event->data->object;
+
+        $history_item = ms_affiliates_load_history_item_by_foreign_key($transfer->id);
+
+        if ($history_item) {
+          // Give back the commission to the user.
+          ms_affiliates_update_balance($history_item->uid, $transfer->amount / 100);
+          ms_affiliates_insert_record($history_item->uid, 0, 0, 0, t('Bank Transfer Failed'), 'stripe_transfer_failed', $transfer->amount / 100, $event->id);
+        }
+        break;
+    }
+  } catch (Exception $e) {
+    ms_core_log_error('ms_affiliates_stripe', 'Error fetching event from Stripe: @error !event',
+      array('@error' => $e->getMessage(), '!event' => ms_core_print_r($event_json)));
+  }
+}
+
+/**
+ * Implements hook_ms_affiliates_bulk_options()
+ */
+function ms_affiliates_stripe_ms_affiliates_bulk_options() {
+  return array('stripe' => t("Pay via Stripe"));
+}
+
+/**
+ * Form constructor for the pay affiliates via Stripe Transfer form.
+ *
+ * @see ms_affiliates_stripe_payout_form_validate()
+ * @see ms_affiliates_stripe_payout_form_submit()
+ *
+ * @ingroup forms
+ */
+function ms_affiliates_stripe_payout_form($form, &$form_state) {
+  $uids = $_SESSION['ms_affiliates_bulk_uids'];
+
+  if ($uid = arg(4)) {
+    $uids = array(arg(4));
+  }
+
+  // Fetch and display the current Stripe balance.
+  try {
+    // Require needed Stripe library.
+    require_once libraries_get_path('stripe-php') . '/lib/Stripe.php';
+    Stripe::setApiKey(variable_get('ms_stripe_secret_key', ''));
+    $stripe_balance = Stripe_Balance::retrieve();
+    foreach ($stripe_balance->available as $i => $balance_item) {
+      $form['stripe_balance_available_' . $i] = array(
+        '#type' => 'item',
+        '#title' => t("Stripe balance available"),
+        '#markup' => ms_core_format_money($balance_item->amount / 100, strtoupper($balance_item->currency)),
+      );
+    }
+
+    foreach ($stripe_balance->pending as $i => $balance_item) {
+      $form['stripe_balance_pending_' . $i] = array(
+        '#type' => 'item',
+        '#title' => t("Stripe balance pending"),
+        '#markup' => ms_core_format_money($balance_item->amount / 100, strtoupper($balance_item->currency)),
+      );
+    }
+  } catch (Exception $e) {
+    drupal_set_message($e->getMessage(), 'error');
+  }
+
+  $currency = variable_get('ms_affiliates_default_currency', 'USD');
+  $form['currency'] = array(
+    '#type' => 'select',
+    '#title' => t('Currency'),
+    '#options' => ms_core_get_currencies(),
+    '#default_value' => variable_get('ms_affiliates_default_currency', 'USD'),
+    '#description' => t("The Currency to use for these transactions."),
+    '#required' => TRUE,
+  );
+  $form['statement_description'] = array(
+    '#type' => 'textfield',
+    '#maxlength' => 15,
+    '#title' => t("Statement Description"),
+    '#description' => t("This will be what is shown in their bank account statement. It will be appended to your Company Name. Maximum length is 15 characters."),
+  );
+  $form['stripe']['accounts'] = array(
+    '#type' => 'fieldset',
+    '#tree' => TRUE,
+    '#title' => t('Set up stripe transfer'),
+  );
+
+  foreach ($uids as $uid) {
+    $account = user_load($uid);
+    $linked_account = ms_affiliates_stripe_load_account($uid);
+    if ($linked_account) {
+      $amount = $account->af_balance;
+
+      $form['stripe']['accounts'][$account->uid] = array(
+        '#type' => 'textfield',
+        '#title' => check_plain($account->name),
+        '#default_value' => $amount,
+        '#description' => t("Enter the amount to pay @name. Balance is @balance. Payment will be sent to @bank : Account # @last4",
+          array(
+            '@name' => $account->name,
+            '@balance' => ms_core_format_money($amount, $currency),
+            '@bank' => $linked_account->bank_name,
+            '@last4' => $linked_account->last4,
+          )),
+      );
+    } else {
+      drupal_set_message(t("!name doesn't have bank account info entered (via Stripe Transfers) and has been skipped.",
+        array('!name' => l($account->name, 'user/' . $account->uid))));
+    }
+  }
+
+  $form_state['redirect'] = 'admin/people/pay_affiliates';
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Submit'),
+  );
+  return $form;
+}
+
+/**
+ * Form validation handler for ms_affiliates_stripe_payout_form().
+ */
+function ms_affiliates_stripe_payout_form_validate($form, &$form_state) {
+  global $user;
+  // Require needed Stripe library.
+  require_once libraries_get_path('stripe-php') . '/lib/Stripe.php';
+  Stripe::setApiKey(variable_get('ms_stripe_secret_key', ''));
+
+  $currency = $form_state['values']['currency'];
+  $statement_description = $form_state['values']['statement_description'];
+
+  foreach ($form_state['values']['accounts'] as $uid => $amount) {
+    $account = user_load($uid);
+    $linked_account = ms_affiliates_stripe_load_account($account->uid);
+    if ($linked_account) {
+      // Do the transfer.
+      try {
+        // Create a transfer to the specified recipient
+        $transfer = Stripe_Transfer::create(array(
+            "amount" => round($amount * 100), // Amount in cents.
+            "currency" => strtolower($currency),
+            "recipient" => $linked_account->recipient_id,
+            "statement_descriptor" => $statement_description)
+        );
+
+        // Update the User Balance
+        ms_affiliates_update_balance($account->uid, -$amount);
+
+        // Add Item to History
+        ms_affiliates_insert_record($account->uid, $user->uid, 0, 0, t('Bank Transfer'), 'stripe_transfer', -$amount, $transfer->id);
+      } catch (Exception $e) {
+        ms_core_log_error('ms_stripe_connect', 'Error Transferring Payout. @error !linked_account',
+          array('@error' => $e->getMessage(), '!linked_account' => ms_core_print_r($linked_account)));
+      }
+    }
+  }
+
+  unset($_SESSION['ms_affiliates_bulk_uids']);
+}
+
+/**
+ * Form submission handler for ms_affiliates_stripe_payout_form().
+ */
+function ms_affiliates_stripe_payout_form_submit($form, &$form_state) {
+  $form_state['redirect'] = 'admin/people/pay_affiliates';
+}
+
+/**
+ * Implements hook_ms_affiliates_payment_links_alter().
+ */
+function ms_affiliates_stripe_ms_affiliates_payment_links_alter(&$pay_links, $account, $aff) {
+  if (user_access('connect stripe bank account', $account) && ($linked_account = ms_affiliates_stripe_load_account($account->uid))) {
+    $pay_links[] = l(t("Pay via Bank Transfer"), 'admin/people/pay_affiliates/stripe/' . $account->uid);
+  }
+}
+
+/**
+ * Implements hook_ms_affiliates_history_types_alter().
+ */
+function ms_affiliates_stripe_ms_affiliates_history_types_alter(&$types) {
+  $types['stripe_transfer'] = t("Bank Transfer Payout");
+  $types['stripe_transfer_failed'] = t("Bank Transfer Failed");
+}

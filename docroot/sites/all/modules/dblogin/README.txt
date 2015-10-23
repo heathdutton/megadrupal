@@ -1,0 +1,4 @@
+Attention: bien que le lien pour se logguer (admin/db_login) à partir de Drupal à votre interface web de gestion de DB ne mentionne aucun mot de passe, une redirection http est effectuée par votre fureteur et cette redirection comporte toute l'information nécessaire (username, password, url du serveur) pour se connecter et cette redirection se fera en clair si votre connection à votre site Drupal se fait en http plutôt qu'en https.
+
+Warning: although the login url (admin/db_login) from your Drupal to your DB web interface doesn't mention a password, an http redirection takes place in your browser and this redirection holds all the necessary information (username, password, server url) to login and this redirection will happen in clear text if your connection to Drupal is done accross http instead of https.
+

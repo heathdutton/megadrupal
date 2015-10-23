@@ -1,0 +1,747 @@
+<?php
+
+define('AUTOCACHE_NOBUNDLE', '*');
+define('AUTOCACHE_SEPARATOR', '/');
+
+/**
+ * Implements hook_menu().
+ */
+function autocache_menu() {
+
+  $items = array();
+
+  $items["admin/config/system/autocache"] = array(
+    'title' => 'Autocache settings',
+    'description' => 'Enable disable automatic flushing. Show debug information, etc.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('autocache_settings_form'),
+    'access arguments' => array('administer site configuration'),
+    'file' => 'menu/autocache.menu.inc',
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_init().
+ */
+function autocache_init() {
+  // hook_exit() is not invoked for cron runs, so register it as shutdown
+  // callback to make sure it is always executed
+  drupal_register_shutdown_function('autocache_exit');
+}
+
+/**
+ * Implements hook_views_api().
+ */
+function autocache_views_api() {
+  return array(
+    'api' => 2,
+    'path' => drupal_get_path('module', 'autocache') . '/plugins/views',
+  );
+}
+
+/**
+ * Implements hook_ctools_plugin_directory().
+ */
+function autocache_ctools_plugin_directory($module, $plugin) {
+  if (($module == 'page_manager' || $module == 'panels' || $module == 'ctools') && !empty($plugin)) {
+    return "plugins/$plugin";
+  }
+}
+
+/**
+ * Implements hook_entity_insert().
+ */
+function autocache_entity_update($entity, $type) {
+  if (variable_get('autocache_auto', TRUE)) {
+    $func = variable_get('autocache_debug', FALSE) ? "_autocache_act_on_update_timing" : "_autocache_act_on_update";
+    $func($entity, $type);
+  }
+}
+
+/**
+ * Implements hook_entity_insert().
+ */
+function autocache_entity_insert($entity, $type) {
+  if (variable_get('autocache_auto', TRUE)) {
+    $func = variable_get('autocache_debug', FALSE) ? "_autocache_act_on_update_timing" : "_autocache_act_on_update";
+    $func($entity, $type);
+  }
+}
+
+/**
+ * Implements hook_entity_delete().
+ */
+function autocache_entity_delete($entity, $type) {
+  if (variable_get('autocache_auto', TRUE)) {
+    $func = variable_get('autocache_debug', FALSE) ? "_autocache_act_on_update_timing" : "_autocache_act_on_update";
+    $func($entity, $type);
+  }
+}
+
+/**
+ * Somewhat like entity_load except for a single entity.
+ * This one only loads the identifiers for the entity.
+ */
+function _autocache_entity_light_load($type, $entity_id) {
+
+  switch ($type) {
+
+    case 'comment':
+      // Special handling since no bundle support in EFQ.
+      return comment_load($entity_id);
+    
+    case 'taxonomy_term':
+      // Terms do not return machine name or vid in EFQ.
+      return taxonomy_term_load($entity_id);
+
+    default:
+
+      // On a rare occasion entity_uri will fail if we do not 
+      // completely load the entity when we're using Entity API.
+      if (module_exists('entity')) {
+        return entity_load_single($type, $entity_id);
+      }
+
+      // Implement simple caching for the loads.
+      $cache = &drupal_static(__FUNCTION__, array());
+      $key = $type . '-' . $entity_id;
+      if (isset($cache[$key])) {
+        return $cache[$key];
+      }
+
+      $query = new EntityFieldQuery();
+      $query->entityCondition('entity_type', $type)
+        ->entityCondition('entity_id', $entity_id);
+      $result = $query->execute();
+      $entity = array_shift($result[$type]);
+
+      $cache[$key] = $entity;
+      return $entity;
+  }
+
+  // Will never get here...
+}
+
+/**
+ * Timing and actual autocache update
+ */
+function _autocache_act_on_update_timing(&$entity, $type) {
+  $start = microtime(TRUE); 
+  _autocache_act_on_update($entity, $type);
+  $end = microtime(TRUE); 
+  _autocache_register_time($start, $end);
+}
+
+/**
+ * Clear autocache caches
+ */
+function _autocache_act_on_update(&$entity, $type) {
+
+  $info = entity_get_info($type);
+
+  if (empty($info['entity keys']['bundle'])) {
+    $bundle = AUTOCACHE_NOBUNDLE;
+  } else {
+    $bundle = $entity->{$info['entity keys']['bundle']};
+  }
+
+  // Special handling for comments since they are not using any field refs
+  if ($type == 'comment') {
+    $node = node_load($entity->nid);
+    if ($node) {
+      _autocache_act_on_update($node, 'node');
+    }
+  }
+
+  _autocache_clear_entity_caches($entity, $type);
+  _autocache_clear_entity_type_and_bundle_caches($type, $bundle);
+
+}
+
+/**
+ * Implements hook_exit()
+ */
+function autocache_exit() {
+
+  // Execute cache clears for collected tables and cids
+  $tables = &drupal_static('autocache_tables', array());
+  if (count($tables) == 0) {
+    return;
+  }
+
+  $start = microtime(TRUE);
+ 
+  $varnish = module_exists('varnish');
+  $debug = variable_get('autocache_debug', FALSE);
+  $track_accurately = variable_get('autocache_page_tracking_mode', FALSE);
+
+  $tags = array();
+
+  foreach ($tables as $table => &$cids) {
+    foreach ($cids as $cid => &$enabled) {
+
+      if ($track_accurately) {
+        if ($varnish) {
+          // Varnish tracks cid tags
+          $tags[$cid] = 1;
+        } else {
+          // Others track pages
+          $parts = cache_get($cid, 'cache_auto_url');
+          if ($parts) {
+            _autocache_register_flush_path($parts->data);
+          }
+        }
+      }
+
+      cache_clear_all($cid, $table, TRUE);
+
+      if ($debug) {
+       drupal_set_message(t('Cleared @cid from @table', array('@cid' => $cid, '@table' => $table)), 'status');
+      }
+    }
+  }
+
+  // Make sure we don't end up clearing these with the next update
+  $tables = array();
+  
+  // Clear registered paths
+  if ($track_accurately) {
+
+    if ($varnish) {
+      // Varnish is handles via tags
+      if (count($tags) > 0) {
+        // Tags are only set if varnish is used
+        $tags = array_keys($tags);
+        $tags = array_chunk($tags, 5);
+        foreach ($tags as $set) {
+          $temp = implode('|', $set);
+          _varnish_terminal_run('ban obj.http.X-Cache-Tags ~ ' . $temp);
+          if ($debug) {
+            drupal_set_message(t('Cleared Varnish cache tags: @tags', array('@tags' => $temp)));
+          }
+        }
+      }
+
+    } else {
+      // Other:
+      // Page tracking is enabled so we'll clear only the pages that
+      // were affected
+
+      $paths = _autocache_register_flush_path();
+
+      // Add the root to be also flushed when flushing the frontpage path
+      if (isset($paths['site_frontpage']) || isset($paths['node'])) {
+        $paths[''] = 1;
+      }
+
+      $temp = array();
+
+      foreach ($paths as $path => $i) {
+        if ($debug) {
+          drupal_set_message(t('Cleared page cache for @path', array('@path' => $path)));
+        }
+        cache_clear_all(url($path, array('absolute' => TRUE)), 'cache_page', TRUE);
+      }
+    }
+  } else { 
+    // !$track_accurately
+    // Clear page caches
+    cache_clear_all(url('', array('absolute' => TRUE)), 'cache_page', TRUE);
+
+    // Clear varnish
+    if ($varnish) {
+      varnish_purge_all_pages();
+    }
+
+  }
+
+  $end = microtime(TRUE);
+  if ($debug) {
+
+    $time = round(($end - $start), 5);
+
+    $cid_time = _autocache_register_time();
+    $cid_time = round($cid_time, 5); 
+
+    drupal_set_message(t('Cache identifier collection took @cid_seconds seconds. Clearing took @seconds seconds', array('@cid_seconds' => $cid_time, '@seconds' => $time)));
+  }
+}
+
+/**
+ * Time tracking for update function
+ */
+function _autocache_register_time($t1 = NULL, $t2 = NULL) {
+
+  $total = &drupal_static(__FUNCTION__, 0);
+
+  if ($t1 > 0 && $t2 > 0) {
+    $total += $t2 - $t1;
+  }
+
+  return $total;
+}
+
+/**
+ * Clear caches for given entity type and bundle
+ */
+function _autocache_clear_entity_caches(&$entity, $type) {
+
+  // Prevention of clearing cache multiple times and loops
+  $cleared = &drupal_static(__FUNCTION__, array());
+  
+  $entity_id = entity_extract_ids($type, $entity);
+  $entity_id = $entity_id[0];
+  $entity_key = $type . ':' . $entity_id;
+
+  if (isset($cleared[$entity_key])) {
+    // Already cleared these
+    return;
+  }
+
+  $cleared[$entity_key] = TRUE;
+
+  $uri = entity_uri($type, $entity);
+  if ($uri) {
+    _autocache_register_flush_path($uri['path']);
+    _autocache_register_flush_path(drupal_get_path_alias($uri['path']));
+  }
+
+   
+  // Field specific functionality
+
+  $followed_field_types = array(
+    'entityreference' => '_autocache_escalate_entity_reference_reverse',
+    'taxonomy_term_reference' => '_autocache_escalate_term_reference_reverse',
+    'commerce_product_reference' => '_autocache_escalate_commerce_product_reference_reverse',
+  );
+
+  // Scan entity fields only once.
+  $fields = &drupal_static('autocache_scannable_fields', FALSE);
+  if (!$fields) {
+    $fields = array();
+    $all_fields = field_info_fields();
+    foreach ($all_fields as $name => &$value) {
+      $field_info = field_info_field($name);
+      $field_type = $field_info['type'];
+      if (isset($followed_field_types[$field_type])) {
+        $fields[$field_type][] = $field_info;
+      }
+    }
+  }
+
+  foreach ($fields as $field_type => &$fields) {
+    foreach ($fields as &$field_info) {
+      $followed_field_types[$field_type]($field_info, $entity, $type);
+    }
+  }
+}
+
+/**
+ * Register given path for flushing from external (or simply page) cache
+ */
+function _autocache_register_flush_path($path = NULL) {
+  $paths = &drupal_static(__FUNCTION__, array());
+  if ($path == NULL) {
+    return $paths;
+  }
+  if (is_array($path)) {
+    $paths = array_merge($paths, array_flip($path));
+  } else {
+    $paths[$path] = 1;
+  }
+}
+
+/**
+ * Clear caches for given entity type and bundle
+ */
+function _autocache_clear_entity_type_and_bundle_caches($type, $bundle) {
+
+  // Prevention of clearing cache multiple times and loops
+  $cleared = &drupal_static(__FUNCTION__, array());
+
+  $entity_bundle_key = $type . ':' . $bundle;
+
+  if (isset($cleared[$entity_bundle_key])) {
+    // Already cleared these
+    return;
+  }
+
+  $cleared[$entity_bundle_key] = TRUE;
+
+  // Collect some initial information 
+  $tables = &drupal_static('autocache_tables', array());
+
+  $info = entity_get_info($type);
+
+  $followed_field_types = array(
+    'taxonomy_term_reference' => '_autocache_escalate_term_reference',
+    'entityreference' => '_autocache_escalate_entity_reference',
+    'commerce_product_reference' => '_autocache_escalate_commerce_product_reference',
+  );
+
+  // collect some info on fields 
+  $fields = field_info_instances($type, $bundle);
+  foreach ($fields as $name => &$value) {
+    $field_info = field_info_field($name);
+    $field_type = $field_info['type'];
+    if (isset($followed_field_types[$field_type])) {
+      $followed_field_types[$field_type]($field_info);
+    }
+  }
+
+  // Collect tables and cids for view caches
+
+  if (module_exists('views')) {
+
+    if (!isset($tables['cache_views_data'])) {
+      $tables['cache_views_data'] = array();
+    }
+
+    $ac_type = 'ac-' . $info['base table'];
+
+    $tables['cache_views_data'][$ac_type . '-' . $bundle] = TRUE;
+    $tables['cache_views_data'][$ac_type . '-' . AUTOCACHE_NOBUNDLE] = TRUE;
+  }
+  
+  // Collect tables and cids for pane caches
+
+  if (module_exists('panels')) {
+
+    if (!isset($tables['cache'])) {
+      $tables['cache'] = array();
+    }
+
+    $ac_type = 'ac-' . $info['base table'];
+    $tables['cache'][$ac_type . '-' . $bundle] = TRUE;
+    $tables['cache'][$ac_type . '-' . AUTOCACHE_NOBUNDLE] = TRUE;
+  }
+
+  // Invoke associated bundles
+  // This needs some more loving 'cause it aint pretty considering
+  // we're doign all sort of field_info_instances above
+  $set = autocache_get_bundle_set($type, $bundle);
+  foreach ($set as $key) {
+    _autocache_clear_entity_type_and_bundle_caches($type, $key);
+  }
+}
+
+/**
+ * Follow term reference fields
+ */
+function _autocache_escalate_term_reference(&$field_info) {
+  foreach ($field_info['settings']['allowed_values'] as &$vocab) {
+    _autocache_clear_entity_type_and_bundle_caches('taxonomy_term', $vocab['vocabulary']);
+  }
+}
+
+/**
+ * Follow term reference fields in reverse
+ */
+function _autocache_escalate_term_reference_reverse(&$field, &$entity, $type) {
+
+  if ($type != 'taxonomy_term') {
+    return;
+  }
+
+  $entity_id = $entity->tid;
+
+  foreach ($field['settings']['allowed_values'] as &$item) {
+    if ($item['vocabulary'] == $entity->vocabulary_machine_name) {
+
+      foreach ($field['bundles'] as $referring_entity_type => &$bundles) {
+
+        foreach ($bundles as &$bundle) {
+
+          $query = new EntityFieldQuery();            
+          $result = $query->entityCondition('entity_type', $referring_entity_type)
+            ->entityCondition('bundle', $bundle)
+            ->fieldCondition($field['field_name'], 'tid', $entity_id)
+            ->execute();
+
+          foreach ($result as $referring_entity_type => &$referring_entities) {
+            foreach ($referring_entities as $referring_entity_id => &$referring_entity) {
+              $referring_entity = _autocache_entity_light_load($referring_entity_type, $referring_entity_id);
+             if ($referring_entity) {
+                _autocache_act_on_update($referring_entity, $referring_entity_type);
+              }
+            } // entities
+          } // entity types
+        } // referencing bundles
+      } // referencing entity types
+    }
+  }
+}
+
+/**
+ * Follow entity reference fields
+ */
+function _autocache_escalate_entity_reference(&$field_info) {
+  // This will take care of entities we reference.
+  $type = $field_info['settings']['target_type'];
+  if (isset($field_info['settings']['handler_settings']['target_bundles'])) {
+    foreach ($field_info['settings']['handler_settings']['target_bundles'] as &$bundle) {
+      _autocache_clear_entity_type_and_bundle_caches($type, $bundle);
+    }
+  } else {
+    _autocache_clear_entity_type_and_bundle_caches($type, AUTOCACHE_NOBUNDLE);
+  }
+}
+
+/**
+ * Follow entity reference fields in reverse
+ */
+function _autocache_escalate_entity_reference_reverse(&$field, &$entity, $type) {
+
+  // This function will look if the field is referencing the
+  // given entity.
+  $entity_id = entity_extract_ids($type, $entity);
+  $entity_id = $entity_id[0];
+
+  $referred_entity_type = $field['settings']['target_type'];
+
+  if ($referred_entity_type == $type) {
+
+    foreach ($field['bundles'] as $referring_entity_type => &$bundles) {
+
+      foreach ($bundles as &$bundle) {
+      
+        $query = new EntityFieldQuery();            
+        $result = $query->entityCondition('entity_type', $referring_entity_type)
+          ->entityCondition('bundle', $bundle)
+          ->fieldCondition($field['field_name'], 'target_id', $entity_id)
+          ->execute();
+
+        foreach ($result as $referring_entity_type => &$referring_entities) {
+          foreach ($referring_entities as $referring_entity_id => &$referring_entity) {
+            $referring_entity = _autocache_entity_light_load($referring_entity_type, $referring_entity_id);
+            if ($referring_entity) {
+              _autocache_act_on_update($referring_entity, $referring_entity_type);
+            }
+          } // entities
+        } // entity types
+      } // referencing bundles
+    } // referencing entity types
+  } // this entity type is being referenced
+}
+
+/**
+ * Follow commerce product reference fields
+ */
+function _autocache_escalate_commerce_product_reference(&$field_info) {
+
+  // This will take care of entities we reference.
+  $type = "commerce_product";
+  //$bundles = commerce_product_types();
+  _autocache_clear_entity_type_and_bundle_caches($type, AUTOCACHE_NOBUNDLE);
+}
+
+/**
+ * Follow commerce product reference fields in reverse
+ */
+function _autocache_escalate_commerce_product_reference_reverse(&$field, &$entity, $type) {
+
+  // This function will look if the field is referencing the
+  // given entity.
+  $entity_id = entity_extract_ids($type, $entity);
+  $entity_id = $entity_id[0];
+
+  $referred_entity_type = "commerce_product";
+
+  if ($referred_entity_type == $type) {
+
+    foreach ($field['bundles'] as $referring_entity_type => &$bundles) {
+
+      foreach ($bundles as &$bundle) {
+      
+        $query = new EntityFieldQuery();            
+        $result = $query->entityCondition('entity_type', $referring_entity_type)
+          ->entityCondition('bundle', $bundle)
+          ->fieldCondition($field['field_name'], 'product_id', $entity_id)
+          ->execute();
+
+        foreach ($result as $referring_entity_type => &$referring_entities) {
+          foreach ($referring_entities as $referring_entity_id => &$referring_entity) {
+            $referring_entity = _autocache_entity_light_load($referring_entity_type, $referring_entity_id);
+            if ($referring_entity) {
+              _autocache_act_on_update($referring_entity, $referring_entity_type);
+            }
+          } // entities
+        } // entity types
+      } // referencing bundles
+    } // referencing entity types
+  } // this entity type is being referenced
+}
+
+
+/**
+ * Determined uniqueness for this page, such as user roles
+ */
+function _autocache_uniqueness() {
+  $unique = &drupal_static(__FUNCTION__);
+  if (isset($unique)) {
+    return $unique;
+  }
+  
+  global $user;
+  global $language;
+  $unique = array();
+
+  $unique[] = $language->language;
+  $unique = array_merge($unique, $user->roles);
+  $unique = implode(':', $unique);
+  $unique = '-' . md5($unique);
+  
+  return $unique;
+}
+
+/**
+ * Register a cache cid for this page
+ */
+function autocache_register_cache_key($key) {
+  $registered = &drupal_static('autocache_keys', array());
+
+  if ($key) {
+    // Add determined uniqueness for this page
+    $key .= _autocache_uniqueness();
+    $registered[] = $key;
+  }
+
+  return $key;
+}
+
+/**
+ * Register bundle set and generate a key for it
+ */
+function autocache_register_bundle_set($entity_type, array $bundles) {
+  
+  // Only one bundle so we use that as a key
+  if (count($bundles) == 1) {
+    return array_shift($bundles);
+  }
+
+  $prefix = 'acbs-' . $entity_type . '-';
+
+  if (count($bundles) == 0) {
+    $key = AUTOCACHE_NOBUNDLE;
+  } else {
+    $key = '(' . join('+', $bundles) . ')';
+  }
+
+  // Generate a multi key
+  foreach ($bundles as $bundle) {
+    $cache = cache_get($prefix . $bundle);
+    $set = $cache ? $cache->data : array();
+    $set[$key] = $key;
+    cache_set($prefix . $bundle, $set);
+  }
+
+  return $key;
+}
+
+/**
+ * Get registered bundle sets
+ */
+function autocache_get_bundle_set($entity_type, $bundle) {
+  $prefix = 'acbs-' . $entity_type . '-';
+  $cache = cache_get($prefix . $bundle);
+  $set = $cache ? $cache->data : array();
+  return $set;
+}
+
+/**
+ * Register a cache cid for this page
+ */
+function autocache_get_cache_keys() {
+  return drupal_static('autocache_keys', array());
+}
+
+/**
+ *
+ */
+function _autocache_get_cid_key($cid) {
+  $pos = 0;
+  for ($i = 0; $i < 3; $i++) {
+    $pos = strpos($cid, '-', $pos + 1);
+  }
+  return substr($cid, 0, $pos);
+}
+
+/**
+ * Implements hook_page_alter().
+ */
+function autocache_page_alter(&$page) {
+
+  // Store registered caches cids for this path
+  // but avoid logging them for 404 pages
+  $keys = autocache_get_cache_keys(); 
+  $status = drupal_get_http_header("status");
+  
+  $track_accurately = variable_get('autocache_page_tracking_mode', FALSE);
+  $varnish = module_exists('varnish');
+
+  if ($track_accurately &&
+    count($keys) > 0 && 
+    $status != '404 Not Found') {
+
+    if ($varnish) {
+      // Varnish is handled via Tags
+      $cid_keys = array();
+      
+      foreach ($keys as $key) {
+        $cid_keys[_autocache_get_cid_key($key)] = 1;
+      }
+
+      $cid_keys = array_keys($cid_keys);
+      drupal_add_http_header('X-Cache-Tags', implode(',', $cid_keys));
+
+    } else {
+
+      $path = drupal_get_destination();
+      $path = $path['destination'];
+
+      $page_key = 'page-' . md5($path);
+
+      $tracked = cache_get($page_key, 'cache_auto_url');
+
+      if (!$tracked) {
+
+        $caches = array();
+        foreach ($keys as $cid) {
+          $cid_key = _autocache_get_cid_key($cid);
+          if (!isset($caches[$cid_key])) {
+            $caches[$cid_key] = array();
+          }
+          // Add path to the prefix of the
+          if (!in_array($path, $caches[$cid_key])) {
+            $caches[$cid_key][] = $path;
+          }
+        }
+
+        foreach ($caches as $key => $cache) {
+          $existing = cache_get($key, 'cache_auto_url');
+          if ($existing) {
+            $cache = array_merge($cache, $existing->data);
+          }
+          cache_set($key, $cache, 'cache_auto_url', CACHE_TEMPORARY);
+        }
+
+        // Store key types used for this page
+        $key_types = cache_get('keys', 'cache_auto_url');
+        $key_types = $key_types ? array_merge($key_types->data, array_keys($caches)) : array_keys($caches);
+        cache_set('keys', $key_types, 'cache_auto_url', CACHE_PERMANENT);
+
+        // Mark page indexed
+        cache_set($page_key, TRUE, 'cache_auto_url', CACHE_TEMPORARY);
+      }
+    }
+  }
+
+  if (variable_get('autocache_debug', FALSE) && count($keys) > 0) {
+    drupal_set_message("Cache keys used in this page:<br/>" . implode("<br/>", $keys));
+  }
+
+}
+
+

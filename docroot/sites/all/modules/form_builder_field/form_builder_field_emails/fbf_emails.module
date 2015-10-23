@@ -1,0 +1,647 @@
+<?php
+
+define('FBF_EMAILS_MANUAL', 'manual');
+define('FBF_EMAILS_REFERENCE', 'reference');
+define('FBF_EMAILS_TEMPLATE_API', 'template_api');
+
+/**
+ * Implements hook_menu().
+ */
+function fbf_emails_menu() {
+  $items = array();
+
+  $items['fbf-emails/entity-get'] = array(
+    'type' => MENU_CALLBACK,
+    'page callback' => 'fbf_emails_entity_complete',
+    //'page arguments' => array(2, 3, 4, 5),
+    'access arguments' => array('access content') //@TODO MAKE THIS BETTER
+  );
+
+  $items['fbf-emails/autocomplete'] = array(
+    'type' => MENU_CALLBACK,
+    'page callback' => 'fbf_emails_form_element_autocomplete',
+    'access arguments' => array('access content') //@TODO make this better
+  );
+
+  $items['fbf-emails/description'] = array(
+    'type' => MENU_CALLBACK,
+    'page callback' => 'fbf_emails_element_descriptions',
+    'access arguments' => array('access content') //@TODO make this better
+  );
+
+  return $items;
+}
+
+/**
+ * AJAX callback to get the description for template usage
+ */
+function fbf_emails_element_descriptions($field_id, $instance_id, $entity_type, $id = NULL, $rev_id = NULL) {
+  if (empty($id) || empty($rev_id)) {
+    $form_id = form_builder_field_new_id($instance_id);
+  }
+  else {
+    $form_id = form_builder_field_build_id($instance_id, array('id' => $id, 'vid' => $rev_id), $entity_type);
+  }
+
+  module_load_include('inc', 'form_builder', 'includes/form_builder.api');
+  $form = form_builder_crud_form_load($form_id);
+  $form_element_ids = form_builder_get_element_ids($form);
+  $form_builder_elements = form_builder_get_elements($form, $form_element_ids);
+
+  $out = '<ul>';
+  foreach (element_children($form_builder_elements) as $form_builder_element_key) {
+    $out .= "<li>{$form_builder_element_key}: {$form_builder_elements[$form_builder_element_key]['#title']}</li>";
+  }
+  $out .= '</ul>';
+
+  $json = array(
+    'status' => TRUE,
+    'html' => $out,
+    'id' => "fbf-email-element-description-{$field_id}",
+  );
+
+  drupal_json_output($json);
+}
+
+/**
+ * Autocomplete callback for form elements
+ *
+ */
+function fbf_emails_form_element_autocomplete($instance_id, $entity_type, $id = NULL, $rev_id = NULL) {
+  if (empty($id) || empty($rev_id)) {
+    $form_id = form_builder_field_new_id($instance_id);
+  }
+  else {
+    $form_id = form_builder_field_build_id($instance_id, array('id' => $id, 'vid' => $rev_id), $entity_type);
+  }
+
+  module_load_include('inc', 'form_builder', 'includes/form_builder.api');
+  $form = form_builder_crud_form_load($form_id);
+  $form_element_ids = form_builder_get_element_ids($form);
+  $form_builder_elements = form_builder_get_elements($form, $form_element_ids);
+
+  $form_builder_elements_list = array();
+  foreach (element_children($form_builder_elements) as $form_builder_element_key) {
+    $form_builder_elements_list[$form_builder_element_key] =
+      $form_builder_elements[$form_builder_element_key]['#title'];
+  }
+
+  drupal_json_output($form_builder_elements_list);
+}
+
+function fbf_emails_entity_complete($entity_type, $field_name, $bundle_name, $string) {
+  $instance = field_info_instance($entity_type, $field_name, $bundle_name);
+
+  // @TODO Make this work with all entities
+  $allowed_types = $instance['settings']['entity_allowed_to_ref'];
+
+  $matches = array();
+  if ($string) {
+    $query = db_select('node')
+      ->fields('node', array('nid', 'title'))
+      ->condition('title', db_like($string) . '%', 'LIKE')
+      ->range(0, 10);
+
+    if ($allowed_types) {
+      $query->condition('type', $allowed_types, "IN");
+    }
+
+    $result = $query->execute();
+    foreach ($result as $node) {
+      $matches[$node->title . " [$node->nid]"] = check_plain($node->title);
+    }
+  }
+
+  drupal_json_output($matches);
+}
+
+/**
+ * Implements form_builder_field_action().
+ */
+function fbf_emails_form_builder_field_action($values, &$form, &$form_state) {
+  //only send the email if no errors on the form
+  if (!form_get_errors()) {
+    $entity_type = $form_state['values']['instance']['entity_type'];
+    $bundle = $form_state['values']['instance']['bundle'];
+    $field_infos = field_info_instances($entity_type, $bundle);
+    $email_fields = array();
+    foreach ($field_infos as $field_name => $instance) {
+      $field_info = field_info_field($instance['field_name']);
+      if ($field_info['type'] === 'fbf_email' && $form_state['values']['instance']['field_name'] == $instance['widget']['settings']['form_builder_field']) {
+        $email_fields[$field_name] = array(
+          'field_info' => $field_info,
+          'instance' => $instance,
+        );
+      }
+    }
+    foreach ($email_fields as $field_name => $field_info) {
+      if ($field_items = field_get_items($entity_type, $values['entity'], $field_name)) {
+        foreach ($field_items as $delta => $item) {
+          // active flag for reference fields default to TRUE
+          // Only flips this if we have a reference field active
+          $is_active = TRUE;
+          // if we are using a reference email make sure it is published before we use it as an email
+          if ($item['email_body']['email_body_type'] == FBF_EMAILS_REFERENCE) {
+            // make inactive till we run through the logic
+            $is_active = FALSE;
+            // extract the nid
+            preg_match("/.+\[(\d+)\]/", $item['email_body'][FBF_EMAILS_REFERENCE], $matches);
+            if (is_numeric($matches[1])) {
+              // try to get the node
+              $node = node_load($matches[1]);
+            }
+            // allow other modules a chance to change the values.
+            // for instance modules like state_flow has states that have the node status at 1 but the node is not published
+            foreach (module_implements('fbf_emails_item_values') as $module) {
+              $function = $module . '_fbf_emails_item_values';
+              $function($is_active, $item, $node);
+            }
+          }
+          if ($is_active) {
+            $params = array();
+            $params['to'] = fbf_emails_form_builder_field_action_to_address($item, $values);
+            $params['from'] = $field_info['instance']['widget']['settings']['from_email_address'];
+            $params['subject'] = $item['subject'];
+            $params['body'] = fbf_emails_form_builder_field_action_body($item, $values);
+
+            if (fbf_email_html_capable() && $item['email_format'] == 'html') {
+              $params['headers']['Content-Type'] = 'text/html; charset=UTF-8';
+              $params['html'] = TRUE;
+              $params['plain'] = FALSE;
+              $params['plaintext'] = NULL;
+            }
+            else {
+              $params['html'] = FALSE;
+              $params['plain'] = TRUE;
+            }
+            drupal_mail('fbf_emails', 'email', $params['to'], field_language('node', $values['entity']), $params, $params['from']);
+          }
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_mail().
+ */
+function fbf_emails_mail($key, &$message, $params) {
+  if (isset($params['headers']) && is_array($params['headers'])) {
+    $message['headers'] = $params['headers'] + $message['headers'];
+  }
+
+  $message['subject'] = $params['subject'];
+  $message['body'][] = $params['body'];
+}
+
+/**
+ * Check if any available HTML mail handlers are available.
+ */
+function fbf_email_html_capable() {
+  // TODO: Right now we only support MIME Mail. Support others if available
+  // through a hook?
+  if (module_exists('mimemail')) {
+    $mail_systems = variable_get('mail_system', array('default-system' => 'DefaultMailSystem'));
+    $enable = !isset($mail_systems['fbf_emails']) || $mail_systems['fbf_emails'] == 'MimeMailSystem';
+
+    if ($enable) {
+      $GLOBALS['conf']['mail_system']['fbf_emails'] = 'MimeMailSystem';
+      return TRUE;
+    }
+  }
+  else {
+    return FALSE;
+  }
+}
+
+/**
+ * Build the body for the email
+ *
+ * @param $item
+ * @param $values
+ *
+ * @return array|mixed|string
+ */
+function fbf_emails_form_builder_field_action_body($item, $values) {
+  $body = array();
+  switch($item['email_body']['email_body_type']) {
+    case FBF_EMAILS_MANUAL:
+      $settings = $item['email_body'][FBF_EMAILS_MANUAL]['email_body'];
+      $body = check_markup($settings['value'], $settings['format']);
+      break;
+
+    case FBF_EMAILS_REFERENCE:
+      $body = drupal_render($item['email_body'][FBF_EMAILS_REFERENCE]);
+      break;
+
+    case FBF_EMAILS_TEMPLATE_API:
+      $settings = $item['email_body'][FBF_EMAILS_TEMPLATE_API];
+      $template_markup = check_markup($settings['value'], $settings['format']);
+
+      $template = new Template();
+      $template->name = "fbf_email";
+      $template->content = $template_markup;
+      $template->renderer = "mustache"; // @TODO make ths configurable
+
+      $renderer = template_api_get_renderer_controller($template->renderer);
+      $body = $renderer->render($template, $values);
+  }
+
+  return $body;
+}
+
+/**
+ * Setup to address for the email action
+ *
+ * @param array
+ *  values
+ *
+ * @return string
+ *  email address
+ */
+function fbf_emails_form_builder_field_action_to_address($item, $values) {
+  $to_address = NULL;
+
+  // Setup to address
+  switch ($item['to_address']['to_address_type']) {
+    case FBF_EMAILS_MANUAL:
+      $to_address = $item['to_address'][FBF_EMAILS_MANUAL]['to_address'];
+      break;
+
+    case FBF_EMAILS_REFERENCE:
+      $to_address = $values[$item['to_address'][FBF_EMAILS_REFERENCE]['to_address_reference']];
+      break;
+  }
+
+  return $to_address;
+}
+
+
+/**
+ * Implements hook_field_info().
+ */
+function fbf_emails_field_info() {
+  return array(
+    'fbf_email' => array(
+      'label' => t('Form Builder Emails'),
+      'description' => t('This field stores emails information to send when a Form is submitted.'),
+      'settings' => array(),
+      'instance_settings' => array(),
+      'default_widget' => 'fbf_email',
+      'default_formatter' => 'fbf_email',
+    ),
+  );
+}
+
+/**
+ * Implements hook_field_widget_info().
+ */
+function fbf_emails_field_widget_info() {
+  return array(
+    'fbf_email' => array(
+      'label' => t('Form Builder Emails'),
+      'field types' => array('fbf_email'),
+      'settings' => array(
+        'form_builder_field' => '',
+        'entity_allowed_to_ref' => array(),
+        'from_email_address' => '',
+      ),
+    ),
+  );
+}
+
+/**
+ * Implements hook_field_widget_settings_form().
+ */
+function fbf_emails_field_widget_settings_form($field, $instance) {
+  $widget = $instance['widget'];
+  $settings = $widget['settings'];
+
+  $form = array();
+
+  // Build holder for fields of type form_builder
+  $form_builder_fields = array();
+  $entity_type = $instance['entity_type'];
+  $bundle = $instance['bundle'];
+  $field_infos = field_info_instances($entity_type, $bundle);
+
+  // Fetch all the fields on this content type that are type form_builder
+  foreach ($field_infos as $field_name => $form_field_instance) {
+    $field_info = field_info_field($form_field_instance['field_name']);
+    if ($field_info['type'] === 'form_builder') {
+      $id = "{$form_field_instance['field_name']}:::{$form_field_instance['entity_type']}:::{$form_field_instance['bundle']}";
+      $form_builder_fields[$id] = "{$form_field_instance['entity_type']} : {$form_field_instance['bundle']} : {$form_field_instance['field_name']}";
+    }
+  }
+
+  $options = array();
+  // @TODO Make this work for any entity in fbf_emails_entity_complete before removing the node only entities
+  foreach (entity_get_info() as $entity => $entity_info) {
+    foreach ($entity_info['bundles'] as $bundle => $bundle_info) {
+      $options["{$entity}:::{$bundle}"] = "{$entity_info['label']} : {$bundle_info['label']}";
+    }
+  }
+
+  $form['form_builder_field'] = array(
+    '#type' => 'select',
+    '#multiple' => FALSE,
+    '#title' => t('Form Builder Field'),
+    '#description' => t('The Form Builder Field that will be using this email field'),
+    '#options' => $form_builder_fields,
+    '#default_value' => $settings['form_builder_field'],
+  );
+
+  $form['entity_allowed_to_ref'] = array(
+    '#type' => 'select',
+    '#multiple' => TRUE,
+    '#title' => t('Content Type allowed to be referenced as emails'),
+    '#default_value' => $settings['entity_allowed_to_ref'],
+    '#options' => $options,
+  );
+
+  $form['from_email_address'] = array(
+    '#type' => 'textfield',
+    '#title' => t('From Email Address'),
+    '#default_value' => $settings['from_email_address'],
+  );
+
+  return $form;
+}
+
+/**
+ * Implements hook_field_formatter_info().
+ */
+function fbf_emails_field_formatter_info() {
+  return array(
+    'fbf_emails' => array(
+      'label' => t('Default'),
+      'field types' => array('fbf_emails'),
+    ),
+  );
+}
+
+  /**
+   * Implements hook_field_widget_form().
+   */
+function fbf_emails_field_widget_form(&$form, &$form_state, $field, $instance, $langcode, $items, $delta, $element) {
+  drupal_add_js(drupal_get_path('module', 'fbf_emails') . '/fbf_emails.js');
+
+  $element+= array(
+    '#title' => t('Email Information'),
+    '#collapsible' => TRUE,
+    '#collapsed' => FALSE,
+  );
+
+  if ($field['cardinality'] == 1) {
+    $element['#type'] = 'fieldset';
+  }
+
+  $values = isset($items[$delta]) ? $items[$delta] : array();
+  $to_address_values = isset($values['to_address']) ? $values['to_address'] : array();
+  $body_values = isset($values['email_body']) ? $values['email_body'] : array();
+
+  $email_formats = array(
+    'text' => t('text'),
+  );
+
+  if (module_exists('mimemail')) {
+    $email_formats['html'] = t('HTML');
+  }
+
+  $element['email_format'] = array(
+    '#type' => 'radios',
+    '#title' => t('Email Format'),
+    '#options' => $email_formats,
+    '#default_value' => isset($values['email_format']) ? $values['email_format'] : 'text',
+  );
+
+  $element['subject'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Subject'),
+    '#default_value' => isset($values['subject']) ? $values['subject'] : '',
+  );
+
+  $element['to_address'] = array(
+    '#type' => 'fieldset',
+    '#collapsible' => TRUE,
+    '#collapsed' => FALSE,
+    '#title' => t('To Address'),
+  );
+
+  $base_selector = "{$field['field_name']}[{$element['#language']}][{$delta}]";
+  $address_type_selector = "{$base_selector}[to_address][to_address_type]";
+  $body_type_selector = "{$base_selector}[email_body][email_body_type]";
+
+  $element['to_address']['to_address_type'] = array(
+    '#type' => 'select',
+    '#title' => t('To Email Address Type'),
+    '#options' => array(
+      FBF_EMAILS_MANUAL => t('Manual'),
+      FBF_EMAILS_REFERENCE => t('Reference Field'),
+    ),
+    '#default_value' => isset($to_address_values['to_address_type']) ?
+      $to_address_values['to_address_type'] : FBF_EMAILS_MANUAL,
+  );
+
+  $element['to_address'][FBF_EMAILS_MANUAL]['to_address'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Email Address'),
+    '#states' => array(
+      'visible' => array(
+        ':input[name="' . $address_type_selector . '"]' => array('value' => FBF_EMAILS_MANUAL),
+      )
+    ),
+    '#default_value' => isset($to_address_values[FBF_EMAILS_MANUAL]['to_address']) ?
+      $to_address_values[FBF_EMAILS_MANUAL]['to_address'] : '',
+  );
+
+  // Get the field info for the form field
+  $form_field_name = $instance['widget']['settings']['form_builder_field'];
+  list($form_field_name, $form_field_entity_type, $form_field_bundle) = explode(":::", $form_field_name);
+  $form_field_instance = field_info_instance($form_field_entity_type, $form_field_name, $form_field_bundle);
+
+  if (!empty($instance['entity_type']) && !empty($element['#entity'])) {
+    list($id, $rev_id, $bundle) = entity_extract_ids($instance['entity_type'], $element['#entity']);
+  }
+  else {
+    $id = $rev_id = NULL;
+  }
+
+
+  $url = "fbf-emails/autocomplete/{$form_field_instance['id']}/{$form_field_instance['entity_type']}";
+  if (!empty($id)) {
+    $url .= "/$id";
+  }
+
+  if (!empty($rev_id)) {
+    $url .= "/$rev_id";
+  }
+
+  $element['to_address'][FBF_EMAILS_REFERENCE]['to_address_reference'] = array(
+    '#type' => 'textfield',
+    '#autocomplete_path' => $url,
+    '#title' => t('To Email Address'),
+    '#states' => array(
+      'visible' => array(
+        ':input[name="' . $address_type_selector . '"]' => array('value' => FBF_EMAILS_REFERENCE),
+      )
+    ),
+    '#default_value' => isset($to_address_values[FBF_EMAILS_REFERENCE]['to_address_reference']) ?
+      $to_address_values[FBF_EMAILS_REFERENCE]['to_address_reference'] : '',
+  );
+
+  $options = array(
+    FBF_EMAILS_MANUAL => t('Manual Entry'),
+    FBF_EMAILS_REFERENCE => t('Reference another Entity'),
+  );
+
+  if (module_exists('template_api')) {
+    $options[FBF_EMAILS_TEMPLATE_API] = t('Template API');
+  }
+
+  $element['email_body'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Email Body'),
+    '#collapsible' => TRUE,
+    '#collapsed' => FALSE,
+  );
+
+
+  $element['email_body']['email_body_type'] = array(
+    '#type' => 'select',
+    '#title' => t('Email Type'),
+    '#options' => $options,
+    '#default_value' => isset($body_values['email_body_type']) ? $body_values['email_body_type'] : FBF_EMAILS_MANUAL,
+  );
+
+  $element['email_body'][FBF_EMAILS_MANUAL] = array(
+    '#type' => 'fieldset',
+    '#states' => array(
+      'visible' => array(
+        ':input[name="' . $body_type_selector . '"]' => array('value' => FBF_EMAILS_MANUAL),
+      ),
+    ),
+    '#tree' => TRUE,
+  );
+
+  $element['email_body'][FBF_EMAILS_MANUAL]['email_body'] = array(
+    '#type' => 'text_format',
+    '#title' => t('Email Body'),
+    '#default_value' => isset($body_values[FBF_EMAILS_MANUAL]['email_body']['value']) ?
+      $body_values[FBF_EMAILS_MANUAL]['email_body']['value'] : '',
+    '#format' => isset($body_values[FBF_EMAILS_MANUAL]['email_body']['format']) ?
+      $body_values[FBF_EMAILS_MANUAL]['email_body']['format'] : filter_default_format(),
+  );
+
+  $url = "/fbf-emails/description/{$instance['id']}/{$form_field_instance['id']}/{$form_field_instance['entity_type']}";
+  if (!empty($id)) {
+    $url .= "/$id";
+  }
+
+  if (!empty($rev_id)) {
+    $url .= "/$rev_id";
+  }
+
+  $description = t('The template uses the mustache syntax to build the email body') . '<br /><br />';
+  $description .= t('The following variables are available') . '<br /><br />';
+  $description .= '<a href="#" class="fbf-email-elements" data-url="' . $url . '">Click to Refresh Variable List</a>';
+  $description .= '<div id="fbf-email-element-description-' . $instance['id'] . '"></div>';
+
+  $element['email_body'][FBF_EMAILS_TEMPLATE_API] = array(
+    '#type' => 'fieldset',
+    '#tree' => TRUE,
+    '#states' => array(
+      'visible' => array(
+        ':input[name="' . $body_type_selector . '"]' => array('value' => FBF_EMAILS_TEMPLATE_API),
+      ),
+    ),
+  );
+
+  $element['email_body'][FBF_EMAILS_TEMPLATE_API]['email_body_template'] = array(
+    '#type' => 'text_format',
+    '#title' => t('Email Body'),
+    '#default_value' => isset($body_values[FBF_EMAILS_TEMPLATE_API]['email_body_template']['value']) ?
+      $body_values[FBF_EMAILS_TEMPLATE_API]['email_body_template']['value'] : '',
+    '#format' => isset($body_values[FBF_EMAILS_MANUAL]['email_body_template']['format']) ?
+      $body_values[FBF_EMAILS_TEMPLATE_API]['email_body_template']['format'] : filter_default_format(),
+    '#description' => $description,
+  );
+
+  $path = "fbf-emails/entity-get/{$instance['entity_type']}/{$instance['field_name']}/{$instance['bundle']}";
+  $element['email_body'][FBF_EMAILS_REFERENCE] = array(
+    '#type' => 'textfield',
+    '#autocomplete_path' => $path,
+    '#title' => t('Field'),
+    '#states' => array(
+      'visible' => array(
+        ':input[name="' . $body_type_selector . '"]' => array('value' => FBF_EMAILS_REFERENCE),
+      )
+    ),
+    '#default_value' => isset($body_values[FBF_EMAILS_REFERENCE]) ?
+      $body_values[FBF_EMAILS_REFERENCE] : '',
+  );
+
+  return $element;
+}
+
+/**
+ * Implements hook_field_presave().
+ */
+function fbf_emails_field_presave($entity_type, $entity, $field, $instance, $langcode, &$items) {
+  foreach ($items as $delta => &$item) {
+    if (is_array($item['to_address'])) {
+      $item['to_address'] = serialize($item['to_address']);
+    }
+
+    if (is_array($item['email_body'])) {
+      $item['email_body'] = serialize($item['email_body']);
+    }
+  }
+}
+
+/**
+ * Implements hook_field_attach_insert().
+ *
+ *
+ */
+function fbf_emails_field_insert($entity_type, $entity, $field, $instance, $langcode, &$items) {
+  foreach ($items as $delta => &$item) {
+    if (is_array($item['to_address'])) {
+      $item['to_address'] = serialize($item['to_address']);
+    }
+
+    if (is_array($item['email_body'])) {
+      $item['email_body'] = serialize($item['email_body']);
+    }
+  }
+}
+
+/**
+ * Implements hook_hook_field_load()
+ */
+function fbf_emails_field_load($entity_type, $entities, $field, $instances, $langcode, &$items, $age) {
+  foreach ($entities as $id => $entity) {
+    foreach ($items[$id] as &$item) {
+      $item['to_address'] = unserialize($item['to_address']);
+      $item['email_body'] = unserialize($item['email_body']);
+    }
+  }
+}
+
+/**
+ * Implement hook_field_is_empty()
+ */
+function fbf_emails_field_is_empty($item, $field) {
+  switch ($item['to_address']['to_address_type']) {
+    case FBF_EMAILS_MANUAL:
+      return empty($item['to_address']['manual']['to_address']);
+      break;
+    case FBF_EMAILS_REFERENCE:
+      return empty($item['to_address']['reference']['to_address_reference']);
+      break;
+    default:
+      return empty($item['to_address']);
+  }
+}
+
+
