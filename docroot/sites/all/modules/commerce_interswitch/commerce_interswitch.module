@@ -1,0 +1,662 @@
+<?php
+/**
+ * @file
+ * Provides Interswitch WebPay payment method for Drupal Commerce.
+ */
+
+// Define URLs and API endpoints.
+define('COMMERCE_INTERSWITCH_LIVE_PAY', 'https://webpay.interswitchng.com/paydirect/pay');
+define('COMMERCE_INTERSWITCH_TEST_PAY', 'https://stageserv.interswitchng.com/test_paydirect/pay');
+define('COMMERCE_INTERSWITCH_LIVE_LOOKUP', 'https://webpay.interswitchng.com/paydirect/api/v1/gettransaction.json');
+define('COMMERCE_INTERSWITCH_TEST_LOOKUP', 'https://stageserv.interswitchng.com/test_paydirect/api/v1/gettransaction.json');
+
+
+/**
+ * Implements hook_perm().
+ */
+function commerce_interswitch_permission() {
+  return array(
+    'access interswitch webpay payments' => array(
+      'title' => t('Manage Interswitch WebPay Payments'),
+    ),
+    'manage interswitch webpay config' => array(
+      'title' => t('Manage Interswitch WebPay Config'),
+    ),
+  );
+}
+
+/**
+ * Implements hook_menu().
+ */
+function commerce_interswitch_menu() {
+  $items = array();
+
+  $items['admin/interswitch-webpay/look-up/nojs/%'] = array(
+    'page callback' => 'commerce_interswitch_ajax_requery_interswitch',
+    'access arguments' => array('access interswitch webpay payments'),
+    'page arguments' => array(4),
+    'type' => MENU_CALLBACK,
+  );
+
+  $items['admin/interswitch-webpay/look-up/ajax/%'] = array(
+    'delivery callback' => 'ajax_deliver',
+  ) + $items['admin/interswitch-webpay/look-up/nojs/%'];
+
+  return $items;
+}
+
+/**
+ * Menu Ajax callback to look up transaction from InterSwitch.
+ */
+function commerce_interswitch_ajax_requery_interswitch($txn_id) {
+  $info = commerce_interswitch_lookup_transaction($txn_id);
+  $commands = array();
+
+  if (!$info) {
+    $commands[] = ajax_command_alert(t('Payment transaction not found'));
+    return array(
+      '#type' => 'ajax',
+      '#commands' => $commands,
+    );
+  }
+  // Remove leading zeroes before attempting to load.
+  $transaction = commerce_payment_transaction_load(ltrim($txn_id, '0'));
+
+  // Update transaction with new information from Interswitch.
+  $transaction->remote_id = $info['PaymentReference'];
+  $transaction->remote_status = $info['ResponseCode'];
+  $transaction->status = commerce_interswitch_set_payment_status($info['ResponseCode']);
+  $transaction->message = $info['ResponseDescription'];
+  $transaction->payload = $info;
+  commerce_payment_transaction_save($transaction);
+
+  // Now that the payment status has been updated set the approproptiate status
+  // of the order.
+  $order = commerce_order_load($transaction->order_id);
+  if (COMMERCE_PAYMENT_STATUS_SUCCESS == $transaction->status) {
+    commerce_payment_redirect_pane_next_page($order);
+  }
+  else {
+    commerce_payment_redirect_pane_previous_page($order);
+  }
+
+  $commands[] = ajax_command_alert(t('Payment transaction status is: @status The page will now reload', array('@status' => strtoupper($transaction->status))));
+
+  // Send a command for the page to reload.
+  ctools_add_js('ajax-responder');
+  $commands[] = array('command' => 'reload');
+
+  return array(
+    '#type' => 'ajax',
+    '#commands' => $commands,
+  );
+}
+
+/**
+ * Implements hook_commerce_payment_method_info().
+ */
+function commerce_interswitch_commerce_payment_method_info() {
+  $payment_methods['interswitch'] = array(
+    'base' => 'commerce_interswitch',
+    'title' => t('Commerce Interswitch'),
+    'short_title' => t('Interswitch WebPay'),
+    'description' => t('Interswitch WebPay for Commerce'),
+    'terminal' => FALSE,
+    'offsite' => TRUE,
+    'offsite_autoredirect' => TRUE,
+  );
+
+  return $payment_methods;
+}
+
+/**
+ * Payment method callback: settings form.
+ */
+function commerce_interswitch_settings_form($settings = array()) {
+  $default_pay_item_id = '101';
+  $default_product_id = '4220';
+  $default_mac_key = '199F6031F20C63C18E2DC6F9CBA7689137661A05ADD4114ED10F5AFB64BE625B6A9993A634F590B64887EEB93FCFECB513EF9DE1C0B53FA33D287221D75643AB';
+
+  $form = array();
+  $form['mac_key'] = array(
+    '#type' => 'textfield',
+    '#title' => t('MAC Key'),
+    '#description' => t('Your Interswitch MAC Key'),
+    '#default_value' => $settings['mac_key'] ? $settings['mac_key'] : $default_mac_key,
+    '#maxlength' => 150,
+  );
+
+  $form['product_id'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Product ID'),
+    '#default_value' => $settings['product_id'] ? $settings['product_id'] : $default_product_id,
+  );
+
+  $form['pay_item_id'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Pay Item ID'),
+    '#default_value' => $settings['pay_item_id'] ? $settings['pay_item_id'] : $default_pay_item_id,
+  );
+
+  $form['server'] = array(
+    '#type' => 'select',
+    '#title' => t('Interswitch Server URL'),
+    '#description' => t('Select either the live or test server.'),
+    '#options' => array(COMMERCE_INTERSWITCH_TEST_PAY => t('Test server') . ' - ' . COMMERCE_INTERSWITCH_TEST_PAY, COMMERCE_INTERSWITCH_LIVE_PAY => t('Live server') . ' - ' . COMMERCE_INTERSWITCH_LIVE_PAY),
+    '#default_value' => $settings['server'] ? $settings['server'] : COMMERCE_INTERSWITCH_TEST_PAY,
+  );
+
+  $form['currency_code'] = array(
+    '#type' => 'select',
+    '#title' => t('Select currency'),
+    '#options' => array('NGN' => 'Naira - NGN'),
+    '#default_value' => 'NGN',
+  );
+
+  $form['enable_charges'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Enable Interswitch Charges'),
+    '#description' => t('All other settings under "Interswitch Charges" will be ignored if this is unchecked'),
+    '#default_value' => isset($settings['enable_charges']) ? $settings['enable_charges'] : TRUE,
+  );
+
+  $form['charges'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Interswitch Charges'),
+    '#collapsible' => FALSE,
+  );
+
+  $form['charges']['percentage'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Interswitch charge percentage'),
+    '#description' => t('The percentage of the charge without the "%". Usually 1.5.'),
+    '#maxlength' => 4,
+    '#size' => 5,
+    '#element_validate' => array('_commerce_interswitch_settings_form_validate'),
+    '#default_value' => $settings['charges']['percentage'] ? $settings['charges']['percentage'] : 1.5,
+  );
+
+  $form['charges']['max_amount'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Max amount to charge'),
+    '#maxlength' => 10,
+    '#size' => 10,
+    '#element_validate' => array('_commerce_interswitch_settings_form_validate'),
+    '#default_value' => $settings['charges']['max_amount'] ? $settings['charges']['max_amount'] : 2000,
+  );
+
+  $line_item_types = array();
+  foreach (commerce_line_item_types() as $type => $line_item_type) {
+    if ('interswitch_charge' != $type) {
+      $line_item_types[$type] = $line_item_type['name'];
+    }
+  }
+  $form['charges']['excluded_line_items'] = array(
+    '#type' => 'select',
+    '#title' => t('Excluded line items'),
+    '#description' => t('Specify the line items on which Interswitch charge should not apply'),
+    '#multiple' => TRUE,
+    '#options' => $line_item_types,
+    '#default_value' => $settings['charges']['excluded_line_items'],
+  );
+
+  $product_types = array();
+  foreach (commerce_product_types() as $type => $a_product_type) {
+    $product_types[$type] = $a_product_type['name'];
+  }
+  $form['charges']['excluded_product_types'] = array(
+    '#type' => 'select',
+    '#title' => t('Excluded product types'),
+    '#description' => t('Specify the product types on which Interswitch charge should not apply'),
+    '#multiple' => TRUE,
+    '#options' => $product_types,
+    '#default_value' => $settings['charges']['excluded_product_types'],
+  );
+
+  $form['charges']['info'] = array(
+    '#type' => 'item',
+    '#markup' => t('<p><strong>Note:</strong> You can further configure how the charge is set by editting <a href="@url">this rule</a></p>', array('@url' => url('admin/config/workflow/rules/reaction/manage/set_interswitch_charge'))),
+  );
+  return $form;
+}
+
+/**
+ * Validation callback for some settings form elements.
+ */
+function _commerce_interswitch_settings_form_validate($element, &$form_state, $form) {
+  if (!is_numeric($element['#value']) || $element['#value'] <= 0) {
+    form_error($element, t('You must set a number greater than zero'));
+  }
+}
+
+/**
+ * Payment method callback.
+ */
+function commerce_interswitch_redirect_form($form, &$form_state, $order, $payment_method) {
+  if (empty($payment_method['settings']['mac_key']) ||
+    empty($payment_method['settings']['product_id']) ||
+    empty($payment_method['settings']['pay_item_id'])) {
+
+    drupal_set_message(t('Commerce Interswitch has not been properly configured'), 'error');
+    return array();
+  }
+
+  $settings = array(
+    'return' => url('checkout/' . $order->order_id . '/payment/return/' . $order->data['payment_redirect_key'], array('absolute' => TRUE)),
+
+    // Specify the current payment method instance ID in the notify_url
+    'payment_method' => $payment_method['instance_id'],
+  );
+
+  return commerce_interswitch_order_form($form, $form_state, $order, $payment_method['settings'] + $settings);
+}
+
+/**
+ * Builds an order form from an order object and returns a renderable array.
+ */
+function commerce_interswitch_order_form($form, &$form_state, $order, $settings) {
+  global $user;
+
+  $wrapper = entity_metadata_wrapper('commerce_order', $order);
+  $amount = $wrapper->commerce_order_total->amount->value();
+  $currency_code = $settings['currency_code'];
+  $order_currency_code = $wrapper->commerce_order_total->currency_code->value();
+  $amount = commerce_currency_amount_to_decimal(
+    commerce_currency_convert($amount, $order_currency_code, $currency_code),
+    $currency_code
+  );
+
+  // Create a new payment transaction to represent this payment attempt.
+  $transaction = commerce_payment_transaction_new(
+    'interswitch',
+    $order->order_id
+  );
+  $transaction->instance_id = $settings['payment_method'];
+  $transaction->status = COMMERCE_PAYMENT_STATUS_PENDING;
+  // Commerce always stores amount in multiples of 100, so NGN13 is stored as
+  // 1,300. So remember to multiply the amount by 100 before storing the
+  // transaction.
+  $transaction->amount = $amount * 100;
+  $transaction->currency_code = $currency_code;
+  commerce_payment_transaction_save($transaction);
+  // Hard lesson learned: the transaction does not have an ID until it is saved.
+  $_SESSION['commerce_interswitch_transaction_id'] = $transaction->transaction_id;
+
+  $currency_code = $settings['currency_code'];
+  $currency_info = commerce_currency_load($currency_code);
+  $hash = hash(
+    'sha512',
+    commerce_interswitch_left_pad_transaction_id(
+      $transaction->transaction_id
+    )
+    . $settings['product_id']
+    . $settings['pay_item_id']
+    . $transaction->amount
+    . $settings['return']
+    . $settings['mac_key']
+  );
+
+  $data = array(
+    'product_id' => $settings['product_id'],
+    'pay_item_id' => $settings['pay_item_id'],
+    'amount' => $transaction->amount,
+    'currency' => $currency_info['numeric_code'],
+    'site_redirect_url' => $settings['return'],
+     // @TODO: should this be billing profile name instead?
+    'cust_name' => $user->name,
+    'site_name' => url('', array('absolute' => TRUE)),
+    'cust_id' => $user->uid,
+    'txn_ref' => commerce_interswitch_left_pad_transaction_id(
+      $transaction->transaction_id
+    ),
+    'hash' => $hash,
+  );
+
+  // Allow modules to alter parameters of the API request.
+  drupal_alter('commerce_interswitch_order_form_data', $data, $order);
+
+  // Add the payment information for the user as required by Interswitch's UAT.
+  $form['desc'] = array(
+    '#type' => 'item',
+    '#title' => 'Below are the details of the payment you are about to make:',
+  );
+
+  $form['transaction_id'] = array(
+    '#type' => 'item',
+    '#title' => t('Transaction ID'),
+    '#markup' => commerce_interswitch_left_pad_transaction_id(
+      $transaction->transaction_id
+    ),
+  );
+
+  $form['amount_display'] = array(
+    '#type' => 'item',
+    '#title' => t('Amount'),
+    '#markup' => commerce_currency_format(
+      $transaction->amount,
+      $settings['currency_code']
+    ),
+  );
+
+  $form['#action'] = $settings['server'];
+  foreach ($data as $name => $value) {
+    if (!empty($value)) {
+      $form[$name] = array('#type' => 'hidden', '#value' => $value);
+    }
+  }
+
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Proceed to Interswitch WebPay'),
+  );
+
+  return $form;
+}
+
+/**
+ * Payment method callback: redirect form return validation.
+ */
+function commerce_interswitch_redirect_form_validate($order, $payment_method) {
+  // Ensure the transaction is present.
+  if (!isset($_SESSION['commerce_interswitch_transaction_id'])) {
+    return FALSE;
+  }
+  else {
+    return TRUE;
+  }
+}
+
+/**
+ * Payment method callback: redirect form submission.
+ */
+function commerce_interswitch_redirect_form_submit($order, $payment_method) {
+  // Look up transaction from Interswitch.
+  $txn_ref = $_SESSION['commerce_interswitch_transaction_id'];
+  unset($_SESSION['commerce_interswitch_transaction_id']);
+
+  $txn_info = commerce_interswitch_lookup_transaction($txn_ref);
+  if (!$txn_info) {
+    drupal_set_message(t('There was an unexpected error looking up the your transaction details from Interswitch'), 'error');
+    watchdog('commerce_interswitch', 'Error looking up transaction ID ' . $txn_ref . 'on Interswitch', array(), WATCHDOG_ALERT);
+    commerce_payment_redirect_pane_previous_page($order);
+    return;
+  }
+
+  $transaction = commerce_payment_transaction_load($txn_ref);
+
+  $transaction->remote_id = $txn_info['PaymentReference'];
+  $transaction->remote_status = $txn_info['ResponseCode'];
+  $transaction->status = commerce_interswitch_set_payment_status($txn_info['ResponseCode']);
+  $transaction->message = $txn_info['ResponseDescription'];
+  $transaction->payload = $txn_info;
+  commerce_payment_transaction_save($transaction);
+
+  if (COMMERCE_PAYMENT_STATUS_SUCCESS == $transaction->status) {
+    drupal_set_message(t('Payment successful.<br/>Payment Transaction ID:') . ' '
+      . commerce_interswitch_left_pad_transaction_id($transaction->transaction_id)
+      . t('<br/>WebPay Reference:') . ' '
+      . $transaction->remote_id, 'status');
+    commerce_payment_redirect_pane_next_page($order);
+  }
+  else {
+    drupal_set_message(
+      t('Your payment was not successful<br/>Payment Transaction ID:') . ' '
+      . commerce_interswitch_left_pad_transaction_id($transaction->transaction_id)
+      . t('<br/>Reason:') . ' ' . $transaction->message, 'error');
+    commerce_payment_redirect_pane_previous_page($order);
+  }
+}
+
+/**
+ * Maps a status codes returned by Interswitch to a Commerce payment status.
+ *
+ * @param string $status_code
+ *   Status code returned by Interswitch.
+ *
+ * @return string
+ *   returns one of the following
+ *   COMMERCE_PAYMENT_STATUS_SUCCESS
+ *   COMMERCE_PAYMENT_STATUS_FAILURE
+ *   COMMERCE_PAYMENT_STATUS_PENDING
+ */
+function commerce_interswitch_set_payment_status($status_code) {
+  $payment_status = '';
+  switch ($status_code) {
+    // 11: Approved by Financial Institution, VIP.
+    case '00':
+    case '11':
+      $payment_status = COMMERCE_PAYMENT_STATUS_SUCCESS;
+      break;
+
+    // 09: Request in progress.
+    // 10: Approved by Financial Institution, Partial.
+    case '09':
+    case '10':
+      $payment_status = COMMERCE_PAYMENT_STATUS_PENDING;
+      break;
+
+    default:
+      $payment_status = COMMERCE_PAYMENT_STATUS_FAILURE;
+  }
+
+  return $payment_status;
+}
+
+/**
+ * Looks up transaction information from Interswitch.
+ *
+ * Returns an array containing transaction information on success,
+ * FALSE otherwise.
+ *
+ * @param string $txn_id
+ *   Payment transaction ID.
+ *
+ * @return array
+ *   Array containing transaction information
+ */
+function commerce_interswitch_lookup_transaction($txn_id) {
+  $payment_method = commerce_payment_method_instance_load(
+    'interswitch|commerce_payment_interswitch'
+  );
+  if (!$payment_method['settings']) {
+    // Most likely the method is not enabled.
+    return FALSE;
+  }
+
+  $url = '';
+  if (COMMERCE_INTERSWITCH_LIVE_PAY == $payment_method['settings']['server']) {
+    // Live server.
+    $url = COMMERCE_INTERSWITCH_LIVE_LOOKUP;
+  }
+  else {
+    // Test server.
+    $url = COMMERCE_INTERSWITCH_TEST_LOOKUP;
+  }
+
+  $transaction = commerce_payment_transaction_load($txn_id);
+  // This already multiplied by 100 when it was set.
+  $amount = $transaction->amount;
+  $txn_id = commerce_interswitch_left_pad_transaction_id($txn_id);
+
+  $hash = hash('sha512',
+    $payment_method['settings']['product_id'] . $txn_id . $payment_method['settings']['mac_key']
+  );
+  $url .= "?productid={$payment_method['settings']['product_id']}&transactionreference=$txn_id&amount=$amount";
+  $options = array();
+  $options['headers'] = array('Hash' => $hash);
+
+  $response = drupal_http_request($url, $options);
+  if ($response->error) {
+    return FALSE;
+  }
+  else {
+    return json_decode($response->data, TRUE);
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * Adds the Interswitch logo. Informs the user of the Interswitch charge that
+ * will be added or removed (if it applies and charges are enabled).
+ */
+function commerce_interswitch_form_commerce_checkout_form_alter(&$form, &$form_state) {
+  // If this checkout form contains the payment method radios...
+  if (empty($form['commerce_payment']['payment_method']['#options'])) {
+    return;
+  }
+  // Check if there is an Interswitch charge line item in the order.
+  $order_wrapper = entity_metadata_wrapper('commerce_order', $form_state['order']);
+  $interswitch_charge_present = FALSE;
+  foreach ($order_wrapper->commerce_line_items as $delta => $line_item_wrapper) {
+    if ('interswitch_charge' == $line_item_wrapper->type->value()) {
+      $interswitch_charge_present = TRUE;
+      break;
+    }
+  }
+  // Loop over its options array looking for an Interswitch option.
+  foreach ($form['commerce_payment']['payment_method']['#options'] as $key => &$value) {
+    list($method_id) = explode('|', $key);
+    // If we find Interswitch..
+    if ($method_id == 'interswitch') {
+      $path = url('<front>', array('absolute' => TRUE)) . '/' . drupal_get_path('module', 'commerce_interswitch') . '/logo.png';
+
+      $interswitch = commerce_payment_method_instance_load('interswitch|commerce_payment_interswitch');
+      if ($interswitch['settings']['enable_charges']) {
+        if ($interswitch_charge_present) {
+          $value = t('Interswitch WebPay') . ' (<i>' . t('Interswitch charge will be removed if not selected') . "</i>) <img src = '$path'/>";
+        }
+        else {
+          $charge = commerce_interswitch_calculate_charge($form_state['order']);
+          if (!$charge) {
+            $value = t('Interswitch WebPay') . " <img src = '$path'/>";
+          }
+          else {
+            $formatted_charge = commerce_currency_format($charge, $order_wrapper->commerce_order_total->currency_code->value());
+            $value = t('Interswitch WebPay') . ' (<i>' . t('Additional charge of') . "</i> <strong>$formatted_charge</strong>) <img src = '$path'/>";
+          }
+        }
+      }
+      else {
+        $value = t('Interswitch WebPay') . " <img src = '$path'/>";
+      }
+
+      break;
+    }
+  }
+}
+
+/**
+ * Left-pads transaction ID with zeroes.
+ *
+ * Apparently Interswitch requires transaction references (ID) to between 6 and
+ * 50 characters long. Commerce, on the other hand, serially numbers all
+ * transaction IDs ie 1, 2, 3, 4...etc. So this function will left-pad a
+ * transaction ID with zeroes to meet Interswitch's conditions.
+ *
+ * @param string $txn_id
+ *   The transaction to be left-padded.
+ *
+ * @return string
+ *   Left-padded transaction with a minimum of 6 characters.
+ */
+function commerce_interswitch_left_pad_transaction_id($txn_id) {
+  if (strlen($txn_id) < 6) {
+    return str_pad($txn_id, 6, '0', STR_PAD_LEFT);
+  }
+  else {
+    return $txn_id;
+  }
+}
+
+/**
+ * Implements hook_commerce_line_item_type_info().
+ */
+function commerce_interswitch_commerce_line_item_type_info() {
+  $line_item_types = array();
+
+  $line_item_types['interswitch_charge'] = array(
+    'type' => 'interswitch_charge',
+    'name' => t('Interswitch Charge'),
+    'description' => t('Line item to represent the Interswitch charge on a payment'),
+    'product' => FALSE,
+  );
+
+  return $line_item_types;
+}
+
+/**
+ * Implements hook_commerce_price_component_type_info().
+ *
+ * Defines the custom price component to be used for the Interswitch charge.
+ */
+function commerce_interswitch_commerce_price_component_type_info() {
+  $info = array();
+
+  $info['interswitch_charge'] = array(
+    'title' => t('Interswitch Charge'),
+    'display_title' => t('Interswitch Charge'),
+  );
+
+  return $info;
+}
+
+/**
+ * Implements hook_views_api().
+ */
+function commerce_interswitch_views_api() {
+  return array(
+    'api' => 3,
+    'path' => drupal_get_path('module', 'commerce_interswitch') . '/includes/views',
+  );
+}
+
+/**
+ * Calculates the Interswitch for an order.
+ *
+ * @param object $order
+ *   The order to calculate the interswitch on.
+ *
+ * @return int
+ *   The Interswitch charge if charges are enabled. FALSE otherwise.
+ */
+function commerce_interswitch_calculate_charge($order) {
+  // Load payment method settings.
+  $interswitch = commerce_payment_method_instance_load('interswitch|commerce_payment_interswitch');
+
+  if (!$interswitch['settings']['enable_charges']) {
+    return FALSE;
+  }
+
+  $interswitch_charge = 0;
+  $interswitch_rate = (100 - $interswitch['settings']['charges']['percentage']) / 100;
+
+  $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+  foreach ($order_wrapper->commerce_line_items as $delta => $line_item_wrapper) {
+    if ('interswitch_charge' == $line_item_wrapper->type->value()) {
+      continue;
+    }
+
+    if (in_array($line_item_wrapper->type->value(), $interswitch['settings']['charges']['excluded_line_items'])) {
+      continue;
+    }
+
+    if (in_array($line_item_wrapper->type->value(), commerce_product_line_item_types())) {
+      if (in_array($line_item_wrapper->commerce_product->type->value(), $interswitch['settings']['charges']['excluded_product_types'])) {
+        continue;
+      }
+    }
+
+    // Calculate the charge on this line item.
+    $line_item_unit_price = $line_item_wrapper->commerce_unit_price->amount->value();
+    $interswitch_charge += (($line_item_unit_price / $interswitch_rate) - $line_item_unit_price) * $line_item_wrapper->quantity->value();
+  }
+
+  // Apply the maximum charge amount.
+  $max_amount = $interswitch['settings']['charges']['max_amount'] * 100;
+  if ($interswitch_charge > $max_amount) {
+    $interswitch_charge = $max_amount;
+  }
+
+  return $interswitch_charge;
+}

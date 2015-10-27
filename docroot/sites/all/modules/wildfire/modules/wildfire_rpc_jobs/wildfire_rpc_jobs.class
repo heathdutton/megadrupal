@@ -1,0 +1,692 @@
+<?php
+/**
+ * @file
+ *  Classes for Wildfire RPC Jobs module
+ *
+ * @author Craig Jones <craig@tiger-fish.com>
+ */
+
+/**
+ * Custom Exception thrown whenever we run out of quota when processing an
+ * XML-RPC upload request.
+ */
+class WildfireInsufficientQuotaException extends RuntimeException {
+}
+
+/**
+ * Class to collate and send a Job to WildfireHQ
+ *
+ * Extends the base WildfireClientJob class so that we don't have to reinvent
+ * the wheel to add RPC functionality atop of it.
+ */
+class WildfireClientJobRpc extends WildfireClientJob {
+
+  /**
+   * @var bool $test_mode
+   *  Set to TRUE for test mode. If set, the job will be marked as processed
+   *  but the request will not actually be sent to the server. Note that this
+   *  will also set a job to a state where it can be polled, but that the job
+   *  status calls will fail due to there being no corresponding job at the
+   *  servers end.
+   */
+  protected $testMode = FALSE;
+
+  /**
+   * Sets test mode
+   *
+   * @param bool $test_mode
+   *  Sets the test mode to either TRUE or FALSE
+   */
+  public function testMode($test_mode) {
+    if ($test_mode) {
+      $this->testMode = TRUE;
+    }
+    else {
+      $this->testMode = FALSE;
+    }
+  }
+
+  /**
+   * Marks a job as cancelled
+   *
+   * @return bool
+   *  Returns TRUE if the job was successfully cancelled, else FALSE
+   *  In FALSE conditions, the reason that the status could not be changed
+   *  will be raised as an Exception and logged.
+   */
+  public function cancelJob() {
+
+    if ($this->canCancel()) {
+      try {
+
+        if (!empty($this->dbrow['juid'])) {
+
+          // If there's a JUID, it's gone to the server, so cancel there too.
+          $cancelled = $this->sendRequest(
+            'wildfire.job.cancelJob',
+            array(
+              'uid' => $this->dbrow['juid']
+            )
+          );
+
+          if ($cancelled['status'] == WILDFIRE_JOB_CANCELLED) {
+            $this->setStatus(WILDFIRE_JOB_CANCELLED);
+          }
+          else {
+            // Job wasn't cancelled at the server end for whatever reason.
+            return FALSE;
+          }
+
+        }
+        else {
+
+          // It's not gone to the server yet, so just mark as cancelled if
+          // we can.
+          $this->setStatus(WILDFIRE_JOB_CANCELLED);
+
+        }
+
+      }
+      catch (Exception $e) {
+
+        watchdog(
+          'wildfire_jobs',
+          t(
+            'Cancelling Job !jid failed: !message',
+            array(
+              '!jid' => $this->dbrow['jid'],
+              '!message' => $e->getMessage()
+            )
+          )
+        );
+
+      }
+    }
+
+    return TRUE;
+
+  }
+
+
+  /**
+   * Gets the status of the job from the remote server.
+   *
+   * @throws BadMethodCallException
+   *  If you attempt to obtain status for a job that has not been loaded
+   *
+   * @return int
+   *  The current status of the job.
+   */
+  public function getStatus() {
+
+    if (!isset($this->dbrow['status'])) {
+      throw new BadMethodCallException(
+        t('Cannot obtain status for a job that has not been loaded')
+      );
+    }
+
+    // Get the job status
+
+    try {
+
+      $result = $this->sendRequest(
+        'wildfire.job.getStatus',
+        array(
+          'uid' => $this->dbrow['juid'],
+        )
+      );
+
+      if (!empty($result)) {
+
+        /**
+         * If the remote and local statuses differ, update our local copy with
+         * the new data.
+         */
+        if ($this->dbrow['last_modified'] !== $result['last_modified']) {
+
+          /**
+           * If the jobs status has changed, inform the client and log the
+           * change for future reference.
+           */
+          if ($this->dbrow['status'] !== $result['status']) {
+
+            $message = t(
+              'Job #!jid has changed from status !status_from to !status_to',
+              array(
+                '!jid' => $this->dbrow['jid'],
+                '!status_from' => $this->dbrow['status'],
+                '!status_to' => $result['status'],
+              )
+            );
+
+            drupal_set_message($message, 'status');
+            watchdog('wildfire_rpc_jobs', $message, NULL, WATCHDOG_INFO);
+
+          }
+
+          // Store the retrieved status to our local job.
+          $update = array(
+            'status' => $result['status'],
+            'last_modified' => $result['last_modified'],
+            'started' => $result['started'],
+            'completed' => $result['completed'],
+            'processed_count' => $result['sent_mails'],
+            'failed_count' => $result['failed_mails'],
+            'count' => $result['total_mails'],
+          );
+          foreach($update as $key => $value) {
+            $this->{$key} = $value;
+          }
+
+          $this->save();
+
+        }
+
+      }
+
+    }
+    catch (Exception $e) {
+
+      $message = t(
+        'Obtaining status for Job #!jid raised an exception: !message',
+        array(
+          '!jid' => $this->dbrow['jid'],
+          '!message' => $e->getMessage(),
+        )
+      );
+
+      drupal_set_message($message, 'status');
+      watchdog('wildfire_rpc_jobs', $message, NULL, WATCHDOG_INFO);
+
+    }
+
+    return $this->dbrow['status'];
+
+  }
+
+  /**
+   * Performs an XML-RPC request with Wildfire HQ
+   *
+   * This function is essentially a wrapper around wildfire_rpc_send_request()
+   * in Wildfire core.
+   *
+   * @param string $method
+   *  Method to call with the server
+   * @param array $params
+   *  Params to send to the server
+   * @param string $auth_key
+   *  Auth key for the request. If not given, will use the stored variable
+   * @param string $system_name
+   *  System name for the request. If not given, will use the stored variable
+   *
+   * @throws UnexpectedValueException
+   *  If the XML-RPC call returns a failure code for the call rather than the
+   *  result.
+   *
+   * @return array
+   *  Result of the request, else FALSE
+   *
+   */
+  public function sendRequest($method, $params, $auth_key = NULL, $system_name = NULL) {
+
+    module_load_include('inc', 'wildfire', 'wildfire.rpc');
+    return wildfire_rpc_send_request($method, $params, $auth_key, $system_name);
+
+  }
+
+  /**
+   * Sends the job to the XML-RPC server
+   *
+   * @throws Exception
+   *  If the XML-RPC call failed, it will log the Exception then bubble it up
+   *  for the next Exception handler in the chain to catch.
+   *
+   * @throws UnexpectedValueException
+   *  If the Job creation was successful, but no JUID was returned from the API
+   *
+   * @return bool
+   *  Returns TRUE if the job was created at the remote side.
+   */
+  public function uploadJob() {
+
+    // Get the list and content chunk counts
+    $content_count =& $this->getContentCount();
+    $list_count =& $this->getListUsersCount();
+
+    // Set up the metadata to send, depending on the type of job.
+    $message = array(
+      'type' => $this->dbrow['type'],
+      'mid' => $this->dbrow['extra'],
+    );
+    $metadata = module_invoke_all('wildfire_message_metadata', $message);
+
+    // Create a new job with the server
+    try {
+
+      $uid = $this->sendRequest(
+        'wildfire.job.newJob',
+        array(
+          'content_count' => $content_count,
+          'list_count' => $list_count,
+          'metadata' => $metadata,
+          'mode' => $this->mode,
+        )
+      );
+
+    }
+    catch (Exception $e) {
+      /**
+       * The XML-RPC request raised an Exception. Log what went wrong,
+       * then rethrow the exception so that it bubbles up to the next handler.
+       */
+
+      $message = t(
+        'Could not create a job with the server: !message',
+        array(
+          '!message' => $e->getMessage()
+        )
+      );
+
+      drupal_set_message($message, 'error');
+      watchdog('wildfire_rpc_jobs', $message, NULL, WATCHDOG_ERROR);
+
+      $type = get_class($e);
+      throw new $type($message);
+
+    }
+
+    // Catch cases where we got a 'success' from the RPC request, but the
+    // Job UID is bad.
+    if (empty($uid['uid'])) {
+
+      throw new UnexpectedValueException(
+        t('Job creation produced no errors yet the Job UID is empty??')
+      );
+
+    }
+
+    // Set multiple items on the Jobs DB Row
+    $this->status = WILDFIRE_JOB_PREPARING;
+    $this->juid = $uid['uid'];
+    $this->save();
+
+    return TRUE;
+
+  }
+
+  /**
+   * Sends the content to the XML-RPC server
+   *
+   * It's expected that this method is called repeatedly in either a queue or
+   * batch until it returns 0 remaining chunks to upload.
+   *
+   * @param int $limit
+   *  How many chunks to process in one run. Defaults to 10. Set to -1
+   *  to do all remaining chunks in one hit.
+   *
+   * @throws Exception
+   *  If the XML-RPC call failed, it will log the Exception then bubble it up
+   *  for the next Exception handler in the chain to catch.
+   *
+   * @return bool
+   *  TRUE if there are chunks that have yet to be uploaded, or 0 if
+   *  all chunks have now been uploaded.
+   */
+  public function uploadJobContent($limit = 10) {
+
+    // Get the content chunks
+    $chunks = $this->getContent($limit, TRUE);
+
+    if (empty($chunks)) {
+      return 0;
+    }
+
+    // Upload the content chunks
+    try {
+
+      foreach ($chunks as $chunk) {
+
+        $chunk['uid'] = $this->dbrow['juid'];
+
+        /**
+         * Chunk fragments may contain line breaks and other special markup that
+         * won't pass through the XML-RPC encode/decode without getting
+         * 'sanitized'. Therefore, to ensure that the exact content comes
+         * through on the other side, we encode each fragment to a pure string,
+         * and decode on the other side.
+         */
+        foreach($chunk['content'] as &$fragment) {
+          $fragment = base64_encode($fragment);
+        }
+
+        $result = $this->sendRequest(
+          'wildfire.job.addToContentSet',
+          $chunk
+        );
+
+        if ($result['success'] == TRUE) {
+
+          // Upload was successful, set the content status as uploaded
+          $this->setContentUploaded(
+            WILDFIRE_JOB_PART_UPLOADED,
+            $chunk['content_type']
+          );
+
+        }
+        elseif (empty($result)) {
+          /**
+           * If the add failed, but did not throw an exception in the process,
+           * log it and bail out.
+           */
+          $message = t(
+            'Adding content to Job !jid failed: result of RPC call was empty',
+            array(
+              '!jid' => $this->dbrow['jid'],
+            )
+          );
+
+          drupal_set_message($message, 'error');
+          watchdog('wildfire_rpc_jobs', $message, NULL, WATCHDOG_ERROR);
+
+          return FALSE;
+        }
+      }
+
+    }
+    catch (Exception $e) {
+      /**
+       * The XML-RPC request raised an Exception. Log what went wrong,
+       * then rethrow the exception so that it bubbles up to the next handler.
+       */
+
+      $message = t(
+        'Adding content to Job !jid failed: !message',
+        array(
+          '!jid' => $this->dbrow['jid'],
+          '!message' => $e->getMessage()
+        )
+      );
+
+      drupal_set_message($message, 'error');
+      watchdog('wildfire_rpc_jobs', $message, NULL, WATCHDOG_ERROR);
+
+      $type = get_class($e);
+      throw new $type($message);
+
+    }
+
+    return TRUE;
+
+  }
+
+  /**
+   * Sends the list to the XML-RPC server
+   *
+   * It's expected that this method is called repeatedly in either a queue or
+   * batch until it returns 0 remaining entries to upload.
+   *
+   * @param int $limit
+   *  How many entries to process in one run. Defaults to 10. Set to -1
+   *  to do all remaining entries in one hit.
+   *
+   * @throws Exception
+   *  If the XML-RPC call failed, it will log the Exception then bubble it up
+   *  for the next Exception handler in the chain to catch.
+   *
+   * @return bool
+   *  TRUE if there are list entries that have yet to be uploaded, or 0 if
+   *  all chunks have now been uploaded.
+   */
+  public function uploadJobList($limit = 10) {
+
+    // Get the next entries in the list to upload:
+    $users = $this->getListUsers($limit, TRUE);
+
+    if (empty($users)) {
+      return 0;
+    }
+
+    // Remove the 'uid field from each user being uploaded, as this doesn't
+    // need to go up to the server.
+    $upload_users = array();
+    foreach($users as $user) {
+      $upload_user = $user;
+      unset($upload_user['uid']);
+      $upload_users[] = $upload_user;
+    }
+
+    // Upload the entries
+    try {
+      $result = $this->sendRequest(
+        'wildfire.job.addToList',
+        array(
+          'uid' => $this->dbrow['juid'],
+          'entries' => $upload_users,
+        )
+      );
+
+      $this->setListUsersUploaded($users, WILDFIRE_JOB_PART_UPLOADED);
+
+    }
+    catch (Exception $e) {
+      /**
+       * The XML-RPC request raised an Exception. Log what went wrong,
+       * then rethrow the exception so that it bubbles up to the next handler.
+       */
+
+      $message = t(
+        'Adding list entries to Job !jid failed: !message',
+        array(
+          '!jid' => $this->dbrow['jid'],
+          '!message' => $e->getMessage()
+        )
+      );
+
+      drupal_set_message($message, 'error');
+      watchdog('wildfire_rpc_jobs', $message, NULL, WATCHDOG_ERROR);
+
+      $type = get_class($e);
+      throw new $type($message);
+
+    }
+
+    return TRUE;
+
+  }
+
+  /**
+   * Processes the job with the XML-RPC server
+   *
+   * @throws Exception
+   *  On failure, any Exception thrown will be rethrow to allow it to bubble up
+   *
+   * @return array|bool
+   *  Returns the current contents of $this->dbrow on the server if the
+   *  request to process the job was accepted, or an Exception is thrown on
+   *  failure. Any exceptions raised will be logged via watchdog.
+   */
+  public function processJob() {
+
+    /**
+     * If in test mode, set the job as processed but don't actually send the
+     * job to the server
+     */
+    if ($this->testMode) {
+      return array(
+        'status' => WILDFIRE_JOB_PREPARED
+      );
+    }
+
+    // Process the job
+    try {
+      $result = $this->sendRequest(
+        'wildfire.job.processJob',
+        array(
+          'uid' => $this->dbrow['juid'],
+          'starttime' => $this->dbrow['scheduled'],
+        )
+      );
+
+      if (isset($result['status'])) {
+        $this->setStatus($result['status']);
+      }
+
+    }
+    catch (Exception $e) {
+
+      watchdog(
+        'wildfire_rpc_jobs',
+        t(
+          'Processing Job !jid failed: !message',
+          array(
+            '!jid' => $this->dbrow['jid'],
+            '!message' => $e->getMessage()
+          )
+        )
+      );
+
+      // Rethrow so that the exception bubbles up to the handler in the Job
+      // build phase, ect.
+      throw $e;
+
+    }
+
+    return $result;
+
+  }
+
+  /**
+   * Retries an existing job with the XML-RPC server
+   *
+   * @throws Exception
+   *  On failure, any Exception thrown will be rethrow to allow it to bubble up
+   *
+   * @return array|bool
+   *  Returns the current contents of $this->dbrow on the server if the
+   *  request to retry the job was accepted, or an Exception is thrown on
+      *  failure. Any exceptions raised will be logged via watchdog.
+   */
+  public function retryJob() {
+
+    try {
+      $result = $this->sendRequest(
+        'wildfire.job.retryJob',
+        array(
+          'uid' => $this->dbrow['juid'],
+        )
+      );
+
+      if (isset($result['status'])) {
+        $this->setStatus($result['status']);
+      }
+
+    }
+    catch (Exception $e) {
+
+      watchdog(
+        'wildfire_rpc_jobs',
+        t(
+          'Requesting a retry of Job !jid failed: !message',
+          array(
+            '!jid' => $this->dbrow['jid'],
+            '!message' => $e->getMessage()
+          )
+        )
+      );
+
+      throw $e;
+    }
+
+    return $result;
+
+  }
+
+  /**
+   * Sets the Job UID for server transactions
+   *
+   * @param string $juid
+   *  The Job UID to set
+   */
+  public function setJuid($juid) {
+
+    $this->dbrow['juid'] = $juid;
+    $this->save();
+
+  }
+
+  /**
+   * Set the uploaded flag on the list of users given
+   *
+   * @param array $users
+   *  Array of users, in the same format as $this->users
+   *
+   * @param int $status
+   *  Status to set, either:
+   *  WILDFIRE_JOB_PART_PENDING or WILDFIRE_JOB_PART_UPLOADED
+   */
+  protected function setListUsersUploaded($users, $status) {
+    /**
+     * Collate all of the UIDs / Emails in the list to set as uploaded, so
+     * that we only have to do a single SQL statement with an IN to set the
+     * statuses on all of the users passed in.
+     */
+    $user_ids = array();
+    $mails = array();
+
+    foreach($users as $user) {
+      if (!empty($user['uid'])) {
+        $user_ids[] = $user['uid'];
+      }
+      elseif (!empty($user['mail'])) {
+        $mails[] = $user['mail'];
+      }
+    }
+
+    if (!empty($user_ids) || !empty($mails)) {
+
+      $query = db_update('wildfire_job_mails');
+      $query->fields(array(
+        'uploaded' => $status
+      ));
+      $query->condition('jid', $this->dbrow['jid'], '=');
+
+      $or = db_or();
+      if (!empty($user_ids)) {
+        $or->condition('uid', $user_ids, 'IN');
+      }
+      if (!empty($mails)) {
+        $or->condition('mail', $mails, 'IN');
+      }
+      $query->condition($or);
+      $query->execute();
+
+    }
+
+  }
+
+  /**
+   * Sets the uploaded flag on content
+   *
+   *
+   * @param int $status
+   *  Status to set, either:
+   *  WILDFIRE_JOB_PART_PENDING or WILDFIRE_JOB_PART_UPLOADED
+   * @param string $content_type
+   *  The content type to set the status on.
+   * @param int $delta
+   *  The delta for which chunk of the given content type to update.
+   */
+  protected function setContentUploaded($status, $content_type, $delta = 0) {
+
+    $query = db_update('wildfire_job_content');
+    $query->fields(array(
+      'uploaded' => $status
+    ));
+    $query->condition('jid', $this->dbrow['jid'], '=');
+    $query->condition('type', $content_type, '=');
+    $query->condition('delta', $delta, '=');
+    $query->execute();
+
+  }
+
+}

@@ -1,0 +1,1912 @@
+<?php
+
+/**
+ * @file
+ * Provides advanced recurring billing for licenses.
+ */
+
+/**
+ * Implements hook_menu().
+ */
+function commerce_license_billing_menu() {
+  $items = array();
+  $items['admin/commerce/billing/analyze/%commerce_order'] = array(
+    'title' => 'Analyze a recurring order',
+    'page callback' => 'commerce_license_billing_analyze_page',
+    'page arguments' => array(4),
+    'access callback' => 'commerce_order_access',
+    'access arguments' => array('view'),
+    'delivery callback' => 'ajax_deliver',
+    'type' => MENU_CALLBACK,
+    'file' => 'includes/commerce_license_billing.pages.inc',
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_views_api().
+ */
+function commerce_license_billing_views_api() {
+  return array(
+    'version' => 3,
+    'path' => drupal_get_path('module', 'commerce_license_billing') . '/includes/views',
+  );
+}
+
+/**
+ * Implements hook_ctools_plugin_directory().
+ */
+function commerce_license_billing_ctools_plugin_directory($module, $plugin) {
+  if ($module == 'commerce_license_billing') {
+    return 'plugins/' . $plugin;
+  }
+}
+
+/**
+ * Implements hook_ctools_plugin_type().
+ */
+function commerce_license_billing_ctools_plugin_type() {
+  $plugins['billing_cycle_engine'] = array(
+    'classes' => array('class'),
+  );
+  $plugins['usage_group'] = array(
+    'classes' => array('class'),
+  );
+
+  return $plugins;
+}
+
+/**
+ * Returns the available billing cycle engine plugins.
+ */
+function commerce_license_billing_get_plugins($type) {
+  ctools_include('plugins');
+  $plugins = ctools_get_plugins('commerce_license_billing', $type);
+  foreach ($plugins as $key => $plugin) {
+    if (!class_exists($plugin['class'])) {
+      // Invalid class specified.
+      unset($plugins[$key]);
+      continue;
+    }
+  }
+  uasort($plugins, 'ctools_plugin_sort');
+  return $plugins;
+}
+
+/**
+ * Implements hook_entity_info().
+ */
+function commerce_license_billing_entity_info() {
+  // commerce_license_billing_cycle_type is too long for Drupal, so all
+  // entity types and field names had to have their prefix shortened to cl_.
+  // Yuck.
+  $entity_info['cl_billing_cycle'] = array(
+    'label' => t('Commerce License Billing Cycle'),
+    'module' => 'commerce_license_billing',
+    'base table' => 'cl_billing_cycle',
+    'entity class' => 'CommerceLicenseBillingCycle',
+    'controller class' => 'EntityAPIController',
+    'metadata controller class' => 'CommerceLicenseBillingCycleMetadataController',
+    'label callback' => 'entity_class_label',
+    'fieldable' => FALSE,
+    'bundles' => array(),
+    'bundle keys' => array(
+      'bundle' => 'name',
+    ),
+    'entity keys' => array(
+      'id' => 'billing_cycle_id',
+      'bundle' => 'type',
+    ),
+  );
+  // Bypass entity_load() as it cannot be used here (recursion).
+  $billing_cycle_type = db_select('cl_billing_cycle_type', 'bct')
+    ->fields('bct', array('name', 'title'))
+    ->execute()
+    ->fetchAllKeyed();
+  foreach ($billing_cycle_type as $name => $title) {
+    $entity_info['cl_billing_cycle']['bundles'][$name] = array(
+      'label' => $title,
+    );
+  }
+
+  $entity_info['cl_billing_cycle_type'] = array(
+    'label' => t('Commerce License Billing Cycle Type'),
+    'module' => 'commerce_license_billing',
+    'base table' => 'cl_billing_cycle_type',
+    'access callback' => 'commerce_license_billing_cycle_type_access',
+    'controller class' => 'EntityBundlePluginEntityControllerExportable',
+    'fieldable' => TRUE,
+    'exportable' => TRUE,
+    'bundles' => array(),
+    'bundle of' => 'cl_billing_cycle',
+    'bundle plugin' => array(
+      'plugin type' => 'billing_cycle_engine',
+    ),
+    'entity keys' => array(
+      'id' => 'billing_cycle_type_id',
+      'bundle' => 'engine',
+      'label' => 'title',
+      'name' => 'name',
+    ),
+    'admin ui' => array(
+      'path' => 'admin/commerce/config/license/billing-cycle-types',
+      'file' => 'includes/commerce_license_billing.cycle_type_ui.inc',
+      'controller class' => 'CommerceLicenseBillingCycleTypeUIController',
+    ),
+  );
+  // Bypass entity_load() as it cannot be used here (recursion).
+  foreach (commerce_license_billing_get_plugins('billing_cycle_engine') as $name => $plugin) {
+    $entity_info['cl_billing_cycle_type']['bundles'][$name] = array(
+      'label' => $plugin['title'],
+    );
+  }
+
+  return $entity_info;
+}
+
+/**
+ * Implements hook_entity_info_alter().
+ */
+function commerce_license_billing_entity_info_alter(&$entity_info) {
+  $entity_info['commerce_order']['bundles']['recurring'] = array(
+    'label' => t('Recurring'),
+  );
+}
+
+/**
+ * Implements hook_commerce_line_item_type_info().
+ */
+function commerce_license_billing_commerce_line_item_type_info() {
+  $line_item_types = array();
+  $line_item_types['recurring'] = array(
+    'type' => 'recurring',
+    'name' => t('Recurring'),
+    'description' => t('References a product in a recurring order.'),
+    'product' => TRUE,
+    'add_form_submit_value' => t('Add product'),
+    'base' => 'commerce_product_line_item',
+  );
+
+  return $line_item_types;
+}
+
+/**
+ * Access callback for the entity API.
+ *
+ * @param $op
+ *   The operation being performed. One of 'view', 'update', 'create', 'delete'
+ *   or just 'edit' (being the same as 'create' or 'update').
+ * @param $cycle_type
+ *   (optional) A cycle type to check access for. If nothing is given, access
+ *   for all cycle types is determined.
+ * @param $account
+ *   (optional) The user to check for. Leave it to NULL to check for the global
+ *   user.
+ *
+ * @return boolean
+ *   Whether access is allowed or not.
+ */
+function commerce_license_billing_cycle_type_access($op, $cycle_type = NULL, $account = NULL) {
+  if ($op == 'view') {
+    // This allows billing cycle types to always show up in the
+    // cl_billing_cycle_type entityreference field on the product edit form.
+    // Otherwise a recurring product couldn't be managed without the
+    // "administer licenses" permission.
+    return TRUE;
+  }
+  else {
+    $engines = commerce_license_billing_get_plugins('billing_cycle_engine');
+    return user_access('administer licenses', $account) && !empty($engines);
+  }
+}
+
+/**
+ * Implements hook_commerce_order_state_info().
+ */
+function commerce_license_billing_commerce_order_state_info() {
+  $order_states['recurring'] = array(
+    'name' => 'recurring',
+    'title' => t('Recurring order'),
+    'description' => t('Orders in this state are used for recurring payments.'),
+    'weight' => 10,
+    'default_status' => 'recurring_open',
+  );
+  return $order_states;
+}
+
+/**
+ * Implements hook_commerce_order_status_info().
+ */
+function commerce_license_billing_commerce_order_status_info() {
+  $order_statuses = array();
+  $order_statuses['recurring_open'] = array(
+    'name' => 'recurring_open',
+    'title' => t('Recurring: Open'),
+    'state' => 'recurring',
+  );
+  $order_statuses['recurring_payment_pending'] = array(
+    'name' => 'recurring_payment_pending',
+    'title' => t('Recurring: Payment pending'),
+    'state' => 'recurring',
+  );
+  $order_statuses['recurring_usage_pending'] = array(
+    'name' => 'recurring_usage_pending',
+    'title' => t('Recurring: Usage pending'),
+    'state' => 'recurring',
+  );
+  return $order_statuses;
+}
+
+/**
+ * Implements hook_flush_caches().
+ */
+function commerce_license_billing_flush_caches() {
+  $product_types = commerce_license_product_types();
+  commerce_license_billing_configure_product_types($product_types);
+  commerce_license_billing_configure_line_item_type();
+  commerce_license_billing_configure_order_type();
+}
+
+/**
+ * Implements hook_cron().
+ */
+function commerce_license_billing_cron() {
+  $query = new EntityFieldQuery();
+  $query->entityCondition('entity_type', 'cl_billing_cycle')
+    ->propertyCondition('status', 1)
+    ->propertyCondition('end', commerce_license_get_time(), '<=');
+  $results = $query->execute();
+  if (!empty($results['cl_billing_cycle'])) {
+    foreach (array_keys($results['cl_billing_cycle']) as $billing_cycle_id) {
+      // A new billing cycle and order are created right away, and the licenses
+      // are renewed.
+      $renew_queue = DrupalQueue::get('commerce_license_billing_cycle_renew');
+      $task = array(
+        'billing_cycle_id' => $billing_cycle_id,
+        'title' => 'Renew billing cycle #' . $billing_cycle_id,
+      );
+      $renew_queue->createItem($task);
+
+      // The expired billing cycle might be closed right away, or days later,
+      // depending on the completeness of usage records.
+      $close_queue = DrupalQueue::get('commerce_license_billing_cycle_close');
+      $task = array(
+        'billing_cycle_id' => $billing_cycle_id,
+        'title' => 'Close billing cycle #' . $billing_cycle_id,
+      );
+      $close_queue->createItem($task);
+    }
+  }
+}
+
+/**
+ * Implements hook_advanced_queue_info().
+ */
+function commerce_license_billing_advanced_queue_info() {
+  return array(
+    'commerce_license_billing_cycle_renew' => array(
+      'worker callback' => 'commerce_license_billing_cycle_renew_queue_process',
+    ),
+    'commerce_license_billing_cycle_close' => array(
+      'worker callback' => 'commerce_license_billing_cycle_close_queue_process',
+      'retry after' => 86400,
+      'max attempts' => 5,
+    ),
+  );
+}
+
+/**
+ * Worker callback for renewing expired billing cycles.
+ */
+function commerce_license_billing_cycle_renew_queue_process($item) {
+  $billing_cycle_id = $item->data['billing_cycle_id'];
+  $billing_cycle = entity_load_single('cl_billing_cycle', $billing_cycle_id);
+  if (!$billing_cycle) {
+    // The billing cycle has been deleted in the meantime. Nothing more to do.
+    return array(
+      'status' => ADVANCEDQUEUE_STATUS_FAILURE,
+      'result' => 'Could not find the billing cycle.',
+    );
+  }
+  $order = $billing_cycle->getOrder();
+
+  $licenses = commerce_license_billing_get_recurring_order_licenses($order);
+  foreach ($licenses as $license) {
+    // Apply scheduled changes.
+    $changes = commerce_license_billing_schedule_changes_list($license);
+    if ($changes) {
+      commerce_license_billing_apply_changes($license, $changes);
+    }
+
+    // Filter out non-active (revoked / expired) licenses, only the active
+    // ones can be charged in the next billing cycle.
+    if ($license->status != COMMERCE_LICENSE_ACTIVE) {
+      unset($licenses[$license->license_id]);
+      continue;
+    }
+  }
+
+  if ($licenses) {
+    $result = 'Opened a new billing cycle.';
+    // Open a new billing cycle for the active licenses, and renew each one.
+    $billing_cycle_type = entity_load_single('cl_billing_cycle_type', $billing_cycle->type);
+    $next_billing_cycle = $billing_cycle_type->getNextBillingCycle($billing_cycle);
+    foreach ($licenses as $license) {
+      $license->renew($next_billing_cycle->end);
+    }
+
+    // Generate a new recurring order.
+    commerce_license_billing_generate_recurring_order($order, $next_billing_cycle, $licenses);
+  }
+  else {
+    $result = 'All licenses are now inactive, no new billing cycle is needed.';
+  }
+
+  return array(
+    'status' => ADVANCEDQUEUE_STATUS_SUCCESS,
+    'result' => $result,
+  );
+}
+
+/**
+ * Worker callback for closing expired billing cycles.
+ */
+function commerce_license_billing_cycle_close_queue_process($item) {
+  $billing_cycle_id = $item->data['billing_cycle_id'];
+  $billing_cycle = entity_load_single('cl_billing_cycle', $billing_cycle_id);
+  if (!$billing_cycle) {
+    // The billing cycle has been deleted in the meantime. Nothing more to do.
+    return array(
+      'status' => ADVANCEDQUEUE_STATUS_FAILURE,
+      'result' => 'Could not find the billing cycle.',
+    );
+  }
+  $order = $billing_cycle->getOrder();
+  // The recurring order is empty. It probably contained prepaid licenses
+  // that got cancelled in the meantime. Delete the order and stop here.
+  if (empty($order->commerce_line_items)) {
+    commerce_order_delete($order->order_id);
+    return array(
+      'status' => ADVANCEDQUEUE_STATUS_SUCCESS,
+      'result' => 'Closed the billing cycle.',
+    );
+  }
+
+  // Close the billing cycle right away.
+  if ($billing_cycle->status == 1) {
+    $billing_cycle->status = 0;
+    $billing_cycle->save();
+  }
+
+  // Gather licenses and check if the order can be closed as well.
+  $can_close_order = TRUE;
+  $licenses = commerce_license_billing_get_recurring_order_licenses($order);
+  foreach ($licenses as $license) {
+    if ($license instanceof CommerceLicenseBillingUsageInterface) {
+      // Ensure each usage group has the complete usage records.
+      foreach (array_keys($license->usageGroups()) as $group_name) {
+        $usage_group = commerce_license_billing_usage_group($license, $group_name);
+        if (!$usage_group->isComplete($billing_cycle)) {
+          $can_close_order = FALSE;
+          break;
+        }
+      }
+    }
+  }
+
+  if ($can_close_order) {
+    $order->status = 'recurring_payment_pending';
+    commerce_order_save($order);
+    // Clean-up usage.
+    $license_ids = array_keys($licenses);
+    commerce_license_billing_usage_history_clear($license_ids, $billing_cycle);
+
+    return array(
+      'status' => ADVANCEDQUEUE_STATUS_SUCCESS,
+      'result' => 'Closed the billing cycle.',
+    );
+  }
+  else {
+    if ($order->status != 'recurring_usage_pending') {
+      $order->status = 'recurring_usage_pending';
+      commerce_order_save($order);
+    }
+    else {
+      // Release the lock.
+      entity_get_controller('commerce_order')->resetCache();
+    }
+
+    // Advancedqueue will retry every 24h, until 5 retries have failed, as
+    // specified in commerce_license_billing_advanced_queue_info().
+    return array(
+      'status' => ADVANCEDQUEUE_STATUS_FAILURE_RETRY,
+      'result' => 'Incomplete usage information.',
+    );
+  }
+}
+
+/**
+ * Returns all licenses found on a recurring order.
+ *
+ * @param $order
+ *   The order entity.
+ *
+ * @return
+ *   An array of all found licenses, keyed by license id.
+ */
+function commerce_license_billing_get_recurring_order_licenses($order) {
+  $licenses = array();
+  $wrapper = entity_metadata_wrapper('commerce_order', $order);
+  foreach ($wrapper->commerce_line_items as $line_item_wrapper) {
+    if (isset($line_item_wrapper->cl_billing_license)) {
+      $license_id = $line_item_wrapper->cl_billing_license->raw();
+      if (!isset($licenses[$license_id])) {
+        $licenses[$license_id] = $line_item_wrapper->cl_billing_license->value();
+      }
+    }
+  }
+
+  // Remove any licenses that couldn't be loaded due to broken references.
+  $licenses = array_filter($licenses);
+
+  return $licenses;
+}
+
+/**
+ * Creates recurring orders for licenses in the provided order.
+ *
+ * The provided order is first scanned, and all licensable products are
+ * gathered. Their billing cycle types are gathered, and the appropriate
+ * billing cycles are opened (if they haven't been previously).
+ * An order per billing cycle is created (if it hasn't been previously),
+ * and the new line items are added.
+ *
+ * @param $order
+ *   The order to use as a base of the new recurring orders.
+ */
+function commerce_license_billing_create_recurring_orders($order) {
+  if ($order->uid == 0) {
+    // This is an anonymous order.
+    $message = 'Could not open a recurring order for order #@order_id because its owner is not known.';
+    watchdog('commerce_license_billing', $message, array('@order_id' => $order->order_id), WATCHDOG_ERROR);
+    return;
+  }
+
+  // Group licenses by billing cycle type.
+  $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+  $billing_cycle_type_ids = array();
+  $grouped_licenses = array();
+  foreach ($order_wrapper->commerce_line_items as $line_item_wrapper) {
+    if (!empty($line_item_wrapper->value()->commerce_license)) {
+      $product_wrapper = $line_item_wrapper->commerce_product;
+      if (!empty($product_wrapper->value()->cl_billing_cycle_type)) {
+        $billing_cycle_type_id = $product_wrapper->cl_billing_cycle_type->raw();
+        $billing_cycle_type_ids[] = $billing_cycle_type_id;
+        $grouped_licenses[$billing_cycle_type_id][] = $line_item_wrapper->commerce_license->value();
+      }
+    }
+  }
+  // Load all found billing cycle types.
+  $billing_cycle_types = entity_load('cl_billing_cycle_type', $billing_cycle_type_ids);
+
+  foreach ($grouped_licenses as $billing_cycle_type_id => $licenses) {
+    // Open a billing cycle.
+    $billing_cycle_type = $billing_cycle_types[$billing_cycle_type_id];
+    $billing_cycle = $billing_cycle_type->getBillingCycle($order->uid);
+    // Sync the license expiration and billing cycle end timestamps.
+    foreach ($licenses as $license) {
+      $license->expires = $billing_cycle->end;
+      $license->expires_automatically = FALSE;
+      $license->save();
+    }
+
+    // Check if there's an existing order attached to that billing cycle.
+    $recurring_order = $billing_cycle->getOrder();
+    if ($recurring_order) {
+      $recurring_order_wrapper = entity_metadata_wrapper('commerce_order', $recurring_order);
+      // Generate a base line item for each license.
+      $existing_line_items = $recurring_order_wrapper->commerce_line_items->value();
+      $line_items = array();
+      foreach ($licenses as $license) {
+        $line_items[] = commerce_license_billing_generate_base_line_item($license, $billing_cycle, $recurring_order->order_id);
+      }
+      $recurring_order_wrapper->commerce_line_items = array_merge($existing_line_items, $line_items);
+      $recurring_order_wrapper->save();
+    }
+    else {
+      commerce_license_billing_generate_recurring_order($order, $billing_cycle, $licenses);
+    }
+  }
+}
+
+/**
+ * Generates a new recurring order.
+ *
+ * @param $previous_order
+ *   The previous order.
+ * @param $billing_cycle
+ *   The billing cycle for the new order.
+ * @param $licenses
+ *   An array of licenses added to the new order.
+ *
+ * @return
+ *   The newly created and saved recurring order.
+ */
+function commerce_license_billing_generate_recurring_order($previous_order, $billing_cycle, $licenses) {
+  $previous_order_wrapper = entity_metadata_wrapper('commerce_order', $previous_order);
+  // Create a new order and save it immediately to get the order_id.
+  $recurring_order = commerce_order_new($previous_order->uid, 'recurring_open', 'recurring');
+  commerce_order_save($recurring_order);
+
+  $recurring_order_wrapper = entity_metadata_wrapper('commerce_order', $recurring_order);
+  // We need to duplicate all fields which contain a customer profile.
+  $recurring_order_properties = $recurring_order_wrapper->getPropertyInfo();
+  $previous_order_properties = $previous_order_wrapper->getPropertyInfo();
+  foreach ($previous_order_properties as $field_name => $info) {
+    if (!empty($info['field']) && $info['type'] == 'commerce_customer_profile') {
+      if (in_array($field_name, array_keys($recurring_order_properties))) {
+        $recurring_order_wrapper->{$field_name} = $previous_order_wrapper->{$field_name}->value();
+      }
+    }
+  }
+  $recurring_order_wrapper->cl_billing_cycle = $billing_cycle;
+
+  // Generate a base line item for each license.
+  $line_items = array();
+  foreach ($licenses as $license) {
+    $line_items[] = commerce_license_billing_generate_base_line_item($license, $billing_cycle, $recurring_order->order_id);
+  }
+  $recurring_order_wrapper->commerce_line_items = $line_items;
+
+  // Allow modules to alter the newly generated order, carrying over custom
+  // fields from the previous order, for example.
+  drupal_alter('commerce_license_billing_new_recurring_order', $recurring_order, $previous_order);
+
+  $recurring_order_wrapper->save();
+
+  return $recurring_order;
+}
+
+/**
+ * Generates the recurring line item for the base product of a license.
+ *
+ * Takes into account whether the product is prepaid or postpaid.
+ *
+ * @param $license
+ *   The license entity.
+ * @param $billing_cycle
+ *   The billing cycle entity.
+ * @param $order_id
+ *   The order_id to be set on the newly created line items.
+ *
+ * @return
+ *   The newly created and saved line item.
+ */
+function commerce_license_billing_generate_base_line_item(CommerceLicenseInterface $license, $billing_cycle, $order_id) {
+  $product_wrapper = $license->wrapper->product;
+  // Charge for the base product, there's no usage at this point.
+  $line_item = commerce_line_item_new('recurring', $order_id);
+  $line_item_wrapper = entity_metadata_wrapper('commerce_line_item', $line_item);
+  $line_item_wrapper->line_item_label = $product_wrapper->sku->value();
+  $line_item_wrapper->commerce_product = $product_wrapper->value();
+  $line_item_wrapper->quantity = 1;
+  $line_item_wrapper->cl_billing_license = $license;
+
+  $line_item_wrapper->commerce_unit_price = $license->wrapper->product->commerce_price->value();
+  $line_item_wrapper->commerce_unit_price->data = commerce_price_component_add(
+    $line_item_wrapper->commerce_unit_price->value(),
+    'base_price',
+    $line_item_wrapper->commerce_unit_price->value(),
+    TRUE
+  );
+  if ($product_wrapper->cl_billing_type->value() == 'prepaid') {
+    // In case of prepaid, the line item always charges for the next
+    // billing cycle. So if the just opened billing cycle is "February",
+    // the line item needs to charge for March.
+    $billing_cycle_type = entity_load_single('cl_billing_cycle_type', $billing_cycle->type);
+    $next_billing_cycle = $billing_cycle_type->getNextBillingCycle($billing_cycle, FALSE);
+    $line_item_wrapper->cl_billing_start = $next_billing_cycle->start;
+    $line_item_wrapper->cl_billing_end = $next_billing_cycle->end;
+  }
+  elseif ($product_wrapper->cl_billing_type->value() == 'postpaid') {
+    // In case of postpaid, the line item always charges for the current
+    // billing cycle.
+    $line_item_wrapper->cl_billing_start = $billing_cycle->start;
+    $line_item_wrapper->cl_billing_end = $billing_cycle->end;
+  }
+  // Trigger price calculation to get any needed discounts or price changes.
+  rules_invoke_event('commerce_product_calculate_sell_price', $line_item);
+  // Save the line item.
+  $line_item_wrapper->save();
+
+  return $line_item_wrapper->value();
+}
+
+/**
+ * Implements hook_commerce_order_load().
+ *
+ * When a recurring order gets loaded, update its line items based on latest
+ * product history and usage. This is a process similar to the cart refresh
+ * done by commerce_cart_commerce_order_load().
+ */
+function commerce_license_billing_commerce_order_load($orders) {
+  $refreshed = &drupal_static(__FUNCTION__, array());
+  $recurring_statuses = array('recurring_open', 'recurring_usage_pending');
+
+  foreach ($orders as $order) {
+    // Refresh only if this is a recurring order and it hasn't been refreshed.
+    if (!isset($refreshed[$order->order_id]) && $order->type == 'recurring' && in_array($order->status, $recurring_statuses)) {
+      // Refresh the order and add its ID to the refreshed array.
+      $refreshed[$order->order_id] = TRUE;
+      commerce_license_billing_order_refresh($order);
+    }
+  }
+}
+
+/**
+ * Updates the recurring order based on latest product history and usage.
+ *
+ * @param $order
+ *   The order entity.
+ */
+function commerce_license_billing_order_refresh($order) {
+  // The first time an order is saved, entity_load_unchanged() in the controller
+  // leads to this function being called, with no line items to work on.
+  if (empty($order->commerce_line_items)) {
+    return;
+  }
+
+  $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+  $billing_cycle = $order_wrapper->cl_billing_cycle->value();
+  $licenses = array();
+  $old_line_items = array();
+  $old_line_item_ids = array();
+  foreach ($order_wrapper->commerce_line_items as $line_item_wrapper) {
+    // If this isn't a recurring line item, we need to make note of its ID so
+    // we can accurately compare our original and updated line item ID arrays
+    // at the end of the refresh process. The rest of the license-based logic
+    // does not apply.
+    if ($line_item_wrapper->getBundle() != 'recurring') {
+      $old_line_item_ids[] = $line_item_wrapper->line_item_id->value();
+      continue;
+    }
+    // Gather all licenses that are in this order.
+    $license_id = $line_item_wrapper->cl_billing_license->raw();
+    if (!isset($licenses[$license_id])) {
+      $licenses[$license_id] = $line_item_wrapper->cl_billing_license->value();
+    }
+
+    // Group the old line items by their license id.
+    $old_line_items[$license_id][] = $line_item_wrapper;
+    $old_line_item_ids[] = $line_item_wrapper->line_item_id->value();
+  }
+
+  $order_needs_save = FALSE;
+  // Remove any licenses that couldn't be loaded due to broken references.
+  $old_license_count = count($licenses);
+  $licenses = array_filter($licenses);
+  $new_license_count = count($licenses);
+  if ($old_license_count != $new_license_count) {
+    // Resave the order to remove the line items that are no longer relevant.
+    $order_needs_save = TRUE;
+  }
+
+  $line_items = array();
+  foreach ($licenses as $license_id => $license) {
+    $charges = commerce_license_billing_collect_charges($license, $billing_cycle);
+    foreach ($charges as $charge) {
+      $existing_line_item = NULL;
+      // Try to find an existing line item that can be updated.
+      foreach ($old_line_items[$license_id] as $line_item_wrapper) {
+        $match = TRUE;
+        foreach ($charge['match'] as $key) {
+          if ($line_item_wrapper->{$key}->value() != $charge[$key]) {
+            $match = FALSE;
+            break;
+          }
+        }
+
+        if ($match) {
+          $existing_line_item = $line_item_wrapper->value();
+          break;
+        }
+      }
+
+      if (!$existing_line_item) {
+        // No line item found, create one.
+        $line_item = commerce_license_billing_line_item_new($license, $charge, $order->order_id);
+        commerce_line_item_save($line_item);
+
+        $line_items[$line_item->line_item_id] = $line_item;
+        $order_needs_save = TRUE;
+      }
+      else {
+        // Update a copy of the line item.
+        $line_item = clone $existing_line_item;
+        commerce_license_billing_populate_line_item($line_item, $charge);
+
+        $existing_line_item_wrapper = entity_metadata_wrapper('commerce_line_item', $existing_line_item);
+        $line_item_wrapper = entity_metadata_wrapper('commerce_line_item', $line_item);
+        // Compare the price (amount, currency, components) of the previous
+        // line item with the price of the updated line item.
+        $previous_price = $existing_line_item_wrapper->commerce_unit_price;
+        $current_price = $line_item_wrapper->commerce_unit_price;
+        $data = $previous_price->data->value() + array('components' => array());
+        $current_data = $current_price->data->value() + array('components' => array());
+        $amount_changed = ($previous_price->amount->value() != $current_price->amount->value());
+        $currency_changed = ($previous_price->currency_code->value() != $current_price->currency_code->value());
+        $components_changed = ($data['components'] != $current_data['components']);
+        // The quantity can only change if the free usage issued by a product changes.
+        $quantity_changed = ($existing_line_item->quantity != $line_item->quantity);
+        if ($amount_changed || $currency_changed || $components_changed || $quantity_changed) {
+          // Found a difference, save the updated line item.
+          commerce_line_item_save($line_item);
+          $order_needs_save = TRUE;
+        }
+
+        $line_items[$line_item->line_item_id] = $line_item;
+      }
+    }
+  }
+
+  // Allow other modules to alter the process, adding order-level discounts
+  // or fees for example. See commerce_license_billing.api.php for more info.
+  drupal_alter('commerce_license_billing_order_refresh', $order, $line_items, $order_needs_save);
+
+  // One or more line items might have been dropped (for example, because a
+  // prepaid license has been scheduled for cancellation).
+  $new_line_item_ids = array_keys($line_items);
+  $dropped_line_item_ids = array_diff($old_line_item_ids, $new_line_item_ids);
+  if ($dropped_line_item_ids) {
+    // Make sure to update the order line item list.
+    $order_needs_save = TRUE;
+    // Delete dropped line items.
+    commerce_line_item_delete_multiple($dropped_line_item_ids);
+  }
+
+  // Update the order, if new line items were created.
+  if ($order_needs_save) {
+    if ($line_items) {
+      $order_wrapper->commerce_line_items = array_values($line_items);
+    }
+    else {
+      // Doing $order_wrapper->commerce_line_items = array() produces
+      // $order->commerce_line_items = array(LANGUAGE_NONE => array()), which
+      // messes up the empty($order->commerce_line_items) check, so that
+      // case is handled separately without the wrapper.
+      $order->commerce_line_items = array();
+    }
+    $order_wrapper->save();
+  }
+}
+
+/**
+ * Creates a new recurring line item populated with the charge data.
+ *
+ * @param $license
+ *   The license entity.
+ * @param $charge
+ *   The charge data.
+ * @param $order_id
+ *   The ID of the order the line item belongs to (if available).
+ *
+ * @return
+ *   The unsaved line item populated with the charge data.
+ */
+function commerce_license_billing_line_item_new(CommerceLicenseInterface $license, $charge, $order_id = 0) {
+  // Create an empty line item and set the license reference.
+  $line_item = commerce_line_item_new('recurring', $order_id);
+  $line_item_wrapper = entity_metadata_wrapper('commerce_line_item', $line_item);
+  $line_item_wrapper->cl_billing_license = $license;
+
+  // Populate the line item with the charge data.
+  commerce_license_billing_populate_line_item($line_item, $charge);
+
+  return $line_item;
+}
+
+/**
+ * Populates a recurring line item with the charge data.
+ *
+ * @param $line_item
+ *   The line item entity, populated by reference.
+ * @param $charge
+ *   The charge data.
+ */
+function commerce_license_billing_populate_line_item($line_item, $charge) {
+  $line_item_wrapper = entity_metadata_wrapper('commerce_line_item', $line_item);
+  $line_item_wrapper->line_item_label = $charge['commerce_product']->sku;
+  $line_item_wrapper->commerce_product = $charge['commerce_product'];
+  $line_item_wrapper->quantity = $charge['quantity'];
+  $line_item_wrapper->commerce_unit_price = $charge['commerce_unit_price'];
+  $line_item_wrapper->commerce_unit_price->data = commerce_price_component_add(
+    $line_item_wrapper->commerce_unit_price->value(),
+      'base_price',
+      $line_item_wrapper->commerce_unit_price->value(),
+      TRUE
+  );
+  $line_item_wrapper->cl_billing_start = $charge['cl_billing_start'];
+  $line_item_wrapper->cl_billing_end = $charge['cl_billing_end'];
+  // Store the revision ID of the license used to generate the charge, if any.
+  if (!empty($charge['license_revision_id'])) {
+    $line_item->data['license_revision_id'] = $charge['license_revision_id'];
+  }
+
+  // Trigger price calculation to get any needed discounts or price changes.
+  rules_invoke_event('commerce_product_calculate_sell_price', $line_item);
+}
+
+/**
+ * Collects charges for a license in the given billing cycle.
+ *
+ * @param $license
+ *   The license entity.
+ * @param $billing_cycle
+ *   The billing cycle entity.
+ *
+ * @return
+ *   An array of charge arrays that have the following keys:
+ *   - quantity: The quantity of the charge.
+ *   - commerce_product: The product entity that represents the charge.
+ *   - commerce_unit_price: The unit price of the charge.
+ *   - cl_billing_start: The start of the period covered by the charge.
+ *   - cl_billing_end: The end of the period covered by the charge.
+ *   - match: An array of keys to compare on the charge and the line item
+ *     when looking for an existing line item for the charge.
+ */
+function commerce_license_billing_collect_charges(CommerceLicenseInterface $license, $billing_cycle) {
+  $charges = array();
+  // Charge the plan.
+  // In case of prepaid, the plan charge is for the entire next billing cycle.
+  // In case of postpaid, all plan changes in the current month are charged.
+  $product_wrapper = $license->wrapper->product;
+  if ($product_wrapper->cl_billing_type->value() == 'prepaid') {
+    $scheduled_for_cancellation = FALSE;
+    $scheduled_changes = commerce_license_billing_schedule_changes_list($license);
+    foreach ($scheduled_changes as $scheduled_change) {
+      if ($scheduled_change['property'] == 'status' && $scheduled_change['value'] == COMMERCE_LICENSE_REVOKED) {
+        $scheduled_for_cancellation = TRUE;
+        break;
+      }
+    }
+
+    // If the license is scheduled for cancellation, then it doesn't need
+    // a charge for the next billing cycle, it will already be gone by then.
+    if (!$scheduled_for_cancellation) {
+      $billing_cycle_type = entity_load_single('cl_billing_cycle_type', $billing_cycle->type);
+      $next_billing_cycle = $billing_cycle_type->getNextBillingCycle($billing_cycle, FALSE);
+      $charges[] = array(
+        'license_revision_id' => $license->revision_id,
+        'quantity' => 1,
+        'commerce_product' => $product_wrapper->value(),
+        'commerce_unit_price' => $product_wrapper->commerce_price->value(),
+        'cl_billing_start' => $next_billing_cycle->start,
+        'cl_billing_end' => $next_billing_cycle->end,
+        'match' => array('commerce_product'),
+      );
+    }
+  }
+  elseif ($product_wrapper->cl_billing_type->value() == 'postpaid') {
+    $plan_history = commerce_license_billing_plan_history_list($license, $billing_cycle);
+    // Gather all products.
+    $product_ids = array();
+    foreach ($plan_history as $history_record) {
+      $product_ids[] = $history_record['product_id'];
+    }
+    $products = commerce_product_load_multiple($product_ids);
+
+    foreach ($plan_history as $history_record) {
+      $product = $products[$history_record['product_id']];
+      $product_wrapper = entity_metadata_wrapper('commerce_product', $product);
+
+      $charges[] = array(
+        'license_revision_id' => $history_record['revision_id'],
+        'quantity' => 1,
+        'commerce_product' => $product,
+        'commerce_unit_price' => $product_wrapper->commerce_price->value(),
+        'cl_billing_start' => $history_record['start'],
+        'cl_billing_end' => $history_record['end'],
+        'match' => array('commerce_product', 'cl_billing_start'),
+      );
+    }
+  }
+
+  // Charge for usage, if the license type supports it.
+  if ($license instanceof CommerceLicenseBillingUsageInterface) {
+    $usage_groups = $license->usageGroups();
+    foreach ($usage_groups as $group_name => $group_info) {
+      $usage_group = commerce_license_billing_usage_group($license, $group_name);
+      $chargeable_usage = $usage_group->chargeableUsage($billing_cycle);
+      foreach ($chargeable_usage as $usage_record) {
+        $product = commerce_product_load_by_sku($group_info['product']);
+        $product_wrapper = entity_metadata_wrapper('commerce_product', $product);
+
+        $charges[] = array(
+          // Not all usage records supply the revision ID of the license, as
+          //   is it not always relevant.
+          'license_revision_id' => (isset($usage_record['revision_id']) ? $usage_record['revision_id'] : NULL),
+          'commerce_product' => $product,
+          'quantity' => $usage_record['quantity'],
+          'commerce_unit_price' => $product_wrapper->commerce_price->value(),
+          'cl_billing_start' => $usage_record['start'],
+          'cl_billing_end' => $usage_record['end'],
+          'match' => array('commerce_product', 'cl_billing_start'),
+        );
+      }
+    }
+  }
+
+  return $charges;
+}
+
+/**
+ * Estimate the cost of a license with the given plan and usage.
+ *
+ * @param $license_type
+ *   The license type.
+ * @param $uid
+ *   The uid of the license owner.
+ * @param $product
+ *   The product representing the license plan.
+ * @param $usage
+ *  An array in the usage_group => quantity format.
+ *
+ * @return
+ *   An array with the following keys:
+ *   - billing_cycle: An array with the title, start, end keys.
+ *   - charges: An array of arrays with product, unit_price, quantity keys.
+ *   - total: The total price array (amount, currency_code, data).
+ */
+function commerce_license_billing_estimate_cost($license_type, $uid, $product, $usage = NULL) {
+  // Prepare commonly needed data.
+  $product_wrapper = entity_metadata_wrapper('commerce_product', $product);
+  // Construct a billing cycle.
+  $billing_cycle_type = $product_wrapper->cl_billing_cycle_type->value();
+  $current_time = commerce_license_get_time();
+  $billing_cycle = $billing_cycle_type->getBillingCycle($GLOBALS['user']->uid, $current_time, FALSE);
+  // Try to determine the order_id to be set on the line item, used during
+  // price calculation. Start by searching for an active recurring order.
+  // If not found, see if the user has an active cart, and use its order_id.
+  $order_id = 0;
+  $query = new EntityFieldQuery;
+  $query
+    ->entityCondition('entity_type', 'commerce_order')
+    ->entityCondition('bundle', 'recurring')
+    ->propertyCondition('uid', $uid)
+    ->fieldCondition('cl_billing_cycle', 'target_id', $billing_cycle->billing_cycle_id);
+  $result = $query->execute();
+  if ($result) {
+    $order_id = key($result['commerce_order']);
+  }
+  else {
+    if ($cart_order = commerce_cart_order_load($uid)) {
+      $order_id = $cart_order->order_id;
+    }
+  }
+
+  $estimation = array(
+    'billing_cycle' => array(
+      'title' => $billing_cycle->label(),
+      'start' => $billing_cycle->start,
+      'end' => $billing_cycle->end,
+    ),
+  );
+  // Price the base product.
+  $price = commerce_license_billing_calculate_sell_price($order_id, $product, 1, $billing_cycle);
+  $estimation['charges'][] = array(
+    'product' => $product,
+    'quantity' => 1,
+    'unit_price' => $price,
+    'total' => $price,
+  );
+  // The price calculation might have changed the currency of the price, so
+  // we don't initialize our "zero" price struct until this point.
+  $zero_price = array(
+    'amount' => 0,
+    'currency_code' => $price['currency_code'],
+    'data' => array(),
+  );
+  $zero_price['data'] = commerce_price_component_add($zero_price, 'base_price', $zero_price, TRUE, FALSE);
+
+  // Price the usage.
+  $license = entity_create('commerce_license', array('type' => $license_type));
+  $license->product_id = $product->product_id;
+  $license->granted = commerce_license_get_time();
+  $license->expires = $billing_cycle->end;
+  if ($license instanceof CommerceLicenseBillingUsageInterface && !empty($usage)) {
+    $usage_groups = $license->usageGroups();
+    foreach ($usage as $group_name => $quantity) {
+      $usage_group = $usage_groups[$group_name];
+      $usage_product = commerce_product_load_by_sku($usage_group['product']);
+      if ($quantity <= $usage_group['free_quantity']) {
+        $unit_price = $total_price = $zero_price;
+      }
+      else {
+        $quantity -= $usage_group['free_quantity'];
+        $unit_price = commerce_license_billing_calculate_sell_price($order_id, $usage_product, $quantity, $billing_cycle);
+        $total_price = $unit_price;
+        // Multiply the amount and all price components by quantity.
+        $total_price['amount'] *= $quantity;
+        foreach ($total_price['data']['components'] as $key => &$component) {
+          $component['price']['amount'] *= $quantity;
+        }
+      }
+
+      $estimation['charges'][] = array(
+        'product' => $usage_product,
+        'quantity' => $quantity,
+        'unit_price' => $unit_price,
+        'total' => $total_price,
+      );
+    }
+  }
+  // Calculate the total.
+  $estimation['total'] = $zero_price;
+
+  foreach ($estimation['charges'] as $charge) {
+    // Add the charge total to the estimation total.
+    $estimation['total']['amount'] += $charge['total']['amount'];
+    $estimation['total']['data'] = commerce_price_components_combine($estimation['total'], $charge['total']);
+  }
+  // Make sure the final amount has been rounded.
+  $estimation['total']['amount'] = round($estimation['total']['amount']);
+
+  // Allow anyone doing order-level logic or other tricky things to alter the
+  // estimation here.
+  $context = array(
+    'license' => $license,
+    'billing_cycle' => $billing_cycle,
+    'usage' => $usage,
+    'order_id' => $order_id,
+  );
+  drupal_alter('commerce_license_billing_estimation', $estimation, $context);
+
+  return $estimation;
+}
+
+/**
+ * Returns the calculated sell price for the given product.
+ *
+ * @param $order_id
+ *   The order_id to set on the line item, used for context by pricing rules.
+ * @param $product
+ *   The product whose sell price will be calculated.
+ * @param $quantity
+ *   The product quantity.
+ * @param $billing_cycle
+ *   The billing cycle for this product.
+ *
+ * @return
+ *   A price field data array as returned by entity_metadata_wrapper().
+ */
+function commerce_license_billing_calculate_sell_price($order_id, $product, $quantity, $billing_cycle) {
+  $line_item = commerce_line_item_new('recurring', $order_id);
+  $line_item_wrapper = entity_metadata_wrapper('commerce_line_item', $line_item);
+  $line_item_wrapper->cl_billing_start = $billing_cycle->start;
+  $line_item_wrapper->cl_billing_end = $billing_cycle->end;
+  $line_item_wrapper->quantity = $quantity;
+  commerce_product_line_item_populate($line_item, $product);
+  // Pass the line item to Rules.
+  rules_invoke_event('commerce_product_calculate_sell_price', $line_item);
+  // Get the calculated unit price. If it was unset, provide a default.
+  $unit_price = $line_item_wrapper->commerce_unit_price->value();
+  if (empty($unit_price)) {
+    $unit_price = commerce_price_field_data_auto_creation();
+  }
+
+  return $unit_price;
+}
+
+/**
+ * Returns the billing cycle for the given license.
+ *
+ * @param $license
+ *   The license entity.
+ *
+ * @return
+ *   A billing cycle entity, or FALSE if none found.
+ */
+function commerce_license_billing_get_license_billing_cycle(CommerceLicenseInterface $license) {
+  // Load a line item that references the license.
+  $query = new EntityFieldQuery;
+  $query
+    ->entityCondition('entity_type', 'commerce_line_item')
+    ->entityCondition('bundle', 'recurring')
+    ->fieldCondition('cl_billing_license', 'target_id', $license->license_id)
+    ->range(0, 1);
+  $result = $query->execute();
+  if ($result) {
+    $line_item_id = key($result['commerce_line_item']);
+    $line_item = commerce_line_item_load($line_item_id);
+    $line_item_wrapper = entity_metadata_wrapper('commerce_line_item', $line_item);
+    return $line_item_wrapper->order->cl_billing_cycle->value();
+  }
+  else {
+    return FALSE;
+  }
+}
+
+/**
+ * Implements hook_commerce_license_presave().
+ *
+ * Ensures that a new license revision is created on product or status changes.
+ */
+function commerce_license_billing_commerce_license_presave($license) {
+  if (empty($license->original) || $license->status < COMMERCE_LICENSE_ACTIVE) {
+    // The license is new, or hasn't been activated yet.
+    return;
+  }
+
+  $product_changed = ($license->product_id != $license->original->product_id);
+  $status_changed = ($license->status != $license->original->status);
+  if ($product_changed || $status_changed) {
+    $license->is_new_revision = TRUE;
+    // Reset the static cache to allow new revision data to show up.
+    drupal_static_reset('commerce_license_billing_plan_history_list');
+  }
+}
+
+/**
+ * Implements hook_commerce_license_update().
+ *
+ * Notifies usage groups of revision changes.
+ */
+function commerce_license_billing_commerce_license_update($license) {
+  if ($license->is_new_revision && $license instanceof CommerceLicenseBillingUsageInterface) {
+    foreach (array_keys($license->usageGroups()) as $group_name) {
+      $usage_group = commerce_license_billing_usage_group($license, $group_name);
+      $usage_group->onRevisionChange();
+    }
+  }
+}
+
+/**
+ * Implements hook_commerce_license_delete().
+ */
+function commerce_license_billing_commerce_license_delete($license) {
+  // Delete usage records.
+  $delete = db_delete('cl_billing_usage');
+  $delete->condition('license_id', $license->license_id);
+  $delete->execute();
+}
+
+/**
+ * Implements hook_commerce_order_delete().
+ *
+ * Deletes the matching billing cycle when a recurring order is deleted.
+ */
+function commerce_license_billing_commerce_order_delete($order) {
+  if ($order->type == 'recurring') {
+    $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+    $order_wrapper->cl_billing_cycle->delete();
+  }
+}
+
+/**
+ * Changes the license plan.
+ *
+ * Schedules the change for the end of the billing cycle if needed.
+ * Enqueues the license for synchronization if needed.
+ *
+ * @param $license
+ *   The license entity.
+ * @param $product_id
+ *   The product_id of the new plan.
+ */
+function commerce_license_billing_change_plan(CommerceLicenseInterface $license, $product_id) {
+  if (commerce_license_billing_must_schedule_change($license, 'product')) {
+    commerce_license_billing_schedule_change($license, 'product', $product_id);
+    return;
+  }
+
+  // Change the plan, and trigger a synchronization.
+  $license->product_id = $product_id;
+  $license->save();
+  if ($license instanceof CommerceLicenseSynchronizableInterface) {
+    commerce_license_enqueue_sync($license);
+  }
+}
+
+/**
+ * Changes the license status.
+ *
+ * Schedules the change for the end of the billing cycle if needed.
+ * Enqueues the license for synchronization if needed.
+ *
+ * @param $license
+ *   The license entity.
+ * @param $status
+ *   The new status.
+ */
+function commerce_license_billing_change_status(CommerceLicenseInterface $license, $status) {
+  if (commerce_license_billing_must_schedule_change($license, 'status')) {
+    commerce_license_billing_schedule_change($license, 'status', $status);
+    return;
+  }
+
+  // Change the status, and trigger a synchronization.
+  $license->status = $status;
+  $license->save();
+  if ($license instanceof CommerceLicenseSynchronizableInterface) {
+    commerce_license_enqueue_sync($license);
+  }
+}
+
+/**
+ * Checks whether the specified license change needs to be scheduled.
+ *
+ * Scheduled changes are applied at the end of the billing cycle,
+ * which allows for simpler billing of plans and usage.
+ *
+ * @param $license
+ *   The license entity.
+ * @param $property
+ *   The property that will be changed, usually product or status.
+ *
+ * @return
+ *   TRUE if the license change needs to be scheduled, FALSE otherwise.
+ */
+function commerce_license_billing_must_schedule_change(CommerceLicenseInterface $license, $property) {
+  // Prepaid license changes are always scheduled to avoid having to credit
+  // the customer in case they switch to a cheaper plan (or cancel).
+  if ($license->wrapper->product->cl_billing_type->value() == 'prepaid') {
+    return TRUE;
+  }
+
+  // Allow usage groups to enforce scheduling, in cases where it wouldn't be
+  // possible to prorate the free quantity against reported usage.
+  if ($license instanceof CommerceLicenseBillingUsageInterface) {
+    foreach (array_keys($license->usageGroups()) as $group_name) {
+      $usage_group = commerce_license_billing_usage_group($license, $group_name);
+      if ($usage_group->enforceChangeScheduling($property)) {
+        return TRUE;
+      }
+    }
+  }
+
+  // Consult per-product settings.
+  $schedule_changes = $license->wrapper->product->cl_schedule_changes->value();
+  if (in_array($property, $schedule_changes)) {
+    return TRUE;
+  }
+
+  return FALSE;
+}
+
+/**
+ * Schedules a change of a license property for the end of the billing cycle.
+ *
+ * Usually used to schedule plan changes or license cancellations.
+ *
+ * @param $license
+ *   The license entity.
+ * @param $property
+ *   The property that will be changed, usually product or status.
+ * @param $value
+ *   The new value of the property.
+ */
+function commerce_license_billing_schedule_change(CommerceLicenseInterface $license, $property, $value) {
+  db_insert('cl_scheduled_change')
+    ->fields(array(
+      'license_id' => $license->license_id,
+      'property' => $property,
+      'value' => $value,
+      'created' => REQUEST_TIME,
+    ))
+    ->execute();
+
+  // Reset the static cache to allow the new scheduled change to show up.
+  drupal_static_reset('commerce_license_billing_schedule_changes_list');
+}
+
+/**
+ * Returns the license changes scheduled for the end of the billing cycle.
+ *
+ * @param $license
+ *   The license entity.
+ *
+ * @return
+ *   An array of change records with the following keys:
+ *   - property: The property that will be changed.
+ *   - value: The new value of the property.
+ *   - created: The change request creation timestamp.
+ */
+function commerce_license_billing_schedule_changes_list(CommerceLicenseInterface $license) {
+  $scheduled_changes = &drupal_static(__FUNCTION__, array());
+  if (!isset($scheduled_changes[$license->license_id])) {
+    $scheduled_changes[$license->license_id] = array();
+    $data = array(
+      ':license_id' => $license->license_id,
+    );
+    $result = db_query("SELECT * FROM {cl_scheduled_change}
+                          WHERE license_id = :license_id
+                            ORDER BY created ASC", $data);
+    $scheduled_changes[$license->license_id] = $result->fetchAll(PDO::FETCH_ASSOC);
+  }
+
+  return $scheduled_changes[$license->license_id];
+}
+
+/**
+ * Applies the provided changes to the provided license.
+ *
+ * @param $license
+ *   The license entity.
+ * @param $changes
+ *   An array of change records.
+ */
+function commerce_license_billing_apply_changes(CommerceLicenseInterface $license, $changes) {
+  // Apply each change to the license.
+  foreach ($changes as $change) {
+    $license->wrapper->{$change['property']} = $change['value'];
+  }
+  // Save the license and trigger a synchronization if needed.
+  $license->save();
+  if ($license instanceof CommerceLicenseSynchronizableInterface) {
+    commerce_license_enqueue_sync($license);
+  }
+}
+
+/**
+ * Returns the license plan history for an open billing cycle.
+ *
+ * @param $license
+ *   The license entity.
+ * @param $billing_cycle
+ *   The billing cycle entity.
+ *
+ * @return
+ *   An array of history records in the following format:
+ *   - revision_id: The revision_id of the history record.
+ *   - product_id: The id of the product representing the plan.
+ *   - status: The status of the entry.
+ *   - start: The start timestamp.
+ *   - end: The end timestamp.
+ *   - revision: The loaded revision, so that it doesn't need to be loaded
+ *     separately by each usage group (freeQuantities()).
+ */
+function commerce_license_billing_plan_history_list(CommerceLicenseInterface $license, $billing_cycle) {
+  $history = &drupal_static(__FUNCTION__, array());
+  if (!isset($history[$billing_cycle->billing_cycle_id][$license->license_id])) {
+    $data = array(
+      ':license_id' => $license->license_id,
+      ':start' => $billing_cycle->start,
+      ':end' => $billing_cycle->end,
+    );
+    // Fetch revisions that started or ended in this billing cycle, or are still
+    // in progress.
+    $result = db_query("SELECT revision_id, product_id, status,
+                          revision_created AS start, revision_ended AS end
+                          FROM {commerce_license_revision}
+                          WHERE license_id = :license_id
+                              AND (
+                                (revision_created BETWEEN :start AND :end) OR
+                                (revision_ended BETWEEN :start AND :end) OR
+                                (revision_ended = 0)
+                              )", $data);
+    $license_history = $result->fetchAll(PDO::FETCH_ASSOC);
+
+    foreach ($license_history as $index => $history_record) {
+      // Filter out non-active records.
+      if ($history_record['status'] != COMMERCE_LICENSE_ACTIVE) {
+        unset($license_history[$index]);
+        continue;
+      }
+      // Adjust the start and end timestamps for the current billing cycle.
+      if ($history_record['start'] < $billing_cycle->start) {
+        $license_history[$index]['start'] = $billing_cycle->start;
+      }
+      if (empty($history_record['end'])) {
+        $license_history[$index]['end'] = $billing_cycle->end;
+      }
+      // Load the referenced revision.
+      $license_history[$index]['revision'] = entity_revision_load('commerce_license', $history_record['revision_id']);
+    }
+    $license_history = array_values($license_history);
+
+    // Add the data to the static cache.
+    $history[$billing_cycle->billing_cycle_id][$license->license_id] = $license_history;
+  }
+
+  return $history[$billing_cycle->billing_cycle_id][$license->license_id];
+}
+
+/**
+ * Returns the license usage history for an open billing cycle.
+ *
+ * The usage history records are grouped by usage group.
+ *
+ * @param $license
+ *   The license entity.
+ * @param $billing_cycle
+ *   The billing cycle entity.
+ *
+ * @return
+ *   An array in the group_name => usage_records format, where each usage
+ *   record has the following keys:
+ *   - product_id: The id of the product representing the plan.
+ *   - start: The start timestamp.
+ *   - end: The end timestamp.
+ */
+function commerce_license_billing_usage_history_list(CommerceLicenseBillingUsageInterface $license, $billing_cycle) {
+  $history = &drupal_static(__FUNCTION__, array());
+  if (!isset($history[$billing_cycle->billing_cycle_id][$license->license_id])) {
+    $data = array(
+      ':license_id' => $license->license_id,
+      ':start' => $billing_cycle->start,
+      ':end' => $billing_cycle->end,
+    );
+    // Fetch usage records that started or ended in this billing cycle, or are
+    // still in progress.
+    $result = db_query("SELECT * FROM {cl_billing_usage}
+                          WHERE license_id = :license_id
+                              AND (
+                                (start BETWEEN :start AND :end) OR
+                                (end BETWEEN :start AND :end) OR
+                                (end = 0)
+                              )
+                          ORDER BY start ASC", $data);
+    $usage_history = $result->fetchAll(PDO::FETCH_ASSOC);
+
+    $group_history = array();
+    foreach ($usage_history as $usage_record) {
+      // Adjust the start and end timestamps for the current billing cycle.
+      if ($usage_record['start'] < $billing_cycle->start) {
+        $usage_record['start'] = $billing_cycle->start;
+      }
+      if (empty($usage_record['end'])) {
+        $usage_record['end'] = $billing_cycle->end;
+      }
+      // Group the records by usage group.
+      $group_history[$usage_record['usage_group']][] = $usage_record;
+    }
+
+    // Add the data to the static cache.
+    $history[$billing_cycle->billing_cycle_id][$license->license_id] = $group_history;
+  }
+
+  return $history[$billing_cycle->billing_cycle_id][$license->license_id];
+}
+
+/**
+ * Clears closed usage records.
+ *
+ * @param $license_ids
+ *   An array of license ids.
+ * @param $billing_cycle
+ *   The billing cycle entity.
+ */
+function commerce_license_billing_usage_history_clear($license_ids, $billing_cycle) {
+  if (!$license_ids) {
+    // No license ids provided.
+    return;
+  }
+
+  $delete = db_delete('cl_billing_usage');
+  $delete->condition('license_id', $license_ids);
+  // Match closed records that started or ended in the provided billing cycle.
+  $cycle_duration = array($billing_cycle->start, $billing_cycle->end);
+  $or = db_or();
+  $or->condition('start', $cycle_duration, 'BETWEEN');
+  $or->condition('end', $cycle_duration, 'BETWEEN');
+  $delete->condition($or);
+  $delete->condition('end', 0, '!=');
+  $delete->execute();
+
+  // Reset the usage history static cache.
+  drupal_static_reset('commerce_license_billing_usage_history_list');
+}
+
+/**
+ * Returns a usage group plugin.
+ *
+ * @param $license
+ *   The license entity.
+ * @param $group_name
+ *   The usage group, as defined by $license->usageGroups().
+ *
+ * @return
+ *   An instance of a usage group plugin.
+ */
+function commerce_license_billing_usage_group(CommerceLicenseBillingUsageInterface $license, $group_name) {
+  $usage_groups = $license->usageGroups();
+  if (!isset($usage_groups[$group_name])) {
+    throw new Exception('Invalid usage group specified for commerce_license_billing_usage_group().');
+  }
+  $group_info = $usage_groups[$group_name];
+  $plugins = commerce_license_billing_get_plugins('usage_group');
+  $plugin = $plugins[$group_info['type']];
+
+  return new $plugin['class']($license, $group_name, $group_info);
+}
+
+/**
+ * Implements hook_field_access().
+ *
+ * Prevents the cl_billing_cycle field from showing up on the order edit form.
+ */
+function commerce_license_billing_field_access($op, $field, $entity_type, $entity, $account) {
+  if ($field['field_name'] == 'cl_billing_cycle' && $op == 'edit') {
+    return FALSE;
+  }
+
+  return TRUE;
+}
+
+/**
+ * Ensures that the license product types have the required billing fields.
+ *
+ * Fields:
+ * - cl_billing_cycle_type: an entityreference field pointing to the
+ *   billing cycle type.
+ * - cl_billing_type: an options field for selecting prepaid or postpaid.
+ * - cl_schedule_changes: a multivalue options field for enabling change
+ *   scheduling.
+ *
+ * @param $types
+ *   An array of product type machine names.
+ */
+function commerce_license_billing_configure_product_types($types) {
+  $field = field_info_field('cl_billing_cycle_type');
+  if (empty($field)) {
+    $field = array(
+      'field_name' => 'cl_billing_cycle_type',
+      'type' => 'entityreference',
+      'cardinality' => 1,
+      'translatable' => 0,
+      'module' => 'entityreference',
+      'settings' => array(
+        'target_type' => 'cl_billing_cycle_type',
+        'handler' => 'base',
+      ),
+    );
+    field_create_field($field);
+  }
+  $existing = array();
+  if (!empty($field['bundles']['commerce_product'])) {
+    $existing = $field['bundles']['commerce_product'];
+  }
+  // Create instances on newly configured product types.
+  foreach (array_diff($types, $existing) as $new_bundle) {
+    $instance = field_info_instance('commerce_product', 'cl_billing_cycle_type', $new_bundle);
+    if (empty($instance)) {
+      $duration_instance = field_info_instance('commerce_product', 'commerce_license_duration', $new_bundle);
+      $instance = array(
+        'field_name' => 'cl_billing_cycle_type',
+        'entity_type' => 'commerce_product',
+        'bundle' => $new_bundle,
+        'label' => 'License billing cycle type',
+        'required' => FALSE,
+        'widget' => array(
+          'type' => 'options_select',
+          'module' => 'options',
+          // Make sure that this field is shown right after the duration field.
+          'weight' => $duration_instance['widget']['weight'] + 1,
+        ),
+      );
+      field_create_instance($instance);
+    }
+  }
+  // Remove instances from product types that can no longer have licenses.
+  foreach (array_diff($existing, $types) as $removed_bundle) {
+    $instance = field_info_instance('commerce_product', 'cl_billing_cycle_type', $removed_bundle);
+    field_delete_instance($instance, TRUE);
+  }
+
+  $field = field_info_field('cl_billing_type');
+  if (empty($field)) {
+    $field = array(
+      'field_name' => 'cl_billing_type',
+      'type' => 'list_text',
+      'cardinality' => 1,
+      'translatable' => 0,
+      'module' => 'list',
+      'settings' => array(
+        'allowed_values' => array(
+          'prepaid' => 'Prepaid',
+          'postpaid' => 'Postpaid'
+        ),
+      ),
+    );
+    field_create_field($field);
+  }
+
+  $existing = array();
+  if (!empty($field['bundles']['commerce_product'])) {
+    $existing = $field['bundles']['commerce_product'];
+  }
+  // Create instances on newly configured product types.
+  foreach (array_diff($types, $existing) as $new_bundle) {
+    $instance = field_info_instance('commerce_product', 'cl_billing_type', $new_bundle);
+    if (empty($instance)) {
+      $duration_instance = field_info_instance('commerce_product', 'commerce_license_duration', $new_bundle);
+      $instance = array(
+        'field_name' => 'cl_billing_type',
+        'entity_type' => 'commerce_product',
+        'bundle' => $new_bundle,
+        'label' => 'License billing type',
+        'required' => TRUE,
+        'default_value' => array(
+          array('value' => 'prepaid'),
+        ),
+        'widget' => array(
+          'type' => 'options_buttons',
+          'module' => 'options',
+          // Make sure that this field is shown right after the billing cycle type.
+          'weight' => $duration_instance['widget']['weight'] + 2,
+        ),
+      );
+      field_create_instance($instance);
+    }
+  }
+  // Remove instances from product types that can no longer have licenses.
+  foreach (array_diff($existing, $types) as $removed_bundle) {
+    $instance = field_info_instance('commerce_product', 'cl_billing_type', $removed_bundle);
+    field_delete_instance($instance, TRUE);
+  }
+
+  $field = field_info_field('cl_schedule_changes');
+  if (empty($field)) {
+    $field = array(
+      'field_name' => 'cl_schedule_changes',
+      'type' => 'list_text',
+      'entity_type' => 'commerce_product',
+      'cardinality' => -1,
+      'translatable' => 0,
+      'module' => 'list',
+      'locked' => TRUE,
+      'settings' => array(
+        'allowed_values_function' => 'commerce_license_billing_allowed_schedule_values',
+      ),
+    );
+    field_create_field($field);
+  }
+
+  $existing = array();
+  if (!empty($field['bundles']['commerce_product'])) {
+    $existing = $field['bundles']['commerce_product'];
+  }
+  // Create instances on newly configured product types.
+  foreach (array_diff($types, $existing) as $new_bundle) {
+    $instance = field_info_instance('commerce_product', 'cl_schedule_changes', $new_bundle);
+    if (empty($instance)) {
+      $duration_instance = field_info_instance('commerce_product', 'commerce_license_duration', $new_bundle);
+      $instance = array(
+        'field_name' => 'cl_schedule_changes',
+        'entity_type' => 'commerce_product',
+        'bundle' => $new_bundle,
+        'label' => 'Postpone license changes',
+        'required' => FALSE,
+        'widget' => array(
+          'type' => 'options_buttons',
+          'module' => 'options',
+          'weight' => $duration_instance['widget']['weight'] + 3,
+        ),
+      );
+      field_create_instance($instance);
+    }
+  }
+  // Remove instances from product types that can no longer have licenses.
+  foreach (array_diff($existing, $types) as $removed_bundle) {
+    $instance = field_info_instance('commerce_product', 'cl_schedule_changes', $removed_bundle);
+    field_delete_instance($instance, TRUE);
+  }
+}
+
+/**
+ * Allowed values callback for the cl_schedule_changes field.
+ */
+function commerce_license_billing_allowed_schedule_values($field, $instance, $entity_type, $entity) {
+  return array(
+    'product' => t('Postpone plan changes to the end of the billing cycle.'),
+    'status' => t('Postpone status changes to the end of the billing cycle.'),
+  );
+}
+
+/**
+ * Ensures that the recurring line item type has the required fields.
+ *
+ * Fields:
+ * - cl_billing_start: a datetime field.
+ * - cl_billing_end: a datetime field.
+ * - cl_billing_license: an entityreference field pointing to the license
+ *   for which the line item was generated.
+ */
+function commerce_license_billing_configure_line_item_type() {
+  if (!$line_item_type = commerce_line_item_type_load('recurring')) {
+    return;
+  }
+  // Make sure Commerce has created all of its required fields.
+  commerce_line_item_configure_line_item_type($line_item_type);
+
+  $field = field_info_field('cl_billing_start');
+  if (empty($field)) {
+    $field = array(
+      'field_name' => 'cl_billing_start',
+      'type' => 'datetime',
+      'cardinality' => 1,
+      'translatable' => 0,
+      'module' => 'date',
+      'settings' => array(
+        'tz_handling' => 'none',
+      ),
+    );
+    field_create_field($field);
+  }
+  $instance = field_info_instance('commerce_line_item', 'cl_billing_start', 'recurring');
+  if (empty($instance)) {
+    $instance = array(
+      'field_name' => 'cl_billing_start',
+      'entity_type' => 'commerce_line_item',
+      'bundle' => 'recurring',
+      'label' => 'Billing cycle start',
+      'required' => TRUE,
+      'widget' => array(
+        'type' => 'date_select',
+        'module' => 'date',
+      ),
+    );
+    field_create_instance($instance);
+  }
+
+  $field = field_info_field('cl_billing_end');
+  if (empty($field)) {
+    $field = array(
+      'field_name' => 'cl_billing_end',
+      'type' => 'datetime',
+      'cardinality' => 1,
+      'translatable' => 0,
+      'module' => 'date',
+      'settings' => array(
+        'tz_handling' => 'none',
+      ),
+    );
+    field_create_field($field);
+  }
+  $instance = field_info_instance('commerce_line_item', 'cl_billing_end', 'recurring');
+  if (empty($instance)) {
+    $instance = array(
+      'field_name' => 'cl_billing_end',
+      'entity_type' => 'commerce_line_item',
+      'bundle' => 'recurring',
+      'label' => 'Billing cycle end',
+      'required' => TRUE,
+      'widget' => array(
+        'type' => 'date_select',
+        'module' => 'date',
+      ),
+    );
+    field_create_instance($instance);
+  }
+
+  $field = field_info_field('cl_billing_license');
+  if (!$field) {
+    $field = array(
+      'settings' => array(
+        'handler' => 'base',
+        'target_type' => 'commerce_license',
+      ),
+      'field_name' => 'cl_billing_license',
+      'type' => 'entityreference',
+    );
+    field_create_field($field);
+  }
+  $instance = field_info_instance('commerce_line_item', 'cl_billing_license', 'recurring');
+  if (empty($instance)) {
+    $instance = array(
+      'field_name' => 'cl_billing_license',
+      'entity_type' => 'commerce_line_item',
+      'bundle' => 'recurring',
+      'label' => 'License',
+      'required' => TRUE,
+    );
+
+    field_create_instance($instance);
+  }
+}
+
+/**
+ * Ensures that the recurring order type has the required fields.
+ *
+ * Fields:
+ * - cl_billing_cycle: an entityreference field pointing to a
+ *   billing cycle.
+ */
+function commerce_license_billing_configure_order_type() {
+  // Make sure Commerce has created all of its required fields.
+  commerce_order_configure_order_type('recurring');
+
+  $field = field_info_field('cl_billing_cycle');
+  if (empty($field)) {
+    $field = array(
+      'field_name' => 'cl_billing_cycle',
+      'type' => 'entityreference',
+      'cardinality' => 1,
+      'translatable' => 0,
+      'module' => 'entityreference',
+      'settings' => array(
+        'target_type' => 'cl_billing_cycle',
+        'handler' => 'base',
+      ),
+    );
+    field_create_field($field);
+  }
+  $instance = field_info_instance('commerce_order', 'cl_billing_cycle', 'recurring');
+  if (empty($instance)) {
+    $instance = array(
+      'field_name' => 'cl_billing_cycle',
+      'entity_type' => 'commerce_order',
+      'bundle' => 'recurring',
+      'label' => 'Billing cycle',
+      'required' => TRUE,
+      'widget' => array(
+        'type' => 'options_select',
+        'module' => 'options',
+      ),
+    );
+    field_create_instance($instance);
+  }
+}
+
+/**
+ * Implements hook_field_widget_form_alter().
+ */
+function commerce_license_billing_field_widget_form_alter(&$element, &$form_state, $context) {
+  // Hide the fields if no billing cycle type was selected.
+  $fields = array('cl_billing_type', 'cl_schedule_changes');
+  if (in_array($context['field']['field_name'], $fields)) {
+    // Build the path to the widget, taking into account all field parents.
+    // This ensures that #states work for embedded forms such as the IEF one.
+    $parents = $element['#field_parents'];
+    $parents[] = 'cl_billing_cycle_type';
+    $parents[] = $element['#language'];
+    $name = '';
+    foreach ($parents as $name_part) {
+      if (empty($name)) {
+        $name = $name_part;
+      }
+      else {
+        $name .= '[' . $name_part . ']';
+      }
+    }
+
+    $element['#states']['visible'] = array(
+      ':input[name="' . $name . '"]' => array('!value' => '_none'),
+    );
+  }
+
+  // Hide the cl_schedule_changes field if cl_billing_type is 'prepaid'.
+  if ($context['field']['field_name'] == 'cl_schedule_changes') {
+    $parents = $element['#field_parents'];
+    $parents[] = 'cl_billing_type';
+    $parents[] = $element['#language'];
+    $name = '';
+    foreach ($parents as $name_part) {
+      if (empty($name)) {
+        $name = $name_part;
+      }
+      else {
+        $name .= '[' . $name_part . ']';
+      }
+    }
+
+    $element['#states']['visible'] += array(
+      ':input[name="' . $name . '"]' => array('!value' => 'prepaid'),
+    );
+  }
+}
+
+/**
+ * Implements hook_theme().
+ */
+function commerce_license_billing_theme() {
+  return array(
+    'commerce_license_billing_estimate' => array(
+      'variables' => array(
+        'estimation' => NULL,
+      ),
+      'file' => 'theme/commerce_license_billing.theme.inc',
+    ),
+  );
+}

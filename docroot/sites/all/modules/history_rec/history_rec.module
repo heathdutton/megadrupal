@@ -1,0 +1,217 @@
+<?php
+
+
+/**
+ * Implements hook_help().
+ */
+function history_rec_help($path, $args) {
+  $output = '';
+  switch ($path) {
+    case 'admin/help#history_rec':
+    case RECOMMENDER_ADMIN_PATH .'/history_rec':
+      $output = '<p>'.  t("This module generates node recommendations based on user browsing history") .'</p>';
+      break;
+  }
+  return $output;
+}
+
+
+/**
+ * Implements hook_menu().
+ */
+function history_rec_menu() {
+  $items = array();
+  $items[RECOMMENDER_ADMIN_PATH .'/history_rec'] = array(
+    'type' => MENU_LOCAL_TASK,
+    'title' => 'Browsing History Recommender',
+    'description' => t('Configure the Browsing History Recommender'),
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('history_rec_settings_form'),
+    'access arguments' => array('administer recommender'),
+  );
+  return $items;
+}
+
+
+/**
+ * Implements hook_views_api().
+ */
+function history_rec_views_api() {
+  return array(
+    'api' => 3,
+  );
+}
+
+/**
+ * Implements hook_recommender_data().
+ */
+function history_rec_recommender_data() {
+  return array(
+    'history_rec_default' => array(
+      'title' => t('Browsing History Recommender'),
+      'description' => t('Run recommender on users browsing history using the item-item algorithm.'),
+      'algorithm' => 'item2item_boolean',
+      'data structure' => array(
+        'preference' => array(
+          'type' => 'table',
+          'name' => 'history_rec_data',
+          'user field' => 'euid',
+          'item field' => 'nid',
+          'score field' => 'score',
+          'score type' => 'boolean',
+          'timestamp field' => 'updated',
+        ),
+        'item similarity' => array(
+          'type' => 'table',
+          'name' => 'history_rec_item_similarity', // using the default table structure, no need to specify more.
+        ),
+        'prediction' => array(
+          'type' => 'table',
+          'name' => 'history_rec_prediction', // using the default table structure, no need to specify more.
+        ),
+        'item entity type' => 'node',
+      ),
+      'options' => array(
+        'prediction skip invalid uid' => TRUE,
+      ),
+      'form elements callback' => 'history_rec_extra_options',
+      'cron callback' => 'history_rec_update_data',
+    ),
+  );
+}
+
+
+function history_rec_extra_options() {
+  $count = db_query("SELECT COUNT(*) FROM {history_rec_data}")->fetchField();
+  if ($count < 5) {
+    drupal_set_message(t('Not enough user browsing history data to compute recommendations. Please wait for the next CRON cycle to pump users browsing history data into the engine before computing recommendations.'), 'warning');
+  }
+
+  return array(
+    'max entities to keep' => array(
+      '#type' => 'select',
+      '#title' => t('How many to save?'),
+      '#description' => t('Specify the maximum number of similar nodes (per node) and recommendations (per user) to save back to the database.'),
+      '#options' => array(
+        5 => '5',
+        10 => '10',
+        15 => '15',
+        20 => '20',
+        30 => '30',
+        50 => '50',
+      ),
+      '#default_value' => 20,
+    ),
+  );
+}
+
+
+function history_rec_settings_form() {
+  $form = array();
+
+  $form['history_rec_source'] = array(
+    '#type' => 'radios',
+    '#title' => t('Where to get users browsing history?'),
+    //'#description' => t('The "history" table is included in Drupal by default. It tracks logged-in users\'s browsing history. The "accesslog" table is provided by the Statistics module in Drupal Core. It tracks anonymous users browsing history too.'),
+    '#default_value' => variable_get('history_rec_source', 'history'),
+    '#options' => array(
+      'history' => t('From the "history" table'),
+      'accesslog' => t('From the "accesslog" table'),
+    ),
+  );
+  $form['history_rec_source']['history']['#description'] = t('The "history" table is included in Drupal by default. It only tracks logged-in users\'s browsing history.');
+  $form['history_rec_source']['accesslog']['#description'] = t('The "accesslog" table is provided by the Statistics module in Drupal Core. It tracks anonymous users browsing history too.');
+
+  if (!module_exists('statistics')) {
+    $form['history_rec_source']['accesslog']['#disabled'] = TRUE;
+  }
+
+  $form['history_rec_allow_anonymous'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Track anonymous users browsing history?'),
+    '#description' => t('Enable this option results in better recommendations. Anonymous users will be distinguished by their IP addresses. Only valid when you select "accesslog" as the data source.'),
+    '#default_value' => variable_get('history_rec_allow_anonymous', FALSE),
+    '#states' => array(
+      'enabled' => array(
+        ':input[name="history_rec_source"]' => array('value' => 'accesslog'),
+      ),
+      'disabled' => array(
+        ':input[name="history_rec_source"]' => array('value' => 'history'),
+      ),
+    ),
+  );
+
+  return system_settings_form($form);
+}
+
+
+/**
+ * Archive users' browsing history data from the data source (either {history} or {accesslog}) into {history_rec_data}.
+ *
+ * @param $current timestamp to track how much data is updated in {history_rec_data}
+ */
+function history_rec_update_data($current) {
+  $previous = variable_get('history_rec_last_data_update', 0);
+
+  // update from {history}
+  if (variable_get('history_rec_source', 'history') == 'history') {
+    $rows = db_query("SELECT uid, nid, timestamp FROM {history} WHERE timestamp BETWEEN :prev AND :curr", array(':prev' => $previous, ':curr' => $current))->fetchAll();
+
+    foreach ($rows as $row) {
+      db_merge('history_rec_data')->key(array('euid' => $row->uid, 'nid' => $row->nid))
+        ->insertFields(array('euid' => $row->uid, 'nid' => $row->nid, 'score' => 1, 'updated' => $row->timestamp))
+        ->updateFields(array('updated' => $row->timestamp))->expression('score', 'score + :inc', array(':inc' => 1))
+        ->execute();
+    }
+  }
+
+  // update from {accesslog}
+  else if (variable_get('history_rec_source') == 'accesslog') {
+
+    // first, update user map if we track anonymous data.
+    if (variable_get('history_rec_allow_anonymous', FALSE)) {
+      $hostname_list = db_query("SELECT DISTINCT hostname from {accesslog} WHERE uid = 0 AND timestamp BETWEEN :prev AND :curr AND hostname NOT IN (SELECT hostname FROM {history_rec_ext_users})", array(':prev' => $previous, ':curr' => $current))->fetchCol();
+
+      $user_insert = db_insert('history_rec_ext_users')->fields(array('hostname', 'updated'));
+      foreach ($hostname_list as $hostname) {
+        $user_insert->values(array('hostname' => $hostname, 'updated' => $current));
+      }
+      $user_insert->execute();
+
+      // set euid to be the negative number of the auto increment ID. The negative number indicate that this user is an "extended" user, not really a logged in user.
+      db_query("UPDATE {history_rec_ext_users} SET euid = -id WHERE euid IS NULL");
+    }
+
+
+    // next, get data from {accesslog}, only logged-in user's data.
+    $rows = db_query("SELECT path, uid, timestamp FROM {accesslog} WHERE uid <> 0 AND path LIKE 'node/%' AND timestamp BETWEEN :prev AND :curr", array(':prev' => $previous, ':curr' => $current))->fetchAll();
+
+    foreach ($rows as $row) {
+      $nid = substr($row->path, 5); // strip "node/"
+      if (!is_numeric($nid)) continue;  // skip the ones like node/21/edit
+
+      db_merge('history_rec_data')->key(array('euid' => $row->uid, 'nid' => $nid))
+        ->insertFields(array('euid' => $row->uid, 'nid' => $nid, 'score' => 1, 'updated' => $row->timestamp))
+        ->updateFields(array('updated' => $row->timestamp))->expression('score', 'score + :inc', array(':inc' => 1))
+        ->execute();
+    }
+
+
+    // finally, track anonymous user's data if enabled.
+    if (variable_get('history_rec_allow_anonymous', FALSE)) {
+      $rows = db_query("SELECT a.path, u.euid AS uid, a.timestamp FROM {accesslog} a INNER JOIN {history_rec_ext_users} u ON a.hostname = u.hostname WHERE uid = 0 AND path LIKE 'node/%' AND timestamp BETWEEN :prev AND :curr", array(':prev' => $previous, ':curr' => $current))->fetchAll();
+
+      foreach ($rows as $row) {
+        $nid = substr($row->path, 5); // strip "node/"
+        if (!is_numeric($nid)) continue;  // skip the ones like node/21/edit
+
+        db_merge('history_rec_data')->key(array('euid' => $row->uid, 'nid' => $nid))
+          ->insertFields(array('euid' => $row->uid, 'nid' => $nid, 'score' => 1, 'updated' => $row->timestamp))
+          ->updateFields(array('updated' => $row->timestamp))->expression('score', 'score + :inc', array(':inc' => 1))
+          ->execute();
+      }
+    }
+  }
+
+  variable_set('history_rec_last_data_update', $current);
+}

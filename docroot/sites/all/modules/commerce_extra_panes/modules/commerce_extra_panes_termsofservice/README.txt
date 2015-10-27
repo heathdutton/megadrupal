@@ -1,0 +1,3 @@
+Submodule of Drupal Commerce Extra checkout panes that provides a Terms of Service checkbox in the checkout form phase.
+-- Install--
+Just enable this module after the Drupal Commerce Extra Checkout Panes and go to the Checkout Settings, configure the pane or panes that you want to be the terms of service and select "Enable this pane as Terms of Service" in the settings, you can also make it required.

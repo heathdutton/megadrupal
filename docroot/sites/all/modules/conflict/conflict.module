@@ -1,0 +1,236 @@
+<?php
+
+/**
+ * @file
+ * Fieldwise conflict prevention and resolution.
+ * @author Brandon Bergren
+ */
+
+/**
+ * @todo
+ *   - Figure out what to do about dependencies between fields?
+ *   - Come up with a cleaner way to compare fields than the current hashing.
+ *   - Figure out a way to inform the user as to what the other side of the
+ *     conflict is?
+ *   - Handle things that aren't fields?
+ *   - Handle non-nodes?
+ */
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function conflict_form_node_form_alter(&$form, &$form_state) {
+  // Force caching enabled so the original $form['node'] survives multiple page
+  // requests.
+  if (variable_get('conflict_enable_' . $form['#node']->type, FALSE)) {
+    $form_state['cache'] = TRUE;
+  }
+
+  // Highlight conflict or expired fields.
+  if (!empty($form_state['temporary']['conflict_fields'])) {
+    foreach ($form_state['temporary']['conflict_fields'] as $field_name) {
+      _conflict_apply_error($form[$field_name]);
+    }
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function conflict_form_node_type_form_alter(&$form, &$form_state) {
+  $form['submission']['conflict_enable'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Conflict resolution'),
+    '#description' => t('Enable field conflict resolution for this content type'),
+    '#default_value' => variable_get('conflict_enable_' . $form['#node_type']->type, FALSE),
+  );
+}
+
+/**
+ * Implements hook_node_validate().
+ */
+function conflict_node_validate($node, &$form, &$form_state) {
+  if (isset($node->nid) && (node_last_changed($node->nid) > $node->changed) && variable_get('conflict_enable_' . $node->type, FALSE)) {
+    // We only support nodes for now.
+    $entity_type = 'node';
+
+    // Bypass the core conflict detector.
+    $errors = &drupal_static('form_set_error', array());
+    if (!empty($errors['changed'])) {
+      unset($errors['changed']);
+      // Remove the message as well.
+      foreach ($_SESSION['messages']['error'] as $k => $v) {
+        if ($v == t('The content on this page has either been modified by another user, or you have already submitted modifications using this form. As a result, your changes cannot be saved.')) {
+          unset($_SESSION['messages']['error'][$k]);
+          $_SESSION['messages']['error'] = array_values($_SESSION['messages']['error']);
+        }
+        if (empty($_SESSION['messages']['error'])) {
+          unset($_SESSION['messages']['error']);
+        }
+      }
+    }
+
+    $nodes = array();
+    // Base node: The common ancestor that was cached when beginning the node
+    // edit.
+    $nodes['base'] = clone($form_state['node']);
+    // Theirs: The current state of the node, with the changes that happened in
+    // parallel.
+    $nodes['theirs'] = clone(node_load($node->nid, NULL, TRUE));
+    // This workaround is done because the $node object in this hook does not
+    // have processed fields and would be innconsistent during comparison.
+    _field_invoke_multiple('load', 'node', array($nodes['theirs']->nid => $nodes['theirs']));
+    // Mine: The node that was about to be saved.
+    $tmp_form_state = $form_state;
+    $nodes['mine'] = node_form_submit_build_node($form, $tmp_form_state);
+    _field_invoke_multiple('load', 'node', array($nodes['mine']->nid => $nodes['mine']));
+    // Store fields names to highlight them after form rebuild.
+    $error_fields = array();
+
+    // Dig through the fields looking for conflicts.
+    $updated = FALSE;
+    $remote_changes = _conflict_get_node_changes($nodes['base'], $nodes['theirs']);
+    if (!empty($remote_changes)) {
+      $local_changes = _conflict_get_node_changes($nodes['mine'], $nodes['base']);
+      $real_changes = _conflict_get_node_changes($nodes['mine'], $nodes['theirs']);
+      $conflicted_fields = array_intersect($local_changes, $remote_changes, $real_changes);
+      $changed_fields = array_diff($remote_changes, array_intersect($local_changes, $remote_changes));
+      foreach ($conflicted_fields as $field_name => $field_title) {
+        drupal_set_message(t('The @label field was changed by another user while you were editing it. Save again to overwrite it.', array('@label' => $field_title)), 'error');
+        $updated = TRUE;
+        $error_fields[] = $field_name;
+      }
+      foreach ($changed_fields as $field_name => $field_title) {
+        // Forget the user-submitted value.
+        unset($form_state['input'][$field_name]);
+        drupal_set_message(t('The @label field was changed by another user. Please verify the updated value.', array('@label' => $field_title)), 'warning');
+        $updated = TRUE;
+        $error_fields[] = $field_name;
+      }
+    }
+
+    if ($updated) {
+      // Reload the node to pick up the updated data.
+      $node = clone($nodes['theirs']);
+      node_object_prepare($node);
+      $form_state['node'] = $node;
+      $form_state['rebuild'] = TRUE;
+      $form_state['temporary']['conflict_fields'] = $error_fields;
+    }
+  }
+}
+
+/**
+ * Iterate all elements children recursively and set error class.
+ *
+ * @param array $elements
+ */
+function _conflict_apply_error(&$elements) {
+  // Iterate through all children.
+  foreach (element_children($elements) as $key) {
+    if (isset($elements[$key]) && $elements[$key]) {
+      _conflict_apply_error($elements[$key]);
+    }
+  }
+  // If there are properties, it's probably safe to set #attributes here.
+  // Ignore container elements, because 'error' class adds a weird style there.
+  $element_properties = element_properties($elements);
+  if (!empty($element_properties) && (isset($elements['#type']) && $elements['#type'] != 'container')) {
+    $elements['#attributes']['class'][] = 'error';
+  }
+}
+
+/**
+ * Helper function. Get differences between two nodes.
+ */
+function _conflict_get_node_changes($node, $unchanged) {
+  $items = array();
+
+  $bundle = field_extract_bundle('node', $node);
+  $instances = field_info_instances('node', $bundle);
+  $properties = array(
+    'title' => array(
+      'field_name' => 'title',
+      'label' => t('Title')
+    ),
+    'created' => array(
+      'field_name' => 'date',
+      'label' => t('Authored on date'),
+    ),
+    'uid' => array(
+      'field_name' => 'name',
+      'label' => t('Authored by'),
+    )
+  );
+
+  foreach ($properties as $property => $property_value) {
+    $same = $node->$property == $unchanged->$property;
+    if (!$same) {
+      $items[$property_value['field_name']] = $property_value['label'];
+    }
+  }
+
+  foreach (field_info_instances('node', $node->type) as $field_name => $instance) {
+    $field = field_info_field($field_name);
+    $field_language = field_language('node', $node, $field_name);
+    $old_value = empty($unchanged->{$field_name}[$field_language]) ? NULL : $unchanged->{$field_name}[$field_language];
+    if (!empty($old_value) && $field['type'] == 'taxonomy_term_reference') {
+      // Thanks to core being inconsistent, $node->original only contains
+      // taxonomy term IDs (tids) for term reference fields, whereas $node
+      // itself contains everything (tid, name, description, etc). We need to
+      // store the full data as part of the nodechanges field here, since when
+      // it comes time to display, if a term has since been removed from the
+      // system, we can no longer load it at that point. So, we load
+      // everything here to make sure we've got it all for now and forever.
+      $tids = array();
+      foreach ($old_value as $key => $value) {
+        if (empty($value['tid'])) {
+          unset($old_value[$key]);
+        }
+        else {
+          $tids[] = $value['tid'];
+        }
+      }
+      if (!empty($tids)) {
+        $terms = taxonomy_term_load_multiple($tids);
+        foreach ($old_value as $key => $value) {
+          $tid = $value['tid'];
+          if (!empty($terms[$tid])) {
+            $old_value[$key] = (array)$terms[$tid];
+          }
+        }
+      }
+    }
+    $new_value = empty($node->{$field_name}[$field_language]) ? NULL : $node->{$field_name}[$field_language];
+    if (!empty($new_value) && $field['type'] == 'image') {
+      // uri is required to show image, see theme_image_formatter(), but does
+      // not exist in new value of image field.
+      foreach ($new_value as $key => $value) {
+        $new_value[$key]['uri'] = file_load($value['fid'])->uri;
+      }
+    }
+    $same = empty($old_value) == empty($new_value);
+    if ($same && !empty($old_value)) {
+      $old_deltas = array_keys($old_value);
+      $new_deltas = array_keys($new_value);
+      $same = !array_diff($old_deltas, $new_deltas) && !array_diff($new_deltas, $old_deltas);
+      if ($same) {
+        $columns = array_keys($field['columns']);
+        foreach ($old_value as $delta => $old_items) {
+          foreach ($columns as $column) {
+            $set = isset($old_items[$column]);
+            if (($set != isset($new_value[$delta][$column])) || ($set && $old_items[$column] != $new_value[$delta][$column])) {
+              $same = FALSE;
+              break;
+            }
+          }
+        }
+      }
+    }
+    if (!$same) {
+      $items[$field_name] = $instances[$field_name]['label'];
+    }
+  }
+
+  return $items;
+}
