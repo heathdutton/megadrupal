@@ -1,0 +1,641 @@
+<?php
+
+/**
+ * @file
+ * Main hooks for anonymous publishing cl module.
+ */
+
+module_load_include('inc', 'anonymous_publishing_cl', 'anonymous_publishing_cl.admin');
+
+/**
+ * Implements hook_help().
+ */
+function anonymous_publishing_cl_help($path, $arg) {
+  switch ($path) {
+    case 'admin/help#anonymous_publishing_cl':
+      $output = t('<p>This submodule of <strong>Anonymous publishing</strong> lets users publish content without first registering an account at the site, but in a manner that affords some protection against spam.</p><p>Just enabling the module does nothing. You also need to enable anonymous publishing for at least one node type.  If you want visitors to be able to create content without registering, you also need to grant the the anonymous user role the permission to &#8220;Create new content&#8220; for at least one node type .  To do this, go to <a title="Set permissions for anonymous." href="@url">Administration » People » Permissions</a> for the node module.</p>',
+        array('@url' => url('admin/people/permissions', array('fragment' => 'module-node'))));
+      $output .= anonymous_publishing_ah_hint();
+      return $output;
+  }
+}
+
+/**
+ * Check if the content type can be published anonymously.
+ *
+ * @param string $type
+ *   The content type to check.
+ *
+ * @return bool
+ *   TRUE if the content type can be published anonymously,
+ *   FALSE otherwise.
+ */
+function anonymous_publishing_cl_content_type_allowed($type) {
+  $types = variable_get('anonymous_publishing_cl_types', array());
+  return !empty($types[$type]);
+}
+
+/**
+ * Class wrapper for honeyfield.
+ *
+ * This will wrap the field in a div so it can be hidden with CSS.
+ * The wrapper class name is deliberately misleading.
+ * The wrapper class need to be set to display_none in css.
+ */
+function _anonymous_publishing_honeyfield_cl_post_render($content, $element) {
+  return '<div class="edit-email-confirm-wrapper">' . $content . '</div>';
+}
+
+/**
+ * Implements a custom submit form for nodes.
+ */
+function anonymous_publishing_cl_node_form_submit($form, &$form_state) {
+  $emailusedtoactivate = $form_state['node']->anonymous_publishing['email'];
+  if (user_is_logged_in() || !isset($emailusedtoactivate)) {
+    // No need to manage insertion of this content.
+    return;
+  }
+
+  $nid = $form_state['nid'];
+  $node = $form_state['node'];
+
+  if ($form_state['node']->status) {
+    db_insert('anonymous_publishing')
+      ->fields(array(
+        'nid' => $nid,
+        'cid' => 0,
+        'akey' => NULL,
+        'verified' => 1,
+        'email' => $emailusedtoactivate,
+        'ip' => ip_address(),
+      ))
+      ->execute();
+    return;
+  }
+
+  $options = variable_get('anonymous_publishing_cl_options', array());
+  $at = $options['sactivate'] ? 'A' : 'V';
+
+  $akey = $at . drupal_hmac_base64(mt_rand(), drupal_get_hash_salt());
+  db_insert('anonymous_publishing')
+    ->fields(array(
+      'nid' => $nid,
+      'cid' => 0,
+      'akey' => $akey,
+      'verified' => 0,
+      'email' => $emailusedtoactivate,
+      'ip' => ip_address(),
+    ))
+    ->execute();
+  _anonymous_publishing_send_email($node, $akey);
+}
+
+/**
+ * Helper function to handle anonymous comment submits.
+ */
+function _anonymous_publishing_cl_my_comment_insert($content) {
+  if (user_is_logged_in() || (!isset($content->anonymous_publishing['email']) && !isset($content->anonymous_publishing['options']))) {
+    // Nothing do to with this module.
+    return;
+  }
+
+  if (isset($content->anonymous_publishing['email'])) {
+    $comm = comment_load($content->cid);
+    $comm->uid = 0;
+    $comm->name = '';
+    $comm->mail = '';
+    comment_save($comm);
+  }
+
+  // Not logged in.
+  if ($content->status) {
+    $comm = comment_load($content->cid);
+    $comm->name = '';
+    if (user_access('skip comment approval')) {
+      $comm->status = COMMENT_PUBLISHED;
+    }
+    else {
+      $comm->status = COMMENT_NOT_PUBLISHED;
+    }
+    comment_save($comm);
+    db_insert('anonymous_publishing')
+      ->fields(array(
+        'nid' => $content->nid,
+        'cid' => $content->cid,
+        'akey' => NULL,
+        'verified' => 1,
+        'email' => $content->anonymous_publishing['email'],
+        'ip' => ip_address(),
+      ))
+      ->execute();
+    return;
+  }
+
+  $options = variable_get('anonymous_publishing_cl_options', array());
+
+  $at = $options['sactivate'] ? 'A' : 'V';
+  if (isset($content->anonymous_publishing['email'])) {
+    $emailusedtoactivate = $content->anonymous_publishing['email'];
+    $akey = $at . drupal_hmac_base64(mt_rand(), drupal_get_hash_salt());
+  }
+  if (user_is_anonymous() && 0 == $content->status) {
+    _anonymous_publishing_send_email($content, $akey);
+  }
+
+  db_insert('anonymous_publishing')
+    ->fields(array(
+      'nid' => $content->nid,
+      'cid' => $content->cid,
+      'akey' => $akey,
+      'verified' => 0,
+      'email' => $emailusedtoactivate,
+      'ip' => ip_address(),
+    ))
+    ->execute();
+}
+
+/**
+ * Implements a custom submit form for comments.
+ *
+ * Hacks the system messages generated when comments are posted.
+ * Needed because system messages for comments are confusing with the
+ * logic in this module. No need to hack messages for nodes.
+ */
+function anonymous_publishing_cl_comment_form_submit($form, &$form_state) {
+  if (user_is_logged_in()) {
+    return;
+  }
+  _anonymous_publishing_cl_my_comment_insert($form_state['comment']);
+  $mm = drupal_get_messages('status', TRUE);
+
+  $options = variable_get('anonymous_publishing_cl_options', array());
+  if (user_access('skip comment approval') && $options['sactivate']) {
+    $key = array_search(t('Your comment has been queued for review by site administrators and will be published after approval.'), $mm['status']);
+    if (FALSE !== $key) {
+      $mm['status'][$key] = t('Your comment will be published when you validate your e-mail address.');
+    }
+  }
+  elseif (!user_access('skip comment approval')) {
+    $key = array_search(t('Your comment has been posted.'), $mm['status']);
+    if (FALSE !== $key) {
+      $mm['status'][$key] = t('Your comment will be published after it has been approved by an administrator.');
+    }
+    $key = array_search(t('Your comment has been queued for review by site administrators and will be published after approval.'), $mm['status']);
+    if (FALSE !== $key) {
+      $mm['status'][$key] = t("Your comment will be published after you've confirmed your email and the comment has been approved by an administrator.");
+    }
+  }
+  else {
+    $key = array_search(t('Your comment has been queued for review by site administrators and will be published after approval.'), $mm['status']);
+    if (FALSE !== $key) {
+      $mm['status'][$key] = t("Your comment will be published after you've confirmed your email and the comment has been approved by an administrator.");
+    }
+  }
+
+  foreach ($mm['status'] as $msg) {
+    drupal_set_message($msg, 'status');
+  }
+}
+
+/**
+ * Helper function to make form alterations to input form.
+ *
+ * Changes form for any content type managed by anonymous publishing
+ * to add two additional fields. The field for the verification email
+ * address, and a bogus "email_confirm_field".
+ */
+function _anonymous_publishing_cl_alter_comment_or_node_form(&$form, &$form_state, $type, $entity_type) {
+  if (user_is_anonymous() && anonymous_publishing_cl_content_type_allowed($type)) {
+    $form['anonymous_publishing'] = array(
+      '#type' => 'fieldset',
+      '#collapsible' => TRUE,
+      '#tree' => TRUE,
+    );
+    $options = variable_get('anonymous_publishing_cl_options', array());
+    $selfactmsg = $options['sactivate'] ? '' : ' ' . t('and the content is approved by by an administrator');
+    $verifymsg = t('Your content will not appear on this site until your e-mail is verified!selfactmsg.', array('!selfactmsg' => $selfactmsg));
+    $form['anonymous_publishing']['#title'] = t('E-mail (your e-mail address will not be shown publicly)');
+    $form['anonymous_publishing']['#weight'] = (variable_get('anonymous_publishing_emailweight', 0));
+    $form['anonymous_publishing']['email'] = array(
+      '#type' => 'textfield',
+      '#title' => t('Verification e-mail address'),
+      '#description' => $verifymsg,
+      '#size' => 60,
+      '#maxlength' => EMAIL_MAX_LENGTH,
+      '#required' => TRUE,
+    );
+
+    if (isset($form['#node_edit_form'])) {
+      $form['actions']['submit']['#submit'][] = 'anonymous_publishing_cl_node_form_submit';
+    }
+    if ($type === 'comment') {
+      $form['#submit'][] = 'anonymous_publishing_cl_comment_form_submit';
+      $form['#validate'][] = 'anonymous_publishing_cl_comment_form_validate';
+      // We disable the author field in the comment form.
+      $form['author']['name']['#access'] = FALSE;
+    }
+
+    // Set default_value non-empty to simulate 'bot.
+    // The text for the #title field is not user facing, it's bait for the 'bot.
+    // It shall never be seen by humans. 'Bots look for English words like
+    // "e-mail", so it is better to leave this untranslated to make sure the
+    // 'bot bites the bait.
+    $form['email_confirm_field'] = array(
+      '#title' => 'Enter your e-mail address (not!):',
+      '#type' => 'textfield',
+      '#default_value' => '',
+      '#size' => 20,
+      '#name' => 'email_confirm_field',
+      '#description' => t('This field should not even be visible to humans.'),
+      '#post_render' => array('_anonymous_publishing_honeyfield_cl_post_render'),
+    );
+    $form['#attached'] = array(
+      'css' => array(
+        drupal_get_path('module', 'anonymous_publishing') . '/anonymous_publishing.css',
+      ),
+    );
+  }
+}
+
+
+/**
+ * Implements hook_form_BASE_FORM_ID_alter().
+ */
+function anonymous_publishing_cl_form_node_form_alter(&$form, &$form_state, $form_id) {
+  _anonymous_publishing_cl_alter_comment_or_node_form($form, $form_state, $form['#bundle'], 'node');
+}
+
+/**
+ * Implements hook_form_BASE_FORM_ID_alter().
+ */
+function anonymous_publishing_cl_form_comment_form_alter(&$form, &$form_state) {
+  _anonymous_publishing_cl_alter_comment_or_node_form($form, $form_state, 'comment', 'comment');
+}
+
+/**
+ * Implements hook_username_alter().
+ */
+function anonymous_publishing_cl_username_alter(&$name, $account) {
+  $options = variable_get('anonymous_publishing_cl_options', array());
+  if (isset($account->comment_body) || isset($account->body) && isset($options['atalias']) && $options['atalias'] &&  !$account->uid) {
+    if (isset($account->comment_body) && $account->cid) {
+      $amail = db_query("SELECT email FROM {anonymous_publishing} WHERE cid = :cid", array(':cid' => $account->cid))->fetchField();
+    }
+    elseif (isset($account->body) && $account->nid) {
+      $amail = db_query("SELECT email FROM {anonymous_publishing} WHERE nid = :nid", array(':nid' => $account->nid))->fetchField();
+    }
+    else {
+      $amail = '';
+    }
+    $alias = db_query("SELECT alias FROM {anonymous_publishing_emails} WHERE email = :email", array(':email' => $amail))->fetchField();
+    if (!empty($alias)) {
+      $name = $alias;
+    }
+  }
+}
+
+/**
+ * Content submission and verification.
+ */
+
+/**
+ * Page callback: Activate a node or comment published anonymously.
+ *
+ * This is the page callback for the link sent to the user by email
+ * to activate the node.
+ */
+function anonymous_publishing_cl_verify($nn) {
+  if (isset($_GET['akey'])) {
+    $akey = $_GET['akey'];
+  }
+  else {
+    drupal_set_message(t('No activation key present.'));
+    drupal_goto();
+  }
+
+  // Do the key exist?
+  $result1 = db_query("SELECT nid, cid, akey, verified, email FROM {anonymous_publishing} WHERE akey = :akey", array(':akey' => $akey))->fetchAssoc();
+  $nid = $result1['nid'];
+  $cid = $result1['cid'];
+  $rkey  = $result1['akey'];
+  $vfied = $result1['verified'];
+  $email = $result1['email'];
+  $at = $akey[0];
+
+  if ($akey != $rkey) {
+    drupal_set_message(t('Invalid activation key.'), 'error');
+    drupal_goto();
+  }
+
+  if ($vfied) {
+    drupal_set_message(t('Stale activation key.'), 'error');
+    drupal_goto();
+  }
+
+  $found = FALSE;
+  $result = db_query("SELECT email, blocked FROM {anonymous_publishing_emails} WHERE email = :email", array(':email' => $email));
+  if ($result) {
+    $row = $result->fetchAssoc();
+    $found = $row['email'];
+  }
+  if ($found) {
+    if ($row['blocked']) {
+      // Hand-moderate if already blocked.
+      $at = 'V';
+    }
+  }
+  else {
+    $ip  = ip_address();
+    $now = date('Y-m-d');
+    $auid = db_insert('anonymous_publishing_emails')
+      ->fields(array(
+      'email' => $email,
+      'ipaddress' => $ip,
+      'firstseen' => $now,
+      'lastseen'  => $now,
+    ))
+    ->execute();
+    $alias = 'user' . $auid;
+    db_update('anonymous_publishing_emails')
+      ->fields(array(
+      'alias' => $alias,
+    ))
+    ->condition('auid', $auid, '=')
+    ->execute();
+  }
+
+  db_update('anonymous_publishing')
+    ->fields(array(
+    'verified' => 1,
+  ))
+  ->condition('akey', $akey, '=')
+  ->execute();
+
+  $vfymsg = t('Thanks for verifying your e-mail,');
+  if ('V' == $at) {
+    drupal_set_message($vfymsg . ' ' . t('your content will be published when it has been approved by an administrator.'));
+    drupal_goto();
+  }
+  else {
+    // Activate (unless comment moderation).
+    if ($cid &&  user_access('skip comment approval')) {
+      $comm_obj = comment_load($cid, TRUE);
+      comment_publish_action($comm_obj);
+      comment_save($comm_obj);
+      drupal_set_message($vfymsg . ' ' . t('your comment has been published and will appear on the site soon.'));
+      drupal_goto('comment/' . $cid, array('fragment' => 'comment-' . $cid));
+    }
+    elseif ($cid) {
+      drupal_set_message($vfymsg . ' ' . t('your comment will be published when it has been approved by an administrator.'));
+      drupal_goto();
+    }
+    else {
+      $node_obj = node_load($nid, NULL, TRUE);
+      node_publish_action($node_obj);
+      node_save($node_obj);
+      drupal_set_message($vfymsg . ' ' . t('your content has been published and will appear on the site soon.'));
+      if (node_access('view', $node_obj)) {
+        drupal_goto('node/' . $nid . '/view');
+      }
+    }
+  }
+
+}
+
+/**
+ * Helper function to check whether we need to process it.
+ *
+ * Is this content something amonymous publishing should handle?
+ *
+ * @return bool
+ *   TRUE if content should be handled, else FALSE.
+ */
+function _anonymous_publishing_relevantp($content, $nodep) {
+  if (user_is_logged_in()) {
+    return FALSE;
+  }
+  if ($nodep) {
+    $isrelevantp = isset($content->anonymous_publishing['email']);
+  }
+  else {
+    $isrelevantp = isset($content['anonymous_publishing']['email']);
+  }
+  return $isrelevantp;
+}
+
+/**
+ * Common validation of submission form for nodes and comments.
+ *
+ * Only called when content is first posted (not when it it is
+ * activated via link).
+ *
+ * @param mixed $content
+ *   The content (array or object).
+ *
+ * @return bool
+ *   TRUE if the form validates, FALSE otherwise.
+ */
+function _anonymous_publishing_cl_content_validate($content) {
+  // Node contents is object. comment conent is array.
+  $nodep = 'object' == gettype($content);
+  $isrelevantp = _anonymous_publishing_relevantp($content, $nodep);
+  if (!$isrelevantp) {
+    return TRUE;
+  }
+
+  // Extract email confirm field.
+  if ($nodep) {
+    $ecfld = $content->email_confirm_field;
+    $email = check_plain($content->anonymous_publishing['email']);
+  }
+  else {
+    $ecfld = $content['email_confirm_field'];
+    $email = check_plain($content['anonymous_publishing']['email']);
+  }
+
+  if (!empty($ecfld)) {
+    drupal_set_message(t("I smell a 'bot.  Please log in to post."), 'status');
+    watchdog('anonymous_publishing', 'Bot with email "@email".', array('@email' => $email));
+
+    $id = db_query("SELECT id FROM {anonymous_publishing_bots} WHERE ip = :ip", array(':ip' => ip_address()))->fetchField();
+    if ($id) {
+      db_update('anonymous_publishing_bots')
+        ->fields(array(
+          'last'  => REQUEST_TIME,
+        ))
+        ->expression('visits', 'visits + 1')
+        ->condition('id', $id)
+        ->execute();
+    }
+    else {
+      db_insert('anonymous_publishing_bots')
+        ->fields(array(
+        'ip' => ip_address(),
+        'visits' => 1,
+        'first' => REQUEST_TIME,
+        'last'  => REQUEST_TIME,
+      ))
+      ->execute();
+    }
+    drupal_goto('<front>');
+    return FALSE;
+  }
+
+  $cntid = $nodep ? $content->nid : $content['cid'];
+  if (empty($cntid) && user_is_anonymous()) {
+    if (!isset($email)) {
+      form_set_error('anonymous_publishing][email', t('No e-mail-field. (This should not happen.)'));
+      return FALSE;
+    }
+    if (user_validate_mail($email)) {
+      form_set_error('anonymous_publishing][email', t('Please type in a valid e-mail address.'));
+      return FALSE;
+    }
+    $options = variable_get('anonymous_publishing_cl_options', array());
+    if (db_query("SELECT COUNT(*) FROM {users} WHERE mail = :email", array(':email' => $email))->fetchField()) {
+      if (!$options['aregist']) {
+        form_set_error('anonymous_publishing][email', t('This e-mail is already in use.  If this is you, please log in to post.'));
+        return FALSE;
+      }
+    }
+
+    $ip = ip_address();
+    $sql1 = "SELECT auid, email, ipaddress, blocked FROM {anonymous_publishing_emails} WHERE email = :email";
+    $parameters = array(':email' => $email);
+    if ($options['blockip']) {
+      $sql1 .= " OR ipaddress = :ip";
+      $parameters[':ip'] = $ip;
+    }
+    $result = db_query($sql1, $parameters);
+    $nmrows = $result->rowCount();
+
+    // Block if at least one record indicate that this should be blocked.
+    $blocked = 0;
+    $now = date('Y-m-d');
+    if ($nmrows) {
+      foreach ($result as $record) {
+        $auid = $record->auid;
+        $blocked += $record->blocked;
+        db_update('anonymous_publishing_emails')
+        ->fields(array(
+          'lastseen' => $now,
+        ))
+        ->condition('auid', $auid)
+        ->execute();
+      }
+    }
+    else {
+      $flood = variable_get('anonymous_publishing_flood');
+      $flooded = FALSE;
+      if (flood_is_allowed('anonymous_publishing_ip', $flood, 3600)) {
+        flood_register_event('anonymous_publishing_ip', 3600);
+        if (flood_is_allowed('anonymous_publishing_em', $flood, 3600, $email)) {
+          flood_register_event('anonymous_publishing_em', 3600, $email);
+        }
+        else {
+          $flooded = TRUE;
+        }
+      }
+      else {
+        $flooded = TRUE;
+      }
+
+      if ($flooded) {
+        form_set_error('anonymous_publishing][email',
+          t('This website only allows @flood postings of content from non-registered users within one hour.  This restriction may be lifted if you register.',
+            array('@flood' => $flood)));
+        return FALSE;
+      }
+
+      return FALSE;
+    }
+
+    if ($blocked) {
+      form_set_error('anonymous_publishing][email', t('This e-mail/ip-address is banned from posting content on this site.  Please contact the site administrator if you believe this is an error.'));
+      return FALSE;
+    }
+  }
+  return TRUE;
+}
+//==============================================================================
+/**
+ * Callback for comment_form_validate.
+ */
+function anonymous_publishing_cl_comment_form_validate($form, $form_state) {
+  _anonymous_publishing_cl_content_validate($form_state['values']);
+}
+
+/**
+ * Implements hook_node_validate().
+ *
+ * The validate function will handle the honeyfield.
+ */
+function anonymous_publishing_cl_node_validate($node) {
+  $nodep = 'object' == gettype($node);
+  $isrelevantp = _anonymous_publishing_relevantp($node, $nodep);
+  if ($isrelevantp) {
+    _anonymous_publishing_cl_content_validate($node);
+  }
+}
+
+
+/**
+ * Implements hook_comment_presave().
+ */
+function anonymous_publishing_cl_comment_presave($comment) {
+
+  if (isset($comment->anonymous_publishing['email'])) {
+    $result = db_query("SELECT email, ipaddress, blocked FROM {anonymous_publishing_emails} WHERE email = :email", array(':email' => $comment->anonymous_publishing['email']))->fetchAssoc();
+    if ($result['email']) {
+      // Blocked status handled by_anonymous_publishing_cl_content_validate().
+      $comment->status = COMMENT_PUBLISHED;
+      drupal_set_message(t('Your email has been activated previously.'));
+    }
+    else {
+      $comment->status = COMMENT_NOT_PUBLISHED;
+      drupal_set_message(t('Thank you for posting here. You must also confirm that the email-address belongs to you.'));
+    }
+  }
+}
+
+
+/**
+ * Implements hook_node_presave().
+ */
+function anonymous_publishing_cl_node_presave($node) {
+  if (isset($node->anonymous_publishing['email'])) {
+    $mustconfirm = TRUE;
+    $options = variable_get('anonymous_publishing_cl_options', array());
+    if ($options['sactstick']) {
+      $result = db_query("SELECT email, ipaddress, blocked FROM {anonymous_publishing_emails} WHERE email = :email", array(':email' => $node->anonymous_publishing['email']))->fetchAssoc();
+      if ($result['email']) {
+        // Blocked status handled by_anonymous_publishing_cl_content_validate().
+        $node->status = NODE_PUBLISHED;
+        drupal_set_message(t('Your email has been activated previously.'));
+        $mustconfirm = FALSE;
+      }
+    }
+    if ($mustconfirm) {
+      $node->status = NODE_NOT_PUBLISHED;
+      drupal_set_message(t('Thank you for posting here. You must also confirm that the email-address belongs to you.'));
+    }
+  }
+}
+
+/**
+ * Implements hook_entity_delete().
+ */
+function anonymous_publishing_cl_entity_delete($entity, $type) {
+  $apid = NULL;
+  if ('node' == $type) {
+    $apid = db_query("SELECT apid FROM {anonymous_publishing} WHERE :nid = nid", array(':nid' => $entity->nid))->fetchField();
+  }
+  elseif ('comment' == $type) {
+    $apid = db_query("SELECT apid FROM {anonymous_publishing} WHERE :cid = cid", array(':cid' => $entity->cid))->fetchField();
+  }
+  if (!empty($apid)) {
+    db_delete('anonymous_publishing')
+      ->condition('apid', $apid)
+      ->execute();
+  }
+}

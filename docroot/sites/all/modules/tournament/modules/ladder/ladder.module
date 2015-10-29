@@ -1,0 +1,1236 @@
+<?php
+
+/**
+ * Tournament statuses
+ */
+define('LADDER_CALCULATION_ELO', 1);
+define('LADDER_CALCULATION_LEVEL', 2);
+
+/**
+ * Implements hook_node_info().
+ */
+function ladder_node_info() {
+  return array(
+    'ladder' => array(
+      'name' => t('Ladder'),
+      'base' => 'tournament',
+      'description' => t('A ladder tournament is a form of tournament in which participants are listed as if on the rungs of a ladder. Each participant can challenge others. By winning matches, the participants score increases.'),
+      'title_label' => t('Tournament title'),
+    ),
+  );
+}
+
+/**
+ * Implements hook_cron().
+ */
+function ladder_cron() {
+  // Automatically finish expired ladder tournaments
+  $query = db_select('tournament', 't');
+  $query->join('tournament_ladder', 'l', 't.nid = l.nid');
+
+  $nids = $query->fields('t', array('nid'))
+    ->condition('l.end_date', REQUEST_TIME, '<=')
+    ->condition('t.tournament_status', TOURNAMENT_STATUS_STARTED)
+    ->execute()
+    ->fetchCol();
+
+  if (!empty($nids)) {
+    $nodes = node_load_multiple($nids);
+
+    foreach ($nodes as $node) {
+      tournament_finish($node);
+    }
+  }
+}
+
+/**
+ * Implements hook_theme().
+ */
+function ladder_theme() {
+  return array(
+    'ladder_level_bar' => array(
+      'variables' => array(
+        'level' => NULL,
+        'exp' => NULL,
+        'data' => NULL,
+      ),
+      'file' => 'ladder.pages.inc',
+    ),
+  );
+}
+
+/**
+ * Implements hook_load().
+ */
+function ladder_node_load($nodes, $types) {
+  if (in_array('ladder', $types)) {
+    // Gather a list of node ids to work with
+    foreach ($nodes as $node) {
+      if ($node->type == 'ladder') {
+        $nids[] = $node->nid;
+      }
+    }
+
+    $result = db_select('tournament_ladder', 'ladder')
+      ->fields('ladder')
+      ->condition('nid', $nids, 'IN')
+      ->execute();
+
+    foreach ($result as $field) {
+      $nodes[$field->nid]->calculation = $field->calculation;
+      $nodes[$field->nid]->duration = $field->duration;
+      $nodes[$field->nid]->end_date = $field->end_date;
+      $nodes[$field->nid]->force_crown = $field->force_crown;
+      $nodes[$field->nid]->max_challenges = $field->max_challenges;
+    }
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function ladder_form_ladder_node_form_alter(&$form, &$form_state, $form_id) {
+  $node = $form_state['node'];
+
+  $form['module'] = array(
+    '#title' => t('Ladder settings'),
+    '#type' => 'fieldset',
+    '#collapsible' => TRUE,
+    '#collapsed' => FALSE,
+    '#group' => 'settings',
+    '#weight' => 5,
+  );
+  $form['module']['calculation'] = array(
+    '#title' => t('System'),
+    '#type' => 'radios',
+    '#default_value' => !empty($node->calculation) ? $node->calculation : LADDER_CALCULATION_ELO,
+    '#options' => array(
+      LADDER_CALCULATION_ELO => t('ELO rating system'),
+      LADDER_CALCULATION_LEVEL => t('Level system'),
+    ),
+    '#disabled' => !empty($node->calculation) ? $node->tournament_status >= TOURNAMENT_STATUS_STARTED : FALSE,
+  );
+  $form['module']['duration'] = array(
+    '#title' => t('Duration'),
+    '#type' => 'select',
+    '#default_value' => !empty($node->duration) ? $node->duration : 0,
+    '#options' => array(
+      604800 => t('1 week'),
+      1209600 => t('2 weeks'),
+      1814400 => t('3 weeks'),
+      2629743 => t('1 month'),
+      5259486 => t('2 months'),
+      7889229 => t('3 months'),
+    ),
+    '#description' => t('After the tournament has started, ladder matches can be played until this duration ends.'),
+    '#disabled' => !empty($node->tournament_status) ? $node->tournament_status >= TOURNAMENT_STATUS_STARTED : FALSE,
+  );
+  $form['module']['max_challenges'] = array(
+    '#title' => t('Match limit'),
+    '#type' => 'select',
+    '#default_value' => !empty($node->max_challenges) ? $node->max_challenges : 2,
+    '#options' => drupal_map_assoc(array(1,2,3,4,5)),
+    '#empty_option' => t('No limit'),
+    '#description' => t('To prevent foul play, you may limit the amount of matches between any <strong>same two</strong> participants within 24 hours.'),
+  );
+  $form['module']['force_crown'] = array(
+    '#title' => t('Force the highest ranked participant to accept challenges'),
+    '#type' => 'checkbox',
+    '#default_value' => !empty($node->force_crown) ? $node->force_crown : 0,
+  );
+
+  // Force enabling of size for ladder leagues
+  $form['general']['size']['#disabled'] = FALSE;
+}
+
+/**
+ * Implements hook_node_insert().
+ */
+function ladder_node_insert($node) {
+  if ($node->type == 'ladder') {
+    drupal_write_record('tournament_ladder', $node);
+  }
+}
+
+/**
+ * Implements hook_node_update().
+ */
+function ladder_node_update($node) {
+  if ($node->type == 'ladder') {
+    drupal_write_record('tournament_ladder', $node, array('nid'));
+  }
+  elseif ($node->type == 'match') {
+    if ($node->original->match_status == MATCH_STATUS_FINISHED && $node->original->match_status != $node->match_status) {
+      // In the rare case that a match is re-opened, update the ladder to remove the match result.
+      if (!empty($node->tid)) {
+        $tournament = node_load($node->tid);
+        if ($tournament->type == 'ladder') {
+          ladder_match_remove($node, $tournament);
+          ladder_refresh($tournament);
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_node_delete().
+ */
+function ladder_node_delete($node) {
+  if ($node->type == 'ladder') {
+    db_delete('tournament_ladder_matches')->condition('nid', $node->nid)->execute();
+    db_delete('tournament_ladder_participants')->condition('nid', $node->nid)->execute();
+    db_delete('tournament_ladder')->condition('nid', $node->nid)->execute();
+  }
+  elseif ($node->type == 'match' && !empty($node->tid)) {
+    $tournament = node_load($node->tid);
+    if ($tournament->type == 'ladder') {
+      ladder_match_remove($node, $tournament);
+      ladder_refresh($tournament);
+    }
+  }
+}
+
+/**
+ * Display ladder rankings table
+ *
+ * @param $node
+ *   Ladder node object
+ *
+ * @return
+ *   A rankings table render array
+ */
+function ladder_rankings($node) {
+  $query = db_select('tournament_ladder_participants', 'lp');
+  $query->join('tournament_participants', 'tp', 'lp.id = tp.id AND lp.nid = tp.nid');
+  $query->addExpression('lp.win + lp.loss', 'pld');
+
+  $participants = $query
+    ->fields('lp')
+    ->fields('tp', array('status'))
+    ->condition('lp.nid', $node->nid)
+    ->condition('tp.status', 2, '<')
+    ->orderBy('lp.rank')
+    ->execute()
+    ->fetchAllAssoc('id');
+
+  // Add participant names
+  tournament_participants_populate_names($node, $participants);
+
+  $header = array(
+    array('data' => t('Rank'), 'align' => 'left'),
+    array('data' => t('Name'), 'align' => 'left'),
+    array('data' => t('W'), 'align' => 'center'),
+    array('data' => t('L'), 'align' => 'center'),
+    array('data' => t('Streak'), 'align' => 'center'),
+    array('data' => t('Exp'), 'align' => 'center'),
+  );
+
+  // Determine if current user is a participant
+  $exists = tournament_user_exist($node);
+
+  // Full list of participant the user has access over
+  $ids = array();
+  if ($exists) {
+    $ids = match_participants_access_list($node->entity_type);
+    $ids = tournament_participants_exist_list($node, $ids);
+  }
+
+  if ($node->calculation == LADDER_CALCULATION_LEVEL) {
+    $header[] = array('data' => t('Level'), 'align' => 'center');
+  }
+
+  if ($exists && $node->tournament_status != TOURNAMENT_STATUS_FINISHED) {
+    $header[] = array('data' => t('Action'), 'align' => 'center');
+  }
+
+  $rows = array();
+  $inactive = array();
+  foreach ($participants as $id => $participant) {
+    $change = abs($participant->previous - $participant->rank);
+
+    if ($participant->rank == 0) {
+      $title = t('Unranked');
+      $path = drupal_get_path('module', 'ladder') . '/images/rank_stay.png';
+    }
+    elseif ($participant->previous == 0) {
+      $title = t('Initial rank');
+      $path = drupal_get_path('module', 'ladder') . '/images/rank_up.png';
+    }
+    elseif ($participant->previous < $participant->rank) {
+      $title = t('Down @change since last match', array('@change' => $change));
+      $path = drupal_get_path('module', 'ladder') . '/images/rank_down.png';
+    }
+    elseif ($participant->previous > $participant->rank) {
+      $title = t('Up @change since last match', array('@change' => $change));
+      $path = drupal_get_path('module', 'ladder') . '/images/rank_up.png';
+    }
+    else {
+      $title = t('Rank not changed since last match');
+      $path = drupal_get_path('module', 'ladder') . '/images/rank_stay.png';
+    }
+
+    $rank_change = theme('image', array('path' => $path, 'title' => $title, 'alt' => $title));
+
+    if (!$participant->status) {
+      $name = '<del>' . $participant->name . '</del>';
+    }
+    else {
+      $name = $participant->name;
+    }
+
+    $row = array(
+      array('data' => $participant->rank . $rank_change, 'width' => '10%', 'align' => 'left'),
+      array('data' => $name, 'width' => '40%', 'align' => 'left'),
+      array('data' => $participant->win, 'width' => '5%', 'align' => 'center'),
+      array('data' => $participant->loss, 'width' => '5%', 'align' => 'center'),
+      array('data' => $participant->streak, 'width' => '5%', 'align' => 'center'),
+      array('data' => $participant->exp, 'width' => '10%', 'align' => 'center'),
+    );
+
+    // Level bar
+    if ($node->calculation == LADDER_CALCULATION_LEVEL) {
+      $level_data = _ladder_level_data($participant->level, $participant->exp);
+      $row[] = array(
+        'data' => theme('ladder_level_bar', array('level' => $participant->level, 'exp' => $participant->exp, 'data' => $level_data)),
+        'width' => '10%',
+        'align' => 'center',
+      );
+    }
+
+    // Challenge link
+    if ($exists && $node->tournament_status != TOURNAMENT_STATUS_FINISHED && $participant->status == 1 && !in_array($id, $ids)) {
+      $row[] = array(
+        'data' => l(t('Challenge'), $participant->uri['path'] . '/challenge', array('query' => array('ladder' => $node->nid))),
+        'width' => '15%',
+        'align' => 'center',
+        'class' => array('challenge-link')
+      );
+    }
+
+    if (empty($participant->rank)) {
+      $inactive[] = $row;
+    }
+    else {
+      $rows[] = $row;
+    }
+  }
+
+  $build = array(
+    '#prefix' => '<div id="tournament-ladder" class="tournament-module-rankings">',
+    '#suffix' => '</div>',
+  );
+
+  // Ladder end date
+  if (!empty($node->end_date)) {
+    $build['ladder_status'] = array(
+      '#prefix' => '<p>',
+      '#suffix' => '<p>',
+      '#markup' => t('Tournament ends on @date', array('@date' => format_date($node->end_date))),
+      '#weight' => -15,
+    );
+  }
+
+  $build['rankings'] = array(
+    '#theme' => 'table',
+    '#rows' => $rows,
+    '#header' => $header,
+    '#empty' => t('No active participants in this ladder.'),
+  );
+
+  if (!empty($inactive)) {
+    $build['inactive'] = array(
+      '#theme' => 'table',
+      '#rows' => $inactive,
+      '#header' => $header,
+      '#caption' => t('Inactive participants'),
+      '#weight' => 10,
+    );
+  }
+
+  return $build;
+}
+
+/**
+ * Implements hook_menu().
+ */
+function ladder_menu() {
+  $items['node/%node/ladder'] = array(
+    'title' => 'Ladder rankings',
+    'page callback' => 'ladder_rankings',
+    'page arguments' => array(1),
+    'access callback' => '_ladder_rankings_callback_access',
+    'access arguments' => array(1),
+    'type' => MENU_LOCAL_TASK,
+  );
+
+  return $items;
+}
+
+/**
+ * Access callback for full screen knockout brackets
+ */
+function _ladder_rankings_callback_access($node) {
+  if ($node->type != 'ladder') {
+    return;
+  }
+
+  return $node->tournament_status >= TOURNAMENT_STATUS_STARTED;
+}
+
+/**
+ * Implements hook_node_view().
+ */
+function ladder_node_view($node, $view_mode, $language) {
+  if ($node->type == 'match' && $node->match_status == MATCH_STATUS_FINISHED && !empty($node->tid)) {
+    $node->tournament_node = node_load($node->tid);
+    if ($node->tournament_node->type == 'ladder') {
+      $ids = array_keys($node->participants);
+      $result = db_select('tournament_ladder_matches', 'lm')
+        ->fields('lm', array('id', 'exp'))
+        ->condition('nid', $node->nid)
+        ->condition('id', $ids)
+        ->execute();
+
+      foreach ($result as $record) {
+        if ($record->exp > 0) {
+          $exp = '<div class="positive">+' . $record->exp . '</div>';
+        }
+        else {
+          $exp = '<div class="negative">' . $record->exp . '</div>';
+        }
+
+        $rows[] = array(
+          $node->participants[$record->id]['name'],
+          $exp,
+        );
+      }
+
+      $node->content['ladder'] = array(
+        '#theme' => 'table',
+        '#rows' => $rows,
+        '#header' => array(t('Name'), t('EXP')),
+        '#weight' => 5,
+      );
+    }
+  }
+}
+
+/**
+ * Implements hook_match_finish().
+ */
+function ladder_match_finish($node) {
+  if (isset($node->tournament_node) && $node->tournament_node->type == 'ladder') {
+    ladder_match_process($node, $node->tournament_node);
+    ladder_refresh($node->tournament_node);
+  }
+}
+
+/**
+ * Implements hook_tournament_participant_rank().
+ */
+function ladder_tournament_participant_rank($rank) {
+  return t('@rank', array('@rank' => tournament_ordinal_suffix($rank)));
+}
+
+/**
+ * Implements hook_tournament_finish().
+ */
+function ladder_tournament_finish($node) {
+  if ($node->type == 'ladder') {
+    $result = db_select('tournament_ladder_participants', 'l')
+      ->fields('l', array('id', 'rank'))
+      ->condition('nid', $node->nid)
+      ->execute();
+
+    foreach ($result as $record) {
+      db_update('tournament_participants')
+        ->fields(array(
+          'rank' => $record->rank
+        ))
+        ->condition('nid', $node->nid)
+        ->condition('id', $record->id)
+        ->execute();
+    }
+  }
+}
+
+/**
+ * Implements hook_tournament_participant_add().
+ */
+function ladder_tournament_participant_add($node, $id) {
+  // Ensure this is a ladder tournament
+  if ($node->type == 'ladder') {
+    // Ladder participants shouldn't go to waiting list for started tournaments
+    if ($node->tournament_status == TOURNAMENT_STATUS_STARTED && !tournament_is_full($node)) {
+      db_update('tournament_participants')
+        ->fields(array(
+          'status' => 1
+        ))
+        ->condition('nid', $node->nid)
+        ->condition('id', $id)
+        ->execute();
+    }
+
+    // Add custom participant data. There may be previously deleted participants
+    // so we should use merge.
+    $query = db_merge('tournament_ladder_participants')
+      ->key(array(
+        'nid' => $node->nid,
+        'id' => $id,
+      ));
+
+    // Set default exp for started ELO ladders
+    if ($node->calculation == LADDER_CALCULATION_ELO && $node->tournament_status == TOURNAMENT_STATUS_STARTED) {
+      $query->insertFields(array(
+        'nid' => $node->nid,
+        'id' => $id,
+        'exp' => 1000,
+      ));
+    }
+
+    $query->execute();
+  }
+}
+
+/**
+ * Implements hook_tournament_participant_delete().
+ */
+function ladder_tournament_participant_delete($id, $node, $old_status) {
+  if ($node->type == 'ladder') {
+    // Refresh ladders to reflect updated ranks
+    ladder_refresh($node);
+    if ($node->tournament_status == TOURNAMENT_STATUS_STARTED && $old_status == 1) {
+      // Ladder leagues should auto-promote even when started
+      tournament_participant_promote($node);
+    }
+  }
+}
+
+/**
+ * Implements hook_tournament_participant_replace().
+ */
+function ladder_tournament_participant_replace($node, $new, $old) {
+  // We switch the old and new participants around for ladders. However, as our
+  // primary key is nid-id, we must use a temporary id to avoid db errors.
+
+  db_update('tournament_ladder_participants')
+    ->fields(array(
+      'id' => 0,
+    ))
+    ->condition('id', $new)
+    ->condition('nid', $node->nid)
+    ->execute();
+
+  db_update('tournament_ladder_participants')
+    ->fields(array(
+      'id' => $new,
+    ))
+    ->condition('id', $old)
+    ->condition('nid', $node->nid)
+    ->execute();
+
+  db_update('tournament_ladder_participants')
+    ->fields(array(
+      'id' => $old,
+    ))
+    ->condition('id', 0)
+    ->condition('nid', $node->nid)
+    ->execute();
+
+  db_update('tournament_ladder_matches')
+    ->fields(array(
+      'id' => $new,
+    ))
+    ->condition('id', $old)
+    ->condition('nid', $node->nid)
+    ->execute();
+}
+
+/**
+ * Implements hook_tournament_access_finish().
+ */
+function ladder_tournament_access_finish($node) {
+  // Never finish a ladder tournament. We finish these ourselves in cron.
+  return FALSE;
+}
+
+/**
+ * Implements hook_tournament_access_leave().
+ */
+function ladder_tournament_access_leave($node) {
+  return $node->tournament_status != TOURNAMENT_STATUS_FINISHED;
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function ladder_form_tournament_start_form_alter(&$form, &$form_state, $form_id) {
+  $node = $form_state['node'];
+
+  // Only alter for ladder tournaments
+  if ($node->type != 'ladder') {
+    return;
+  }
+
+  // Our custom submit handler
+  $form['#submit'][] = 'ladder_form_tournament_start_form_submit';
+
+  // Calculate the ladder end date
+  $end_date = REQUEST_TIME + $node->duration;
+
+  // Store the date for use in our submit handler
+  $form['end_date'] = array(
+    '#type' => 'value',
+    '#value' => $end_date,
+  );
+
+  $form['message'] = array(
+    '#markup' => t('You are about to start ladder tournament @name. Participants will be able to challenge each other until <strong>@date</strong>', array('@name' => $node->title, '@date' => format_date($end_date))),
+  );
+}
+
+/**
+ * Submit handler for the ladder tournament start form.
+ *
+ * @see ladder_form_tournament_start_form_alter()
+ */
+function ladder_form_tournament_start_form_submit($form, &$form_state) {
+  $node = $form_state['node'];
+  $end_date = $form_state['values']['end_date'];
+
+  // Set the end date (for the first time)
+  db_update('tournament_ladder')
+    ->fields(array(
+      'end_date' => $end_date,
+    ))
+    ->condition('nid', $node->nid)
+    ->execute();
+
+  // Set the default EXP for ELO rated ladders
+  if ($node->calculation = LADDER_CALCULATION_ELO) {
+    db_update('tournament_ladder_participants')
+      ->fields(array(
+        'exp' => 1000,
+      ))
+      ->condition('nid', $node->nid)
+      ->execute();
+  }
+}
+
+/**
+ * Access callback; Ensure match challenges are allowed for a given ladder.
+ *
+ * @param $node
+ *   A ladder tournament node object.
+ */
+function ladder_challenge_access($node) {
+  if ($node->type != 'ladder') {
+    return FALSE;
+  }
+
+  return $node->tournament_status == TOURNAMENT_STATUS_STARTED;
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function ladder_form_match_challenge_form_alter(&$form, &$form_state, $form_id) {
+  if (empty($_GET['ladder'])) {
+    // Do not show ladder form elements unless coming from the 'Challenge' link
+    // of a ladder tournament rankings table.
+    return;
+  }
+
+  // Load the tournament ladder node
+  $node = node_load($_GET['ladder']);
+
+  // Access check; Ensure the ladder node allows challenges
+  if (empty($node) || !ladder_challenge_access($node)) {
+    return;
+  }
+
+  // The opponent ID is already set by the challenge form
+  $opponent_id = $form['opponent_id']['#value'];
+
+  // Access check; Ensure the opponent exists in the given ladder
+  if (!tournament_participants_exist($node, $opponent_id, 1)) {
+    return;
+  }
+
+  // Access check; Ensure the current user exists in the given ladder
+  if (!tournament_user_exist($node)) {
+    return;
+  }
+
+  // Store for use in handler callbacks
+  $form_state['node'] = $node;
+
+  $opponent = entity_label($form_state['entity_type'], $form_state['entity']);
+  $form['message']['#markup'] = t('You are challenging @opponent to a <strong>ladder tournament</strong> match.', array('@opponent' => $opponent));
+
+  if (isset($form['request_id']['#value'])) {
+    // Single request id value
+    $request_id = $form['request_id']['#value'];
+  }
+  else {
+    $ids = array_keys($form['request_id']['#options']);
+    $ids_exist = tournament_participants_exist_list($node, $ids);
+
+    // Remove participant options that don't exist in the ladder
+    foreach ($ids as $id) {
+      if (!in_array($id, $ids_exist)) {
+        unset($form['request_id']['#options'][$id]);
+      }
+    }
+  }
+
+  if ($form['request_id']['#type'] == 'select') {
+    $form['request_id']['#weight'] = -5;
+  }
+
+  $form['ladder'] = array(
+    '#prefix' => '<div id="ladder-selector">',
+    '#suffix' => '</div>',
+    '#type' => 'container',
+    '#weight' => -1,
+  );
+
+  // If the participants are in a ladder together, provide ladder challenge selection
+  $info = entity_get_info();
+  $entity_type = $form_state['entity_type'];
+
+  // To be stored in the {matches} table
+  $form['ladder']['tid'] = array(
+    '#type' => 'value',
+    '#value' => $node->nid,
+  );
+
+  $form['ladder']['link'] = array(
+    '#type' => 'item',
+    '#title' => t('Ladder'),
+    '#markup' => l($node->title, 'node/' . $node->nid),
+  );
+
+  $form['actions']['back'] = array(
+    '#markup' => l(t('Back'), 'node/' . $node->nid . '/ladder'),
+  );
+
+  // Our custom validation handler
+  $form['#validate'][] = 'ladder_form_match_challenge_form_validate';
+  $form['#submit'][] = 'ladder_form_match_challenge_form_submit';
+}
+
+/**
+ * Validate handler for the match challenge form.
+ *
+ * @see ladder_form_match_challenge_form_alter()
+ */
+function ladder_form_match_challenge_form_validate($form, &$form_state) {
+  $node = $form_state['node'];
+
+  if (empty($node->max_challenges)) {
+    // No challenge limit is set
+    return;
+  }
+
+  $query = db_select('matches', 'm');
+  $query->join('matches_participants', 'mp1', 'm.nid = mp1.nid');
+  $query->join('matches_participants', 'mp2', 'm.nid = mp2.nid');
+  $query->join('matches_log', 'ml', 'm.nid = ml.nid');
+
+  $count = $query->condition('m.tid', $node->nid)
+    ->condition('ml.delta', 'challenge_enter')
+    ->condition('ml.created', REQUEST_TIME - 86400, '>')
+    ->condition('mp1.id', $form_state['values']['request_id'])
+    ->condition('mp2.id', $form_state['values']['opponent_id'])
+    ->countQuery()
+    ->execute()
+    ->fetchField();
+
+  if ($count >= $node->max_challenges) {
+    form_set_error('ladder][link', t('You can not challenge the same participant more than @max times in 24 hours.', array('@max' => $node->max_challenges)));
+  }
+}
+
+/**
+ * Submit handler for the match challenge form.
+ *
+ * @see ladder_form_match_challenge_form_alter()
+ */
+function ladder_form_match_challenge_form_submit($form, &$form_state) {
+  $node = $form_state['node'];
+  drupal_goto('node/' . $node->nid . '/ladder');
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function ladder_form_match_action_form_alter(&$form, &$form_state, $form_id) {
+  $op = $form_state['op'];
+  $node = $form_state['node'];
+
+  if (!empty($node->tid)) {
+    $tournament = node_load($node->tid);
+    if ($tournament->type == 'ladder') {
+      switch ($op) {
+        case 'challenge_respond':
+          // Add the ladder tournament title to challenge review
+          $form['review']['#rows'][] = array(
+            t('Ladder'),
+            l($tournament->title, 'node/' . $tournament->nid),
+          );
+
+          // Deliberately no break
+        case 'challenge_cancel':
+
+          // Store for later use in our validation handler
+          $form_state['tournament'] = $tournament;
+
+          // Add a custom validation handler
+          $form['#validate'][] = 'ladder_form_match_action_form_validate';
+          break;
+
+        case 'result_enter':
+          // Add a custom validation handler
+          $form['#validate'][] = 'ladder_form_match_action_form_validate_score';
+          break;
+      }
+    }
+  }
+}
+
+/**
+ * Validate handler for the match action form.
+ *
+ * @see ladder_form_match_action_form_alter()
+ */
+function ladder_form_match_action_form_validate($form, &$form_state) {
+  $op = $form_state['triggering_element']['#name'];
+
+  if ($op == 'challenge_respond_reject' || $op == 'challenge_cancel') {
+    $node = $form_state['node'];
+    $tournament = $form_state['tournament'];
+    $request_id = $form_state['values']['id'];
+
+    // Continue only when the participant is not the original challenger
+    if (!empty($tournament->force_crown)) {
+      $rank = db_select('tournament_ladder_participants', 'lp')
+        ->fields('lp', array('rank'))
+        ->condition('nid', $tournament->nid)
+        ->condition('id', $request_id)
+        ->execute()
+        ->fetchField();
+
+      if ($rank == 1) {
+        form_set_error('', t('The highest ranked participant in ladder @title can not reject challenges.', array('@title' => $tournament->title)));
+      }
+    }
+  }
+}
+
+/**
+ * Validate handler for the match action form.
+ *
+ * @see ladder_form_match_action_form_alter()
+ */
+function ladder_form_match_action_form_validate_score($form, &$form_state) {
+  foreach ($form_state['values']['participants'] as $id => $participant) {
+    $scores[] = $participant['score'];
+  }
+
+  if ($scores[0] == $scores[1]) {
+    form_set_error('', t('Matches in ladder tournaments cannot be drawn.'));
+  }
+}
+
+/**
+ * Gather ladder tournaments for which both given participants exist
+ *
+ * @param $id1, $id2
+ *   Participant entity IDs
+ */
+function _ladder_get_related($id1, $id2) {
+  $query = db_select('tournament', 't');
+  $query->join('tournament_participants', 'tp1', 't.nid = tp1.nid');
+  $query->join('tournament_participants', 'tp2', 't.nid = tp2.nid');
+  $query->join('tournament_ladder', 'l', 't.nid = l.nid');
+
+  $result = $query->fields('t', array('nid'))
+    ->condition('t.tournament_status', TOURNAMENT_STATUS_STARTED)
+    ->condition('l.end_date', REQUEST_TIME, '>')
+    ->condition('tp1.id', $id1)
+    ->condition('tp2.id', $id2)
+    ->condition('tp1.status', 1)
+    ->condition('tp2.status', 1)
+    ->execute()
+    ->fetchCol();
+
+  return $result;
+}
+
+/**
+ * Refreshes a ladder tournament ranks
+ *
+ * @param $node
+ *   A ladder tournament node object
+ */
+function ladder_refresh($node) {
+  db_update('tournament_ladder_participants')
+    ->fields(array(
+      'rank' => 0,
+    ))
+    ->condition('nid', $node->nid)
+    ->execute();
+
+  $query = db_select('tournament_ladder_participants', 'lp');
+  $query->join('tournament_participants', 'tp', 'lp.id = tp.id AND lp.nid = tp.nid');
+
+  // Rankable participants must have played a match
+  $or = db_or()->condition('win', 0, '>')->condition('loss', 0, '>');
+
+  $ids = $query->fields('lp', array('id'))
+    ->condition('lp.nid', $node->nid)
+    ->condition($or)
+    ->condition('tp.status', 1)
+    ->execute()
+    ->fetchCol();
+
+  if (!empty($ids)) {
+    // TODO: Can this be ported to DB API?
+    db_query('SET @rank := 0');
+    db_query('UPDATE {tournament_ladder_participants} SET rank = (SELECT @rank := @rank + 1) WHERE nid = :nid AND id IN (:ids) ORDER BY exp DESC, win DESC', array(':nid' => $node->nid, ':ids' => $ids));
+  }
+}
+
+/**
+ * Remove ladder match data
+ */
+function ladder_match_remove($node, $tournament) {
+  // Determine the match winner
+  $ids = array_keys($node->participants);
+
+  if (count($ids) != 2) {
+    return;
+  }
+
+  if ($node->participants[$ids[0]]['score'] > $node->participants[$ids[1]]['score']) {
+    $winner = $ids[0];
+  }
+  else {
+    $winner = $ids[1];
+  }
+
+  // Get the current stats and exp change for participants
+  $query = db_select('tournament_ladder_participants', 'lp');
+  $query->join('tournament_ladder_matches', 'lm', 'lp.id = lm.id');
+  $query->addField('lm', 'exp', 'exp_change');
+
+  $result = $query->fields('lp', array('id', 'level', 'exp', 'streak'))
+    ->condition('lm.nid', $node->nid)
+    ->condition('lp.nid', $tournament->nid)
+    ->execute();
+
+  // Remove participants EXP
+  foreach ($result as $record) {
+    $exp = $record->exp - $record->exp_change;
+
+    if ($tournament->calculation == LADDER_CALCULATION_LEVEL) {
+      // Losing participant level decrease, minimum being 1
+      $exp_tll = _ladder_exp_req($record->level);
+      if ($exp < $exp_tll && $record->level >= 1) {
+        $record->level--;
+      }
+    }
+
+    // Update the participants ladder data
+    $query = db_update('tournament_ladder_participants');
+
+    // Decrement matches played
+    if ($winner == $record->id) {
+      $query->expression('win', 'win - :win', array(':win' => 1));
+      if ($record->streak > 0) {
+        $query->expression('streak', 'streak - :streak', array(':streak' => 1));
+      }
+    }
+    else {
+      $query->expression('loss', 'loss - :loss', array(':loss' => 1));
+    }
+
+    $query->fields(array(
+        'exp' => $exp,
+        'level' => $record->level,
+      ))
+      ->condition('nid', $node->tid)
+      ->condition('id', $record->id)
+      ->execute();
+  }
+
+  // Clear ladder match exp traces
+  db_delete('tournament_ladder_matches')
+    ->condition('nid', $node->nid)
+    ->execute();
+}
+
+/**
+ * Processes a match node result and updates the
+ * relative ladder data.
+ *
+ * @param @node
+ *   A match node object
+ * @param $tournament
+ *   A ladder tournament node object
+ */
+function ladder_match_process($node, $tournament) {
+  $ids = array_keys($node->participants);
+
+  // Get the participants ladder data
+  $participants = db_select('tournament_ladder_participants', 'lp')
+    ->fields('lp')
+    ->condition('id', $ids)
+    ->condition('nid', $tournament->nid)
+    ->execute()
+    ->fetchAll();
+
+  // Add match score data
+  foreach ($participants as $participant) {
+    $participant->score = $node->participants[$participant->id]['score'];
+  }
+
+  // Update $participants with the new ranking data. New rankings
+  // are based upon the result of the match and the ladder system.
+  if ($tournament->calculation == LADDER_CALCULATION_LEVEL) {
+    _ladder_match_level_process($participants);
+  }
+  elseif ($tournament->calculation == LADDER_CALCULATION_ELO) {
+    _ladder_match_elo_process($participants);
+  }
+
+  // Order participants by winner
+  if ($participants[0]->score < $participants[1]->score) {
+    $participants = array_reverse($participants);
+  }
+
+  // Update winning participants ladder data
+  db_update('tournament_ladder_participants')
+    ->fields(array(
+      'level' => $participants[0]->level,
+      'exp' => $participants[0]->exp,
+      'previous' => $participants[0]->rank
+    ))
+    ->expression('win', 'win + :win', array(':win' => 1))
+    ->expression('streak', 'streak + :streak', array(':streak' => 1))
+    ->condition('nid', $tournament->nid)
+    ->condition('id', $participants[0]->id)
+    ->execute();
+
+  // Update losing participants ladder data
+  db_update('tournament_ladder_participants')
+    ->fields(array(
+      'level' => $participants[1]->level,
+      'exp' => $participants[1]->exp,
+      'previous' => $participants[1]->rank,
+      'streak' => 0,
+    ))
+    ->expression('loss', 'loss + :loss', array(':loss' => 1))
+    ->condition('nid', $tournament->nid)
+    ->condition('id', $participants[1]->id)
+    ->execute();
+
+  // Add participants match exp data
+  $query = db_insert('tournament_ladder_matches')
+    ->fields(array('nid', 'id', 'exp'))
+    ->values(array(
+      'nid' => $node->nid,
+      'id' => $participants[0]->id,
+      'exp' => $participants[0]->exp_change,
+    ))
+    ->values(array(
+      'nid' => $node->nid,
+      'id' => $participants[1]->id,
+      'exp' => $participants[1]->exp_change,
+    ))
+    ->execute();
+}
+
+/**
+ * Process ladder matches (Elo calculation system)
+ * For more details: http://en.wikipedia.org/wiki/Elo_rating_system
+ */
+function _ladder_match_elo_process(&$participants) {
+  // Exp differences
+  $diffs[0] = $participants[0]->exp - $participants[1]->exp;
+  $diffs[1] = $participants[1]->exp - $participants[0]->exp;
+
+  // Score total
+  $score_total = $participants[0]->score + $participants[1]->score;
+
+  // New exp calculations
+  foreach ($participants as $i => $participant) {
+    $win = $participant->score ? $participant->score / $score_total : 0;
+    $expected = 1 / (1 + pow(10, (-$diffs[$i] / 400)));
+    $new = round($participant->exp + 32 * ($win - ($expected)));
+
+    $participant->exp_change = $new - $participant->exp;
+    $participant->exp = $new;
+  }
+}
+
+/**
+ * Process ladder matches (Level calculation system)
+ */
+function _ladder_match_level_process(&$participants) {
+  // Order participants by exp
+  if ($participants[0]->exp < $participants[1]->exp) {
+    $participants = array_reverse($participants);
+  }
+
+  // Calculate level difference between the participants
+  $lvl_diff = abs($participants[0]->level - $participants[1]->level);
+
+  // Add the exp changes based on the match result
+  if ($lvl_diff > 9) {
+    if ($participants[0]->score > $participants[1]->score) {
+      // Higher rated participant wins
+      $participants[0]->exp_change = 1;
+      $participants[1]->exp_change = -1 * _ladder_loss_ratio($participants[1]->level);
+    }
+    else {
+      // Lower rated participant wins
+      $participants[0]->exp_change = -200 * _ladder_loss_ratio($participants[0]->level);
+      $participants[1]->exp_change = 250;
+    }
+  }
+  else {
+    if ($participants[0]->score > $participants[1]->score) {
+      // Higher rated participant wins
+      $participants[0]->exp_change =  100 - ($lvl_diff * 10);
+      $participants[1]->exp_change = ((100 - ($lvl_diff * 10)) * -1) * _ladder_loss_ratio($participants[1]->level);
+    }
+    else {
+      // Lower rated participant wins
+      $participants[0]->exp_change = ((100 + ($lvl_diff * 10)) * -1) * _ladder_loss_ratio($participants[0]->level);
+      $participants[1]->exp_change = _ladder_lower_exp($lvl_diff);
+    }
+  }
+
+  // Force integers
+  $participants[0]->exp_change = floor($participants[0]->exp_change);
+  $participants[1]->exp_change = floor($participants[1]->exp_change);
+
+  // Calculate participants new exp
+  $participants[0]->exp += $participants[0]->exp_change;
+  $participants[1]->exp += $participants[1]->exp_change;
+
+  // EXP cannot be negative
+  foreach ($participants as &$participant) {
+    if ($participant->exp_change < 0) {
+      if ($participant->exp < abs($participant->exp_change)) {
+        $participant->exp = 0;
+        $participant->exp_change = $participant->exp * -1;
+      }
+    }
+  }
+
+  // Order participants by winner
+  if ($participants[0]->score < $participants[1]->score) {
+    $participants = array_reverse($participants);
+  }
+
+  // Winning participant level increase
+  for ($i=0;$i<2;$i++) {
+    // We loop here as it is possible to level up 2 times in a single match
+    $exp_tnl = _ladder_exp_req($participants[0]->level + 1);
+    if ($participants[0]->exp >= $exp_tnl) {
+      $participants[0]->level++;
+    }
+  }
+
+  // Losing participant level decrease, minimum being 1
+  $exp_tll = _ladder_exp_req($participants[1]->level);
+  if ($participants[1]->exp < $exp_tll && $participants[1]->level >= 1) {
+    $participants[1]->level--;
+  }
+}
+
+/**
+ * Determines the exp_change percentage based on a given exp level.
+ *
+ * @param $level
+ *   An exp level
+ */
+function _ladder_loss_ratio($level) {
+  if ($level >= 9) {
+    return 1;
+  }
+  if ($level % 2 == 1) {
+    $level++;
+  }
+
+  return ($level / 2) * 0.25;
+}
+
+/**
+ * Returns the amount of exp required to reach a given level.
+ *
+ * @param $level
+ *   An exp level
+ */
+function _ladder_exp_req($level) {
+  $req = 0;
+
+  for ($i=1;$i<$level;$i++) {
+    if ($i % 2) {
+      $req += (($i + 1) * 100) / 2;
+    }
+    else {
+      $req += ($i * 100) / 2;
+    }
+  }
+
+  return $req;
+}
+
+/**
+ * Returns ladder ranking data to reaching the next level.
+ *
+ * @param $level
+ *   An exp level
+ * @param $exp
+ *   Current exp
+ */
+function _ladder_level_data($level, $exp) {
+  $data = array();
+
+  $data['current_level'] = ($level == 1) ? 0 : _ladder_exp_req($level);
+  $data['next_level'] = _ladder_exp_req($level + 1);
+  $data['gap'] = $data['next_level'] - $data['current_level'];
+  $data['tnl'] = $exp - $data['current_level'];
+  $data['percent'] = round(($data['tnl'] * 100) / $data['gap']);
+
+  return $data;
+}
+
+/**
+ * Determines the EXP awarded for a lower participant
+ * beating a higher participant.
+ *
+ * @param $lvl_diff
+ *   Level difference as an integer
+ */
+function _ladder_lower_exp($lvl_diff) {
+  $exps = array(
+    0 => 100,
+    1 => 120,
+    2 => 140,
+    3 => 160,
+    4 => 175,
+    5 => 190,
+    6 => 205,
+    7 => 215,
+    8 => 225,
+    9 => 245
+  );
+
+  return $exps[$lvl_diff];
+}

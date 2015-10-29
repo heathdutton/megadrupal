@@ -1,0 +1,557 @@
+<?php
+/**
+ * @file
+ * The Webserver Auth Module
+ *
+ * This module manages automatic web server user login and logout.
+ */
+
+/**
+ * Implements hook_menu().
+ *
+ * Adds settings page to configuration.
+ */
+function webserver_auth_menu() {
+  $items = array();
+  $items['admin/config/people/webserver_auth'] = array(
+    'title' => 'Webserver authentication',
+    'description' => 'Configure external user authentication. Optional.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('_webserver_auth_settings'),
+    'access arguments' => array('administer site configuration'),
+  );
+  return $items;
+}
+
+/**
+ * Implements hook_menu_get_item_alter().
+ *
+ * We can't use hook_init here in Drupal 7 because some changes were made
+ * to the order that hooks run. Essentially, there a bunch of things that
+ * run in between hook_boot and hook_init in D7. One of these is
+ * menu_get_item, which runs the menu access callback functions on the
+ * request and returns $router_item['access'] before hook_init even
+ * runs. This means that if a user links directly to an https page with any
+ * Drupal permissions protection, the user will hit an access denied page
+ * immediately after authenticating through the web server. Refreshing that
+ * page or navigating to a new one does not produce a second access denied
+ * because by that point $user is defined from hook_init on the previous
+ * page request.
+ *
+ * @see http://drupal.org/node/928160
+ * @see http://drupal.org/node/553944
+ */
+function webserver_auth_menu_get_item_alter(&$router_item, $path, $original_map) {
+  $login_checked = &drupal_static(__FUNCTION__);
+  if (!isset($login_checked)) {
+    $login_checked = TRUE;
+    // Call a function that handles user login.
+    _webserver_auth_route();
+  }
+}
+
+/**
+ * Implements hook_boot().
+ *
+ * We need to check if a cached page is being served to an authenticated user,
+ * and if so, force the start of a session and reload the page.
+ */
+function webserver_auth_boot() {
+
+  /* Get authname from environment */
+  $authname = _webserver_auth_retrieve_remote_user();
+  if (! $authname) {
+    return;
+  }
+
+  /* authenticated pages are never cacheable... */
+  drupal_page_is_cacheable(FALSE);
+
+  /* We only care if hook_boot called on cached pages */
+  if (! drupal_page_get_cache(TRUE)) {
+    return;
+  }
+
+  /* Cache busting only relevant in BOOTSTRAP_PAGE_CACHE
+     NOTE: drupal_get_bootstrap_phase() resets the bootstrap phase (bug?) */
+  if (drupal_bootstrap(NULL, FALSE) >= DRUPAL_BOOTSTRAP_PAGE_HEADER) {
+    return;
+  }
+
+  /* Use hash to check if we've already attempted to verify this user
+     recently (to avoid redirect loops, and regular users in maintenance) */
+  $authhash = hash('md5', $authname);
+  if (isset($_COOKIE['webserver_auth'])
+      && ($authhash == $_COOKIE['webserver_auth'])) {
+    return;
+  }
+
+  /* We have an authenticated cached page during early boot.
+     Finish bootstrap so drupal_goto is available */
+  drupal_bootstrap(DRUPAL_BOOTSTRAP_FULL);
+
+  /* Set our hash cookie so we only attempt to force authentication
+     every minute or so (in case of maintenance or some other force logout
+     condition) */
+  $params = session_get_cookie_params();
+  setcookie('webserver_auth', $authhash, REQUEST_TIME + 60, $params['path'], $params['domain'], FALSE, $params['httponly']);
+  _webserver_auth_route();
+
+  /* Now, with session and hash cookie set, attempt to reload the page */
+  drupal_goto(request_path());
+}
+
+/**
+ * Logout the current user (ending session)
+ *
+ * Ends current session mirroring user_logout() (without the redirect)
+ */
+function _webserver_auth_logout() {
+
+  global $user;
+
+  // logout current user (sadly, user module doesn't have an api for this)
+  watchdog('user', 'Session closed for %name.', array('%name' => $user->name));
+
+  module_invoke_all('user_logout', $user);
+
+  // Destroy the current session, and reset $user to the anonymous user.
+  session_destroy();
+}
+
+/**
+ * Validates that the authname from the environment and the current session
+ * are in sync, and if not ends the current session and attempts a fresh
+ * login for the remote user.
+ */
+function _webserver_auth_route() {
+
+  /* Get authname from environment */
+  $authname = _webserver_auth_retrieve_remote_user();
+
+  if ($authname) {
+    drupal_alter('webserver_auth_authname', $authname);
+  }
+
+  if (! $authname) {
+    // Empty authname is anonymous: close any current session.
+    if (user_is_logged_in()) {
+      _webserver_auth_logout();
+    }
+
+    return;
+  }
+
+  /* Check if the authname matches the current session.
+     If it does, we're done. */
+  if (user_is_logged_in()) {
+
+    /* Validate session authname.  We don't match against uid as authmap may
+       link to a user with uid different than authname. */
+    if (isset($_SESSION['webserver_authname'])
+	&& ($_SESSION['webserver_authname'] == $authname)) {
+      return;
+    }
+
+    // We need to logout the current user
+    _webserver_auth_logout();
+  }
+
+  if (_webserver_auth_attempt_login($authname)) {
+    return;
+  }
+
+  // Check if we should create accounts for unknown users
+  if (! variable_get('webserver_auth_create_user', FALSE)) {
+    watchdog('webserver_auth', 'user @authname does not exist in the database or is not included in the authmap table for webserver_auth, and the create user option is disabled.', array('@authname' => $authname));
+    return;
+  }
+
+  // First check if just authmap is missing
+  $account = user_load_by_name($authname);
+  if ($account) {
+
+    $authmaps = user_get_authmaps($authname);
+    if (is_array($authmaps) && isset($authmaps['webserver_auth'])) {
+      watchdog('webserver_auth', 'user @authname blocked.', array('@authname' => $authname), WATCHDOG_INFO);
+      return;
+    }
+
+    /* match_existing must be TRUE initially so admin users aren't logged out
+       when they enable the module */
+    if (! variable_get('webserver_auth_match_existing', TRUE)) {
+      watchdog('webserver_auth', 'account exists for user @authname, but matching against existing accounts is disabled.  Therefore you must manually create an entry in the authmap table for webserver_auth.', array('@authname', $authname), WATCHDOG_ERROR);
+      return;
+    }
+
+    // add missing authmap
+    user_set_authmaps($account, array("authname_webserver_auth" => $authname));
+
+    // now try login again
+    if (! _webserver_auth_attempt_login($authname)) {
+      watchdog('webserver_auth', 'user @authname blocked.', array('@authname' => $authname), WATCHDOG_INFO);
+    }
+    return;
+  }
+
+  /* We didn't find the user so we create an account for them.
+     Note, hook_user_presave() is called during this process.
+     That's where we modify the user account to add email etc. */
+  try {
+    user_external_login_register($authname, 'webserver_auth');
+    $_SESSION['webserver_authname'] = $authname;
+  }
+  catch(PDOException $e) {
+    watchdog('webserver_auth', 'unable to create new user record for user @authname.', array('@authname', $authname), WATCHDOG_ERROR);
+  }
+}
+
+/**
+ * Helper function, attempts to retrieve the remote user from the $_SERVER
+ * variable.
+ *
+ * If the user is logged in to the webserver, the remote user variable
+ * will contain the name of the user logged in.
+ *
+ * @return
+ *   String authname or empty string.
+ */
+function _webserver_auth_retrieve_remote_user() {
+  // Get the login name from the $_SERVER variable.
+  $authname = '';
+  if (isset($_SERVER ['REDIRECT_REMOTE_USER'])) {
+    $authname = $_SERVER ['REDIRECT_REMOTE_USER'];
+  }
+  elseif (isset($_SERVER ['REMOTE_USER'])) {
+    $authname = $_SERVER ['REMOTE_USER'];
+  }
+  elseif (isset($_SERVER ['PHP_AUTH_USER'])) {
+    $authname = $_SERVER ['PHP_AUTH_USER'];
+  }
+  return $authname;
+}
+
+/**
+ * Attempts to log the user in.
+ *
+ * @param $preparedauthname
+ *   Authname prepared to attempt match in authmap db table.
+ *
+ * @return
+ *   Boolean whether user is found and logged in or not.
+ */
+function _webserver_auth_attempt_login($preparedauthname) {
+  // Can we find the user in the db already and is the user not blocked?
+  $query = db_select('users', 'u');
+  $query->groupBy('u.uid');
+  $query->fields('u', array('uid'));
+  $query->condition('u.status', 1, '=');
+
+  // this next condition checks the module name in the authmap table to map
+  // authname to drupal user; the check can be ommitted using a config setting.
+  if (variable_get('webserver_auth_skip_check', FALSE)) {
+    $query->condition('u.name', $preparedauthname, '=');
+  }
+  else {
+    $query->join('authmap', 'a', 'u.uid = a.uid');
+    $query->condition('a.authname', $preparedauthname, '=');
+    $query->condition('a.module', 'webserver_auth', '=');
+  }
+
+  $result = $query->execute();
+  $uid = $result->fetchField();
+
+  if ( $uid === FALSE ) {
+    // User not found, or authmap entry missing
+    return FALSE;
+  }
+
+  // We found the user so just log them in.
+  $form_state['uid'] = (int)$uid;
+  user_login_submit(array(), $form_state);
+  // Save authname in session to compare in webserver_auth_route()
+  $_SESSION['webserver_authname'] = $preparedauthname;
+  return TRUE;
+}
+
+/*
+* Implements hook_user_presave()
+*/
+function webserver_auth_user_presave(&$edit, $account, $category) {
+  global $user;
+
+  if (!isset($edit['mail'])) {
+    if ($domain = variable_get('webserver_auth_email_domain', '')) {
+      // Create the email address by concatenating the name and domain (if there
+      // is one) ensure we don't get double @ by removing them from the domain
+      // first.
+      $edit['mail'] = strtolower($edit['name'] . '@' . str_replace('@', '', $domain));
+
+      // Replace any spaces with dots.
+      $edit['mail'] = str_replace(' ', '.', $edit['mail']);
+    }
+  }
+}
+
+/**
+ * Implements hook_user_insert().
+ */
+function webserver_auth_user_insert(&$edit, $account, $category) {
+  // if set, run the code submitted as part of the module config
+  if ($code = variable_get('webserver_auth_insert', '')) eval('?>'. $code);
+
+  // depending on the module setting, add all new users created using any means to the authmap table
+  if (variable_get('webserver_auth_add_all_new', FALSE)) {
+    user_set_authmaps($account, array("authname_webserver_auth" => $account->name));
+  }
+}
+
+/**
+ * Webserver_auth admin settings form.
+ */
+function _webserver_auth_settings($form, &$form_state) {
+  $form['webserver_auth_create_user'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Automatically create user when user does not exist in the Drupal user table'),
+    '#default_value' => variable_get('webserver_auth_create_user', FALSE),
+    '#description' => t('If this option is disabled, a user that does not exist in Drupal is considered an anonymous user'),
+  );
+  $form['webserver_auth_email_domain'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Email domain'),
+    '#default_value' => variable_get('webserver_auth_email_domain', ''),
+    '#size' => 30,
+    '#maxlength' => 55,
+    '#description' => t('Append this domain name to each new user in order to generate their email address.'),
+  );
+  $form['webserver_auth_match_existing'] = array(
+    '#type' => 'checkbox',
+    '#title' => 'Match external names to existing Drupal users',
+    '#default_value' => variable_get('webserver_auth_match_existing', TRUE),
+    '#description' => t("Match against the usernames of existing Drupal users that weren't created by this module when validating logins."
+      . "  Disable if you want to manage authentication module mappings manually."),
+  );
+  $form['advanced'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Advanced settings'),
+    '#collapsible' => TRUE,
+    '#collapsed' => TRUE,
+    'webserver_auth_strip_prefix' => array(
+      '#type' => 'checkbox',
+      '#title' => t('Strip prefix'),
+      '#default_value' => variable_get('webserver_auth_strip_prefix', TRUE),
+      '#description' => t("Strip NTLM-style prefixes (e.g. 'foo1\foo2') from the login name ('foo1\foo2\bar') to generate the username ('bar')."),
+    ),
+    'webserver_auth_strip_domain' => array(
+      '#type' => 'checkbox',
+      '#title' => t('Strip domain'),
+      '#default_value' => variable_get('webserver_auth_strip_domain', TRUE),
+      '#description' => t("Strip a domain name (e.g. '@EXAMPLE.COM') from the login name ('newuser@EXAMPLE.COM') to generate the username ('newuser')."),
+    ),
+    'webserver_auth_disallow_pw_change' => array(
+      '#type' => 'checkbox',
+      '#title' => t('Remove option to change password'),
+      '#default_value' => variable_get('webserver_auth_disallow_pw_change', TRUE),
+      '#description' => t("Remove the option for users to change their password.  This is most useful when the web server is already authenticating against an external database."
+	. "  This also removes the password validation requirement to change email addresses."),
+    ),
+    'webserver_auth_disallow_username_change' => array(
+      '#type' => 'checkbox',
+      '#title' => t('Disable option to change username'),
+      '#default_value' => variable_get('webserver_auth_disallow_username_change', TRUE),
+      '#description' => t("Disable the option for users to change their username.  This is most useful when the web server is already authenticating against an external database."),
+    ),
+    'webserver_auth_login_url' => array(
+      '#type' => 'textfield',
+      '#size' => 75,
+      '#maxlength' => 1024,
+      '#title' => t('Login URL'),
+      '#default_value' => variable_get('webserver_auth_login_url', ''),
+      '#description' => t("Custom login URL. An empty URL disables the login link on anonymous user pages, any other value will be used as the login URL."),
+    ),
+    'webserver_auth_logout_url' => array(
+      '#type' => 'textfield',
+      '#size' => 75,
+      '#maxlength' => 1024,
+      '#title' => t('Logout URL'),
+      '#default_value' => variable_get('webserver_auth_logout_url', ''),
+      '#description' => t("Custom logout URL. An empty URL disables the logout link on authenticated pages, any other value will be used as the logout URL."),
+    ),
+    'webserver_auth_insert' => array(
+      '#type' => 'textarea',
+      '#title' => t('User account modification'),
+      '#default_value' => variable_get('webserver_auth_insert', ''),
+      '#description' => t("Modify user accounts at the time of creation. Use PHP code (enclosed in <code>&lt;?php</code> and <code>?&gt;</code>)."
+	. "  The variable <code>\$account</code> is available as in <a href=\"http://api.drupal.org/api/function/hook_user/7\">hook_user('insert',...)</a>."
+	. "  Changes to the user object must be explicitly saved to the database to be made permanent."),
+    ),
+    'webserver_auth_add_all_new' => array(
+      '#type' => 'checkbox',
+      '#title' => t('Register manually created new users'),
+      '#default_value' => variable_get('webserver_auth_add_all_new', FALSE),
+      '#description' => t("By default new users created outside this module will not be able to login using this module."
+	. "  Checking this option allows all new users created by any means to login via this module.  Only applies to newly created users."),
+    ),
+    'webserver_auth_skip_check' => array(
+      '#type' => 'checkbox',
+      '#title' => t('Skip authorisation table check'),
+      '#default_value' => variable_get('webserver_auth_skip_check', FALSE),
+      '#description' => t("Skips the authorisation check, allowing users to login even if they were not created though this module.  Not recommended if you use multiple authentication methods."),
+    ),
+  );
+  return system_settings_form($form);
+}
+
+/**
+ * Implement hook_help().
+ */
+function webserver_auth_help($path, $arg) {
+
+  switch ($path) {
+    case 'admin/help#webserver_auth':
+      $output = '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('The Webserver Authentication module replaces the drupal user authentication with authentication provided by the web server.'
+        . '  The web server should be configured to provide the name of the (externally) authenticated user in one of the environment variables REMOTE_USER, PHP_AUTH_USER or REDIRECT_REMOTE_USER.'
+        . '  Empty usernames are considered anonymous. The <a href="@user">User module</a> is still used to manage user settings, roles and permissions, or block users.'
+        . '  The Webserver Authentication module will automatically authenticate against existing user accounts, but may be <a href="@config">configured</a>'
+        . ' to instead require externally authenticated usernames to be manually mapped to Drupal users.',
+	array('@user' => url('admin/help/user'), '@config' => url('admin/config/people/webserver_auth'))) . '</p>';
+      return $output;
+  }
+}
+
+/**
+  * Implements hook_form_FORM_ID_alter().
+  * FORM_ID = user_profile_form
+  * We are going to disable the ability to change passwords and usernames!
+  */
+function webserver_auth_form_user_profile_form_alter(&$form, &$form_state, $form_id) {
+  // Disable option to change username and give reason why.
+  if (variable_get('webserver_auth_disallow_username_change', TRUE)) {
+    $form['account']['name']['#disabled'] = TRUE;
+    $form['account']['name']['#description'] = t('This value has been set by default from the browser login and cannot be changed.');
+  }
+
+  // Disable password fields and checking on user account edits.
+  if (variable_get('webserver_auth_disallow_pw_change', TRUE)) {
+    unset($form['account']['pass']);
+    unset($form['account']['current_pass']);
+    unset($form['account']['current_pass_required_values']);
+    $form['#validate'] = array_diff($form['#validate'], array('user_validate_current_pass'));
+  }
+}
+
+/**
+ * Implements hook_webserver_auth_authname_alter()
+ *
+ * Strip the prefix and suffix from the username according to the settings.
+ */
+function webserver_auth_webserver_auth_authname_alter(&$username) {
+  if (variable_get('webserver_auth_strip_prefix', TRUE)) {
+    $fields = explode("\\", $username);
+    $username = $fields [count ($fields) - 1];
+  }
+  if (variable_get('webserver_auth_strip_domain', TRUE)) {
+    $fields = explode ('@', $username);
+    $username = $fields [0];
+  }
+}
+
+/**
+  * Implements hook_block_info_alter().
+  */
+function webserver_auth_block_info_alter(&$blocks, $theme, $code_blocks) {
+  // Disable the login block.
+  $blocks['user']['login']['status'] = 0;
+}
+
+/**
+ * User page callback.  Redirect anonymous users to homepage, or fallback
+ * to user module's page for authenticated users.
+ */
+function _webserver_auth_user_page() {
+
+  if (user_is_logged_in()) {
+    return user_page();
+  }
+
+  drupal_goto('<front>');
+}
+
+/**
+ * Redirect callback.
+ */
+function _webserver_auth_redirect($config_name) {
+  $dest = drupal_parse_url(variable_get($config_name, ''));
+  if (strpos($dest['path'], '://') !== FALSE) {
+    $dest['external'] = TRUE;
+  }
+  elseif (strpos($dest['path'], '/') == 0) {
+    $dest['external'] = TRUE;
+  }
+  drupal_goto($dest['path'], $dest);
+}
+
+/**
+ * Login access callback.
+ */
+function _webserver_auth_login_access() {
+  if (user_is_anonymous()) {
+    return variable_get('webserver_auth_login_url') ? TRUE : FALSE;
+  }
+  return FALSE;
+}
+
+/**
+ * Login page callback.
+ */
+function _webserver_auth_login_page() {
+  _webserver_auth_redirect('webserver_auth_login_url');
+}
+
+/**
+ * Logout access callback.
+ */
+function _webserver_auth_logout_access() {
+  if (user_is_logged_in()) {
+    return variable_get('webserver_auth_logout_url') ? TRUE : FALSE;
+  }
+  return FALSE;
+}
+
+/**
+ * Logout callback.  Redirect to configured logout URL.
+ */
+function _webserver_auth_logout_page() {
+  _webserver_auth_logout();
+  _webserver_auth_redirect('webserver_auth_logout_url');
+}
+
+/**
+  * Implements hook_menu_alter().
+  */
+function webserver_auth_menu_alter(&$items) {
+  /* Disable register and password tasks */
+  $items['user/register']['access callback'] = FALSE;
+  $items['user/password']['access callback'] = FALSE;
+  /* Redirect user page if anonymous */
+  $items['user']['page callback'] = '_webserver_auth_user_page';
+  /* Customize login/logout */
+  $items['user/login']['page callback'] = '_webserver_auth_login_page';
+  $items['user/login']['type'] = MENU_NORMAL_ITEM;
+  $items['user/login']['menu_name'] = 'user-menu';
+  $items['user/login']['access callback'] = '_webserver_auth_login_access';
+  $items['user/logout']['page callback'] = '_webserver_auth_logout_page';
+  $items['user/logout']['access callback'] = '_webserver_auth_logout_access';
+}
+
+/**
+ * Implements hook_menu_link_alter().
+ */
+function webserver_auth_menu_link_alter(&$link) {
+  // Force the Login link to appear on the top-level of 'user-menu' menu by
+  // default (i.e., unless it has been customized).
+  if ($link['link_path'] == 'user/login' && $link['module'] == 'system' && empty($link['customized'])) {
+    $link['plid'] = 0;
+  }
+}

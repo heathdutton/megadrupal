@@ -1,0 +1,1 @@
+Sheetnode integrates the JavaScript spreadsheet engine SocialCalc as a new node type in Drupal. SocialCalc was written by Dan Bricklin, co-author of the original VisiCalc spreadsheet app in 1979, and is used in the OLPC XO laptop and the SocialText Collaboration Platform. 

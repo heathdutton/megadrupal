@@ -1,0 +1,378 @@
+<?php
+
+/**
+ * @file
+ * Track availability of products.
+ */
+
+/**
+ * Implements hook_init().
+ */
+function ec_availability_init() {
+  if (module_exists('ec_cart')) {
+    $expires_period = 300;
+    $items = array();
+    $result = db_query("SELECT * FROM {ec_cart} c INNER JOIN {node} n ON c.nid = n.nid WHERE cookie_id = :cookie_id", array(':cookie_id' => ec_checkout_get_id()))
+      ->fetchAll();
+    foreach ($result as $node) {
+      if (!empty($node->data) && ($extra = unserialize($node->data))) {
+        foreach ($extra as $key => $value) {
+          $node->{$key} = $value;
+        }
+      }
+      $items[$node->nid] = $node;
+    }
+    if (!empty($items)) {
+      $result = db_query("SELECT * FROM {ec_available_alloc} WHERE cookie_id = :cookie_id AND expires < :expires", array(':cookie_id' => ec_checkout_get_id(), ':expires' => REQUEST_TIME));
+
+      foreach ($result as $row) {
+        if (ec_availability_ec_checkout_validate_item($items[$row->nid], 'cart', $items[$row->nid]->qty, NULL, NULL, EC_VALIDATE_ITEM_SEVERITY_LOW) !== FALSE) {
+          db_update('ec_available_alloc')
+            ->fields(array(
+                'expires' => REQUEST_TIME + $expires_period,
+              ))
+            ->condition('nid', $row->nid)
+            ->condition('cookie_id', ec_checkout_get_id())
+            ->execute();
+        }
+        else {
+          db_delete('ec_available_alloc')
+            ->condition('nid', $row->nid)
+            ->condition('cookie_id', ec_checkout_get_id())
+            ->execute();
+          drupal_set_message(t('Temporary allocation for !title has expired, Please check availability to see if there is any left.', array('!title' => l($items[$row->nid]->title, 'node/' . $row->nid))), 'error');
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_exit().
+ *
+ * TODO: This should really be done in the init.
+ */
+function ec_availability_exit() {
+  $expires_period = 300;
+
+  if (module_exists('ec_checkout')) {
+    db_update('ec_available_alloc')
+      ->fields(array(
+          'expires' => REQUEST_TIME + $expires_period,
+        ))
+      ->condition('cookie_id', ec_checkout_get_id())
+      ->execute();
+  }
+}
+
+/**
+ * Implements hook_link().
+ */
+function ec_availability_link($type, $node = NULL, $teaser = FALSE) {
+  $l = array();
+
+  switch ($type) {
+    case 'node':
+      if (!variable_get('ec_product_cart_addition_by_link', TRUE) ||
+        ($teaser && !variable_get('ec_product_cart_on_teaser', 1))) {
+        break;
+      }
+
+    case 'checkout':
+      if (isset($node->ptype) && ec_product_feature_exists($node, 'availability')) {
+        $alloc = ec_availability_get_current($node->nid);
+        if ($alloc['actual'] <= 0) {
+          $l['no_stock'] = array(
+            'title' => t('Out of stock'),
+          );
+        }
+        elseif ($alloc['current'] <= 0) {
+          $l['temp_no_stock'] = array(
+            'title' => t('Temporarily out of stock'),
+          );
+        }
+      }
+      break;
+  }
+
+  return $l;
+}
+
+/**
+ * Implements hook_node_view().
+ */
+function ec_availability_node_view($node, $view_mode = 'full') {
+  if (isset($node->ptype) && ec_product_feature_exists($node, 'availability') && !variable_get('ec_product_cart_addition_by_link', 1) && (!$a3 || variable_get('ec_product_cart_on_teaser', 1))) {
+    $alloc = ec_availability_get_current($node->nid);
+
+    if ($alloc['actual'] <= 0) {
+      $node->content['no_stock'] = array(
+        '#value' => t('Out of stock'),
+        '#prefix' => '<div class="ec-available-no-stock">',
+        '#suffix' => '</div>',
+        '#weight' => 5,
+      );
+    }
+    elseif ($alloc['current'] <= 0) {
+      $node->content['temp_no_stock'] = array(
+        '#value' => t('Temporarily out of stock'),
+        '#prefix' => '<div class="ec-available-no-stock ec-available-temporarily-no-stock">',
+        '#suffix' => '</div>',
+        '#weight' => 5,
+      );
+    }
+  }
+}
+
+/**
+ * Implements hook_product_form_alter().
+ */
+function ec_availability_form_alter(&$form, &$form_state, $form_id) {
+  if (ec_product_form_is_product($form) && ec_product_feature_exists($form['#node']->ptype, 'availability')) {
+    $node = & $form['#node'];
+
+    $form['product']['inventory'] = array(
+      '#type' => 'fieldset',
+      '#title' => t('Availability control'),
+    );
+    $form['product']['inventory']['available'] = array(
+      '#type' => 'textfield',
+      '#title' => t('Items available'),
+      '#default_value' => ((isset($node->available) && $node->available != '') ? $node->available : 0),
+      '#size' => 25,
+      '#maxlength' => 50,
+      '#description' => t('Amount of the product is which available for sale.'),
+    );
+    $form['product']['inventory']['reserved'] = array(
+      '#type' => 'textfield',
+      '#title' => t('Items reserved'),
+      '#default_value' => ((isset($node->reserved) && $node->reserved != '') ? $node->reserved : 0),
+      '#size' => 25,
+      '#maxlength' => 50,
+      '#description' => t('Amount of the product which has been sold, but has not been shipped or the order has not been completed'),
+    );
+  }
+}
+
+/**
+ * Implements hook_feature_info().
+ */
+function ec_availability_feature_info() {
+  return array(
+    'availability' => array(
+      'name' => t('Availability'),
+      'description' => t('Track availabilty of products. These products can be inventory based or restricted like an event or training session.'),
+      'module' => 'ec_availability_feature',
+    ),
+  );
+}
+
+/**
+ * Implements hook_feature_load().
+ */
+function ec_availability_feature_load($node) {
+  if (is_object($node)) {
+    $nid = $node->nid;
+  }
+  elseif (is_array($node)) {
+    $nid = $node['nid'];
+  }
+  else {
+    $nid = $node;
+  }
+
+  if ($extra = db_query('SELECT * FROM {ec_available} WHERE nid = :nid', array(':nid' => $nid))->fetchAssoc()) {
+    return $extra;
+  }
+}
+
+/**
+ * Implements hook_feature_insert().
+ */
+function ec_availability_feature_insert($node) {
+  drupal_write_record('ec_available', $node);
+}
+
+/**
+ * Implements hook_feature_update().
+ */
+function ec_availability_feature_update($node) {
+  try {
+    drupal_write_record('ec_available', $node);
+  }
+  catch (Exception $e) {
+    drupal_write_record('ec_available', $node, 'nid');
+  }
+}
+
+/**
+ * Implements hook_feature_delete().
+ */
+function ec_availability_feature_delete($node) {
+  db_delete('ec_available')
+    ->condition('nid', $node->nid)
+    ->execute();
+}
+
+/**
+ * Implements hook_feature_attributes().
+ */
+function ec_availability_feature_attributes($node) {
+  if (!isset($node->available) || $node->available <= 0) {
+    return array('no_stock' => TRUE);
+  }
+}
+
+/**
+ * Implements hook_feature_ec_checkout_validate_item().
+ *
+ * FIXME: This check needs to be changed to always be done from the db, not
+ * the node past.
+ */
+function ec_availability_ec_checkout_validate_item($node, $type, $qty, $data, $severity, $return) {
+  $qty = $qty ? $qty : 1;
+  $alloc = ec_availability_get_current($node->nid);
+  if ($qty > $alloc['current']) {
+    if ($severity > EC_VALIDATE_ITEM_SEVERITY_MEDIUM) {
+      form_set_error("products][{$node->nid}][qty", t('Not enough %title available to fulfill the amount of %qty', array('%title' => $node->title, '%qty' => format_plural($qty, '1 item', '@count items'))));
+    }
+    return FALSE;
+  }
+}
+
+/**
+ * Implements hook_feature_ec_checkout_add_complete().
+ */
+function ec_availability_ec_checkout_add_complete($node, $qty, $data) {
+  $expires_period = 300;
+  
+  $ret = db_update('ec_available_alloc')
+    ->fields(array(
+      'nid' => $node->nid,
+      'cookie_id' => ec_checkout_get_id(),
+      'expires' => REQUEST_TIME + $expires_period,
+      'allocated' => $qty,
+    ))
+    ->execute();
+
+  if (!$ret) {
+    $id = db_insert('ec_available_alloc')
+      ->fields(array(
+          'nid' => $node->nid,
+          'cookie_id' => ec_checkout_get_id(),
+          'expires' => REQUEST_TIME + $expires_period,
+          'allocated' => $qty,
+        ))
+      ->execute();
+  }
+}
+
+/**
+ * @todo Please document this function.
+ * @see http://drupal.org/node/1354
+ */
+function ec_availability_cart_remove_item($node, $cookie_id) {
+  db_delete('ec_available_alloc')
+    ->condition('nid', $node->nid)
+    ->condition('cookie_id', $cookie_id)
+    ->execute();
+}
+
+/**
+ * @todo Please document this function.
+ * @see http://drupal.org/node/1354
+ */
+function ec_availability_transaction($node, $op) {
+  if ($op == 'load') {
+    return ec_availability_feature_load($node);
+  }
+}
+
+/**
+ * @todo Please document this function.
+ * @see http://drupal.org/node/1354
+ */
+function ec_availability_txn_workflow($node, $txn, $orig) {
+  /**
+   * Remove the quantity sold when the transaction is created. Not once the
+   * transaction has been completed.
+   */
+  if (empty($orig)) {
+    db_update('ec_available')
+      ->fields(array(
+          'available' => $node->available - $node->qty,
+        ))
+      ->condition('nid', $node->nid)
+      ->execute();
+  }
+
+  $workflow = ec_store_transaction_workflow('type', $txn->workflow);
+  $orig_workflow = ec_store_transaction_workflow('type', $orig->workflow);
+  switch ($workflow['type']) {
+    case EC_WORKFLOW_TYPE_COMPLETE:
+      if (!empty($orig) && $orig_workflow['type'] != EC_WORKFLOW_TYPE_COMPLETE) {
+        db_update('ec_available')
+          ->fields(array(
+              'reserved' => $node->reserved - $node->qty,
+            ))
+          ->condition('nid', $node->nid)
+          ->execute();
+      }
+      break;
+
+    case EC_WORKFLOW_TYPE_CANCEL:
+      if (!empty($orig) && $orig_workflow['type'] != EC_WORKFLOW_TYPE_CANCEL) {
+        db_update('ec_available')
+          ->fields(array(
+              'reserved' => $node->reserved - $node->qty,
+            ))
+          ->condition('nid', $node->nid)
+          ->execute();
+      }
+      if (!empty($orig)) {
+        db_update('ec_available')
+          ->fields(array(
+              'available' => $node->available + $node->qty,
+            ))
+          ->condition('nid', $node->nid)
+          ->execute();
+      }
+      break;
+
+    default:
+      if (empty($orig) || $orig_workflow['type'] != EC_WORKFLOW_TYPE_IN_PROGRESS) {
+        db_update('ec_available')
+          ->fields(array(
+              'reserved' => $node->reserved + $node->qty,
+            ))
+          ->condition('nid', $node->nid)
+          ->execute();
+      }
+      break;
+
+    default:
+      if (empty($orig) || $orig_workflow['type'] != EC_WORKFLOW_TYPE_IN_PROGRESS) {
+        db_query('UPDATE {ec_available} SET reserved = %d WHERE nid = %d', $node->reserved+$node->qty, $node->nid);
+      }
+      break;
+  }
+}
+
+/**
+ * Get the current availability figures
+ */
+function ec_availability_get_current($nid) {
+  $avaiable = & drupal_static(__FUNCTION__ . '_avaiable', array());
+
+  if (empty($avaiable[$nid])) {
+    if ($avail = ec_availability_feature_load($nid)) {
+      $avail['temp'] = db_query("SELECT SUM(allocated) FROM {ec_available_alloc} WHERE nid = :nid AND cookie_id <> :cookie_id", array(':nid' => $nid, ':cookie_id' => ec_checkout_get_id()))->fetchField() + 0;
+      $avail['current'] = $avail['available'] -$avail['temp'];
+      $avail['actual'] = $avail['available'] + $avail['reserved'];
+      $avaiable[$nid] = $avail;
+    }
+  }
+
+  return empty($avaiable[$nid]) ? array('available' => 0) : $avaiable[$nid];
+}
+
