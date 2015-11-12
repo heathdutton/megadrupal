@@ -1,0 +1,247 @@
+<?php
+/**
+ * @file
+ * Provide the Trackback protocol to the Vinculum module.
+ */
+
+// User-Agent to send when connecting to external sites.
+define ('VINCULUM_TRACKBACK_UA', 'Drupal Trackback (+http://drupal.org/project/vinculum)');
+
+
+/**
+ * Implements hook_menu().
+ */
+function vinculum_trackback_menu() {
+  // ENDPOINT for trackback registration. Not for humans!
+  $items['node/%node/trackback'] = array(
+    'title' => 'Trackbacks',
+    'page callback' => 'vinculum_trackback_receive',
+    'page arguments' => array(1),
+    // This URL is accessible according to the node's visibility to ANONYMOUS
+    // users and whether 'Receive vinculums' is allowed on the node.
+    'access callback' => 'vinculum_node_allows_vinculum',
+    'access arguments' => array(1, 'receive'),
+    'file' => 'vinculum_trackback.pages.inc',
+    'type' => MENU_CALLBACK,
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_node_view().
+ *
+ * RDF meta-data is added to nodes which permit vinculums, to allow third-
+ * parties to auto-discover Trackback support.
+ */
+function vinculum_trackback_node_view($node, $view_mode, $langcode) {
+  if ($view_mode == 'full' && vinculum_node_allows_vinculum($node, 'receive')) {
+    _vinculum_add_trackback_autodiscovery_metadata($node);
+  }
+}
+
+
+
+/**********************************************************
+ * Public API functions.
+ *********************************************************/
+
+/**
+ * Save a new trackback (record a third-party site linking to the Drupal site).
+ *
+ * @param Object $trackback
+ */
+function vinculum_trackback_save_trackback($trackback) {
+  // Build a vinculum object.
+  $vinculum = new vinculum($trackback->nid, $trackback->url, 'vinculum_trackback');
+  $vinculum->data = $trackback;
+
+  // The vinculum_receive_validate() function handles delegated validation.
+  $result = vinculum_receive_validate($vinculum);
+  if ($result != VINCULUM_VALIDATES) {
+    return $result;
+  }
+  else {
+    // Mark the record as valid, to save the overhead of re-validation.
+    $vinculum->isValid();
+  }
+
+  // Write an entry in the trackback tracker table.
+  db_merge('vinculum_trackback_received')
+    ->key(array(
+      'nid' => $trackback->nid,
+      'url' => $trackback->url,
+      ))
+    ->fields(array(
+      'blog_name' => $trackback->blog_name,
+      'title'     => $trackback->title,
+      'excerpt'   => $trackback->excerpt,
+      'origin_ip' => ip_address(),
+      'timestamp' => time(),
+    ))
+    ->execute();
+
+  // Call the API to register receipt of the vinculum.
+  vinculum_receive($vinculum);
+}
+
+
+/**
+ * Send a trackback request (notify a third-party site of a link).
+ *
+ * @param String $endpoint_url
+ *   The URL of the remote Trackback endpoint.
+ * @param Array $params
+ * - url       The URL of the local node (REQUIRED).
+ * - title     The title of the local node (optional).
+ * - excerpt   Excerpt from the local node (optional).
+ * - blog_name Name of the local site (optional; defaults to site-name).
+ *
+ * @return Boolean
+ * TRUE if the remote site reported success.
+ * FALSE if the remote site reported failure, or any other error occurred (e.g.
+ *   network error preventing the site from being reached).
+ */
+function vinculum_trackback_send_trackback($endpoint_url, $params) {
+  if (!is_array($params) || empty ($params['url'])) {
+    throw new Exception ("The vinculum_trackback_send_trackback() function requires that \$params['url'] is provided");
+  }
+  // Data to send in the trackback.
+  $params += array(
+    'blog_name' => variable_get('site_name', 'Drupal'),
+  );
+  $params = http_build_query($params);
+
+  $options = array(
+    // The Trackback protocol supports requires POST.
+    'method' => 'POST',
+    'headers' => array(
+      'User-Agent' => VINCULUM_TRACKBACK_UA,
+      'Content-Type' => 'application/x-www-form-urlencoded; charset=utf-8',
+    ),
+    // Add the data to send in the Trackback.
+    'data' => $params,
+  );
+  $result = drupal_http_request($endpoint_url, $options);
+
+  if ($result->data) {
+    list($error, $message) = _vinculum_trackback_parse_response($result->data);
+
+    // Log the error.
+    if (is_null($error)) {
+      // The response could not be parsed.
+      $params = array(
+        '%url' => $endpoint_url,
+        '!verbose_output' => filter_xss(str_replace("\n", "<br />\n", htmlentities($result->data))),
+      );
+      watchdog('Trackback', 'Trackback response for endpoint %url could not be parsed as XML.<br />!verbose_output', $params, WATCHDOG_DEBUG);
+    }
+    elseif ($error && $message) {
+      $params = array(
+        '%url' => $endpoint_url,
+        '!verbose_output' => filter_xss(str_replace("\n", "<br />\n", htmlentities($message))),
+      );
+      watchdog('Trackback', 'Trackback failed for endpoint %url with the message:<br />!verbose_output', $params, WATCHDOG_DEBUG);
+    }
+    elseif ($error) {
+      $params = array(
+        '%url' => $endpoint_url,
+      );
+      watchdog('Trackback', 'Trackback failed for endpoint %url. No error message was provided.', $params, WATCHDOG_DEBUG);
+    }
+
+    return ($error === FALSE);
+  }
+}
+
+/**********************************************************
+ * Private helper functions.
+ *********************************************************/
+
+/**
+ * Parse the response from a trackback endpoint, and report if the response is
+ * an error (and any message, if provided).
+ *
+ * @param String $html
+ *  The response provided by the Trackback endpoint.
+ *
+ * @return Array(
+ *   0 => Error state (boolean|NULL),
+ *   1 => Message (if set),
+ * );
+ */
+function _vinculum_trackback_parse_response($html) {
+  // If the html can't be parsed as XML, return error response NULL.
+  if (!$xml = @simplexml_load_string($html)) {
+    return array(NULL, '');
+  }
+
+  // Check for the <error> response.
+  $error_response = $xml->xpath('//response/error/text()');
+  if (empty($error_response)) {
+    return array(NULL, '');
+  }
+  elseif ($error_response[0] == 1) {
+    // Check for an error message.
+    $error_message = $xml->xpath('//response/message/text()');
+    if (count($error_message)) {
+      return array(TRUE, $error_message[0]);
+    }
+    return array(TRUE, '');
+  }
+  elseif ($error_response[0] == 0) {
+    // Error response 0 means OK
+    return array(FALSE, '');
+  }
+  else {
+    // There's an <error> response, but it doesn't conform to the standard
+    // of being 0 or 1.
+    return array(NULL, '');
+  }
+}
+
+/**
+ * Get the local Trackback API endpoint URL for a local node.
+ *
+ * The trackback endpoint for each node is at:
+ * node/%node/trackback
+ *
+ * @param Object $node
+ *   A drupal node.
+ *
+ * @return String
+ * The URL of the Trackback endpoint.
+ */
+function _vinculum_get_trackback_endpoint($node) {
+  return url("node/{$node->nid}/trackback", array('absolute' => TRUE));
+}
+
+/**
+ * Add the RDF meta-data which allows third-party sites to auto-discover
+ * Trackback support.
+ *
+ * @TODO: investigate integrating this with the RDF module.
+ */
+function _vinculum_add_trackback_autodiscovery_metadata($node) {
+
+  // Get the canonical URL to this node.
+  $url = url("node/{$node->nid}", array('absolute' => TRUE));
+
+  // Get the Trackback endpoint for this specific node.
+  $tb_url = _vinculum_get_trackback_endpoint($node);
+
+  $rdf_text = "\n<!--\n";
+  $rdf_text .= '<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:trackback="http://madskills.com/public/xml/rss/module/trackback/">' . "\n";
+  $rdf_text .= "\t" . '<rdf:Description';
+  $rdf_text .= ' rdf:about="' . $url . '"';
+  $rdf_text .= ' dc:identifier="' . $url . '"';
+  $rdf_text .= ' dc:title="' . strtr(check_plain($node->title), array('--' => '&mdash;')) . '"';
+  $rdf_text .= ' trackback:ping="' . $tb_url . '" />' . "\n";
+  $rdf_text .= '</rdf:RDF>';
+  $rdf_text .= "\n-->\n";
+
+  // Add the RDF meta-data to the node.
+  $node->content['trackback'] = array(
+    '#markup' => $rdf_text,
+  );
+}

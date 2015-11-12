@@ -1,1 +1,0 @@
-The tests folder contains meant to test the functionality of the Mockable module itself.
