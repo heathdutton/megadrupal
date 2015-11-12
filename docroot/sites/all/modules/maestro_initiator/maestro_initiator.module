@@ -1,0 +1,412 @@
+<?php
+
+include('maestro_initiator_autocomplete_task.class.php');
+include(drupal_get_path('module', 'maestro') . '/maestro_task_interface.class.php');
+include('maestro_initiator_autocomplete_interface.class.php');
+
+/**
+ * Implements hook_menu().
+ */
+function maestro_initiator_menu() {
+  $items['admin/structure/maestro/manage-templates'] = array(
+    'title' => 'Manage Templates',
+    'access arguments' => array('maestro admin'),
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('maestro_initiator_settings_form'),
+    'type' => MENU_LOCAL_TASK,
+    'file' => 'maestro_initiator.admin.inc',
+  );
+  return $items;
+}
+
+/**
+ * Initiates a workflow
+ * @param $key - Key provided in the hook_maestro_enabled_process
+ * @param $params - Array of name-value pairs for all process variables to be set to create the process
+ *
+ * @return TRUE if process was initiated, FALSE otherwise
+ * @see hook_maestro_enabled_process().
+ */
+function maestro_initiator_initiate_workflow($key, $params = array()) {
+  $template_id = maestro_initiator_get_template_id($key);
+  if (!empty($template_id)) {
+    $maestro = Maestro::createMaestroObject(maestro_initiator_get_version());
+    $process_id = $maestro->engine()->newProcess($template_id);
+    if (!empty($params) && is_array($params)) {
+      foreach ($params as $variable => $value) {
+        $maestro->engine()->setProcessVariable($variable, $value, $process_id);
+      }
+    }
+    watchdog('maestro', 'Workflow @templateid initiated', array('@templateid' => $template_id), WATCHDOG_INFO);
+    return TRUE;
+  }
+
+  watchdog('maestro', 'Workflow @templateid not found. No workflow initiated.', array('@templateid' => $template_id), WATCHDOG_INFO);
+  return FALSE;
+}
+
+/**
+ * returns the template if
+ */
+function maestro_initiator_get_template_id($key) {
+  return variable_get('maestro_initiator_' . $key, 0);
+}
+
+/**
+ * Implements hook_maestro_handler_options().
+ */
+function maestro_initiator_maestro_handler_options() {
+  $handlers = array(
+    'MaestroTaskTypeAutocompleteTask' => array(
+      'maestro_initiator_autocomplete_siblings' => t('Autocomplete sibling tasks after number of days specified by the template variable "hold_task".
+        You can set a specific value in "hold_until" template variable. hold_until has a higher preference than hold_task'),
+      'maestro_initiator_autocomplete_self' => t('Autocomplete this task on the date specified in the template variable "autocomplete_on"'),
+    ),
+  );
+  return $handlers;
+}
+
+/**
+ * Autocomplete sibilings
+ */
+function maestro_initiator_autocomplete_siblings($queue_id, $process_id) {
+  $output = FALSE;
+  
+  //1. check if we already have this queue_id & process_id
+  $check = db_select('maestro_initiator_processes', 'mp')->fields('mp', array('trigger_date', 'completed'))
+    ->condition('process_id', $process_id)
+    ->condition('queue_id', $queue_id)
+    ->execute()->fetchObject();
+  //2. If yes check if we complete this task and move on
+  if (is_object($check) && !empty($check->trigger_date)) {
+    //complete this task or go to hold
+    if ($check->trigger_date <= time()) {
+      //time to complete this task
+      $result = _maestro_initiator_complete_tasks($process_id, $queue_id);
+      //if result is false, then a sibling was automatically closed. there may be follow up tasks
+      //so send false and set completed to 0
+      //if true, then a sibiling might get generated in this run, so we should skip the run if completed
+      //is zero. if completed is 1 then we can close the task!
+      if ($result) {
+        if ($check->completed) {
+          $maestro = Maestro::createMaestroObject(maestro_initiator_get_version());
+          $maestro->engine()->completeTask($queue_id);
+          $output = TRUE;
+        }
+        //set this queue as processed
+        $completed = 1;
+      }
+      else {
+        $completed = 0;
+      }
+      if ($completed != $check->completed) {
+        db_update('maestro_initiator_processes')->fields(array('completed' => $completed))
+          ->condition('process_id', $process_id)
+          ->condition('queue_id', $queue_id)
+          ->execute();
+      }
+    }
+  }
+  else {
+    //3. If queueid is not found then log and go to hold
+    $maestro = Maestro::createMaestroObject(maestro_initiator_get_version());
+    $hold_until = $maestro->engine()->getProcessVariable('hold_until', $process_id);
+    $created = time();
+    $days_to_hold = $maestro->engine()->getProcessVariable('hold_task', $process_id);
+    if (empty($hold_until)){
+      $hold_until = strtotime("+$days_to_hold day", $created);
+    }
+    else {
+      if(!is_numeric($hold_until)) {
+        $hold_until = strtotime($hold_until);
+        if (!$hold_until) {
+          //if time conversion failed
+          $hold_until = strtotime("+$days_to_hold day", $created);
+          watchdog('maestro', 'Failed to find trigger date: !date, defaulting to !day days', array(
+            '!date' => $hold_until, '!day' => $days_to_hold), WATCHDOG_ERROR);
+        }
+      }
+    }
+
+    db_insert('maestro_initiator_processes')->fields(array(
+      'process_id' => $process_id,
+      'queue_id' => $queue_id,
+      'created_date' => $created,
+      'trigger_date' => $hold_until,
+      'completed' => 0,
+    ))->execute();
+  }
+  //we want it to be set on hold
+  return $output;
+}
+
+/**
+ * Autocomplete this task
+ */
+function maestro_initiator_autocomplete_self($queue_id, $process_id) {
+  $maestro = Maestro::createMaestroObject(maestro_initiator_get_version());
+  $autocomplete_on = $maestro->engine()->getProcessVariable('autocomplete_on', $process_id);
+  if (!empty($autocomplete_on)) {
+    if ($autocomplete_on <= time()) {
+      return TRUE;
+    }
+  }
+  else {
+    watchdog('maestro', 'Autocomplete Task variable autocomplete_on is empty for process %processid', 
+      array('%processid' => $process_id), WATCHDOG_ERROR);
+  }
+  return FALSE;
+}
+
+function maestro_initiator_get_version() {
+  return variable_get('maestro_initiator_maestro_version', 1);
+}
+
+/**
+ * time out has occurred. complete the selected set of tasks
+ */
+function _maestro_initiator_complete_tasks($process_id, $queue_id) {
+  $output = TRUE;
+  $maestro = Maestro::createMaestroObject(maestro_initiator_get_version());    
+  //get all open tasks in the same branch and complete them
+  $subquery = db_select('maestro_queue_from', 'f')->fields('f', array('from_queue_id'))
+    ->condition('queue_id', $queue_id);
+
+  $query = db_select('maestro_queue', 'mq')->fields('mq', array('process_id', 'id'));
+  $query->innerjoin('maestro_queue_from', 'f', 'f.queue_id = mq.id');
+  $query->addJoin('inner', $subquery, 'fromqs', 'fromqs.from_queue_id = f.from_queue_id');
+  $query->addField('f', 'from_queue_id', 'from_queue_id');
+  $open_tasks = $query->condition('process_id', $process_id)
+    ->condition('mq.status', 0)
+    ->execute();
+
+  $values = array();
+  foreach ($open_tasks as $item) {
+    //store the queues based on path that we complete only items in the same path
+    $values[$item->from_queue_id][] = $item->id;
+  }
+  
+  //run through all the tasks and close them in the same branch as the
+  //autocomplete task
+  $auto_values = array(
+    'process_id' => $process_id,
+    'queue_id' => 0,
+    'completed_date' => time(),
+  );
+  $maestro = Maestro::createMaestroObject(maestro_initiator_get_version());    
+  foreach ($values as $queues) {
+    //complete the other tasks
+    foreach ($queues as $id) {
+      if ($queue_id != $id) {
+        //don't complete the "autocomplete task" on the first run as we need to ensure that 
+        //the entire chain is completed.
+        $output = FALSE;
+        if (_maestro_initiator_execute_task($id, $process_id)) {
+          //we don't try to optimize on insert SQL as there may be many workflows being processed
+          //that may cause a timeout and there by resulting in inconsistency in data.
+          $maestro->engine()->completeTask($id);  
+          $auto_values['queue_id'] = $id;
+          db_insert('maestro_initiator_autoclosed')->fields($auto_values)->execute();
+        }
+        else {
+          watchdog('maestro_initator', 'Failed to autocomplete task with queue id @queue', array('@queue' => $id));
+        }
+      }
+    }
+  }
+  return $output;
+}
+
+/**
+ * Complete a task
+ */
+function _maestro_initiator_execute_task($queue_id, $process_id) {
+  $query = db_select('maestro_queue', 'a');
+  $query->join('maestro_process', 'b', 'a.process_id = b.id');
+  $query->join('maestro_template_data', 'c', 'a.template_data_id = c.id');
+  $query->join('maestro_template', 'd', 'b.template_id = d.id');
+  $query->fields('a',array('id','status','archived','template_data_id','task_class_name','engine_version','is_interactive'));
+  $query->addField('b','id','process_id');
+  $query->addField('c','task_class_name','step_type');
+  $query->addField('a','handler');
+  $query->addField('d','template_name');
+  $query->condition('a.id', $queue_id);
+  $queueRecord = $query->execute()->fetchObject();
+  $object = new $queueRecord->task_class_name($queueRecord);
+  $function = $object->_properties->handler;
+  if (function_exists($function)) {
+    $result = $function('complete', $ftask, array('autocomplete' => TRUE));
+    return $result->retcode;
+  }
+  return FALSE;
+}
+ 
+/**
+ * Implements hook_maestro_get_taskobject_info().
+ */
+function maestro_initiator_maestro_get_taskobject_info() {
+  $options = array(
+    array('display_name' => 'Autocomplete Tasks',
+      'class_name' => 'MaestroTaskInterfaceAutocompleteTask',
+      'file_location' => ''
+      ),
+    );
+  return $options;
+}
+
+/**
+ * Implements hook_features_api().
+ */
+function maestro_initiator_features_api() {
+  return array('maestro' => array(
+      'name' => 'Maestro',
+      'default_hook' => 'maestro_defaults',
+      'file' => drupal_get_path('module', 'maestro_initiator') . '/maestro_initiator.feature.inc',
+      'default_file' => FEATURES_DEFAULTS_INCLUDED,
+      // 'default_filename' => 'features.maestro',
+      'feature_source' => TRUE,
+    ), );
+}
+
+/**
+ * A general interactive form
+ * @param $params: form elements to be added to the form
+ * @param $showcomplete: TRUE to show the complete button FALSE to hide it
+ * @param $showupdate: TRUE to show the update button FALSE to hide it
+ *
+ */
+function maestro_initiator_general_form($form, &$form_state, $params, $showcomplete, $showupdate) {
+  $form += $params;
+  $form['pc'] = array('#markup' => '<div class="clear"></div>');
+  if ($showcomplete) {
+    $form['actions']['complete_task'] = array(
+      '#type' => 'button',
+      '#default_value' => t('Complete Task'),
+      '#attributes' => array('maestro' => array('complete')),
+    );
+  }
+  if ($showupdate) {
+    $form['actions']['update_task'] = array(
+      '#type' => 'button',
+      '#default_value' => t('Update'),
+      '#attributes' => array('maestro' => array('update')),
+    );
+  }
+  return $form;
+}
+
+/**
+ * Implements hook_theme().
+ */
+function maestro_initiator_theme() {
+  return array(
+    'maestro_initiator_autocomplete_task' => array('variables' => array('tdid' => 0, 'taskname' => '', 'ti' => NULL))
+  );
+}
+
+function theme_maestro_initiator_autocomplete_task($variables) {
+  
+  $output = '<div class="maestro_task">
+    <div class="t"><div class="b"><div class="r"><div class="l"><div class="bl"><div class="br"><div class="tl-gry"><div class="tr-gry">
+  
+      <div id="task_title<?php print $tdid; ?>" class="tm-gry maestro_task_title">' .
+        $variables['taskname'] .
+      '</div>
+      <div class="maestro_task_body">' .
+        t('Autocomplete Task') .
+      '</div>
+  
+    </div></div></div></div></div></div></div></div>
+  </div>';
+  return $output;
+}
+
+/**
+ * Helper to track approval status
+ * @param $uniqueid : Unique id from your table
+ * @param $process_key: process key or tablename
+ * @param $uid: user who approved / rejected
+ * @param $status: approval status 0 - No, 1 - True
+ * @param $adate: date of approval
+ */
+function maestro_initiator_log_approval($uniqueid, $process_key, $uid, $status, $adate) {
+  db_insert('maestro_initiator_approval')->fields(compact('uniqueid', 'process_key', 'uid', 'status', 'adate'))
+    ->execute();
+}
+
+/**
+ * Support for userbar module.
+ * Courtesy: Arvind Raghupathy
+ */
+function maestro_initiator_userbar_info() {
+  return array('maestro_initiator' => array('maestro_initiator_cnt' => array(
+        'tip' => t('Number of pending tasks'),
+        'description' => t('Number of pending tasks'),
+        'display' => "/" . drupal_get_path('module', 'maestro_initiator') . '/images/tasks.png',
+        'type' => 'image'
+      ), ));
+}
+
+/**
+ * Implements hook_userbar_view().
+ */
+function maestro_initiator_userbar_view($indexes) {
+  module_load_include('inc', 'maestro', 'maestro.moderator');
+  $cu = maestro_get_all_flows_data(array('myflows' => TRUE));
+  $count = $cu->rowCount();
+
+  $output = array('maestro_initiator' => array());
+  if (in_array('maestro_initiator_cnt', $indexes)) {
+    if ($count != 0) {
+      $output['maestro_initiator']['maestro_initiator_cnt'] = array(
+        'tip' => t("You have !number pending tasks", array("!number" => $count)),
+        'description' => t('Number of Pending tasks'),
+        'callback' => 'maestro/taskconsole',
+        'display' => "/" . drupal_get_path('module', 'maestro_initiator') . '/images/task_new.png',
+        'type' => 'image'
+      );
+
+    }
+    else {
+      $output['maestro_initiator']['maestro_initiator_cnt'] = array(
+        'description' => t('Task Console'),
+        'tip' => t('Task Console'),
+        'callback' => 'maestro/taskconsole',
+        'display' => "/" . drupal_get_path('module', 'maestro_initiator') . '/images/tasks.png',
+        'type' => 'image'
+      );
+
+    }
+  }
+  return $output;
+}
+
+/**
+ * Implements hook_views_api().
+ */
+function maestro_initiator_views_api () {
+  return array (
+    'api' => 3.0,
+    'path' => drupal_get_path ('module', 'maestro_initiator') . '/views',
+  );
+}
+
+/**
+ * Implements hook_cron().
+ */
+function maestro_initiator_cron() {
+  //cancel tasks who were not processed and their trigger date is passed.
+  $result = db_select('maestro_initiator_processes', 'mp')->fields('mp', array('queue_id', 'process_id'))
+    ->condition('completed', 0)
+    //we give one day gap so that orchestrator has a chance to run
+    ->condition('trigger_date', strtotime('-1 day'), '<=')
+    ->execute();
+  $maestro = Maestro::createMaestroObject(maestro_initiator_get_version());    
+  foreach ($result as $row) {
+    $maestro->engine()->cancelTask($row->queue_id);
+    db_update('maestro_initiator_processes')->fields(array('completed' => 2)) //mark as cancelled.
+      ->condition('process_id', $row->process_id)
+      ->condition('queue_id', $row->queue_id)
+      ->execute();
+  } 
+}

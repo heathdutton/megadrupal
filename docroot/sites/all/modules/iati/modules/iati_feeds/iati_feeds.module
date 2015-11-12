@@ -1,0 +1,233 @@
+<?php
+/**
+ * @file
+ * Code for the IATI Feeds feature.
+ */
+
+include_once 'iati_feeds.features.inc';
+
+/**
+ * Implements hook_feeds_after_parse().
+ */
+function iati_feeds_feeds_after_parse(FeedsSource $source, FeedsParserResult $result) {
+  // Given the mixture of the changes in location item in iati standard;
+  // and the complexity required to normalize it, including requesting
+  // external data, it is passed from the parser as raw XML and then
+  // parsed further and looked up before being mapped to the entity
+  // reference field on the activit node.
+  if ($source->id == 'iati_activity') {
+    foreach ($result->items as $item) {
+      $result = _iati_feeds_xpath_extract($item);
+      $normalized = _iati_feeds_location_normalize($result);
+      // @todo EFQ to check if this location already exists.
+      // If exists make ID available for location entity reference field.
+      // If not create new location entity; and pass ID for entity reference field.
+    }
+  }
+}
+
+/**
+ * Gather location data from a result location item.
+ *
+ * The parser is configured to return the full XML in the location node.
+ * This function uses xpath to retrieve all values no matter version of IATI
+ * from this node.
+ *
+ * @param array $item
+ *   FeedsParserResult item.
+ *
+ * @return array
+ *   Keyed array of values and attibutes from location node.
+ */
+function _iati_feeds_xpath_extract($item) {
+  $location_doc = new DOMDocument();
+  $location_doc->loadXML($item['location_raw']);
+  $xpath = new FeedsExXpathDomXpath($location_doc);
+  $mappings = array(
+    // 1.03 & 1.04
+    'name' => 'location/name',
+    'description' => 'location/description',
+    // v1.03
+    'administrative' => 'location/administrative',
+    'administrative:country' => 'location/administrative/@country',
+    'administrative:adm1' => 'location/administrative/@adm1',
+    'administrative:adm2' => 'location/administrative/@adm2',
+    'coordinates:longitude' => 'location/coordinates/@longitude',
+    'coordinates:latitude' => 'location/coordinates/@latitude',
+    'coordinates:precision' => 'location/coordinates/@precision',
+    'location-type' => 'location/location-type/@code',
+    'gazetteer:ref' => 'location/gazetteer-entry/@gazetteer-ref', // Codelist for this is 404.
+    'gazatteer:id' => 'location/gazetteer-entry',
+    // v1.04
+    'location:id' => 'location/location-id/@code',
+    'location:vocabulary' => 'location/location-id/@vocabulary',
+    'administrative:id' => 'location/administrative/@id',
+    'administrative:vocabulary' => 'location/administrative/@vocabulary',
+    'administrative:level' => 'location/administrative/@level',
+    'exactness' => 'location/exactness/@code',
+    'location-reach' => 'location/location-reach/@code',
+    'location-class' => 'location/location-class/@code',
+    'feature-designation' => 'location/feature-designation/@code',
+    'point:pos' => 'location/point/pos',
+  );
+  $result = array();
+  foreach($mappings as $key => $expression) {
+    if ($this_result = _iati_feeds_execute_source_expression($xpath, $key, $expression)) {
+      $result[$key] = $this_result;
+    }
+  }
+  unset($xpath);
+
+  return $result;
+}
+
+/**
+ * Merge values from different versions of location into one array.
+ *
+ * Additionally uses geocoding to retrieve ID and further location hierarchy.
+ *
+ * @param array $result
+ *   See _iati_feeds_xpath_extract for keys.
+ *
+ * @return array
+ *   Normalized location array:
+ *     name => Location name
+ *     description => location description
+ *     location:vocabulary => IATI location (>1.04) vocabulary
+ *     location:id => location id for that vocabulary
+ *     longitude => location longitude
+ *     latitude => location latitude
+ *     administrative:country => administrative country (level 0)
+ *     administrative-1 => administrative region (level 1)
+ *     administrative-2 => administrative region (level 2)
+ */
+function _iati_feeds_location_normalize($result) {
+  $normalized = array();
+  $normalized['name'] = isset($result['name']) ? $result['name'] : '';
+  $normalized['description'] = isset($result['description']) ? $result['description'] : '';
+  if (isset($result['coordinates:longitude'])) {
+    $normalized['longitude'] = $result['coordinates:longitude'];
+    $normalized['latitude'] = $result['coordinates:latitude'];
+  }
+  elseif (isset($result['point:pos'])) {
+    list($normalized['latitude'],$normalized['longitude']) = explode(' ', trim($result['point:pos']));
+  }
+  else {
+    // We may be able to populate this later from geocoding.
+    $normalized['latitude'] = $normalized['longitude'] = '';
+  }
+  if (isset($result['administrative:country'])) {
+    $normalized['country-code'] = $result['administrative:country'];
+  }
+  // Now to get some data to normalize and standardize what is stored.
+  // If there is an 1.04 location or administrative. We can just use that.
+  // 1.03 gazetteer seems similar, but the code list is gone.
+  if (!empty($result['location:id'])){
+    $normalized['location:vocabulary'] = $result['location:vocabulary'];
+    $normalized['location:id'] = $result['location:id'];
+    // @todo add lookups to get source data with hierarchy.
+  }
+  if (!empty($result['administrative:id'])) {
+    // @todo add lookups to get source data with hierarchy.
+
+    // No location, but an administrative. Use that for location.
+    if (empty($normalized['location:vocabulary'])) {
+      $normalized['location:vocabulary'] = $result['administrative:vocabulary'];
+      $normalized['location:id'] = $result['administrative:id'];
+    }
+  }
+  // Or then the description 1.03 and 1.04 which is often cleanly geocodable.
+  if (empty($normalized['location:vocabulary']) && !empty($result['description'])) {
+    _iati_feeds_location_lookup($normalized, $result['description']);
+  }
+  // Failing that the text description of the administrative area 1.03
+  if (empty($normalized['location:vocabulary']) && !empty($result['administrative'])) {
+    _iati_feeds_location_lookup($normalized, $result['administrative']);
+  }
+  // Last option, geocode from lon, lat. It's exact, too exact, and you can't
+  // request importance.
+  // http://open.mapquestapi.com/nominatim/v1/search?q=%2247.82405+35.18578%22&addressdetails=1&format=json&limit=1
+  if (empty($normalized['location:vocabulary']) && !empty($normalized['longitude'])) {
+    _iati_feeds_location_lookup($normalized, $normalized['latitude'] . '+' . $normalized['longitude']);
+  }
+  return $normalized;
+}
+
+/**
+ * Return xpath expression result if it exists.
+ */
+function _iati_feeds_execute_source_expression($xpath, $key, $expression) {
+  $result = $xpath->evaluate($expression, $row);
+
+  if (!$result instanceof DOMNodeList) {
+    return $result;
+  }
+  if ($result->length == 0) {
+    return;
+  }
+
+  $return = array();
+  foreach ($result as $node) {
+    $return[] = $node->nodeValue;
+  }
+  // Return a single value if there's only one value.
+  return count($return) === 1 ? reset($return) : $return;
+}
+
+/**
+ * Geocode, and assign values, for a particular string location.
+ */
+function _iati_feeds_location_lookup(&$normalized, $location) {
+  if (!($data = _iati_feeds_geocode($location)) || !isset($data->lon)) {
+    return;
+  }
+  $normalized['location:vocabulary'] = 'G2'; // OSM
+  $normalized['location:id'] = $data->osm_id;
+  // If no lot lon was supplied, use the geocoded one.
+  if (empty($normalized['longitude'])) {
+    $normalized['longitude'] = $data->lon;
+    $normalized['latitude'] = $data->lat;
+  }
+  if (empty($normalized['country-code'])) {
+    $normalized['country-code'] = $data->address->country_code;
+  }
+  if (empty($normalized['admininstrative-1']) && !empty($data->address->state)) {
+    $normalised['administrative-1'] = $data->address->state;
+    if (empty($normalized['administrative-2']) && !empty($data->address->county)) {
+      $normalized['administrative-2'] = $data->address->county;
+    }
+  }
+}
+
+/**
+ * Make geocode request.
+ *
+ * @todo use some wrapper/module for this wsclient could be good,
+ *   that or write a geocoder plugin (the mapquest_nominatim one hard
+ *   codes that it doesn't want addresses and various other assumptions).
+ */
+function _iati_feeds_geocode($string) {
+  static $cache;
+
+  // In many sets of data the same value is used over again.
+  if (isset($cache[$string])) {
+    return $cache[$string];
+  }
+
+  $nominatim_url = "http://open.mapquestapi.com/nominatim/v1/search";
+  $options = array(
+    'addressdetails' => 1,
+    'format' => 'json',
+    'limit' => 1,
+  );
+
+  $query = array(
+    'q' => $string,
+  );
+  $query += $options;
+  $request = drupal_http_request($nominatim_url . '?' . drupal_http_build_query($query));
+  $data = json_decode($request->data);
+  $result = !empty($data[0]) ? $data[0] : FALSE;
+  $cache[$string] = $result;
+  return $result;
+}

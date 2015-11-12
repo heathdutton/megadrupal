@@ -1,0 +1,578 @@
+<?php
+
+/**
+ * @file
+ * Main hooks and API functions for Rooms Availability Constraints module.
+ */
+
+module_load_include('inc', 'rooms_availability_constraints', 'rooms_availability_constraints.field');
+
+define('ROOMS_AVAILABILITY_CONSTRAINTS_MUST_START', 'must');
+define('ROOMS_AVAILABILITY_CONSTRAINTS_IF_STARTS', 'if');
+define('ROOMS_AVAILABILITY_CONSTRAINTS_NO_DAY', 'none');
+
+/**
+ * Implements hook_menu().
+ */
+function rooms_availability_constraints_menu() {
+  $items['rooms_availability_constraints/ajax'] = array(
+    'title' => 'Remove item callback',
+    'page callback' => 'rooms_availability_constraints_remove_js',
+    'delivery callback' => 'ajax_deliver',
+    'access callback' => TRUE,
+    'theme callback' => 'ajax_base_page_theme',
+    'type' => MENU_CALLBACK,
+    'file path' => 'includes',
+    'file' => 'form.inc',
+  );
+
+  return $items;
+}
+
+/**
+ * Page callback to handle AJAX for removing a rooms availability range item.
+ *
+ * This is a direct page callback. The actual job of deleting the item is
+ * done in the submit handler for the button, so all we really need to
+ * do is process the form and then generate output. We generate this
+ * output by doing a replace command on the id of the entire form element.
+ */
+function rooms_availability_constraints_remove_js() {
+  // drupal_html_id() very helpfully ensures that all html IDS are unique
+  // on a page. Unfortunately what it doesn't realize is that the IDs
+  // we are generating are going to replace IDs that already exist, so
+  // this actually works against us.
+  if (isset($_POST['ajax_html_ids'])) {
+    unset($_POST['ajax_html_ids']);
+  }
+
+  list($form, $form_state, $form_id, $form_build_id, $commands) = ajax_get_form();
+  drupal_process_form($form['#form_id'], $form, $form_state);
+
+  // Get the information on what we're removing.
+  $button = $form_state['triggering_element'];
+  // Go two levels up in the form, to the whole widget.
+  $element = drupal_array_get_nested_value($form, array_slice($button['#array_parents'], 0, -3));
+  // Now send back the proper AJAX command to replace it.
+  $commands[] = ajax_command_replace('#' . $element['#id'], drupal_render($element));
+  $return = array(
+    '#type' => 'ajax',
+    '#commands' => $commands,
+  );
+
+  // Because we're doing this ourselves, messages aren't automatic. We have
+  // to add them.
+  $messages = theme('status_messages');
+  if ($messages) {
+    $return['#commands'][] = ajax_command_prepend('#' . $element['#id'], $messages);
+  }
+
+  return $return;
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * FORM_ID = rooms_unit_type_form
+ */
+function rooms_availability_constraints_form_rooms_unit_type_form_alter(&$form, &$form_state, $form_id) {
+  $unit_type = $form_state['rooms_unit_type'];
+  // Unit availability information for administrators.
+  $form['availability_constraints'] = array(
+    '#type' => 'fieldset',
+    '#group' => 'additional_settings',
+    '#title' => t('Status'),
+    '#tree' => FALSE,
+    '#weight' => 80,
+    '#attributes' => array(
+      'class' => array('unit-type-form-constraints'),
+    ),
+    '#attached' => array(
+      'js' => array(drupal_get_path('module', 'rooms_availability_constraints') . '/js/rooms_availability_constraints_tab.js'),
+    ),
+  );
+
+  $form['availability_constraints']['rooms_availability_range_unit'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Enable availability range constraints per unit'),
+    '#default_value' => variable_get('rooms_availability_constraints_unit_' . $unit_type->type, 0),
+    '#description' => t('This will allow you to define a minimum or maximum booking period for each unit of this type. If you disable this feature, all the stored data will be removed'),
+  );
+
+  $form['availability_constraints']['rooms_availability_range_type'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Enable availability range constraints for all units of this type'),
+    '#default_value' => variable_get('rooms_availability_constraints_type_' . $unit_type->type, 0),
+    '#description' => t('This will allow you to define a minimum or maximum booking period for all units of this type. If you disable this feature, all the stored data will be removed'),
+  );
+
+  if (variable_get('rooms_availability_constraints_type_' . $unit_type->type, 0) == 0) {
+    $form['rooms_constraints_range']['#access'] = FALSE;
+  }
+
+  $form['#submit'][] = 'rooms_availability_constraints_rooms_unit_type_form_submit';
+}
+
+/**
+ * Submit handler for rooms_unit_type_form.
+ */
+function rooms_availability_constraints_rooms_unit_type_form_submit($form, &$form_state) {
+  $unit_type = $form_state['rooms_unit_type'];
+
+  if (variable_get('rooms_availability_constraints_unit_' . $unit_type->type, 0) == 0
+    && $form_state['values']['rooms_availability_range_unit'] == 1) {
+    rooms_availability_constraints_add_availability_range_field('rooms_unit', $unit_type->type);
+  }
+  elseif (variable_get('rooms_availability_constraints_unit_' . $unit_type->type, 0) == 1
+    && $form_state['values']['rooms_availability_range_unit'] == 0) {
+    field_delete_instance(array(
+      'field_name' => 'rooms_constraints_range',
+      'entity_type' => 'rooms_unit',
+      'bundle' => $unit_type->type,
+    ));
+  }
+
+  if (variable_get('rooms_availability_constraints_type_' . $unit_type->type, 0) == 1
+    && $form_state['values']['rooms_availability_range_type'] == 0) {
+    $unit_type->rooms_constraints_range[LANGUAGE_NONE] = array();
+    entity_save('rooms_unit_type', $unit_type);
+  }
+
+  variable_set('rooms_availability_constraints_unit_' . $unit_type->type, $form_state['values']['rooms_availability_range_unit']);
+  variable_set('rooms_availability_constraints_type_' . $unit_type->type, $form_state['values']['rooms_availability_range_type']);
+}
+
+/**
+ * Adds the default Availability range field to certain bundle.
+ */
+function rooms_availability_constraints_add_availability_range_field($entity_type, $bundle) {
+  field_info_cache_clear();
+  // Create field ('rooms_constraint_range') if not exists.
+  if (field_read_field('rooms_constraints_range') === FALSE) {
+    $field = array(
+      'field_name' => 'rooms_constraints_range',
+      'type' => 'rooms_availability_constraints_range',
+      'cardinality' => FIELD_CARDINALITY_UNLIMITED,
+    );
+    field_create_field($field);
+  }
+
+  field_cache_clear();
+
+  if (field_read_instance($entity_type, 'rooms_constraints_range', $bundle) === FALSE) {
+    // Create the instance on the bundle.
+    $instance = array(
+      'field_name' => 'rooms_constraints_range',
+      'entity_type' => $entity_type,
+      'label' => 'Availability ranges',
+      'bundle' => $bundle,
+      'required' => FALSE,
+      'widget' => array(
+        'type' => 'rooms_availability_constraints_range',
+      ),
+    );
+    field_create_instance($instance);
+  }
+}
+
+/**
+ * Implements hook_entity_delete().
+ */
+function rooms_availability_constraints_entity_delete($entity, $type) {
+  if ($type == 'rooms_unit_type') {
+    variable_del('rooms_availability_constraints_unit_' . $entity->type);
+    variable_del('rooms_availability_constraints_type_' . $entity->type);
+  }
+}
+
+/**
+ * Implements hook_rooms_booking_availabilityagent_filter().
+ */
+function rooms_availability_constraints_rooms_booking_availabilityagent_filter() {
+  return array(
+    'availability_agent_range_filter' => array(
+      'label' => t('Availability range'),
+      'handler' => array(
+        'class' => 'AvailabilityAgentDurationFilter',
+      ),
+    ),
+  );
+}
+
+/**
+ * Implements hook_element_info().
+ */
+function rooms_availability_constraints_element_info() {
+  $elements = array();
+  $elements['rooms_availability_range'] = array(
+    '#input' => TRUE,
+    '#process' => array('rooms_availability_range_process'),
+  );
+  return $elements;
+}
+
+/**
+ * Generates the 'rooms_availability_range' Form API element.
+ */
+function rooms_availability_range_process($element, $form_state, $complete_form) {
+  $range = rooms_date_range_fields();
+
+  $always_id = drupal_html_id('rooms-constraints-range-always');
+  $constraint_type_id = drupal_html_id('rooms-constraints-range-type');
+
+  $delta = $element['#delta'];
+
+  $element['group_conditions'] = array(
+    '#type' => 'container',
+    '#prefix' => '<div id="group-conditions-' . $delta . '">',
+    '#suffix' => '</div>',
+  );
+
+  $element['group_conditions']['operation'] = array(
+    '#type' => 'hidden',
+    '#value' => (isset($element['#value']['group_conditions']['operation'])) ? $element['#value']['group_conditions']['operation'] : 0,
+  );
+
+  if (isset($form_state['input']['_triggering_element_value'])) {
+    if ($form_state['input']['_triggering_element_value'] == t('Set min/max period')) {
+      $element['group_conditions']['operation']['#value'] = 1;
+    }
+    elseif ($form_state['input']['_triggering_element_value'] == t('Set check-in day')) {
+      $element['group_conditions']['operation']['#value'] = 2;
+    }
+  }
+
+  if (!empty($element['#value']) && !isset($element['#value']['group_conditions'])) {
+    if ($element['#value']['constraint_type'] == ROOMS_AVAILABILITY_CONSTRAINTS_MUST_START) {
+      $element['group_conditions']['operation']['#value'] = 2;
+    }
+    else {
+      $element['group_conditions']['operation']['#value'] = 1;
+    }
+  }
+
+  $element['group_conditions']['add_min_max'] = array(
+    '#type' => 'button',
+    '#value' => t('Set min/max period'),
+    '#ajax' => array(
+      'wrapper' => 'group-conditions-' . $delta,
+      'callback' => 'rooms_availability_range_form_ajax_callback',
+    ),
+    '#submit' => array('rooms_availability_range_form_ajax_callback'),
+    '#validate' => array(),
+    '#limit_validation_errors' => array(),
+    '#executes_submit_callback' => FALSE,
+    '#name' => 'add_min_max_' . $delta,
+  );
+
+  $element['group_conditions']['add_checkin_day'] = array(
+    '#type' => 'button',
+    '#value' => t('Set check-in day'),
+    '#ajax' => array(
+      'wrapper' => 'group-conditions-' . $delta,
+      'callback' => 'rooms_availability_range_form_ajax_callback',
+    ),
+    '#submit' => array('rooms_availability_range_form_ajax_callback'),
+    '#validate' => array(),
+    '#limit_validation_errors' => array(),
+    '#executes_submit_callback' => FALSE,
+    '#name' => 'add_checkin_day_' . $delta,
+  );
+
+  if ($element['group_conditions']['operation']['#value'] != 0) {
+    $element['group_conditions']['add_min_max']['#prefix'] = '<div style="display: none;">';
+    $element['group_conditions']['add_min_max']['#suffix'] = '</div>';
+
+    $element['group_conditions']['add_checkin_day']['#prefix'] = '<div style="display: none;">';
+    $element['group_conditions']['add_checkin_day']['#suffix'] = '</div>';
+  }
+
+  if ($element['group_conditions']['operation']['#value'] == 1) {
+    $element['group_conditions']['title'] = array(
+      '#markup' => '<div class="condition-title"><strong>' . t('Require that') . '</strong></div>',
+    );
+
+    $element['group_conditions']['minimum_stay'] = array(
+      '#type' => 'checkbox',
+      '#title' => t('Minimum Stay is'),
+      '#size' => 2,
+      '#ajax' => array(
+        'wrapper' => 'group-conditions-' . $delta,
+        'callback' => 'rooms_availability_range_form_ajax_callback',
+      ),
+      '#prefix' => '<div class="group-conditions-minimum-stay">',
+      '#suffix' => '</div>',
+      '#default_value' => (isset($element['#value']['minimum_stay']) && !empty($element['#value']['minimum_stay'])) ? 1 : 0,
+    );
+
+    if ( (isset($element['#value']['group_conditions']['minimum_stay']) &&
+          $element['#value']['group_conditions']['minimum_stay'] == 1) ||
+          (isset($element['#value']['minimum_stay'])) ) {
+
+      $element['group_conditions']['minimum_stay_nights'] = array(
+        '#type' => 'textfield',
+        '#field_suffix' => t('nights'),
+        '#size' => 3,
+        '#required' => TRUE,
+        '#prefix' => '<div class="group-conditions-minimum-stay-nights">',
+        '#suffix' => '</div>',
+        '#default_value' => (isset($element['#value']['minimum_stay']) && !empty($element['#value']['minimum_stay'])) ? $element['#value']['minimum_stay'] : '',
+      );
+    }
+
+    $element['group_conditions']['maximum_stay'] = array(
+      '#type' => 'checkbox',
+      '#title' => t('Maximum Stay is'),
+      '#size' => 2,
+      '#ajax' => array(
+        'wrapper' => 'group-conditions-' . $delta,
+        'callback' => 'rooms_availability_range_form_ajax_callback',
+      ),
+      '#prefix' => '<div class="group-conditions-maximum-stay">',
+      '#suffix' => '</div>',
+      '#default_value' => (isset($element['#value']['maximum_stay']) && !empty($element['#value']['maximum_stay'])) ? 1 : 0,
+    );
+
+    if ( (isset($element['#value']['group_conditions']['maximum_stay']) &&
+          $element['#value']['group_conditions']['maximum_stay'] == 1) ||
+          (isset($element['#value']['maximum_stay'])) ) {
+
+      $element['group_conditions']['maximum_stay_nights'] = array(
+        '#type' => 'textfield',
+        '#field_suffix' => t('nights'),
+        '#size' => 3,
+        '#required' => TRUE,
+        '#prefix' => '<div class="group-conditions-maximum-stay-nights">',
+        '#suffix' => '</div>',
+        '#default_value' => (isset($element['#value']['maximum_stay']) && !empty($element['#value']['maximum_stay'])) ? $element['#value']['maximum_stay'] : '',
+      );
+    }
+
+    $element['group_conditions']['period'] = array(
+      '#title' => t('applicable'),
+      '#type' => 'select',
+      '#options' => array('always' => t('Always'), 'dates' => t('Select period')),
+      '#ajax' => array(
+        'wrapper' => 'group-conditions-' . $delta,
+        'callback' => 'rooms_availability_range_form_ajax_callback',
+      ),
+      '#prefix' => '<div class="group-conditions-period">',
+      '#suffix' => '</div>',
+      '#default_value' => (isset($element['#value']['always']) && !$element['#value']['always']) ? 'dates' : 'always',
+    );
+
+    if ( (isset($element['#value']['group_conditions']['period']) &&
+          $element['#value']['group_conditions']['period'] == 'dates') ||
+          (isset($element['#value']['always']) && !$element['#value']['always']) ) {
+
+      $element['group_conditions']['start_date'] = array(
+        '#title' => t('Start date'),
+        '#required' => TRUE,
+        '#default_value' => (isset($element['#value']['start_date']) && empty($element['#value']['always'])) ? $element['#value']['start_date'] : '',
+        '#states' => array(
+          'visible' => array(
+            '#' . $always_id . ' input' => array('checked' => FALSE),
+          ),
+        ),
+      ) + $range['rooms_start_date'];
+
+      $element['group_conditions']['end_date'] = array(
+        '#title' => t('End date'),
+        '#required' => TRUE,
+        '#default_value' => (isset($element['#value']['end_date']) && empty($element['#value']['always'])) ? $element['#value']['end_date'] : '',
+        '#states' => array(
+          'visible' => array(
+            '#' . $always_id . ' input' => array('checked' => FALSE),
+          ),
+        ),
+      ) + $range['rooms_end_date'];
+    }
+
+    $element['group_conditions']['booking_if_start'] = array(
+      '#type' => 'checkbox',
+      '#title' => t('Only if check-in starts on a specific day'),
+      '#ajax' => array(
+        'wrapper' => 'group-conditions-' . $delta,
+        'callback' => 'rooms_availability_range_form_ajax_callback',
+      ),
+      '#prefix' => '<div class="group-conditions-booking-if-start">',
+      '#suffix' => '</div>',
+      '#default_value' => (isset($element['#value']['constraint_type']) && $element['#value']['constraint_type'] == ROOMS_AVAILABILITY_CONSTRAINTS_IF_STARTS) ? 1 : 0,
+    );
+
+    if ( (isset($element['#value']['group_conditions']['booking_if_start']) &&
+          $element['#value']['group_conditions']['booking_if_start'] == '1') ||
+          (isset($element['#value']['start_day'])) ) {
+
+      $element['group_conditions']['booking_if_start_day'] = array(
+        '#type' => 'select',
+        '#options' => rooms_availability_constraints_weekdays(),
+        '#default_value' => (isset($element['#value']['start_day']) && !empty($element['#value']['start_day'])) ? $element['#value']['start_day'] : '',
+      );
+    }
+  }
+  elseif ($element['group_conditions']['operation']['#value'] == 2) {
+    $element['group_conditions']['title'] = array(
+      '#markup' => '<div class="condition-title"><strong>' . t('Require that') . '</strong></div>',
+    );
+
+    $element['group_conditions']['booking_must_start'] = array(
+      '#type' => 'select',
+      '#options' => rooms_availability_constraints_weekdays(),
+      '#field_prefix' => t('Check-in day must be'),
+      '#prefix' => '<div class="group-conditions-booking-must-start">',
+      '#suffix' => '</div>',
+      '#default_value' => (isset($element['#value']['start_day']) && !empty($element['#value']['start_day'])) ? $element['#value']['start_day'] : '',
+    );
+
+    $element['group_conditions']['period'] = array(
+      '#title' => t('applicable'),
+      '#type' => 'select',
+      '#options' => array('always' => t('Always'), 'dates' => t('Select period')),
+      '#ajax' => array(
+        'wrapper' => 'group-conditions-' . $delta,
+        'callback' => 'rooms_availability_range_form_ajax_callback',
+      ),
+      '#prefix' => '<div class="group-conditions-period">',
+      '#suffix' => '</div>',
+      '#default_value' => (isset($element['#value']['always']) && !$element['#value']['always']) ? 'dates' : 'always',
+    );
+
+    if ( (isset($element['#value']['group_conditions']['period']) &&
+          $element['#value']['group_conditions']['period'] == 'dates') ||
+          (isset($element['#value']['always']) && !$element['#value']['always']) ) {
+
+      $element['group_conditions']['start_date'] = array(
+        '#title' => t('Start date'),
+        '#required' => TRUE,
+        '#default_value' => (isset($element['#value']['start_date']) && empty($element['#value']['always'])) ? $element['#value']['start_date'] : '',
+        '#states' => array(
+          'visible' => array(
+            '#' . $always_id . ' input' => array('checked' => FALSE),
+          ),
+        ),
+      ) + $range['rooms_start_date'];
+
+      $element['group_conditions']['end_date'] = array(
+        '#title' => t('End date'),
+        '#required' => TRUE,
+        '#default_value' => (isset($element['#value']['end_date']) && empty($element['#value']['always'])) ? $element['#value']['end_date'] : '',
+        '#states' => array(
+          'visible' => array(
+            '#' . $always_id . ' input' => array('checked' => FALSE),
+          ),
+        ),
+      ) + $range['rooms_end_date'];
+    }
+  }
+
+  $element['#element_validate'][] = 'rooms_availability_range_validate';
+
+  return $element;
+}
+
+function rooms_availability_range_form_ajax_callback($form, &$form_state) {
+  $delta = $form_state['triggering_element']['#parents'][2];
+
+  return $form['rooms_constraints_range']['und'][$delta]['group_conditions'];
+}
+
+/**
+ * Validation callback for rooms_availability_range Form API element.
+ */
+function rooms_availability_range_validate($element, &$form_state) {
+  if (isset($element['#value']['group_conditions'])) {
+    if (isset($element['#value']['group_conditions']['period'])) {
+      if ($element['#value']['group_conditions']['period'] == 'always') {
+        $parents = array_merge($element['#parents'], array('start_date'));
+        drupal_array_set_nested_value($form_state['values'], $parents, '1970-01-01', TRUE);
+
+        $parents = array_merge($element['#parents'], array('end_date'));
+        drupal_array_set_nested_value($form_state['values'], $parents, '2999-12-31', TRUE);
+
+        $parents = array_merge($element['#parents'], array('always'));
+        drupal_array_set_nested_value($form_state['values'], $parents, 1, TRUE);
+      }
+      elseif ($element['#value']['group_conditions']['period'] == 'dates') {
+        $parents = array_merge($element['#parents'], array('group_conditions', 'start_date'));
+        $start_date = drupal_array_get_nested_value($form_state['values'], $parents);
+
+        $parents = array_merge($element['#parents'], array('group_conditions', 'end_date'));
+        $end_date = drupal_array_get_nested_value($form_state['values'], $parents);
+
+        $parents = array_merge($element['#parents'], array('start_date'));
+        drupal_array_set_nested_value($form_state['values'], $parents, $start_date, TRUE);
+
+        $parents = array_merge($element['#parents'], array('end_date'));
+        drupal_array_set_nested_value($form_state['values'], $parents, $end_date, TRUE);
+
+        $parents = array_merge($element['#parents'], array('always'));
+        drupal_array_set_nested_value($form_state['values'], $parents, 0, TRUE);
+      }
+    }
+
+    if ($element['#value']['group_conditions']['operation'] == 1) {
+      if (isset($element['#value']['group_conditions']['booking_if_start']) && $element['#value']['group_conditions']['booking_if_start']) {
+        $parents = array_merge($element['#parents'], array('constraint_type'));
+        drupal_array_set_nested_value($form_state['values'], $parents, ROOMS_AVAILABILITY_CONSTRAINTS_IF_STARTS, TRUE);
+
+        $start_day = isset($element['#value']['group_conditions']['booking_if_start_day']) ? $element['#value']['group_conditions']['booking_if_start_day'] : 1;
+
+        $parents = array_merge($element['#parents'], array('start_day'));
+        drupal_array_set_nested_value($form_state['values'], $parents, $start_day, TRUE);      
+      }
+      else {
+        $parents = array_merge($element['#parents'], array('constraint_type'));
+        drupal_array_set_nested_value($form_state['values'], $parents, ROOMS_AVAILABILITY_CONSTRAINTS_NO_DAY, TRUE);
+      }
+
+      if (isset($element['#value']['group_conditions']['minimum_stay_nights']) && $element['#value']['group_conditions']['minimum_stay_nights'] != '' && $element['#value']['group_conditions']['minimum_stay']) {
+        $parents = array_merge($element['#parents'], array('minimum_stay'));
+        drupal_array_set_nested_value($form_state['values'], $parents, $element['#value']['group_conditions']['minimum_stay_nights'], TRUE);
+      }
+
+      if (isset($element['#value']['group_conditions']['maximum_stay_nights']) && $element['#value']['group_conditions']['maximum_stay_nights'] != '' && $element['#value']['group_conditions']['maximum_stay']) {
+        $parents = array_merge($element['#parents'], array('maximum_stay'));
+        drupal_array_set_nested_value($form_state['values'], $parents, $element['#value']['group_conditions']['maximum_stay_nights'], TRUE);
+      }
+    }
+    elseif ($element['#value']['group_conditions']['operation'] == 2) {
+      $parents = array_merge($element['#parents'], array('constraint_type'));
+      drupal_array_set_nested_value($form_state['values'], $parents, ROOMS_AVAILABILITY_CONSTRAINTS_MUST_START, TRUE);
+
+      $parents = array_merge($element['#parents'], array('start_day'));
+      drupal_array_set_nested_value($form_state['values'], $parents, $element['#value']['group_conditions']['booking_must_start'], TRUE);
+    }
+  }
+}
+
+/**
+ * Returns weekdays keyed in N format.
+ *
+ * @return array
+ *   The readable weekdays keyed by N format.
+ */
+function rooms_availability_constraints_weekdays() {
+  return array(
+    1 => t('Monday'),
+    2 => t('Tuesday'),
+    3 => t('Wednesday'),
+    4 => t('Thursday'),
+    5 => t('Friday'),
+    6 => t('Saturday'),
+    7 => t('Sunday')
+  );
+}
+
+/**
+ * Gives the human readable weekday given its N identifier.
+ *
+ * @param int $day
+ *   The weekday identifier.
+ * @return string
+ *   The human readable weekday.
+ */
+function rooms_availability_constraints_get_weekday($day) {
+  $weekdays = rooms_availability_constraints_weekdays();
+  return isset($weekdays[$day]) ? $weekdays[$day] : '';
+}

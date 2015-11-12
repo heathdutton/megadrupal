@@ -1,0 +1,290 @@
+<?php
+
+/**
+ * Implements hook_menu().
+ */
+function healthvault_connect_menu() {
+  $items = array();
+
+  $items['admin/config/administration/healthvault'] = array(
+    'title' => 'HealthVault® Connection settings',
+    'description' => 'Configure HealthVault® Connection',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('healthvault_connect_admin_settings'),
+    'access arguments' => array('access administration pages'),
+    'file' => 'healthvault_connect.admin.inc',
+    'type' => MENU_NORMAL_ITEM,
+  );
+
+  $items['healthvault/redirect'] = array(
+    'title' => 'HealthVault® Action Redirector',
+    'description' => 'Redirects to details about the app, like privacy statement, terms of use,...',
+    'page callback' => 'healthvault_connect_target_redirect',
+    'access callback' => TRUE,
+    'type' => MENU_CALLBACK,
+  );
+
+  $items['healthvault/disconnect_user'] = array(
+    'title' => 'HealthVault® Disconnect',
+    'description' => 'Terminates HealthVault® connection.',
+    'page callback' => 'healthvault_connect_disconnect_user',
+    'access arguments' => array('connect healthvault'),
+    'type' => MENU_CALLBACK,
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_permission().
+ */
+function healthvault_connect_permission() {
+  return array(
+    'connect healthvault' => array(
+      'title' => t('connect healthvault'),
+      'description' => t('Permission to establish a personal connection to HealthVault'),
+    ),
+  );
+}
+
+/**
+ * Returns an authenticated connection to HealthVault.
+ * If the connection is not established already, a new one will be opened.
+ *
+ * @return HVClient
+ */
+function healthvault_connect_get_connection() {
+  static $connection = NULL;
+
+  if (is_null($connection)) {
+
+    composer_manager_register_autoloader();
+
+    // FIXME: prevent "The authenticated session token has expired."
+    #  unset($_SESSION['healthVault']);
+
+    $logger = new Psr3Watchdog();
+    $logger->setType('healthvault_connect');
+
+    $hv = new \biologis\HV\HVClient(
+      variable_get_value('healthvault_connect_app_id'),
+      $_SESSION
+    );
+
+    $hv->setLogger($logger);
+
+    if (
+      (isset($_SESSION['healthvault_connect_instance_id']) && 2 == $_SESSION['healthvault_connect_instance_id']) || // multi instance app, UK instance selected by user
+      (!variable_get_value('healthvault_connect_instance_1') && variable_get_value('healthvault_connect_instance_2')) // UK instance only app
+    ) {
+      $hv->setInstance(2, variable_get_value('healthvault_connect_ppe'));
+    }
+    else {
+      $hv->setInstance(1, variable_get_value('healthvault_connect_ppe'));
+    }
+
+    $authenticate = FALSE;
+
+    try {
+      $hv->connect(
+        variable_get_value('healthvault_connect_thumb_print'),
+        variable_get_value('healthvault_connect_private_key')
+      );
+
+      if (empty($_SESSION['healthvault_connect_person_id']) || empty($_SESSION['healthvault_connect_record_id'])) {
+        $person_info = $hv->getPersonInfo();
+        $_SESSION['healthvault_connect_person_id'] = (string) $person_info->person_id;
+        $_SESSION['healthvault_connect_record_id'] = (string) $person_info->selected_record_id;
+      }
+    }
+    catch (\biologis\HV\HVRawConnectorUserNotAuthenticatedException $e) {
+      $authenticate = TRUE;
+    }
+    catch (\biologis\HV\HVRawConnectorAuthenticationExpiredException $e) {
+      $authenticate = TRUE;
+    }
+    catch (Exception $e) {
+      watchdog('HealthVault', 'Error (Code ' . $e->getCode() . '): ' . $e->getMessage(), array(), WATCHDOG_ERROR);
+      drupal_set_message(t('Connecting %platform failed.', array('%platform' => variable_get_value('healthvault_connect_platform_name'))), 'error');
+    }
+
+    if ($authenticate) {
+      healthvault_connect_set_redirect_path();
+
+      $redirect_url = url('healthvault/redirect', array('absolute' => TRUE));
+      drupal_goto($hv->getAuthenticationURL(
+        // Only in PPE this $redirect_url overrides the Action URL configured in ACC.
+        $redirect_url,
+        // HealthVault only supports one Action URL for production.
+        // This additional parameter is used by the small proxy in healthvault_connect_target_redirect().
+        array(
+          'redirect' => $redirect_url,
+          'hash' => '', // TODO protect the redirect param from manipulation
+        )
+      ));
+    }
+
+    $connection = $hv;
+  }
+
+  return $connection;
+}
+
+
+/**
+ * Returns user connection status.
+ *
+ * @return bool
+ *   TRUE if user established and authorized the connection to HealthVault
+ */
+function healthvault_connect_is_user_connected() {
+  return !empty($_SESSION['healthvault_connect_person_id']) &&
+    !empty($_SESSION['healthvault_connect_record_id']);
+}
+
+
+/**
+ * Get the HealthVault® record id of the current user.
+ *
+ * @return string
+ *   HealthVault® user record id
+ */
+function healthvault_connect_get_user_record_id() {
+  return !empty($_SESSION['healthvault_connect_record_id']) ?
+    $_SESSION['healthvault_connect_record_id'] : '';
+}
+
+
+/**
+ * Implements hook_block_info().
+ */
+function healthvault_connect_block_info() {
+  $block[0] = array(
+    'info' => t('HealthVault: Connect'),
+    'cache' => DRUPAL_CACHE_PER_USER,
+  );
+  return $block;
+}
+
+/**
+ * Implements hook_block_view().
+ */
+function healthvault_connect_block_view($delta) {
+  $block = array(
+    'subject' => variable_get_value('healthvault_connect_platform_name'),
+    'content' => healthvault_connect_is_user_connected() ?
+          l(t('Disconnect'), 'healthvault/disconnect_user', array('query' => array('return_path' => $_GET['q']))) :
+          l(t('Connect'), 'healthvault/redirect', array('query' => array('return_path' => $_GET['q']))),
+  );
+  return $block;
+}
+
+/**
+ * Redirects the user using HTTP redirects according to given "targets"
+ * defined by HealthVault.
+ */
+function healthvault_connect_target_redirect() {
+  // HealthVault only supports one Action URL.
+  // This proxy solves that issue with an additional redirect to the right domain.
+  if (!empty($_GET['actionqs'])) {
+    $actionqs = array();
+    parse_str($_GET['actionqs'], $actionqs);
+    if (isset($actionqs['redirect'])) {
+      $parts = parse_url($actionqs['redirect']);
+      $host = $parts['host'];
+      if (isset($parts['port']) && ($parts['port'] != 80) && ($parts['port'] != 443)) {
+        $host .= ':' . $parts['port'];
+      }
+      if ($host != $_SERVER['HTTP_HOST']) {
+        drupal_goto(str_replace($parts['path'], '', $actionqs['redirect']) . $_SERVER['REQUEST_URI']);
+      }
+    }
+  }
+
+  $target = '';
+
+  if (isset($_GET['target'])) {
+    switch (drupal_strtolower($_GET['target'])) {
+      case 'home':
+        $target = variable_get_value('healthvault_connect_action_target_home');
+        break;
+      case 'serviceagreement':
+        $target = variable_get_value('healthvault_connect_action_target_serviceagreement');
+        break;
+      case 'privacy':
+        $target = variable_get_value('healthvault_connect_action_target_privacy');
+        break;
+      case 'appauthsuccess':
+        // Redirect from HealthVault after successfull app authorization.
+        // First save the HealthVault instance where the current user's data
+        // is stored for further requests to support "multi-instance applications".
+        // @see http://msdn.microsoft.com/en-us/library/dn269023
+        // @see healthvault_connect_get_platform()
+        // @see healthvault_connect_get_shell()
+        $_SESSION['healthvault_connect_instance_id'] = (isset($_GET['instanceid']) && 2 == (int)$_GET['instanceid']) ? 2 : 1;
+        healthvault_connect_get_connection();
+        healthvault_connect_do_redirect();
+        break;
+      case 'appauthreject':
+        drupal_set_message(t('You rejected this application from accessing your account on %platform.', array('%platform' => variable_get_value('healthvault_connect_platform_name'))), 'error');
+        $_SESSION['healthvault_connect_return_path'] = '<front>';
+        healthvault_connect_do_redirect();
+        break;
+    }
+
+    if (!empty($target)) {
+      drupal_goto($target);
+    }
+  }
+
+  drupal_not_found();
+}
+
+
+/**
+ * Disconnects the user from HealthVault.
+ */
+function healthvault_connect_disconnect_user() {
+  if (healthvault_connect_is_user_connected()) {
+    $hv = healthvault_connect_get_connection();
+    $hv->disconnect();
+
+    unset($_SESSION['healthvault_connect_person_id']);
+    unset($_SESSION['healthvault_connect_record_id']);
+    unset($_SESSION['healthvault_connect_instance_id']);
+  }
+  else {
+    healthvault_connect_set_redirect_path();
+  }
+  healthvault_connect_do_redirect();
+}
+
+
+/**
+ * Helper function to route the user according the current connection status
+ * using HTTP redirects.
+ */
+function healthvault_connect_do_redirect() {
+  $healthvault_connect_return_path = $_SESSION['healthvault_connect_return_path'];
+  $healthvault_connect_return_query = $_SESSION['healthvault_connect_return_query'];
+
+  unset($_SESSION['healthvault_connect_return_path']);
+  unset($_SESSION['healthvault_connect_return_query']);
+
+  if (user_access('connect healthvault')) {
+    // TODO $healthvault_connect_return_query needs to be an array of keys and values instead of a string.
+    drupal_goto($healthvault_connect_return_path, array('query' => $healthvault_connect_return_query));
+  }
+  else {
+    drupal_access_denied();
+  }
+}
+
+
+/**
+ * Helper function to cache paths between redirects.
+ */
+function healthvault_connect_set_redirect_path() {
+  $_SESSION['healthvault_connect_return_path'] = !empty($_GET['return_path']) ? $_GET['return_path'] : $_GET['q'];
+  $_SESSION['healthvault_connect_return_query'] = !empty($_GET['return_query']) ? $_GET['return_query'] : '';
+}

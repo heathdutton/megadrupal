@@ -1,0 +1,258 @@
+<?php
+
+/**
+ * @file
+ * Provides OG LDAP integration with the existing ldap module og group handling.
+ */
+
+/**
+ * Implements hook_ldap_ldap_authorization_maps_alter()
+ */
+function og_ldap_api_ldap_ldap_authorization_maps_alter(&$account, &$ldap_user, &$ldap_server, &$consumer_conf, &$proposed_ldap_authorizations, $op) {
+  $cache = &drupal_static(__FUNCTION__);
+
+  // Exit if not og authorization
+  if ($consumer_conf->consumerType != 'og_group') {
+    return;
+  }
+
+  // Exit if not OG 2.x
+  if (ldap_authorization_og_og_version() != 2) {
+    return;
+  }
+
+  // Update cache if needed
+  if (!isset($cache)) {
+    $cache = array();
+    $log_invalid = FALSE;
+
+    // get all groups
+    $groups = _og_ldap_api_get_all_ldap_groups();
+    if (empty($groups)) {
+      return;
+    }
+
+    $entity_raw_mappings = array();
+    foreach ($groups as $entity_type => $entity_stubs) {
+      if (!empty($entity_stubs)) {
+        $entities = entity_load($entity_type, array_keys($entity_stubs));
+        foreach ($entities as $entity_id => $entity) {
+          $entity_raw_mappings = array_merge($entity_raw_mappings, _og_ldap_api_ldap_get_entity_mappings($entity_type, $entity));
+        }
+      }
+    }
+
+    // Normalize mappings
+    $mappings = $consumer_conf->consumer->normalizeMappings(array_values($entity_raw_mappings));
+    if (empty($mappings)) {
+      return;
+    }
+
+    // Find any invalid mappings
+    $invalid_mappings = array();
+    foreach ($mappings as $mapping_index => $mapping) {
+      if (isset($mapping['valid']) && empty($mapping['valid'])) {
+        // Log the error
+        if ($log_invalid) {
+          $watchdog_tokens['%op'] = $op;
+          $watchdog_tokens['%from'] = $mapping['from'];
+          $watchdog_tokens['%simplified'] = $mapping['simplified'];
+          watchdog('ldap_authorization', 'Invalid OG group mapping while updating (op=%op): dn=%from, group=%simplified',
+            $watchdog_tokens, WATCHDOG_WARNING);
+        }
+
+        // Add to the array with same keys
+        $invalid_mappings[$mapping_index] = $mapping;
+      }
+    }
+
+    // Filter out invalid mappings
+    if (!empty($invalid_mappings)) {
+      $mappings = array_diff_key($mappings, $invalid_mappings);
+      if (empty($mappings)) {
+        return;
+      }
+    }
+
+    // Update cache
+    $cache = $mappings;
+    unset($mappings);
+  }
+
+  // Update consumer conf mappings
+  if (!empty($cache)) {
+    // Merge with existing mappings
+    if (!empty($consumer_conf->mappings)) {
+      $new_mappings = _og_ldap_api_ldap_authorization_mappings_diff($cache, $consumer_conf->mappings);
+      // Exit if no new mappings
+      if (empty($new_mappings)) {
+        return;
+      }
+
+      // Merge with existing
+      $consumer_conf->mappings = array_merge($consumer_conf->mappings, $cache);
+    }
+    else {
+      $consumer_conf->mappings = $cache;
+    }
+  }
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function og_ldap_api_ldap_form_ldap_authorization_admin_form_alter(&$form, $form_state) {
+  if (isset($form['status']['consumer_type']['#value']) && $form['status']['consumer_type']['#value'] == 'og_group') {
+    if (isset($form['filter_and_mappings']['mappings'])) {
+      $mappings_element = &$form['filter_and_mappings']['mappings'];
+      if (!empty($mappings_element['#description'])) {
+        $mappings_element['#description'] .= '<br />';
+      }
+      else {
+        $mappings_element['#description'] = '';
+      }
+
+      $mappings_element['#description'] .= t('<strong>Additional mappings can be dynamically used by the LDAP Authorization module by adding the ldap entry fields provided by the OG LDAP API module to any OG bundle.</strong>');
+    }
+
+    // Add special handling to allow form submission with no mappings.
+    array_unshift($form['#validate'], 'og_ldap_api_ldap_form_ldap_authorization_admin_form_validate');
+    array_unshift($form['#submit'], 'og_ldap_api_ldap_form_ldap_authorization_admin_form_submit');
+  }
+}
+
+/**
+ * Validation callback for ldap_authorization_admin_form.
+ */
+function og_ldap_api_ldap_form_ldap_authorization_admin_form_validate($form, &$form_state) {
+  if (empty($form_state['values']['mappings'])) {
+    $groups = _og_ldap_api_get_all_ldap_groups();
+    if (!empty($groups)) {
+      form_set_value($form['filter_and_mappings']['use_filter'], 0, $form_state);
+    }
+    else {
+      form_set_error('mappings', t('Mappings are required to filter the groups. Mappings can be entered below or by populating the ldap entry fields provided by the OG LDAP API module on any OG bundle.'));
+    }
+  }
+}
+
+/**
+ * Submit callback for ldap_authorization_admin_form.
+ */
+function og_ldap_api_ldap_form_ldap_authorization_admin_form_submit($form, &$form_state) {
+  if (empty($form_state['values']['mappings'])) {
+    $groups = _og_ldap_api_get_all_ldap_groups();
+    if (!empty($groups)) {
+      $form_state['values']['use_filter'] = 1;
+    }
+  }
+}
+
+/**
+ * Get LDAP mappings for a given entity
+ *
+ * @param $op
+ *   The operation to perform.
+ *   - "add": Add the group entity mappings
+ *   - "remove": Remove the group entity mappings
+ * @param $group_type
+ *   The group entity type
+ * @param $group
+ *   The group entity object
+ *
+ * @return
+ *   An array of ldap module's raw mappings
+ */
+function _og_ldap_api_ldap_get_entity_mappings($entity_type, $entity) {
+  // Get dn fields
+  $fields = _og_ldap_api_group_role_dn_fields();
+  if (empty($fields)) {
+    return array();
+  }
+
+  // Wrap group
+  $entity_wrapper = entity_metadata_wrapper($entity_type, $entity);
+
+  // Check capabilities
+  if (!isset($entity_wrapper->ogldapIsLDAPCapable) || !$entity_wrapper->ogldapIsLDAPCapable->value()) {
+    return array();
+  }
+
+  // Get entity info
+  $entity_id = $entity_wrapper->getIdentifier();
+  if (empty($entity_id)) {
+    return array();
+  }
+
+  // Process og role ldap dn fields
+  $entity_raw_mappings = array();
+  foreach($fields as $role_name => $field_name) {
+    $ldap_dn = NULL;
+    if (!isset($entity_wrapper->{$field_name})) {
+      continue;
+    }
+
+    $ldap_dn_values = $entity_wrapper->{$field_name}->value();
+    if (!empty($ldap_dn_values)) {
+      if (!is_array($ldap_dn_values)) {
+        if (is_string($ldap_dn_values)) {
+          $ldap_dn_values = array($ldap_dn_values);
+        }
+        else {
+          $ldap_dn_values = array();
+        }
+      }
+
+      foreach ($ldap_dn_values as $ldap_dn_value) {
+        $entity_raw_mappings[] = array(
+          $ldap_dn_value,
+          "{$entity_type}:{$entity_id}:{$role_name}"
+        );
+      }
+    }
+  }
+
+  return $entity_raw_mappings;
+}
+
+/**
+ * Computes the difference of normalized mappings
+ *
+ * Note that keys are preserved
+ *
+ * @param $mappingsA
+ *   A normalized mappings array
+ * @param $mappingsB
+ *   A normalized mappings array
+ *
+ * @return
+ *   An array containing all the values of $mappingsA that are NOT present in $mappingsB.
+ */
+function _og_ldap_api_ldap_authorization_mappings_diff($mappingsA, $mappingsB) {
+  $return = array();
+  foreach ($mappingsA as $a => $item_a) {
+    if (!isset($item_a['from']) || !isset($item_a['simplified'])) {
+      // Assume difference if cannot check equality
+      $return[$a] = $item_a;
+      continue;
+    }
+
+    $match_found = FALSE;
+    foreach ($mappingsB as $b => $item_b) {
+      if (!isset($item_b['from']) || !isset($item_b['simplified'])) {
+        continue;
+      }
+
+      if ($item_a['from'] == $item_b['from'] && $item_a['simplified'] == $item_b['simplified']) {
+        $match_found = TRUE;
+        break;
+      }
+    }
+
+    if (!$match_found) {
+      $return[$a] = $item_a;
+    }
+  }
+
+  return $return;
+}

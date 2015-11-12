@@ -1,0 +1,262 @@
+<?php
+/**
+ * @file
+ * Defines the Parcel Monkey shipping method and services for Drupal Commerce.
+ */
+
+
+/**
+ * Implements hook_menu().
+ */
+function commerce_parcel_monkey_menu() {
+  $items = array();
+
+  $items['admin/commerce/config/shipping/methods/parcel_monkey/edit'] = array(
+    'title' => 'Edit',
+    'description' => 'Adjust Parcel Monkey shipping settings.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('commerce_parcel_monkey_settings_form'),
+    'access arguments' => array('administer shipping'),
+    'file' => 'includes/commerce_parcel_monkey.admin.inc',
+    'type' => MENU_LOCAL_TASK,
+    'context' => MENU_CONTEXT_INLINE,
+    'weight' => 0,
+  );
+
+  return $items;
+}
+
+
+/**
+ * Implements hook_commerce_shipping_method_info().
+ */
+function commerce_parcel_monkey_commerce_shipping_method_info() {
+  $shipping_methods = array();
+
+  $shipping_methods['parcel_monkey'] = array(
+    'title' => t('Parcel Monkey'),
+    'description' => t('Quote rates from Parcel Monkey'),
+  );
+
+  return $shipping_methods;
+}
+
+
+/**
+ * Implements hook_commerce_shipping_service_info().
+ */
+function commerce_parcel_monkey_commerce_shipping_service_info() {
+  $shipping_services = array();
+  $available_services = _commerce_parcel_monkey_service_list();
+  $selected_services = variable_get('commerce_parcel_monkey_services', array());
+  foreach ($selected_services as $id => $val) {
+    if (!empty($val)) {
+      $service = $available_services[$id];
+
+      $shipping_services[drupal_strtolower($id)] = array(
+        'title' => $service,
+        'description' => $service,
+        'display_title' => $service,
+        'shipping_method' => 'parcel_monkey',
+        'price_component' => 'shipping',
+        'callbacks' => array(
+          'rate' => 'commerce_parcel_monkey_service_rate_order',
+        ),
+      );
+    }
+  }
+  return $shipping_services;
+}
+
+
+/**
+ * Returns an array of shipping method rates obtained from the TNT servers.
+ *
+ * @param array $shipping_service
+ *   The shipping service that is being requested by commerce shipping.
+ * @param object $order
+ *   The commerce order object for the order that we're requesting rates for.
+ *
+ * @return array
+ *   The rate values for the requested shipping service.
+ */
+function commerce_parcel_monkey_service_rate_order($shipping_service, $order) {
+
+  // First of all try and recover cached shipping rates.
+  $rates = commerce_shipping_rates_cache_get('parcel_monkey', $order, variable_get('commerce_parcel_monkey_rates_timeout', 0));
+
+  // If no rates were recovered from the cache or the
+  // cached rates are over one minute old.
+  if (!is_array($rates)) {
+    $rates = array();
+
+    // Variables for watchdog.
+    $vars = array();
+    $vars['%order_id'] = $order->order_id;
+
+    // Build the rate request.
+    $rate_request = _commerce_parcel_monkey_build_rate_request($order);
+
+    // Allow other modules to alter the shipping request.
+    drupal_alter('commerce_parcel_monkey_rate_request', $rate_request);
+
+    if ($rate_request) {
+
+      // Submit the request to Parcel Monkey.
+      $service = new CommerceParcelMonkeyGetQuote();
+      $service->setPostParams($rate_request);
+      $result = $service->connectToWebService();
+
+      // Remove the UserId and ApiKey from request so that
+      // not logged to watchdog.
+      $rate_request['UserId'] = str_repeat('*', strlen($rate_request['UserId']));
+      $rate_request['ApiKey'] = str_repeat('*', strlen($rate_request['ApiKey']));
+
+      // Add the request to the vars for debugging.
+      $vars['%request'] = print_r($rate_request, TRUE);
+
+      // If we received data back from the server.
+      if (!empty($result) && _commerce_parcel_monkey_is_valid_xml($result)) {
+
+        // Extract the result into an XML response object.
+        $response = new SimpleXMLElement($result);
+
+        if (isset($response->response->services->service)) {
+
+          foreach ($response->response->services->service as $rate) {
+            $service_name = trim($rate->ServiceCode);
+            $decimal = (string) $rate->QuoteTotalGross;
+            $currency_code = (string) $rate->QuoteCurrency;
+
+            // Add an item to the rates array for the current service.
+            $rates[$service_name] = array(
+              'amount' => commerce_currency_decimal_to_amount($decimal, $currency_code),
+              'currency_code' => $currency_code,
+              'data' => array(),
+            );
+          }
+
+          // Cache the calculated rates for subsequent requests.
+          commerce_shipping_rates_cache_set('parcel_monkey', $order, $rates);
+        }
+      }
+      else {
+        watchdog('commerce_parcel_monkey', 'Empty response for order %order_id: %request', $vars, WATCHDOG_ERROR);
+      }
+    }
+    else {
+      watchdog('commerce_parcel_monkey', 'Empty rate request for order %order_id', $vars, WATCHDOG_ERROR);
+    }
+  }
+  return isset($rates[$shipping_service['name']]) ? $rates[$shipping_service['name']] : FALSE;
+}
+
+
+/**
+ * Build the rate request.
+ */
+function _commerce_parcel_monkey_build_rate_request($order) {
+  $params = array();
+  $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+  $shipping_details = field_get_items('commerce_order', $order, 'commerce_customer_shipping');
+  $shipping_profile = commerce_customer_profile_load($shipping_details[0]['profile_id']);
+  $address_info = field_get_items('commerce_customer_profile', $shipping_profile, 'commerce_customer_address');
+
+  $params = array(
+    'Readable' => '1',
+    'Version' => '2.0',
+    'UserId' => variable_get('commerce_parcel_monkey_user_id'),
+    'ApiKey' => variable_get('commerce_parcel_monkey_api_key'),
+    'ShipmentDeliveryCountryCode' => $address_info[0]['country'],
+    'ShipmentPalletised' => '0',
+    'ShipmentGoodsValue' => _commerce_parcel_monkey_get_order_subtotal($order),
+    'ShipmentCollectionPostcode' => variable_get('commerce_parcel_monkey_collection_postcode'),
+    'ShipmentCollectionTown' => variable_get('commerce_parcel_monkey_collection_town'),
+    'ShipmentDeliveryPostcode' => $address_info[0]['postal_code'],
+    'ShipmentDeliveryTown' => $address_info[0]['locality'],
+  );
+
+  // Add boxes to the $param array from the products on the order.
+  foreach ($order_wrapper->commerce_line_items as $delta => $line_item_wrapper) {
+    if ($line_item_wrapper->type->value() == 'product') {
+      $line_item_dimensions = commerce_physical_product_line_item_dimensions($line_item_wrapper->value());
+      $line_item_weight = commerce_physical_product_line_item_weight($line_item_wrapper->value());
+      $params += array(
+        'Boxes[' . $delta . '][length]' => $line_item_dimensions['length'],
+        'Boxes[' . $delta . '][width]' => $line_item_dimensions['width'],
+        'Boxes[' . $delta . '][height]' => $line_item_dimensions['height'],
+        'Boxes[' . $delta . '][weight]' => $line_item_weight['weight'],
+      );
+    }
+  }
+
+  return $params;
+}
+
+
+/**
+ * Get a list of all services offered by Parcel Monkey.
+ */
+function _commerce_parcel_monkey_service_list() {
+  $parcel_monkey_services = array(
+    'ukparcels_nextday' => t('City Link Parcel (Next day delivery by 6pm)'),
+    'ukparcels_bag0900' => t('City Link Bag (Next day delivery by 9am)'),
+    'ukparcels_bag1030' => t('City Link Bag (Next day delivery by 10:30am)'),
+    'ukparcels_bag1200' => t('City Link Bag (Next day delivery by 12pm)'),
+    'ukparcels_bag' => t('City Link Bag (Next day delivery by 6pm)'),
+    'ukparcels_premium' => t('City Link Premium'),
+    'ukparcels_nextday9am' => t('City Link Parcel (Next day delivery by 9am)'),
+    'ukparcels_nextday1030am' => t('City Link Parcel (Next day delivery by 10:30am)'),
+    'ukparcels_nextday12pm' => t('City Link Parcel (Next day delivery by 12pm)'),
+    'ukparcels_saturday' => t('City Link Parcel (Next Saturday delivery)'),
+    'ireland_ni' => t('City Link Parcel (Northern Ireland)'),
+    'ukparcels_northernireland' => t('City Link Northern Ireland'),
+    'ukislands_iow' => t('City Link (Isle of Wight)'),
+    'ukislands_channel' => t('City Link (Channel Islands)'),
+    'ukislands_scilly' => t('City Link (Isles of Scilly)'),
+    'ukislands_mann' => t('City Link (Isle of Man)'),
+    'ukislands_orkney' => t('City Link (Orkney Islands)'),
+    'ukislands_shetland' => t('City Link (Shetland Islands)'),
+    'ukislands_scottish' => t('City Link (Scotland)'),
+    'ukparcels_pf24' => t('Parcelforce (24 hour delivery)'),
+    'ukparcels_pf48' => t('Parcelforce (48 hour delivery)'),
+    'ukparcels_pfdropoff24' => t('Parcelforce (Drop at a depot for next day delivery)'),
+    'ukparcels_pfdropoff48' => t('Parcelforce (Drop at a depot for 48 hour delivery)'),
+    'ukbag_fast' => t('DX Bag (Fast Delivery)'),
+    'international_pmair' => t('City Link Parcel (International Air)'),
+    'international_parcelforce' => t('Parcelforce International'),
+    'international_air' => t('Parcelforce International Air'),
+  );
+
+  // Allow other modules to add or alter services.
+  drupal_alter('_commerce_parcel_monkey_service_list', $parcel_monkey_services);
+
+  return $parcel_monkey_services;
+}
+
+
+/**
+ * A helper function to check for valid XML in a string.
+ */
+function _commerce_parcel_monkey_is_valid_xml($xml) {
+  libxml_use_internal_errors(TRUE);
+  $doc = new DOMDocument('1.0', 'utf-8');
+  $doc->loadXML($xml);
+  $errors = libxml_get_errors();
+  return empty($errors);
+}
+
+
+/**
+ * A helper function to get the order total without any shipping costs.
+ */
+function _commerce_parcel_monkey_get_order_subtotal($order) {
+  $total = 0;
+  $order_total = field_get_items('commerce_order', $order, 'commerce_order_total');
+  foreach ($order_total[0]['data']['components'] as $components) {
+    if ($components['name'] != 'shipping') {
+      $total += $components['price']['amount'];
+    }
+  }
+  return ($total / 100);
+}

@@ -1,0 +1,487 @@
+<?php
+/**
+ * @file
+ * Module file for Webform Redhen.
+ */
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function webform_redhen_form_webform_configure_form_alter(&$form, &$form_state) {
+  $bundles = webform_redhen_bundles();
+  if (!$bundles) {
+    // Do not show form if there are no Redhen Contact bundles.
+    return;
+  }
+  // Add submit handler to save settings.
+  $form['#submit'][] = 'webform_redhen_webform_configure_form_submit';
+
+  $nid = $form['nid']['#value'];
+  // Load settings for this webform.
+  $config = webform_redhen_config_load($nid);
+
+  $form['webform_redhen'] = array(
+    '#title' => 'Redhen Settings',
+    '#type' => 'fieldset',
+    '#collapsible' => TRUE,
+    '#tree' => TRUE,
+    '#weight' => -2,
+  );
+
+  $form['webform_redhen']['enabled'] = array(
+    '#title' => t('Save information to Redhen?'),
+    '#type' => 'checkbox',
+    '#default_value' => !empty($config['enabled']),
+    '#description' => t('Enabling this checkbox will allow you to save 
+      selected webform fields to a Redhen Contact entity'),
+  );
+
+  $form['webform_redhen']['bundle'] = array(
+    '#title' => t('Redhen Contact bundle'),
+    '#type' => 'select',
+    '#options' => $bundles,
+    '#default_value' => !empty($config['bundle'])
+      ? $config['bundle']
+      : FALSE,
+    '#description' => t('Select the Redhen Contact bundle you would like to
+      save webform data to.'),
+  );
+}
+
+/**
+ * Custom submit handler for webform_configure_form.
+ *
+ * @see webform_redhen_form_webform_configure_form_alter().
+ */
+function webform_redhen_webform_configure_form_submit(&$form, &$form_state) {
+  $nid = $form_state['values']['nid'];
+  // Load settings for this webform.
+  $config = webform_redhen_config_load($nid);
+  if ($form_state['values']['webform_redhen']['enabled']) {
+    $config['enabled'] = TRUE;
+    $config['bundle'] = $form_state['values']['webform_redhen']['bundle'];
+  }
+  else {
+    // We don't have to delete any info, just disable it.
+    $config['enabled'] = FALSE;
+  }
+  webform_redhen_config_save($config);
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function webform_redhen_form_webform_component_edit_form_alter(&$form, &$form_state) {
+  $cid = $form['cid']['#value'];
+  $nid = $form['nid']['#value'];
+  $config = webform_redhen_config_load($nid);
+
+  // If we don't have redhen mapping enabled, don't continue.
+  if (empty($config['enabled'])) {
+    return; 
+  }
+
+  // If we have it enabled, but we haven't selected a bundle, alert.
+  if (empty($config['bundle'])) {
+    drupal_set_message(t('You must set a Redhen Contact bundle for this webform.'), 'error');
+    return;
+  }
+
+  // Add the custom submit handler.
+  $form['#submit'][] = 'webform_redhen_webform_component_edit_form_submit';
+
+  $form['mapping'] = array( 
+    '#title' => t('Redhen mapping'),
+    '#description' => t('Select the Redhen field that you would like to map 
+      this webform field to.'),
+    '#type' => 'select',
+    '#options' => webform_redhen_field_options($config['bundle']),
+    '#default_value' => isset($config['mapping'][$cid]) 
+      ? $config['mapping'][$cid]
+      : '__none',
+    '#weight' => -1,
+  ); 
+}
+
+/**
+ * Custom submit handler for webform_component_edit_form.
+ *
+ * @webform_redhen_form_webform_component_edit_form_alter().
+ */
+function webform_redhen_webform_component_edit_form_submit(&$form, &$form_state) {
+  $cid = $form_state['values']['cid'];
+  $nid = $form_state['values']['nid'];
+
+  $config = webform_redhen_config_load($nid);
+  if (!empty($form_state['values']['mapping'])) {
+    $config['mapping'][$cid] = $form_state['values']['mapping'];
+    webform_redhen_config_save($config);
+  }
+}
+
+/**
+ * Implements hook_node_delete().
+ */
+function webform_redhen_node_delete($node) {
+  if (!empty($node->webform['nid'])) {
+    $config = webform_redhen_config_load($node->nid);
+    if (isset($config['enable']) || isset($config['bundle']) || isset($config['mapping'])) {
+      webform_redhen_config_delete($node->nid);
+    }
+  }
+}
+
+/**
+ * Implements hook_webform_component_delete().
+ */
+function webform_redhen_webform_component_delete($component) {
+  // Remove the setting for that component ID. Component IDs are re-used.
+  $cid = $component['cid'];
+  
+  $config = webform_redhen_config_load($component['nid']);
+  if (isset($config['mapping'][$cid])) {
+    unset($config['mapping'][$cid]);
+    webform_redhen_config_save($config);
+  }
+}
+
+/**
+ * Save a configuration for a given webform nid.
+ *
+ * @param $args
+ *   An array containing
+ *   - nid: Webform nid.
+ *   - mapping: Array of component to field name map.
+ *   - enabled: Boolean indicating whether or not to use Webform Redhen.
+ */
+function webform_redhen_config_save($args = array()) {
+  if (empty($args['nid'])) {
+    return FALSE;
+  }
+  if (isset($args['mapping']) && is_array($args['mapping'])) {
+    $mapping = serialize($args['mapping']);
+  }
+  else {
+    $mapping = FALSE;
+  }
+  db_merge('webform_redhen_config')
+    ->key(array('nid' => $args['nid']))
+    ->fields(array(
+      'nid' => $args['nid'],
+      'mapping' => $mapping,
+      'enabled' => empty($args['enabled']) ? 0 : 1,
+      'bundle' => isset($args['bundle']) ? $args['bundle'] : NULL,
+    ))->execute();
+
+  // Reset webform redhen cache.
+  webform_redhen_config_cache(TRUE);
+}
+
+/**
+ * Delete the configuration for a webform.
+ *
+ * @param Int $nid
+ *   Nid of the webform node.
+ */
+function webform_redhen_config_delete($nid = NULL) {
+  if (!$nid) {
+    return FALSE;
+  }
+  db_delete('webform_redhen_config')->condition('nid', $nid, '=')->execute();
+}
+
+/**
+ * Load the configuration for a given webform nid.
+ *
+ * @param $nid
+ *   Webform nid
+ *
+ * @return
+ *   An array containing
+ *   - nid: Webform nid.
+ *   - mapping: Array of component to field name map.
+ *   - enabled: Boolean indicating whether or not to use Webform Redhen.
+ */
+function webform_redhen_config_load($nid = NULL) {
+  if (!$nid) {
+    return FALSE;
+  }
+  $config = webform_redhen_config_cache();
+  return isset($config[$nid]) ? $config[$nid] : array('nid' => $nid);
+}
+
+/**
+ * Caches and statically caches all webform configurations.
+ */
+function webform_redhen_config_cache($reset = FALSE) {
+  $config = &drupal_static(__FUNCTION__);
+  // If statically cached, and not intentionally reset.
+  if ($config && !$reset) {
+    return $config;
+  }
+
+  // If cache exists.
+  if ($cache = cache_get('webform_redhen_config')) {
+    // And we are not resetting intentionally.
+    if (!$reset) {
+      $config = $cache->data;
+      return $config;
+    }
+  }
+
+  // Run full query.
+  $result = db_select('webform_redhen_config', 'wrc')
+    ->fields('wrc')
+    ->execute();
+
+  foreach ($result as $row) {
+    $array = (array) $row;
+    $array['mapping'] = unserialize($row->mapping);
+    $config[$row->nid] = $array;
+  }
+
+  cache_set('webform_redhen_config', $config, 'cache');
+  return $config;
+}
+
+
+/**
+ * Helper function to populate a list of fields for the option select.
+ * 
+ * @param String $bundle
+ *   Name of entity bundle to get fields for.
+ *
+ * @return
+ *   Array of field labels keyed by field machine name.
+ */
+function webform_redhen_field_options($bundle = NULL) {
+  if (!$bundle) {
+    return FALSE;
+  }
+
+  // Add in Redhen core fields.
+  $options = array(
+    '__none' => t('-- Select a !bundle field --', array('!bundle' => $bundle)),
+    'first_name' => 'First name',
+    'last_name' => 'Last name',
+  );
+
+  $fields = webform_redhen_fields($bundle);
+  foreach ($fields as $field) {
+    $type = $field['widget']['type'];
+    if (function_exists('webform_redhen_field_options_' . $type)) {
+      $func = 'webform_redhen_field_options_' . $type;
+      $func($field, $options);
+    }
+    else {
+      $options[$field['field_name']] = $field['label'];
+    }
+  }
+
+  return $options;
+}
+
+/**
+ * Helper function to get all fields for a Redhen Contact bundle.
+ */
+function webform_redhen_fields($bundle = NULL) {
+  if ($bundle) {
+    return field_info_instances('redhen_contact', $bundle);
+  }
+  return FALSE;
+}
+
+/**
+ * Helper function to load all Redhen Contact entity bundles.
+ *
+ * @return
+ *   An array of bundle labels indexed by machine name.
+ */
+function webform_redhen_bundles() {
+  $entity = entity_get_info('redhen_contact');
+  if (!empty($entity['bundles'])) {
+    $bundles = array();
+    foreach ($entity['bundles'] as $name => $bundle) {
+      $bundles[$name] = $bundle['label'];
+    }
+
+    return $bundles;
+  }
+  
+  return FALSE;
+}
+
+
+/**
+ * Implements webform_redhen_field_options_WIDGET_TYPE().
+ */
+function webform_redhen_field_options_location($field, &$options) {
+  $field_name = $field['field_name'];
+  // Location settings are global for all instances, so we need that
+  // information.
+  $fields = field_info_fields();
+  $address = $fields['field_address'];
+  // These are the settings for collection each field within the 
+  // location field.
+  $settings = $address['settings']['location_settings']['form']['fields'];
+  foreach ($settings as $name => $setting) {
+    // If it isn't set to be collected, we don't want to send data there.
+    if ($setting['collect']) {
+      $options[$field_name . ':' . $name] = "$name ($field_name)";
+    }
+  }
+}
+
+/**
+ * Helper function to save a redhen contact.
+ *
+ * @see webform_redhen_webform_submission_insert().
+ *
+ * @param Object $node
+ *   Fully loaded node object.
+ * @param Array $data
+ *   Array of submission field values to save.
+ *
+ * @return
+ *   New redhen contact_id. 
+ */
+function webform_redhen_contact_save($node, $data) {
+  $config = webform_redhen_config_load($node->nid);
+  $mapping = $config['mapping'];
+
+  // If they've specified a bundle in the configuration.
+  if ($config['bundle']) {
+    $contact_type = $config['bundle'];
+  }
+  else {
+    // If not parameter, use the default Contact type.
+    $contact_type = variable_get(REDHEN_CONTACT_REG_TYPE, FALSE);
+  }
+  
+  // Create new contact object.
+  $contact = redhen_contact_create(array('type' => $contact_type));
+  // Use entity module for saving field values.
+  $wrapper = entity_metadata_wrapper('redhen_contact', $contact);
+  $properties = $wrapper->getPropertyInfo();
+  foreach ($mapping as $cid => $field_name) {
+    if ($field_name == '__none') {
+      // Field has no mapping.
+      continue;
+    }
+    // Some fields that have sub values are saved as ['field:subfield'].
+    $field_name = explode(':', $field_name);
+    $sub_field = count($field_name) > 1 ? $field_name[1] : NULL;
+    // Make sure we extract the root field, that will need to match entity API.
+    $field_name = reset($field_name);
+    // Ensure the entity API is compatible with this field type.
+    if (isset($properties[$field_name])) {
+			// Compatibility with Webform > 4.0: 'value' is no longer used.
+			$v = isset($data[$cid]['value']) ? $data[$cid]['value'] : $data[$cid];
+      // Format the proper value for this particular field, depending on type.
+      $value = _webform_redhen_contact_field_map($v, $field_name, $wrapper, $sub_field);
+      $wrapper->{$field_name}->set($value);
+    }
+  }
+
+  // Save RedhenContact to database.
+  $wrapper->save();
+  return $wrapper->getIdentifier();
+}
+
+/**
+ * Implements hook_webform_submission_insert().
+ */
+function webform_redhen_webform_submission_insert($node, $submission) {
+  
+  $config = webform_redhen_config_load($node->nid);
+  if(!empty($config['enabled'])) {
+    $contact = webform_redhen_contact_save($node, $submission->data);
+  }
+}
+
+/**
+ * Helper function to restructure webform data into a simpler array.
+ *
+ * @param Object $node
+ *   The submitted webform node.
+ * @param Object $submission
+ *   The submitted webform submission object.
+ *
+ * @return
+ *   Array of values keyed by cid.
+ */
+function _webform_redhen_webform_submission_data($node, $submission) {
+  $data = array();
+  foreach ($node->webform['components'] as $index => $component) {
+		// Compatibility with Webform > 4.0: 'value' is no longer used.
+    $value = isset($submission->data[$index]['value']) ? $submission->data[$index]['value'] : $submission->data[$index];
+    $data[$component['cid']] = count($value) > 1 ? $value : reset($value);
+  }
+  return $data;
+}
+
+/**
+ * Map values for webform submissions.
+ *
+ * @param $value
+ *   Submitted form value.
+ * @param String $field_name
+ *   Machine name of the field.
+ * @param Object $wrapper
+ *   Entity Metadata Wrapper for the current node.
+ * @param String $sub_field
+ *   Optional. Some field types have sub field values.
+ *
+ * @return
+ *   Single field value to pass to wrapper.
+ */
+function _webform_redhen_contact_field_map($value, $field_name, $wrapper, $sub_field = NULL) {
+  // Special cases for Redhen core fields.
+  if ($field_name == 'first_name' || $field_name == 'last_name') {
+    return reset($value);
+  }
+  // TODO: Account for the cardinality.
+  if ($field_name == 'redhen_contact_email') {
+    return array(array(
+      'value' => reset($value),
+      'default' => 1,
+      'label_id' => 0,
+      'hold' => 0,
+      'bulk' => 0,
+    ));
+  }
+
+  $return = array();
+
+  // Remaining values should be field module fields.
+  static $fields;
+  // Since this function is looped for each field we'll need to statically cache.
+  if (!$fields) {
+    $fields = field_info_fields();
+  }
+  
+  $info = $fields[$field_name];
+
+  // All webform values are returned as arrays, loop through the values returned
+  // an array even if they are single values.
+  foreach ($value as $index => $item) {
+    $return[$index] = $item;
+    // Map subfields.
+    if ($sub_field) {
+      // Since the sub fields are an array, we have to extract other values
+      // that have already been set. They have not been saved at this point, so
+      // there is no db interaction.
+      $existing_data = $wrapper->{$field_name}->value();
+      $existing_data[$sub_field] = $item;
+      $return[$index] = $existing_data;
+    }
+  }
+
+  // Now is when we convert from the array that webform returned, to
+  // a single value if applicable to hand off to entity API.
+  if ($info['cardinality'] == 1) {
+    $return = reset($return);
+  }
+
+  return $return;
+}

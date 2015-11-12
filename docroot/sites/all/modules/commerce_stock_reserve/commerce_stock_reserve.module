@@ -1,0 +1,479 @@
+<?php
+/**
+ * @file
+ * Main file for the Commerce Stock Reserve module.
+ */
+
+/**
+ * Implements hook_menu().
+ */
+function commerce_stock_reserve_menu() {
+  $items = array();
+  $items['admin/commerce/config/stock/reserve'] = array(
+    'title' => 'Reserved stock',
+    'description' => 'Configure settings for reserved stock.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('commerce_stock_reserve_config_form'),
+    'access arguments' => array('administer commerce_stock settings'),
+    'file' => 'includes/commerce_stock_reserve.admin.inc',
+    'type' => MENU_LOCAL_TASK,
+    'weight' => 10,
+  );
+  return $items;
+}
+
+/**
+ * Implements hook_views_api().
+ */
+function commerce_stock_reserve_views_api() {
+  return array(
+    'api' => 3,
+    'path' => drupal_get_path('module', 'commerce_stock_reserve') . '/includes',
+  );
+}
+
+/**
+ * Implements hook_cron().
+ */
+function commerce_stock_reserve_cron() {
+  // Release reserved stock after a configured interval, deleting the line
+  // items where appropriate.
+  if (!variable_get('commerce_stock_reserve_expire_on_cron', '1')) {
+    return;
+  }
+  $interval = variable_get('commerce_stock_reserve_expire_interval', 1800);
+  $date_ref = variable_get('commerce_stock_reserve_expire_date_ref', 'order_changed');
+  $restore_to_product = variable_get('commerce_stock_reserve_expire_restore', TRUE);
+  $cart_only = variable_get('commerce_stock_reserve_expire_only_cart', TRUE);
+  $limit = variable_get('commerce_stock_reserve_expire_limit', 50);
+  commerce_stock_reserve_expire_line_items($interval, $date_ref, $restore_to_product, $cart_only, $limit);
+}
+
+/**
+ * Expire reserved stock and delete the line items after a certain interval.
+ *
+ * @param int $interval
+ *   The interval (in seconds) after which to release reserved stock. Defaults
+ *   to 1800 (half an hour).
+ * @param string $date_ref
+ *   The date the $interval relates to. The default is 'order_changed', i.e.
+ *   when the order was last modified. The options are defined in
+ *   commerce_stock_reserve_expire_date_ref_options_list().
+ * @param bool $restore_to_product
+ *   Whether to restore released stock back to the product (default: TRUE).
+ * @param bool $cart_only
+ *   Only release stock from orders that are in a shopping cart status (default:
+ *   TRUE). See commerce_cart_order_is_cart().
+ * @param int $limit
+ *   The maximum number of line items to process (default: 50).
+ */
+function commerce_stock_reserve_expire_line_items($interval = 1800, $date_ref = 'order_changed', $restore_to_product = TRUE, $cart_only = TRUE, $limit = 50) {
+  $select = db_select('commerce_stock_reserve', 'csr')
+    ->fields('csr', array('line_item_id'));
+  if ($limit) {
+    $select->range(0, $limit);
+  }
+  switch ($date_ref) {
+    case 'order_created':
+      $select->join('commerce_line_item', 'cli', 'cli.line_item_id = csr.line_item_id');
+      $select->join('commerce_order', 'co', 'co.order_id = cli.order_id');
+      $select->condition('co.created', REQUEST_TIME - $interval, '<');
+      break;
+
+    case 'reservation_created':
+      $select->condition('csr.created', REQUEST_TIME - $interval, '<');
+      break;
+
+    case 'line_item_changed':
+      $select->join('commerce_line_item', 'cli', 'cli.line_item_id = csr.line_item_id');
+      $select->condition('cli.changed', REQUEST_TIME - $interval, '<');
+      break;
+
+    case 'order_changed':
+    default:
+      $select->join('commerce_line_item', 'cli', 'cli.line_item_id = csr.line_item_id');
+      $select->join('commerce_order', 'co', 'co.order_id = cli.order_id');
+      $select->condition('co.changed', REQUEST_TIME - $interval, '<');
+      break;
+  }
+  $line_item_ids = $select->execute()->fetchCol();
+  if (!$line_item_ids) {
+    return;
+  }
+  $line_items = commerce_line_item_load_multiple($line_item_ids);
+  $cart_only_orders = array();
+  $done = array();
+  $errors = array();
+  foreach ($line_items as $line_item_id => $line_item) {
+    if ($cart_only) {
+      // Check that the line item's order is a shopping cart.
+      if (isset($cart_only_orders[$line_item->order_id])) {
+        continue;
+      }
+      $order = commerce_order_load($line_item->order_id);
+      if (!commerce_cart_order_is_cart($order)) {
+        $cart_only_orders[$order->order_id] = $order->order_id;
+        continue;
+      }
+    }
+    $success = commerce_stock_reserve($line_item, TRUE, $restore_to_product);
+    if ($success) {
+      $done[] = $line_item_id;
+    }
+    else {
+      $errors[] = $line_item_id;
+    }
+  }
+  // Only delete line items if their stock could be released.
+  if ($done) {
+    commerce_line_item_delete_multiple($done);
+    watchdog('commerce_stock_reserve', 'Released reserve stock and deleted @count line item(s)', array(
+      '@count' => count($done),
+    ));
+  }
+  if ($errors) {
+    watchdog('commerce_stock_reserve', 'Failed to release reserved stock for line items: @ids', array(
+      '@ids' => implode(', ', $errors),
+    ), WATCHDOG_ERROR);
+  }
+}
+
+/**
+ * The options for a reference date from which to calculate stock as expired.
+ *
+ * @return array
+ *   An array of human-readable options, keyed by their machine names.
+ */
+function commerce_stock_reserve_expire_date_ref_options_list() {
+  return array(
+    'order_changed' => t('Order last modified date'),
+    'reservation_created' => t('Stock reserved date'),
+    'line_item_changed' => t('Line item last modified date'),
+    'order_created' => t('Order created date'),
+  );
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function commerce_stock_reserve_form_commerce_product_product_form_alter(&$form, &$form_state) {
+  // Display the currently reserved stock on the product edit form.
+  $product = $form_state['commerce_product'];
+  if ($product->product_id && isset($product->commerce_stock) && isset($form['commerce_stock'][$product->language][0]['value'])) {
+    $element = &$form['commerce_stock'][$product->language][0]['value'];
+    $select = db_select('commerce_stock_reserve', 'csr')
+      ->condition('product_id', $product->product_id);
+    $select->addExpression('SUM(amount)');
+    $reserved = $select->execute()->fetchField();
+    $integer = isset($element['#number_type']) && $element['#number_type'] == 'integer';
+    $element['#description'] = empty($element['#description']) ? '' : $element['#description'] . ' ';
+    $element['#description'] .= t('Quantity currently reserved: @reserved.', array(
+      '@reserved' => number_format($reserved, $integer ? 0 : 2),
+    ));
+    $element['#field_suffix'] = ' + ' . number_format($reserved, $integer ? 0 : 2);
+  }
+}
+
+/**
+ * Implements hook_entity_delete().
+ */
+function commerce_stock_reserve_entity_delete($entity, $type) {
+  // Release reserved stock when a line item is deleted.
+  if ($type == 'commerce_line_item') {
+    commerce_stock_reserve($entity, TRUE);
+  }
+  // Delete reserved stock when a product is deleted.
+  elseif ($type == 'commerce_product') {
+    db_delete('commerce_stock_reserve')
+      ->condition('product_id', $entity->product_id)
+      ->execute();
+  }
+}
+
+/**
+ * Get the stock amount that has been reserved for a line item.
+ *
+ * @param object $line_item
+ *   The Commerce line item object.
+ *
+ * @return string|int
+ *   The amount that has been reserved.
+ */
+function commerce_stock_reserve_get_reserved_amount($line_item) {
+  // Only act on product line item types.
+  if (!in_array($line_item->type, commerce_product_line_item_types())) {
+    return 0;
+  }
+  $amount = db_select('commerce_stock_reserve', 'csr')
+    ->fields('csr', array('amount'))
+    ->condition('line_item_id', $line_item->line_item_id)
+    ->execute()
+    ->fetchField();
+  return $amount ? $amount : 0;
+}
+
+/**
+ * Get the stock amount that a user has reserved for a product.
+ *
+ * @param object $product
+ *   The Commerce product object.
+ * @param object $account
+ *   A Drupal user account object (defaults to the current user).
+ *
+ * @return string|int
+ *   The amount that has been reserved.
+ */
+function commerce_stock_reserve_get_user_reserved_amount($product, $account = NULL) {
+  static $cache;
+  $account = $account ? $account : $GLOBALS['user'];
+  $cache_key = $account->uid . ':' . $product->product_id;
+  if (isset($cache[$cache_key])) {
+    return $cache[$cache_key];
+  }
+  $cache[$cache_key] = 0;
+  // Load the user's cart if it exists.
+  $order = commerce_cart_order_load($account->uid);
+  if (!$order) {
+    return 0;
+  }
+  $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+  // Get all the line item IDs in the user's cart that contain this product.
+  $line_item_ids = array();
+  foreach ($order_wrapper->commerce_line_items as $line_item_wrapper) {
+    if (in_array($line_item_wrapper->getBundle(), commerce_product_line_item_types())
+      && $line_item_wrapper->commerce_product->product_id->value() == $product->product_id) {
+      $line_item_ids[] = $line_item_wrapper->line_item_id->value();
+    }
+  }
+  if (!count($line_item_ids)) {
+    return 0;
+  }
+  // Get the reserved amount for these line item IDs.
+  $select = db_select('commerce_stock_reserve', 'csr')
+    ->condition('line_item_id', $line_item_ids, 'IN')
+    ->condition('product_id', $product->product_id);
+  $select->addExpression('SUM(csr.amount)', 'amount');
+  $amount = $select->execute()->fetchField();
+  $cache[$cache_key] = $amount ? $amount : 0;
+  return $cache[$cache_key];
+}
+
+/**
+ * Get the amount of product stock that is available for a particular user.
+ *
+ * This is the sum of the product's stock and the amount the user has already
+ * reserved.
+ *
+ * @param object $product
+ *   The Commerce product object.
+ * @param object $account
+ *   A Drupal user account object (defaults to the current user).
+ *
+ * @return float|int
+ *   The amount that has been reserved.
+ */
+function commerce_stock_reserve_get_user_available_amount($product, $account = NULL) {
+  $stock = commerce_stock_reserve_get_product_stock($product);
+  $amount = commerce_stock_reserve_get_user_reserved_amount($product, $account);
+  return $stock + $amount;
+}
+
+/**
+ * Check that a product is enabled for stock control.
+ *
+ * @param object $product
+ *   The Commerce product object.
+ *
+ * @return bool
+ *   TRUE if the product has stock enabled, FALSE otherwise.
+ */
+function commerce_stock_reserve_product_is_enabled($product) {
+  $enabled = FALSE;
+  // Support Commerce Simple Stock (commerce_ss), probably the most common
+  // use-case.
+  if (module_exists('commerce_ss')) {
+    $enabled = $product->product_id
+      && commerce_ss_product_type_enabled($product->type)
+      && commerce_ss_product_not_disabled_by_override($product);
+  }
+  // Allow other modules to alter whether the product has stock control.
+  drupal_alter('commerce_stock_reserve_product_is_enabled', $enabled, $product);
+  return $enabled;
+}
+
+/**
+ * Check the current stock level for a product.
+ *
+ * @param object $product
+ *   The Commerce product object.
+ * @param bool $reset
+ *   Whether to reset the static cache for this check (default: FALSE).
+ *
+ * @return mixed
+ *   The product's stock amount.
+ */
+function commerce_stock_reserve_get_product_stock($product, $reset = FALSE) {
+  static $cache = array();
+  if (!$reset && isset($cache[$product->product_id])) {
+    return $cache[$product->product_id];
+  }
+  $stock = 0;
+  // Support Commerce Simple Stock (commerce_ss).
+  if (module_exists('commerce_ss') && !empty($product->commerce_stock)) {
+    $product_wrapper = entity_metadata_wrapper('commerce_product', $product);
+    $stock = $product_wrapper->commerce_stock->value();
+  }
+  // Allow other modules to alter the returned stock level.
+  drupal_alter('commerce_stock_reserve_get_product_stock', $stock, $product);
+  $cache[$product->product_id] = $stock;
+  return $stock;
+}
+
+/**
+ * Set the stock level for a product.
+ *
+ * @param object $product
+ *   The Commerce product object.
+ * @param mixed $stock
+ *   The new stock.
+ * @param bool $skip_save
+ *   Set this to TRUE to skip saving the product.
+ * @param DatabaseTransaction $transaction
+ *   Optionally a DatabaseTransaction object to use.
+ *
+ * @return bool
+ *   TRUE on success, FALSE on failure.
+ */
+function commerce_stock_reserve_set_product_stock($product, $stock, $skip_save = FALSE, DatabaseTransaction $transaction = NULL) {
+  $success = FALSE;
+  // Support Commerce Simple Stock (commerce_ss).
+  if (module_exists('commerce_ss') && isset($product->commerce_stock)) {
+    $product_wrapper = entity_metadata_wrapper('commerce_product', $product);
+    $product_wrapper->commerce_stock->set($stock);
+    $success = TRUE;
+  }
+  // Allow other modules to try setting the product stock.
+  $hook = 'commerce_stock_reserve_set_product_stock';
+  foreach (module_implements($hook) as $module_name) {
+    $function = $module_name . '_' . $hook;
+    $result = $function($product, $stock);
+    if ($result === FALSE) {
+      return FALSE;
+    }
+  }
+  if (!$skip_save && $success) {
+    $success = (bool) entity_get_controller('commerce_product')->save($product, $transaction);
+  }
+  return $success;
+}
+
+/**
+ * Reserve stock for a line item.
+ *
+ * @param object $line_item
+ *   The Commerce line item object.
+ * @param bool $release
+ *   Whether to release stock rather than reserving it (default: FALSE).
+ * @param bool $restore_to_product
+ *   Whether to restore the stock to the product when it has been released
+ *   (default: TRUE). This only has an effect if $release is TRUE.
+ *
+ * @return bool
+ *   TRUE on success, FALSE otherwise.
+ */
+function commerce_stock_reserve($line_item, $release = FALSE, $restore_to_product = TRUE) {
+  // Only act on product line item types.
+  if (!in_array($line_item->type, commerce_product_line_item_types()) || empty($line_item->commerce_product)) {
+    return FALSE;
+  }
+
+  // Get the product from the line item.
+  $line_item_wrapper = entity_metadata_wrapper('commerce_line_item', $line_item);
+  $product = $line_item_wrapper->commerce_product->value();
+
+  // Check that the product is enabled for stock control.
+  if (!commerce_stock_reserve_product_is_enabled($product)) {
+    return FALSE;
+  }
+
+  // Find out how much stock has been reserved for the line item.
+  $current_reserved = commerce_stock_reserve_get_reserved_amount($line_item);
+  if ($release && !$current_reserved) {
+    // There is no stock to release.
+    return TRUE;
+  }
+
+  // Get the current stock level.
+  $current_stock = commerce_stock_reserve_get_product_stock($product);
+
+  // Calculate how much stock should be reserved. If releasing stock, then this
+  // will be a negative value.
+  $to_reserve = $release ? -$current_reserved : $line_item->quantity;
+
+  // If the stock is already reserved, there is nothing to do.
+  if ($to_reserve == $current_reserved) {
+    return TRUE;
+  }
+  // If there isn't enough stock available for what has been requested, then
+  // reset the line item's quantity to the maximum available and log a warning.
+  elseif ($to_reserve > $current_stock + $current_reserved) {
+    $available = $current_stock + $current_reserved;
+    $line_item->quantity = $available;
+    $line_item_wrapper->save();
+    $to_reserve = $available;
+    watchdog('commerce_stock_reserve', 'Quantity reset (@requested requested, @available available) for line item @line_item in order @order (product @sku)', array(
+      '@requested' => $to_reserve,
+      '@available' => $available,
+      '@line_item' => $line_item->line_item_id,
+      '@order' => $line_item->order_id,
+      '@sku' => $product->sku,
+    ), WATCHDOG_WARNING);
+  }
+
+  // Calculate the new stock values.
+  $new_stock = $current_stock - $to_reserve;
+  if (!$release) {
+    $new_stock += $current_reserved;
+  }
+
+  $transaction = db_transaction(__FUNCTION__);
+  try {
+
+    // Set the new stock level of the product.
+    if (!$release || $restore_to_product) {
+      $update = commerce_stock_reserve_set_product_stock($product, $new_stock, FALSE, $transaction);
+      if (!$update) {
+        throw new Exception('Failed to set stock for product ' . $product->sku);
+      }
+    }
+
+    // Update the quantity reserved for the line item.
+    if ($to_reserve > 0) {
+      $key = array(
+        'line_item_id' => $line_item->line_item_id,
+        'product_id' => $product->product_id,
+      );
+      db_merge('commerce_stock_reserve')
+        ->key($key)
+        ->insertFields($key + array('created' => REQUEST_TIME))
+        ->fields(array(
+          'amount' => $to_reserve,
+          'changed' => REQUEST_TIME,
+        ))
+        ->execute();
+    }
+    else {
+      // If the reserved stock level is now 0, delete the rows.
+      db_delete('commerce_stock_reserve')
+        ->condition('line_item_id', $line_item->line_item_id)
+        ->execute();
+    }
+
+  }
+  catch (Exception $e) {
+    $transaction->rollback();
+    watchdog_exception('commerce_stock_reserve', $e);
+    return FALSE;
+  }
+  return TRUE;
+}

@@ -1,0 +1,1191 @@
+<?php
+
+/**
+ * @file
+ * Calculate Sales Tax using AvaTax service from Avalara, Inc.
+ */
+
+define('COMMERCE_AVATAX_PRODUCTION_MODE', 'Production');
+define('COMMERCE_AVATAX_DEVELOPMENT_MODE', 'Development');
+define('COMMERCE_AVATAX_BASIC_VERSION', 'basic');
+define('COMMERCE_AVATAX_PRO_VERSION', 'pro');
+
+/**
+ * Implements hook_page_alter().
+ */
+function commerce_avatax_page_alter() {
+  $path = current_path();
+  if (module_exists('commerce_tax') && strpos($path, 'admin/commerce/config/taxes') === 0) {
+    drupal_set_message(t('Please disable Commerce Tax module to avoid duplicate sales tax line items. Configure Commerce AvaTax !here.', array('!here' => l(t('here'), 'admin/commerce/config/avatax'))));
+  }
+}
+
+/**
+ * Implements hook_permission().
+ */
+function commerce_avatax_permission() {
+  return array(
+    'administer avatax' => array(
+      'title' => t('Administer Commerce AvaTax'),
+      'description' => t('Allows users to configure Commerce AvaTax'),
+      'restrict access' => TRUE,
+    ),
+  );
+}
+
+/**
+ * Implements hook_commerce_line_item_type_info().
+ */
+function commerce_avatax_commerce_line_item_type_info() {
+  $line_item_types = array();
+
+  $line_item_types['avatax'] = array(
+    'name' => t('Sales tax'),
+    'description' => t('Calculate AvaTax'),
+    'add_form_submit_value' => t('Add Sales tax'),
+    'base' => 'commerce_avatax_line_item',
+    'callbacks' => array(
+      'configuration' => 'commerce_avatax_configure_line_item',
+    ),
+  );
+
+  return $line_item_types;
+}
+
+/**
+ * Line item callback: configures the AvaTax line item type on module enable.
+ */
+function commerce_avatax_configure_line_item() {
+  $field_name = 'avatax';
+  $type = 'avatax';
+
+  $field = field_info_field($field_name);
+  $instance = field_info_instance('commerce_line_item', $field_name, $type);
+
+  if (empty($field)) {
+    $field = array(
+      'field_name' => $field_name,
+      'type' => 'list_text',
+      'cardinality' => 1,
+      'entity_types' => array('commerce_line_item'),
+      'translatable' => FALSE,
+      'locked' => TRUE,
+    );
+    $field = field_create_field($field);
+  }
+
+  if (empty($instance)) {
+    $instance = array(
+      'field_name' => $field_name,
+      'entity_type' => 'commerce_line_item',
+      'bundle' => $type,
+      'label' => t('AvaTax'),
+      'required' => TRUE,
+      'settings' => array(),
+      'widget' => array(
+        'type' => 'options_select',
+        'weight' => 0,
+      ),
+      'display' => array(
+        'display' => array(
+          'label' => 'hidden',
+          'weight' => 0,
+        ),
+      ),
+    );
+    field_create_instance($instance);
+  }
+}
+
+/**
+ * Returns the title of an AvaTax line item.
+ */
+function commerce_avatax_line_item_title($line_item) {
+  if (!empty($line_item->data['avatax']['display_title'])) {
+    return $line_item->data['avatax']['display_title'];
+  }
+}
+
+/**
+ * Implements hook_commerce_price_component_type_info().
+ */
+function commerce_avatax_commerce_price_component_type_info() {
+  // Get Sales Tax description.
+  $tax_title = (variable_get('commerce_avatax_tax_description', ''));
+
+  $components = array();
+
+  // Define a generic AvaTax price component type.
+  $components['avatax'] = array(
+    'title' => t('AvaTax sales tax'),
+    'display_title' => $tax_title,
+    'weight' => 25,
+  );
+
+  return $components;
+}
+
+/**
+ * Calculate sales tax using regular web site checkout.
+ */
+function commerce_avatax_calculate_sales_tax($order) {
+  $product_version = variable_get('commerce_avatax_product_version', COMMERCE_AVATAX_BASIC_VERSION);
+  if (commerce_avatax_check_address($order, $product_version)) {
+    $sales_tax = commerce_avatax_retrieve_sales_tax($order, $product_version);
+  }
+  else {
+    return;
+  }
+
+  // If we have a sales tax amount.
+  if ($sales_tax) {
+    // Create a new AvaTax line item.
+    $line_item = commerce_avatax_line_item_create($sales_tax, $order->order_id);
+    commerce_avatax_add_avatax_line_item($line_item, $order);
+
+    // Add the line item data as a property of the order.
+    $order->avatax['avatax'] = $line_item;
+
+  }
+  else {
+    drupal_set_message(t('AvaTax did not calculate sales tax'), 'error');
+    return;
+  }
+}
+
+/**
+ * Calculate sales tax for manual order entry.
+ */
+function commerce_avatax_manual_calculate_sales_tax($order) {
+  $product_version = variable_get('commerce_avatax_product_version', COMMERCE_AVATAX_BASIC_VERSION);
+  if (commerce_avatax_check_address($order, $product_version)) {
+    $sales_tax = commerce_avatax_retrieve_sales_tax($order, $product_version);
+  }
+  else {
+    drupal_set_message(t('AvaTax error: Invalid state or incomplete address'), 'error');
+    return TRUE;
+  }
+
+  // If we have a sales tax amount.
+  if ($sales_tax) {
+    // Create a new AvaTax line item.
+    $line_item = commerce_avatax_line_item_create($sales_tax, $order->order_id);
+
+    // Add the line item data as a property of the order.
+    $order->avatax['avatax'] = $line_item;
+  }
+  else {
+    drupal_set_message(t('AvaTax error: Sales tax could not be calculated'), 'error');
+    return TRUE;
+  }
+}
+
+/**
+ * Creates a sales tax line item.
+ *
+ * @param array $sales_tax
+ *   A price array used to establish the base unit price for the AvaTax.
+ * @param int $order_id
+ *   If available, the order to which the AvaTax line item will belong.
+ *
+ * @return object
+ *   The sales tax line item.
+ */
+function commerce_avatax_line_item_create($sales_tax = array(), $order_id = 0) {
+  $avatax_service = commerce_avatax_service_load();
+
+  // Create the new line item for AvaTax.
+  $line_item = commerce_avatax_line_item_new($sales_tax, $order_id);
+
+  // Set the price component of the unit price if it hasn't already been done.
+  $line_item_wrapper = entity_metadata_wrapper('commerce_line_item', $line_item);
+  $data = $line_item_wrapper->commerce_unit_price->data->value();
+
+  if (empty($data['components'])) {
+    $line_item_wrapper->commerce_unit_price->data = commerce_price_component_add(
+            $line_item_wrapper->commerce_unit_price->value(), $avatax_service['price_component'], $line_item_wrapper->commerce_unit_price->value(), TRUE, FALSE
+    );
+  }
+
+  return $line_item;
+}
+
+/**
+ * Creates a new AvaTax line item populated with the sales tax values.
+ *
+ * @param array $sales_tax
+ *   A price array used to initialize the value of the line item's unit price.
+ * @param int $order_id
+ *   The ID of the order the line item belongs to.
+ * @param array $data
+ *   An array value to initialize the line item's data array with.
+ * @param string $type
+ *   The name of the line item type being created; defaults to 'avatax'.
+ *
+ * @return object
+ *   The avatax line item initialized to the given
+ *   unit price.
+ */
+function commerce_avatax_line_item_new($sales_tax = array(), $order_id = 0, $data = array(), $type = 'avatax') {
+  // Ensure a default product line item type.
+  if (empty($type)) {
+    $type = 'avatax';
+  }
+
+  // Create the new line item.
+  $line_item = entity_create('commerce_line_item', array(
+    'type' => $type,
+    'order_id' => $order_id,
+    'quantity' => 1,
+    'data' => $data,
+  ));
+
+  // Populate line item with the sales tax unit price data.
+  commerce_avatax_line_item_populate($line_item, $sales_tax);
+
+  return $line_item;
+}
+
+/**
+ * Populates a sales tax line item with the specified values.
+ *
+ * @param array $sales_tax
+ *   A sales tax array to be added to the value of the line item's unit price.
+ */
+function commerce_avatax_line_item_populate($line_item, $sales_tax = array()) {
+  $avatax_service = commerce_avatax_service_load();
+
+  // Use the label to store the display title of the avatax service.
+  $line_item->line_item_label = 'AvaTax';
+  $line_item->quantity = 1;
+
+  $line_item->data['avatax'] = $avatax_service;
+
+  $line_item_wrapper = entity_metadata_wrapper('commerce_line_item', $line_item);
+
+  // Set the unit price.
+  $line_item_wrapper = entity_metadata_wrapper('commerce_line_item', $line_item);
+  $line_item_wrapper->commerce_unit_price = $sales_tax;
+}
+
+/**
+ * Adds an AvaTax line item to an order, and saves the order.
+ *
+ * @param object $line_item
+ *   An unsaved avatax line item that should be added to the order.
+ * @param object $order
+ *   The order to add the avatax line item to.
+ */
+function commerce_avatax_add_avatax_line_item($line_item, $order) {
+  // Delete any existing AvaTax line items from the order.
+  commerce_avatax_delete_avatax_transaction($order);
+
+  // Save the incoming line item now so we get its ID.
+  commerce_line_item_save($line_item);
+
+  // Add it to the order's line item reference value.
+  $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+  $order_wrapper->commerce_line_items[] = $line_item;
+
+  commerce_order_calculate_total($order);
+}
+
+/**
+ * Returns form for adding an AvaTax line item through line item manager widget.
+ */
+function commerce_avatax_line_item_add_form($form, &$form_state) {
+  // Calculate the sales tax amount for this order.
+  if (isset($form_state['commerce_order']->order_id)) {
+    $order = commerce_order_load($form_state['commerce_order']->order_id);
+  }
+  else {
+    $form = array();
+    $form['avatax_error'] = array(
+      '#type' => 'value',
+      '#value' => 0,
+    );
+    return $form;
+  }
+
+  $sales_tax_failed = commerce_avatax_manual_calculate_sales_tax($order);
+
+  // Return empty form with name to detect error.
+  $form = array();
+  if ($sales_tax_failed) {
+    $form['avatax_error'] = array(
+      '#type' => 'value',
+      '#value' => 0,
+    );
+    return $form;
+  }
+
+  // Store the available rates in the form.
+  $form['#attached']['css'][] = drupal_get_path('module', 'commerce_avatax') . '/theme/commerce_avatax.admin.css';
+
+  $form['avatax_rate'] = array(
+    '#type' => 'value',
+    '#value' => $order->avatax,
+  );
+
+  // Create an options array for the sales tax amount.
+  $options = commerce_avatax_options($order);
+
+  $form['avatax'] = array(
+    '#type' => 'radios',
+    '#title' => t('AvaTax'),
+    '#options' => $options,
+    '#default_value' => key($options),
+  );
+
+  return $form;
+}
+
+/**
+ * Adds the selected AvaTax information to a new AvaTax line item.
+ *
+ * @param object $line_item
+ *   The newly created line item object.
+ * @param array $element
+ *   The array representing the widget form element.
+ */
+function commerce_avatax_line_item_add_form_submit($line_item, $element = array()) {
+  // Ensure a quantity of 1.
+  $line_item->quantity = 1;
+
+  // Use the values for avatax.
+  $line_item_wrapper = entity_metadata_wrapper('commerce_line_item', $element['actions']['avatax_rate']['#value']['avatax']);
+  $sales_tax = $line_item_wrapper->commerce_unit_price->value();
+
+  // Populate the line item with the appropriate data.
+  commerce_avatax_line_item_populate($line_item, $sales_tax);
+}
+
+/**
+ * Turns the sales tax amount into a form element options array.
+ *
+ * @param object $order
+ *   An order object with an AvaTax property defined as an array of
+ *   sales tax values.
+ *
+ * @return array
+ *   An options array of calculated AvaTax rates labelled using the display
+ *   title of the AvaTax services.
+ */
+function commerce_avatax_options($order) {
+  $options = array();
+
+  $line_item = $order->avatax['avatax'];
+  $line_item_wrapper = entity_metadata_wrapper('commerce_line_item', $line_item);
+
+  $options['avatax'] = t('!avatax: !price', array(
+    '!avatax' => 'Sales tax',
+    '!price' => commerce_currency_format($line_item_wrapper->commerce_unit_price->amount->value(), $line_item_wrapper->commerce_unit_price->currency_code->value()),
+  ));
+
+  return $options;
+}
+
+/**
+ * Deletes AvaTax line items on an order.
+ *
+ * @param object $order
+ *   The order object to delete the AvaTax line items from.
+ */
+function commerce_avatax_delete_avatax_transaction($order) {
+  $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+
+  // When deleting more than one line item, metadata_wrapper will give problems
+  // if deleting while looping through the line items. So first remove from
+  // order and then delete the line items.
+  $line_item_ids = array();
+
+  foreach ($order_wrapper->commerce_line_items as $delta => $line_item_wrapper) {
+    // If this line item is an avatax line item...
+    if ($line_item_wrapper->type->value() == 'avatax') {
+      // Store its ID for later deletion and remove the reference from the line
+      // item reference field.
+      $line_item_ids[] = $line_item_wrapper->line_item_id->value();
+      $order_wrapper->commerce_line_items->offsetUnset($delta);
+    }
+  }
+
+  // If we found any AvaTax line items.
+  if (!empty($line_item_ids)) {
+    // Then delete the line items.
+    commerce_line_item_delete_multiple($line_item_ids);
+  }
+}
+
+/**
+ * Returns the AvaTax service array.
+ *
+ * @return array
+ *   An array with the AvaTax service details.
+ */
+function commerce_avatax_service_load() {
+  $avatax_service = array(
+    'name' => 'avatax',
+    'base' => 'avatax',
+    'display_title' => 'Sales tax',
+    'description' => 'The calculated sales tax amount',
+    'price_component' => 'avatax',
+    'weight' => 0,
+    'module' => 'commerce_avatax',
+    'title' => 'Drupal Commerce Connector for AvaTax',
+    'admin_list' => TRUE,
+  );
+
+  return $avatax_service;
+}
+
+/**
+ * AvaTax service: returns the sales tax amount as an array.
+ *
+ * @param object $order
+ *   The order object to calculate the AvaTax line items for.
+ * @param bool $commit
+ *   Should we also commit the transaction.
+ *
+ * @return array
+ *   The AvaTax sales tax values as an array.
+ */
+function commerce_avatax_retrieve_sales_tax($order, $product_version, $commit = FALSE) {
+  $sales_tax = array(
+    'amount' => 0,
+    'currency_code' => commerce_default_currency(),
+    'data' => array(),
+  );
+
+  $use_mode = variable_get('commerce_avatax_use_mode');
+  $avatax_microtime = variable_get('commerce_avatax_install_time');
+  $doc_code_prefix = 'dc';
+  $company_code = variable_get('commerce_avatax_' . $product_version . '_' . $use_mode . '_company', '');
+
+  if (!$company_code) {
+    drupal_set_message(t('AvaTax company code is not set.'), 'error');
+    return FALSE;
+  }
+
+  // Sales Tax Shipping code.
+  $shipcode = (variable_get('commerce_avatax_shipcode', ''));
+
+  // Build order wrapper.
+  $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+
+  // Exit if there are no line items in the order wrapper.
+  if (count($order_wrapper->commerce_line_items) == 0) {
+    drupal_set_message(t('There are no line items for this order.'), 'error');
+    return FALSE;
+  }
+
+  // Get taxable address.
+  $tax_address_profile = variable_get('commerce_avatax_tax_address', '');
+  if ($tax_address_profile == 'Billing') {
+    if (isset($order_wrapper->commerce_customer_billing->commerce_customer_address)) {
+      $billing_address = $order_wrapper->commerce_customer_billing->commerce_customer_address->value();
+      $street1 = $billing_address['thoroughfare'];
+      $street2 = $billing_address['premise'];
+      $city = $billing_address['locality'];
+      $state = $billing_address['administrative_area'];
+      $country = $billing_address['country'];
+      $zip = $billing_address['postal_code'];
+    }
+  }
+  elseif ($tax_address_profile == 'Shipping') {
+    if (isset($order_wrapper->commerce_customer_shipping->commerce_customer_address)) {
+      $shipping_address = $order_wrapper->commerce_customer_shipping->commerce_customer_address->value();
+      $street1 = $shipping_address['thoroughfare'];
+      $street2 = $shipping_address['premise'];
+      $city = $shipping_address['locality'];
+      $state = $shipping_address['administrative_area'];
+      $country = $shipping_address['country'];
+      $zip = $shipping_address['postal_code'];
+    }
+  }
+
+  // Get primary business location.
+  $primary_street1 = (variable_get('commerce_avatax_primary_street1', ''));
+  $primary_street2 = (variable_get('commerce_avatax_primary_street2', ''));
+  $primary_city = (variable_get('commerce_avatax_primary_city', ''));
+  $primary_state = (variable_get('commerce_avatax_primary_state', ''));
+  $primary_country = (variable_get('commerce_avatax_primary_country', ''));
+  $primary_zip = (variable_get('commerce_avatax_primary_zip', ''));
+
+  // Initialize sales tax exemption variable.
+  $avatax_exemption_code = '';
+
+  // Get User name or e-mail address.
+  if ($order->uid == 0) {
+    if ($order->order_id != 0 && $order->mail == '') {
+      $user_id = 'administrator';
+    }
+    else {
+      $user_email = $order->mail;
+      $user_id = commerce_avatax_email_to_username($user_email);
+    }
+  }
+  else {
+    $user_data = user_load($order->uid);
+    if (variable_get('commerce_avatax_exemptions_status', 0)) {
+      if (isset($user_data->avatax_exemption_code[LANGUAGE_NONE][0]['value'])) {
+        $avatax_exemption_code = $user_data->avatax_exemption_code[LANGUAGE_NONE][0]['value'];
+      }
+    }
+    $user_id = $user_data->name;
+  }
+
+  $doc_date = REQUEST_TIME;
+  if ($commit) {
+    foreach ($order_wrapper->commerce_line_items as $line_item_wrapper) {
+      // If this line item is an AvaTax line item...
+      if ($line_item_wrapper->type->value() == 'avatax') {
+        // Store its ID for later deletion and remove the reference from the
+        // line item reference field.
+        $doc_date = $line_item_wrapper->created->value();
+      }
+    }
+  }
+
+  // Get currency code from the order.
+  $avatax_total = $order_wrapper->commerce_order_total->value();
+  $currency_code = $avatax_total['currency_code'];
+
+  // Construct arguments for AvaTax functions.
+  $ava_args = compact('product_version', 'company_code', 'doc_code_prefix', 'doc_date', 'user_id', 'avatax_exemption_code',
+                     'commit', 'currency_code', 'shipcode', 'use_mode', 'street1', 'street2', 'city', 'state', 'country', 'zip',
+                     'primary_street1', 'primary_street2', 'primary_city', 'primary_state', 'primary_country', 'primary_zip');
+
+  module_load_include('inc', 'commerce_avatax', 'includes/commerce_avatax_calc');
+
+  // Get sales tax from AvaTax cloud service.
+  $avatax_array = commerce_avatax_get_tax($order, $order_wrapper, $ava_args);
+
+  // Check that there was a return from the tax request.
+  if (!$avatax_array) {
+    drupal_set_message(t("AvaTax did not calculate sales tax."), 'error');
+    return FALSE;
+  }
+
+  $sales_tax = array(
+    'amount' => $avatax_array['TotalTax'] * 100,
+    'currency_code' => $currency_code,
+    'data' => array(),
+  );
+
+  return $sales_tax;
+}
+
+/**
+ * Generate AvaTax user name as approximation of e-mail address.
+ */
+function commerce_avatax_email_to_username($user_email) {
+  // Default to the first part of the e-mail address.
+  $name = substr($user_email, 0, strpos($user_email, '@'));
+
+  // Remove possible illegal characters.
+  $name = preg_replace('/[^A-Za-z0-9_.-]/', '', $name);
+
+  // Trim that value for spaces and length.
+  $name = trim(substr($name, 0, USERNAME_MAX_LENGTH - 4));
+
+  return $name;
+}
+
+/**
+ * Sends HTTP GET request to endpoint.
+ *
+ * @return array
+ *   Returns an associative array containing 'meta' and 'body' elements.
+ */
+function commerce_avatax_get($endpoint, $parameters, $base_url = '', $account = '', $license = '') {
+  $querystring = '';
+  if (is_array($parameters)) {
+    $querystring = http_build_query($parameters);
+    $querystring = str_replace("amp;", "", $querystring);
+  }
+  $curl_opts = array(
+    // Return result instead of echoing.
+    CURLOPT_RETURNTRANSFER => TRUE,
+    // Follow redirects, Location: headers.
+    CURLOPT_FOLLOWLOCATION => FALSE,
+    // But dont redirect more than 10 times.
+    CURLOPT_MAXREDIRS => 10,
+    // Abort if network connection takes more than 5 seconds.
+    CURLOPT_CONNECTTIMEOUT => 10,
+    CURLOPT_SSL_VERIFYPEER => TRUE,
+  );
+
+  list($use_mode, $product_version, $account, $license, $base_url) = commerce_avatax_get_config($account, $license, $base_url);
+  $curl_opts[CURLOPT_HTTPHEADER] = array(
+    'Content-Type: text/json',
+    'Authorization: Basic ' . base64_encode("$account:$license"),
+    'Date: ' . date(DATE_RFC1123, REQUEST_TIME),
+  );
+
+  $url = rtrim($base_url, '/') . '/' . ltrim($endpoint, '/');
+  if ($querystring) {
+    $url .= '?' . $querystring;
+  }
+  $curl = curl_init($url);
+  foreach ($curl_opts as $opt => $val) {
+    curl_setopt($curl, $opt, $val);
+  }
+
+  $body = curl_exec($curl);
+  $meta = curl_getinfo($curl);
+  curl_close($curl);
+  if ($body === FALSE) {
+    watchdog('commerce_avatax', 'AvaTax request failed. message: %msg', array(
+      '%msg' => curl_error($curl)), WATCHDOG_ERROR);
+    return array(
+      'body' => '',
+      'meta' => $meta,
+    );
+  }
+
+  if ($use_mode == COMMERCE_AVATAX_DEVELOPMENT_MODE) {
+    watchdog('commerce_avatax', 'Request info: !url !headers !response !meta', array(
+      '!url' => "<pre>URL : $url</pre>",
+      '!headers' => "<pre>Request Headers:\n" . var_export($curl_opts[CURLOPT_HTTPHEADER], TRUE) . '</pre>',
+      '!response' => "<pre>Response:\n" . check_plain(var_export($body, TRUE)) . '</pre>',
+      '!meta' => "<pre>Response Meta:\n" . var_export($meta, TRUE) . '</pre>',
+    ), WATCHDOG_DEBUG);
+  }
+
+  if ($body) {
+    $body_parsed = json_decode($body, TRUE);
+    return array(
+      'body' => $body_parsed,
+      'meta' => $meta,
+    );
+  }
+  else {
+    return array(
+      'body' => '',
+      'meta' => $meta,
+    );
+  }
+}
+
+/**
+ * Sends HTTP POST request to endpoint.
+ *
+ * @return array
+ *   Returns an associative array containing 'meta' and 'body' elements.
+ */
+function commerce_avatax_post($endpoint, $data, $base_url = '', $account = '', $license = '') {
+  $curl_opts = array(
+    CURLOPT_RETURNTRANSFER => TRUE,
+    CURLOPT_FOLLOWLOCATION => FALSE,
+    CURLOPT_MAXREDIRS => 10,
+    CURLOPT_CONNECTTIMEOUT => 10,
+    CURLOPT_CUSTOMREQUEST => 'POST',
+    CURLOPT_SSL_VERIFYPEER => TRUE,
+  );
+
+  list($use_mode, $product_version, $account, $license, $base_url) = commerce_avatax_get_config($account, $license, $base_url);
+
+  if (is_array($data)) {
+    $data = json_encode($data);
+  }
+  $curl_opts[CURLOPT_POSTFIELDS] = $data;
+
+  $curl_opts[CURLOPT_HTTPHEADER] = array(
+    'Content-Length: ' . strlen($data),
+    'Content-Type: text/json',
+    'Authorization: Basic ' . base64_encode("$account:$license"),
+    'Date: ' . date(DATE_RFC1123, REQUEST_TIME),
+  );
+
+  $url = rtrim($base_url, '/') . '/' . ltrim($endpoint, '/');
+  $curl = curl_init($url);
+  foreach ($curl_opts as $opt => $val) {
+    curl_setopt($curl, $opt, $val);
+  }
+
+  $body = curl_exec($curl);
+  $meta = curl_getinfo($curl);
+  curl_close($curl);
+
+  if ($body === FALSE) {
+    watchdog('commerce_avatax', 'AvaTax request failed. message: %msg', array(
+      '%msg' => curl_error($curl)), WATCHDOG_ERROR);
+    return array(
+      'body' => '',
+      'meta' => $meta,
+    );
+  }
+
+  if ($use_mode == COMMERCE_AVATAX_DEVELOPMENT_MODE) {
+    watchdog('commerce_avatax', 'Request info: !url !headers !body !response !meta', array(
+      '!url' => "<pre>URL : $url</pre>",
+      '!headers' => "<pre>Request Headers:\n" . var_export($curl_opts[CURLOPT_HTTPHEADER], TRUE) . '</pre>',
+      '!body' => "<pre>Request body:\n" . $data . '</pre>',
+      '!response' => "<pre>Response:\n" . check_plain(var_export($body, TRUE)) . '</pre>',
+      '!meta' => "<pre>Response Meta:\n" . var_export($meta, TRUE) . '</pre>',
+    ), WATCHDOG_DEBUG);
+  }
+
+  if ($body) {
+    $body_parsed = json_decode($body, TRUE);
+    return array(
+      'body' => $body_parsed,
+      'meta' => $meta,
+    );
+  }
+  else {
+    return array(
+      'body' => '',
+      'meta' => $meta,
+    );
+  }
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function commerce_avatax_form_alter(&$form, &$form_state, $form_id) {
+  $address_validation_enabled = variable_get('commerce_avatax_validate_address');
+  if ($form_id == 'commerce_checkout_form_checkout' && $address_validation_enabled) {
+    $form['#attributes']['class'][] = 'commerce_checkout_form';
+    $form['buttons']['validate'] = array(
+      '#type' => 'submit',
+      '#value' => t('Validate'),
+      '#attributes' => array(
+        'class' => array('address-validate-btn'),
+      ),
+      '#ajax' => array(
+        'wrapper' => 'address_validation_wrapper',
+        'callback' => 'commerce_avatax_validate_shipping_address_ajax_callback',
+        'progress' => array('type' => 'none'),
+      ),
+    );
+    $form['address_validation_result'] = array(
+      '#type' => 'container',
+      '#prefix' => '<div id="address_validation_wrapper">',
+      '#suffix' => '</div>',
+    );
+
+    $taxable_address = 'customer_profile_shipping';
+    if (isset($form_state['values']['customer_profile_shipping']['commerce_customer_profile_copy'])) {
+      if ($form_state['values']['customer_profile_shipping']['commerce_customer_profile_copy']) {
+        $taxable_address = 'customer_profile_billing';
+      }
+    }
+    elseif (isset($form['customer_profile_shipping']['commerce_customer_profile_copy']['#default_value'])) {
+      if ($form['customer_profile_shipping']['commerce_customer_profile_copy']['#default_value']) {
+        $taxable_address = 'customer_profile_billing';
+      }
+    }
+    drupal_add_js(array(
+      'commerce_avatax' => array(
+        'commerce_avatax_address_validation_profile' => $taxable_address,
+      ),
+    ), 'setting');
+    if (isset($form_state['values'][$taxable_address]['commerce_customer_address'][LANGUAGE_NONE][0])) {
+      $address_value = $form_state['values'][$taxable_address]['commerce_customer_address'][LANGUAGE_NONE][0];
+      $city = $address_value['locality'];
+      $state = $address_value['administrative_area'];
+      $country = $address_value['country'];
+      $postal_code = $address_value['postal_code'];
+      $line1 = $address_value['thoroughfare'];
+      $line2 = isset($address_value['premise']) ? $address_value['premise'] : '';
+      $enabled_countries = variable_get('commerce_avatax_address_validate_countries', array('US'));
+      if (!is_array($enabled_countries)) {
+        $enabled_countries = array($enabled_countries);
+      }
+      if (!in_array($country, $enabled_countries)) {
+        return;
+      }
+
+      $args = compact('line1', 'line2', 'city', 'state', 'country', 'postal_code');
+      $validated_address = commerce_avatax_validate_address($args);
+      if ($validated_address === NULL) {
+        return;
+      }
+      $res = commerce_avatax_address_compare($args, $validated_address);
+      $form_state['address_validation_result'] = $res;
+    }
+    $validate_countries_client_side = TRUE;
+    if (isset($form[$taxable_address]['commerce_customer_address'][LANGUAGE_NONE][0]['country']['#access']) &&
+      $form[$taxable_address]['commerce_customer_address'][LANGUAGE_NONE][0]['country']['#access'] == FALSE
+    ) {
+      $validate_countries_client_side = FALSE;
+    }
+
+    drupal_add_library('system', 'ui.dialog');
+    $countries = variable_get('commerce_avatax_address_validate_countries', array('US'));
+    if (!is_array($countries)) {
+      $countries = array($countries);
+    }
+    drupal_add_js(array(
+      'commerce_avatax' => array(
+        'commerce_avatax_autocomplete_postal_code' => variable_get('commerce_avatax_autocomplete_postal_code', TRUE),
+        'commerce_avatax_address_validate_countries' => $countries,
+        'commerce_avatax_address_do_country_validate' => $validate_countries_client_side,
+      ),
+    ), 'setting');
+    drupal_add_js(drupal_get_path('module', 'commerce_avatax') . '/js/address_validate.js');
+    drupal_add_css(drupal_get_path('module', 'commerce_avatax') . '/theme/commerce_avatax_checkout.css');
+    $form['buttons']['validate']['#validate'][] = 'commerce_avatax_checkout_validate';
+  }
+  elseif ($form_id == 'commerce_order_ui_order_form') {
+    $order = $form['#entity'];
+    $tax_address_profile = variable_get('commerce_avatax_tax_address', '');
+    $profile = NULL;
+    $address = array();
+    if ($tax_address_profile == 'Billing') {
+      $form_state_var = 'commerce_customer_billing';
+      $profile = $form[$form_state_var][LANGUAGE_NONE]['profiles'][0]['profile']['#value'];
+      if (isset($profile->commerce_customer_address[LANGUAGE_NONE][0])) {
+        $address = $profile->commerce_customer_address[LANGUAGE_NONE][0];
+      }
+    }
+    else {
+      $form_state_var = 'commerce_customer_shipping';
+      $profile = $form[$form_state_var][LANGUAGE_NONE]['profiles'][0]['profile']['#value'];
+      if (isset($profile->commerce_customer_address[LANGUAGE_NONE][0])) {
+        $address = $profile->commerce_customer_address[LANGUAGE_NONE][0];
+      }
+    }
+
+    $has_avatax_items = FALSE;
+    if ($order->order_id) {
+      $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+      foreach ($order_wrapper->commerce_line_items as $delta => $line_item_wrapper) {
+        if ($line_item_wrapper->type->value() == 'avatax') {
+          $has_avatax_items = TRUE;
+        }
+      }
+    }
+
+    $has_line_items = FALSE;
+    if ($order->order_id) {
+      $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+      if (count($order_wrapper->commerce_line_items) != 0) {
+        $has_line_items = TRUE;
+      }
+    }
+
+    $has_new_line_items = FALSE;
+    if (isset($form_state['line_item_save_warning'])) {
+      $has_new_line_items = TRUE;
+    }
+
+    $is_complete_address = FALSE;
+    if (isset($profile->profile_id)) {
+      if ($address['postal_code'] && $address['country'] && $address['locality'] && $address['administrative_area'] && $address['thoroughfare']) {
+        $is_complete_address = TRUE;
+      }
+    }
+    else {
+      if (isset($form_state['input'][$form_state_var][LANGUAGE_NONE]['profiles'][0]['commerce_customer_address'][LANGUAGE_NONE][0])) {
+        $address = $form_state['input'][$form_state_var][LANGUAGE_NONE]['profiles'][0]['commerce_customer_address'][LANGUAGE_NONE][0];
+        if ($address['postal_code'] && $address['country'] && $address['locality'] && $address['administrative_area'] && $address['thoroughfare']) {
+          $is_complete_address = TRUE;
+        }
+      }
+    }
+
+    $is_selected_state = FALSE;
+    $avatax_states = variable_get('commerce_avatax_select_states', array());
+    if (isset($profile->profile_id)) {
+      if (!empty($avatax_states) && in_array($address['administrative_area'], $avatax_states)) {
+        $is_selected_state = TRUE;
+      }
+      if (empty($avatax_states)) {
+        $is_selected_state = TRUE;
+      }
+    }
+    else {
+      if (isset($form_state['input'][$form_state_var][LANGUAGE_NONE]['profiles'][0]['commerce_customer_address'][LANGUAGE_NONE][0])) {
+        $address = $form_state['input'][$form_state_var][LANGUAGE_NONE]['profiles'][0]['commerce_customer_address'][LANGUAGE_NONE][0];
+        if (!empty($avatax_states) && in_array($address['administrative_area'], $avatax_states)) {
+          $is_selected_state = TRUE;
+        }
+        if (empty($avatax_states)) {
+          $is_selected_state = TRUE;
+        }
+      }
+    }
+
+    if (!$order->order_id || !$has_line_items || $has_new_line_items || $has_avatax_items || !$is_complete_address || !$is_selected_state) {
+      $form['commerce_line_items'][LANGUAGE_NONE]['actions']['line_item_type']['#ajax'] = array(
+        'wrapper' => 'line-item-manager',
+        'callback' => 'commerce_avatax_line_item_add_btn',
+      );
+      $form['commerce_line_items'][LANGUAGE_NONE]['actions']['line_item_add']['#prefix'] = '<div id="line_item_add_btn">';
+      $form['commerce_line_items'][LANGUAGE_NONE]['actions']['line_item_add']['#suffix'] = '</div>';
+      if (isset($form_state['input']['commerce_line_items'][LANGUAGE_NONE]['actions']['line_item_type']) && $form_state['input']['commerce_line_items'][LANGUAGE_NONE]['actions']['line_item_type'] == 'avatax') {
+        if (!$order->order_id) {
+          drupal_set_message(t('Please save this order to allocate an order # and then calculate sales tax.'), 'warning');
+        }
+        elseif (!$has_line_items) {
+          drupal_set_message(t('You can not calculate sales tax on an order with no line items.'), 'warning');
+        }
+        elseif ($has_avatax_items) {
+          drupal_set_message(t('An order may not have two sales tax lines.'), 'warning');
+        }
+        elseif ($has_new_line_items) {
+          drupal_set_message(t('Please save the order before calculating sales tax.'), 'warning');
+        }
+        elseif (!$is_complete_address) {
+          drupal_set_message(t('Please save a complete taxable address before calculating sales tax.'), 'warning');
+        }
+        else {
+          drupal_set_message(t('State - @state - is not configured for sales tax calculations. Please correct address and save the order.', array(
+            '@state' => $address['administrative_area'])), 'warning');
+        }
+
+        $form['commerce_line_items'][LANGUAGE_NONE]['actions']['line_item_add']['#disabled'] = TRUE;
+      }
+      else {
+        $form['commerce_line_items'][LANGUAGE_NONE]['actions']['line_item_add']['#disabled'] = FALSE;
+      }
+    }
+    // Disable save line item if no sales tax calculated.
+    if (isset($form['commerce_line_items'][LANGUAGE_NONE]['actions']['avatax_error'])) {
+      $form['commerce_line_items'][LANGUAGE_NONE]['actions']['save_line_item']['#disabled'] = TRUE;
+    }
+  }
+}
+
+/**
+ * Ajax callback for commerce order form.
+ */
+function commerce_avatax_line_item_add_btn($form, &$form_state) {
+  return $form['commerce_line_items'];
+}
+
+/**
+ * Checkout form validation callback.
+ */
+function commerce_avatax_checkout_validate($form, &$form_state) {
+  // Rebuild form on Ajax calls.
+  $form_state['rebuild'] = TRUE;
+}
+
+/**
+ * Custom Ajax callback for setting up address validation popup.
+ */
+function commerce_avatax_validate_shipping_address_ajax_callback($form, &$form_state) {
+  $commands = array();
+  $commands[] = array(
+    'command' => 'afterAddressValidation',
+    'validation_result' => isset($form_state['address_validation_result']) ? $form_state['address_validation_result'] : FALSE,
+    'errors' => form_get_errors(),
+  );
+
+  return array('#type' => 'ajax', '#commands' => $commands);
+}
+
+/**
+ * Validate the shipping address entered on checkout form.
+ */
+function commerce_avatax_validate_address($address) {
+  $product_version = variable_get('commerce_avatax_product_version', COMMERCE_AVATAX_COMMUNITY_VERSION);
+  $use_mode = variable_get('commerce_avatax_use_mode', COMMERCE_AVATAX_DEVELOPMENT_MODE);
+  $account_no = variable_get('commerce_avatax_' . $product_version . '_' . $use_mode . '_account');
+  $license_key = variable_get('commerce_avatax_' . $product_version . '_' . $use_mode . '_license');
+  if (!$product_version || !$use_mode || !$account_no || !$license_key) {
+    return FALSE;
+  }
+  $parameters = array();
+  if ($address['line1']) {
+    $parameters['Line1'] = $address['line1'];
+  }
+  if ($address['line2']) {
+    $parameters['Line2'] = $address['line2'];
+  }
+  if ($address['city']) {
+    $parameters['City'] = $address['city'];
+  }
+  if ($address['state']) {
+    $parameters['Region'] = $address['state'];
+  }
+  if ($address['postal_code']) {
+    $parameters['PostalCode'] = $address['postal_code'];
+  }
+
+  $result = commerce_avatax_get('address/validate', $parameters);
+  if (!$result['body']) {
+    watchdog('commerce_avatax', 'Could not connect to AvaTax for address validation.');
+    return NULL;
+  }
+  elseif ($result['body']['ResultCode'] != 'Success') {
+    return array();
+  }
+  return $result['body']['Address'];
+}
+
+/**
+ * Compare entered address and the address returned by AvaTax.
+ */
+function commerce_avatax_address_compare($original, $validated_address) {
+  $result = array(
+    // valid/needs correction/invalid
+    'result' => '',
+    'msg' => '',
+    'suggestions' => array(),
+  );
+  $correct_address = array(
+    'line1' => isset($validated_address['Line1']) ? $validated_address['Line1'] : '',
+    'line2' => isset($validated_address['Line2']) ? $validated_address['Line2'] : '',
+    'city' => isset($validated_address['City']) ? $validated_address['City'] : '',
+    'state' => isset($validated_address['Region']) ? $validated_address['Region'] : '',
+    'country' => isset($validated_address['Country']) ? $validated_address['Country'] : '',
+    'postal_code' => isset($validated_address['PostalCode']) ? $validated_address['PostalCode'] : '',
+  );
+  if (!$validated_address) {
+    $result['result'] = 'invalid';
+    $result['msg'] = '<p>' . t('We could not validate the shipping address entered. Please check that you have entered the correct address.') . '</p>';
+    $result['msg'] .= '<p>' . t('Entered address is:') . '</p>' . theme('commerce_avatax_address', array('address' => $original));
+    return $result;
+  }
+
+  $line1 = $correct_address['line1'] == $original['line1'];
+  $line2 = $correct_address['line2'] == $original['line2'];
+  $city = $correct_address['city'] == $original['city'];
+  $state = $correct_address['state'] == $original['state'];
+  $country = $correct_address['country'] == $original['country'];
+
+  $post_code_full_validation = variable_get('commerce_avatax_address_postal_code', TRUE);
+  $autocomplete_post_code = variable_get('commerce_avatax_autocomplete_postal_code', TRUE);
+  $validated_postal_code = $correct_address['postal_code'];
+  $original_postal_code = $original['postal_code'];
+  if (!$post_code_full_validation || $autocomplete_post_code) {
+    $validated_postal_code = substr($validated_postal_code, 0, 5);
+    $original_postal_code = substr($original_postal_code, 0, 5);
+  }
+  $postal_code = $validated_postal_code == $original_postal_code;
+
+  if (!$line1 || !$line2 || !$city || !$state || !$country || !$postal_code) {
+    $result['result'] = 'needs correction';
+    $form = drupal_get_form('commerce_avatax_address_suggestion_form', $original, array($correct_address));
+    $result['msg'] = drupal_render($form);
+    $result['suggestions'] = array($correct_address);
+  }
+  else {
+    $result['result'] = 'valid';
+    $result['msg'] = '';
+    $result['suggestions'] = array($correct_address);
+  }
+
+  return $result;
+}
+
+/**
+ * Implements hook_theme().
+ */
+function commerce_avatax_theme() {
+  return array(
+    'commerce_avatax_address' => array(
+      'variables' => array(
+        'address' => array(),
+      ),
+    ),
+  );
+}
+
+/**
+ * Format address array to be used in the address suggestion form.
+ */
+function theme_commerce_avatax_address($variables) {
+  $addr = $variables['address'];
+  $output = $addr['line1'] . '<br />';
+  if ($addr['line2']) {
+    $output .= $addr['line2'] . '<br />';
+  }
+  $output .= $addr['city'] . '<br />' .
+          $addr['state'] . ' ' . $addr['postal_code'] . '<br />' .
+          $addr['country'];
+  return $output;
+}
+
+/**
+ * Returns address suggestion form.
+ */
+function commerce_avatax_address_suggestion_form($form, &$form_state, $original_addr, $suggestions) {
+  if (count($suggestions) == 1) {
+    $form['info'] = array(
+      '#type' => 'markup',
+      '#markup' => '<p>' . t('Your shipping address is different from the post office records. We suggest you accept the recommended address to avoid shipping delays.') . '</p>',
+    );
+  }
+  else {
+    $form['info'] = array(
+      '#type' => 'markup',
+      '#markup' => '<p>' . t('Your shipping address is different from the post office records. We suggest you accept one of the recommended addresses to avoid shipping delays.') . '</p>',
+    );
+  }
+  $form['orignal_addr'] = array(
+    '#type' => 'markup',
+    '#markup' => '<p>' . t('Entered address is:') . '</p>' . theme('commerce_avatax_address', array('address' => $original_addr)),
+  );
+  $options = array();
+  foreach ($suggestions as $addr) {
+    $options[] = theme('commerce_avatax_address', array(
+      'address' => $addr,
+    ));
+  }
+  $form['addresses'] = array(
+    '#title' => t('Recommended address'),
+    '#type' => 'radios',
+    '#options' => $options,
+    '#default_value' => '0',
+  );
+
+  return $form;
+}
+
+/**
+ * Returns AvaTax request configurations.
+ */
+function commerce_avatax_get_config($account = '', $license = '', $base_url = '') {
+  $use_mode = variable_get('commerce_avatax_use_mode');
+  $product_version = variable_get('commerce_avatax_product_version');
+  if (!$account) {
+    $account = variable_get('commerce_avatax_' . $product_version . '_' . $use_mode . '_account');
+  }
+  if (!$license) {
+    $license = variable_get('commerce_avatax_' . $product_version . '_' . $use_mode . '_license');
+  }
+  if (!$base_url) {
+    if ($use_mode == COMMERCE_AVATAX_DEVELOPMENT_MODE) {
+      $base_url = 'https://development.avalara.net/1.0';
+    }
+    elseif ($use_mode == COMMERCE_AVATAX_PRODUCTION_MODE) {
+      $base_url = 'https://rest.avalara.net/1.0';
+    }
+  }
+  return array($use_mode, $product_version, $account, $license, $base_url);
+}
+
+/**
+ * Is AvaTax service to be used for this transaction.
+ */
+function commerce_avatax_check_address($order, $product_version) {
+  $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+  $tax_address_profile = variable_get('commerce_avatax_tax_address', '');
+  if ($tax_address_profile == 'Billing') {
+    if (isset($order_wrapper->commerce_customer_billing->commerce_customer_address)) {
+      $billing_address = $order_wrapper->commerce_customer_billing->commerce_customer_address->value();
+      $state = $billing_address['administrative_area'];
+      $country = $billing_address['country'];
+    }
+  }
+  elseif ($tax_address_profile == 'Shipping') {
+    if (isset($order_wrapper->commerce_customer_shipping->commerce_customer_address)) {
+      $shipping_address = $order_wrapper->commerce_customer_shipping->commerce_customer_address->value();
+      $state = $shipping_address['administrative_area'];
+      $country = $shipping_address['country'];
+    }
+  }
+
+  // Exit if not a valid AvaTax state.
+  $avatax_states = variable_get('commerce_avatax_select_states', array());
+  if (!empty($avatax_states) && !in_array($state, $avatax_states)) {
+    return FALSE;
+  }
+  return TRUE;
+}
