@@ -1,6 +1,0 @@
-<?php
-/**
- * @file
- * theme.inc
- */
-

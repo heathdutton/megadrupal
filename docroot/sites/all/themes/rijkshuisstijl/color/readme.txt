@@ -1,1 +1,0 @@
-This directory is exclusively used for the color module if enabled. With the color module the end user can choose between different color palettes and see a live preview of the theme.

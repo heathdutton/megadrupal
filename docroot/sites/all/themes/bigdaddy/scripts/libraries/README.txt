@@ -1,1 +1,0 @@
-ADD HERE ALL YOUR THIRD-PARTY JAVASCRIPT LIBRARIES THAT YOU WILL US IN YOUR PROJECT (jQuery plugins, Respond.js, Selectivzr.js or other polyfills)
