@@ -1,1 +1,0 @@
-Dynamic panes module allows developers to put specific Panels panes into the page and then content editors can control what blocks will be displayed in each pane without going into Panels administration pages, all control available through frontend with IPE-like editing.
