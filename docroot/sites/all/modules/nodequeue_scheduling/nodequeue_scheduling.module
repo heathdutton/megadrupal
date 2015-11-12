@@ -1,0 +1,343 @@
+<?php
+
+/**
+ * @file
+ * Main module file, perform an alteration of the default nodequeue queues edition form
+ * to provide schedule functionnalities on it.
+ */
+
+/**
+ * Implements hook_form_alter().
+ */
+function nodequeue_scheduling_form_alter(&$form, &$form_state, $form_id) {
+  // Alter nodequeue settings form to add our own settings.
+  if ($form_id == 'nodequeue_admin_settings') {
+    $qids = nodequeue_get_qid_map();
+
+    $options = array();
+    foreach ($qids as $name => $qid) {
+      $q = nodequeue_load($qid);
+      $options[$q->name] = $q->title;
+    }
+
+    if (count($options)) {
+      // Set a setting that allow the user to display selected nodequeues with the default interface
+      $form['nodequeue_scheduling_include'] = array(
+        '#title' => t('Nodequeue schedule include'),
+        '#description' => t('Selected nodequeues will be displayed with additional schedule settings.'),
+        '#type' => 'checkboxes',
+        '#options' => $options,
+        '#default_value' => variable_get('nodequeue_scheduling_include', array()),
+      );
+    }
+  }
+
+  // we are going alter any nodequeue subqueue
+  if (strstr($form_id, 'nodequeue_arrange_subqueue_form_')) {
+    // Get queue id and queue object
+    $qid = (int) str_replace('nodequeue_arrange_subqueue_form_', '', $form_id);
+    $queue = nodequeue_load($qid);
+
+    // Check if the queue is included before modifying the form.
+    if (in_array($queue->name, variable_get('nodequeue_scheduling_include', array()), TRUE)) {
+
+      $schedule = _nodequeue_scheduling_load($qid);
+
+      foreach ($form['nodes'] as $nid => $node_properties) {
+        if (is_numeric($nid)) {
+          $class = 'published';
+          if (!$node_properties['#node']['status']) {
+            $class = 'unpublished';
+          }
+          elseif (isset($schedule[$nid]['publish_on']) && $schedule[$nid]['publish_on'] > time()) {
+            $class = 'scheduled';
+          }
+          elseif (isset($schedule[$nid]['unpublish_on']) && $schedule[$nid]['unpublish_on'] < time()) {
+            $class = 'scheduled';
+          }
+
+          $schedulers = array(
+            'publish_on' => t('Schedule publication'),
+            'unpublish_on' => t('Schedule unpublication'),
+          );
+
+          foreach ($schedulers as $key => $value) {
+            $form['nodes'][$nid][$key . '_toggle'] = array(
+              '#type' => 'checkbox',
+              '#title' => $value,
+              '#default_value' => isset($schedule[$nid][$key]) && $schedule[$nid][$key] ? 1 : 0,
+            );
+            // Scheduling widget
+            $form['nodes'][$nid][$key] = array(
+              '#type' => 'date_popup',
+              '#states' => array(
+                'visible' => array(
+                  ':input[name="nodes[' . $nid . '][' . $key . '_toggle]"]' => array('checked' => TRUE),
+                ),
+              ),
+              '#date_format' => 'Y-m-d H:i',
+              '#date_year_range' => '0:+10',
+              '#default_value' => isset($schedule[$nid][$key]) && $schedule[$nid][$key] ? format_date($schedule[$nid][$key], 'custom', 'Y-m-d H:i:s') : '',
+              '#row_class' => $class,
+            );
+          }
+        }
+      }
+
+      // Provide help for editors
+      $help_messages = array(
+        'published' => t('Published content'),
+        'scheduled' => t('Scheduled content for publication or unpublication (currently not published)'),
+        'unpublished' => t('Unpublished content'),
+      );
+      $message = '';
+      foreach ($help_messages as $class => $help_message) {
+        $message .= '<span class="' . $class . '">' . $help_message . '</span> ';
+      }
+      $form['help'] = array(
+        '#markup' => $message,
+        '#prefix' => '<div class="help-message">',
+        '#suffix' => '</div>',
+      );
+
+      // Add some css
+      $form['#attached']['css'][] = drupal_get_path('module', 'nodequeue_scheduling') . '/css/nodequeue_scheduling.css';
+
+      // Change theme function
+      $form['nodes']['#theme'] = 'nodequeue_scheduling_arrange_subqueue_form_table';
+
+      // Make autocomplete field bigger
+      $form['add']['nid']['#size'] = 150;
+
+      // Add validate functions
+      $form['#validate'][] = 'nodequeue_scheduling_arrange_subqueue_form_validate';
+
+      // Add extra submit function
+      $form['actions']['submit']['#submit'][] = 'nodequeue_scheduling_arrange_subqueue_form_submit';
+      $form['#submit'][] = 'nodequeue_scheduling_arrange_subqueue_form_submit';
+    }
+  }
+}
+
+/**
+ * Validate handler for nodequeue drag'n'drop form.
+ */
+function nodequeue_scheduling_arrange_subqueue_form_validate($form, &$form_state) {
+  // Check the publication date defined if there are some in the current node queue.
+  if (!empty($form_state['values']['nodes'])) {
+    foreach ($form_state['values']['nodes'] as $nid => $element) {
+      if (!is_array($element['publish_on']) && !is_array($element['unpublish_on'])) {
+        $time_publish = strtotime($element['publish_on']);
+        $time_unpublish = $element['unpublish_on_toggle'] ? strtotime($element['unpublish_on']) : NULL;
+
+        // If unpublish date is *before* the publish date, return with error
+        if ($time_unpublish && $time_unpublish < $time_publish) {
+          form_set_error('nodes][' . $nid, t('The unpublish date needs to be after the publish date.'));
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Submit handler for nodequeue drag'n'drop form. Updates scheduled highlight times.
+ */
+function nodequeue_scheduling_arrange_subqueue_form_submit($form, &$form_state) {
+  $qid = $form['nodes']['#queue']['qid'];
+
+  // Clean up
+  _nodequeue_scheduling_delete($qid);
+
+  // Save scheduled dates if set
+  foreach ($form_state['values']['nodes'] as $nid => $element) {
+
+    if (is_numeric($nid) && ($element['publish_on_toggle']) || $element['unpublish_on_toggle']) {
+
+      $time = $element['publish_on_toggle'] ? strtotime($element['publish_on']) : NULL;
+      $time_unpublish = $element['unpublish_on_toggle'] ? strtotime($element['unpublish_on']) : NULL;
+
+      $now = time();
+      $node = node_load($nid);
+
+      // Clean up publishing dates that are in the past
+      if ($time && $time < $now) {
+        $time = NULL;
+        drupal_set_message(t('Scheduling publishing date !date for "!title" was removed since it is in the past', array('!date' => $element['publish_on'], '!title' => $node->title)), 'warning');
+      }
+
+      // Warn for unpublishing dates that are in the past
+      if ($time_unpublish && $time_unpublish < $now) {
+        drupal_set_message(t('Scheduling unpublishing date !date for "!title" is in the past, it should probably be removed from the queue.', array('!date' => $element['unpublish_on'], '!title' => $node->title)), 'warning');
+      }
+
+      // Insert the publish/unpublish dates if at least one of them is set
+      if ($time || $time_unpublish) {
+        _nodequeue_scheduling_insert($nid, $qid, $time, $time_unpublish);
+      }
+    }
+  }
+}
+
+/**
+ * Helper function to load nodequeue scheduler data
+ */
+function _nodequeue_scheduling_load($qid) {
+  $result = array();
+  $query = db_select('nodequeue_scheduling', 'ns')
+    ->fields('ns', array('nid', 'publish_on', 'unpublish_on'))
+    ->condition('qid', $qid, '=')
+    ->execute();
+  while ($row = $query->fetchObject()) {
+    $result[$row->nid]['publish_on'] = $row->publish_on;
+    $result[$row->nid]['unpublish_on'] = $row->unpublish_on;
+  }
+  return $result;
+}
+
+/**
+ * Helper function to insert nodequeue scheduler data
+ */
+function _nodequeue_scheduling_insert($nid, $qid, $time, $time_unpublish) {
+  $insert = array(
+    'nid' => $nid,
+    'qid' => $qid,
+  );
+
+  if ($time) {
+    $insert['publish_on'] = $time;
+  }
+
+  if ($time_unpublish) {
+    $insert['unpublish_on'] = $time_unpublish;
+  }
+
+  db_insert('nodequeue_scheduling')
+    ->fields($insert)
+    ->execute();
+}
+
+/**
+ * Helper function to delete nodequeue scheduler data
+ */
+function _nodequeue_scheduling_delete($qid) {
+  db_query("DELETE FROM {nodequeue_scheduling} WHERE qid=:qid", array(':qid' => $qid));
+}
+
+/**
+ * Implements hook_theme().
+ */
+function nodequeue_scheduling_theme() {
+  return array(
+    'nodequeue_scheduling_arrange_subqueue_form_table' => array(
+      'render element' => 'form',
+    ),
+  );
+}
+
+/**
+ * Implements hook_views_api().
+ */
+function nodequeue_scheduling_views_api() {
+  return array("api" => "3.0");
+}
+
+/**
+ * Theme the subqueue overview as a sortable list.
+ *
+ * @ingroup themeable
+ */
+function theme_nodequeue_scheduling_arrange_subqueue_form_table($variables) {
+  $form = $variables['form'];
+
+  $output = '';
+
+  // Get css to hide some of the help text if javascript is disabled.
+  drupal_add_css(drupal_get_path('module', 'nodequeue') . '/nodequeue.css');
+
+  $table_id = 'nodequeue-dragdrop-' . $form['#subqueue']['sqid'];
+  $table_classes = array(
+    'nodequeue-dragdrop',
+    'nodequeue-dragdrop-qid-' . $form['#subqueue']['qid'],
+    'nodequeue-dragdrop-sqid-' . $form['#subqueue']['sqid'],
+    'nodequeue-dragdrop-reference-' . $form['#subqueue']['reference'],
+  );
+  drupal_add_tabledrag($table_id, 'order', 'sibling', 'node-position');
+  drupal_add_js(drupal_get_path('module', 'nodequeue') . '/nodequeue_dragdrop.js');
+
+  $reverse[str_replace('-', '_', $table_id)] = (bool) $form['#queue']['reverse'];
+  drupal_add_js(
+    array(
+      'nodequeue' => array(
+        'reverse' => $reverse,
+      )
+    ),
+    array(
+      'type' => 'setting',
+      'scope' => JS_DEFAULT,
+    )
+  );
+
+  // Render form as table rows.
+  $rows = array();
+  $counter = 1;
+  foreach (element_children($form) as $key) {
+    if (isset($form[$key]['title'])) {
+      $row = array();
+
+      $row[] = drupal_render($form[$key]['title']);
+      $row[] = _nodequeue_scheduling_get_node_type($form[$key]['#node']);
+      $row[] = _nodequeue_scheduling_get_state($form[$key]['#node']);
+      $row[] = drupal_render($form[$key]['date']);
+      $row[] = drupal_render($form[$key]['publish_on_toggle']) . ' ' . drupal_render($form[$key]['publish_on']);
+      $row[] = drupal_render($form[$key]['unpublish_on_toggle']) . ' ' . drupal_render($form[$key]['unpublish_on']);
+      $row[] = drupal_render($form[$key]['position']);
+      $row[] = (!empty($form[$key]['edit'])) ? drupal_render($form[$key]['edit']) : '&nbsp;';
+      $row[] = drupal_render($form[$key]['remove']);
+      $row[] = array(
+        'data' => $counter,
+        'class' => array('position')
+      );
+
+      $rows[] = array(
+        'data'  => $row,
+        'class' => array(
+          'draggable',
+          $form[$key]['publish_on']['#row_class'],
+        ),
+      );
+    }
+
+    $counter++;
+  }
+
+  if (empty($rows)) {
+    $rows[] = array(array('data' => t('No nodes in this queue.'), 'colspan' => 7));
+  }
+
+  // Render the main nodequeue table.
+  $header = array(t('Title'), t('Type'), t('Status'), t('Post Date'), t('Scheduled for highlight'), t('Scheduled for unpublishing'), t('Position'), array('data' => t('Operations'), 'colspan' => 2), t('Position'));
+  $output .= theme('table', array('header' => $header, 'rows' => $rows, 'attributes' => array('id' => $table_id, 'class' => $table_classes)));
+
+  return $output;
+}
+
+/**
+ * Auxiliary function for display in the table.
+ */
+function _nodequeue_scheduling_get_node_type($node) {
+  $types = node_type_get_types();
+  $type = $node['type'];
+  return $types[$type]->name;
+}
+
+/**
+ * Auxiliary function for display in the table.
+ */
+function _nodequeue_scheduling_get_state($node) {
+  if ($node['status']) {
+    return t('Published');
+  }
+  else {
+    return t('Unpublished');
+  }
+}

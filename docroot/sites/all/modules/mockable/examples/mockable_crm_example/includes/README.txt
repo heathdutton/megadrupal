@@ -1,0 +1,1 @@
+Certain functions and groups of functions are extracted from the main .module file to be more readily understood. See the @file block of each file for more details.

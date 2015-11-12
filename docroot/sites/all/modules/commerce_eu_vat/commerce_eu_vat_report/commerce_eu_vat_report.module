@@ -1,0 +1,234 @@
+<?php
+
+/**
+ * Implements hook_help().
+ */
+function commerce_eu_vat_report_help($path, $arg) {
+  switch ($path) {
+    case 'admin/commerce/reports/vat':
+      return '<p>' . t('Here you can see reports about the vat gathered by your store.') . '</p>';
+  }
+}
+
+/**
+ * Implements hook_views_api().
+ */
+function commerce_eu_vat_report_views_api() {
+  return array(
+    'api' => 3,
+    'path' => drupal_get_path('module', 'commerce_eu_vat_report') . '/includes/views',
+  );
+}
+
+/**
+ * Implements hook_menu().
+ */
+function commerce_eu_vat_report_menu() {
+  $items = array();
+
+  $items['admin/commerce/config/vat-reports'] = array(
+    'title' => 'VAT reports settings',
+    'description' => 'Configure VAT reports settings.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('commerce_eu_vat_report_form'),
+    'access arguments' => array('configure commerce vat reports'),
+    'type' => MENU_NORMAL_ITEM,
+    'file' => 'commerce_eu_vat_report.admin.inc',
+  );
+
+  $items['admin/commerce/config/vat-reports/generate'] = array(
+    'title' => 'Generate VAT report',
+    'page callback' => 'commerce_eu_vat_report_generate_callback',
+    'access arguments' => array('configure commerce  vat reports'),
+    'type' => MENU_CALLBACK,
+    'file' => 'commerce_eu_vat_report.admin.inc',
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_menu_alter().
+ */
+function commerce_eu_vat_report_menu_alter(&$items) {
+  $items['admin/commerce/reports/vat']['title'] = 'VAT';
+  $items['admin/commerce/reports/vat']['type'] = MENU_LOCAL_TASK;
+  $items['admin/commerce/reports/vat']['weight'] = 50;
+  if (empty($items['admin/commerce/reports'])) {
+    $items['admin/commerce/reports'] = array(
+      'title' => 'Reports',
+      'description' => 'View reports for your store.',
+      'access arguments' => array('access commerce tax reports'),
+      'page callback' => 'drupal_goto',
+      'page arguments' => array('admin/commerce/reports/vat'),
+      'weight' => 50,
+    );
+  }
+}
+
+/**
+ * Implements hook_permission().
+ */
+function commerce_eu_vat_report_permission() {
+  return array(
+    'access commerce vat reports' => array(
+      'title' => t('Access commerce vat reports'),
+    ),
+    'configure commerce vat reports' => array(
+      'title' => t('Configure commerce vat reports'),
+    ),
+  );
+}
+
+/**
+ * Implements hook_entity_update().
+ */
+function commerce_eu_vat_report_entity_update($entity, $type) {
+  if ($type == 'commerce_order' && isset($entity->original)) {
+    // Mark original entity for easy reference.
+    $original = $entity->original;
+
+    // @todo: These should reflect states, like the Views. Verify
+    //          also, should these be configurable?
+    // Check the updated status against pending, processing, completed
+    $order_current_status = in_array($entity->status, array('pending', 'processing', 'completed'));
+
+    // Check the original status, so we know if we need to remove previous record
+    $order_previous_status = in_array($original->status, array('pending', 'processing', 'completed'));
+
+    // The order changed to a order status we're interested in, but did not
+    // previously have a watched status. Create a new record
+    if ($order_current_status && !$order_previous_status) {
+      commerce_eu_vat_report_order_save($entity);
+    }
+    // The order reverted to a status not watched, and previous had a watched status.
+    elseif (!$order_current_status && $order_previous_status) {
+      commerce_eu_vat_report_order_delete($entity->order_id);
+    }
+    // The price has been modified on a watched order..
+    elseif ($order_current_status && $order_previous_status && $original->commerce_order_total != $entity->commerce_order_total) {
+      commerce_eu_vat_report_order_save($entity);
+    }
+  }
+}
+
+/**
+ * Returns the order statuses that should be taken into account.
+ */
+function commerce_eu_vat_report_order_statuses() {
+  return array('pending', 'completed');
+}
+
+/**
+ * Generate historic tax information.
+ */
+function commerce_eu_vat_report_generate() {
+  $batch = array(
+    'title' => t('Generating vat report'),
+    'operations' => array(
+      array('_commerce_eu_vat_report_generate', array()),
+    ),
+    'finished' => '_commerce_eu_vat_report_finished',
+    'file' => drupal_get_path('module', 'commerce_eu_vat_report') . '/commerce_eu_vat_report.batch.inc',
+  );
+
+  batch_set($batch);
+}
+
+/**
+ * Deletes the tax information of multiple orders.
+ */
+function commerce_eu_vat_report_order_delete_multiple($order_ids = array()) {
+  db_query("DELETE FROM {commerce_eu_vat_report} WHERE order_id IN (:order_ids)", array(':order_ids' => $order_ids));
+}
+
+/**
+ * Deletes the tax information of an order.
+ */
+function commerce_eu_vat_report_order_delete($order_id) {
+  return commerce_eu_vat_report_order_delete_multiple(array($order_id));
+}
+
+/**
+ * Stores the tax information of an order.
+ *
+ * If the order has already been processed in the past it will compare the information
+ * in the database with the generated information and update accordingly.
+ */
+function commerce_eu_vat_report_order_save($order) {
+  $wrapper = entity_metadata_wrapper('commerce_order', $order);
+  $order_id = $wrapper->order_id->value();
+
+  // Loop through all line items and get taxes from taxable line items.
+  $applied_taxes = array();
+  foreach ($wrapper->commerce_line_items as $line_item_wrapper) {
+    if ($tax_rates = _commerce_eu_vat_report_get_tax_rates($line_item_wrapper)) {
+      // Taxable
+      $taxable = $line_item_wrapper->commerce_total->value();
+
+      // Taxed
+      foreach ($tax_rates as $tax_rate) {
+        $taxed = commerce_price_component_total($taxable, $tax_rate['machine_name']);
+        $id = $tax_rate['title'] . $order_id . $taxed['currency_code'];
+
+        // Create fresh record if it doesn't exist
+        if (empty($applied_taxes[$id])) {
+          $applied_taxes[$id] = new StdClass;
+          $applied_taxes[$id]->tax_rate = $tax_rate['title'];
+          $applied_taxes[$id]->order_id = $order_id;
+          $applied_taxes[$id]->currency_code = $taxed['currency_code'];
+          $applied_taxes[$id]->taxable = 0;
+          $applied_taxes[$id]->taxed = 0;
+        }
+
+        // Increase the amounts
+        $applied_taxes[$id]->taxable += $taxable['amount'];
+        $applied_taxes[$id]->taxed += $taxed['amount'];
+      }
+    }
+    else {
+      // TODO: Keep track of amount where taxes were not applied?
+    }
+  }
+
+  // Check to see if save records exist before saving new record.
+  $result = db_query("SELECT tax_rate, order_id, currency_code, taxable, taxed FROM {commerce_eu_vat_report} WHERE order_id = :order_id", array(':order_id' => $order->order_id));
+
+  // If we have records, update the existing, else add new.
+  if ($result->rowCount() > 0) {
+    // Update record
+    while ($row = $result->fetchAssoc()) {
+      $tax_record_id = $row['tax_rate'] . $row['order_id'] . $row['currency_code'];
+      drupal_write_record('commerce_eu_vat_report', $applied_taxes[$tax_record_id], array('tax_rate', 'order_id', 'currency_code'));
+    }
+  }
+  else {
+    // Insert any of the remaining applied taxes.
+    foreach ($applied_taxes as $tax) {
+      $write = drupal_write_record('commerce_eu_vat_report', $tax);
+    }
+  }
+}
+
+/**
+ * Helper function for getting applied tax rate from line item wrapper.
+ * @param  $line_item_wrapper
+ *   The wrapped line item entity.
+ *
+ * @return
+ *   An array set of tax rates from given line item.
+ *
+ */
+function _commerce_eu_vat_report_get_tax_rates($line_item_wrapper) {
+  $commerce_total_data = $line_item_wrapper->commerce_total->data->value();
+  $tax_rates = array();
+  $vat_rates = commerce_vat_rates();
+  foreach ($commerce_total_data['components'] as $component) {
+    if (!empty($component['price']['data']['vat_rate']['title'])) {
+      $vat_name = explode('|', $component['price']['data']['vat_rate']['price_component']);
+      $tax_rates[$vat_name[1]] = $vat_rates[$vat_name[1]];
+      $tax_rates[$vat_name[1]]['machine_name'] = $component['name'];
+    }
+  }
+  return $tax_rates;
+}

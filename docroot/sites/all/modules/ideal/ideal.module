@@ -1,0 +1,462 @@
+<?php
+
+/**
+ * @file
+ * Hook implementations and shared functions.
+ */
+
+/**
+ * The maximum transaction amount.
+ */
+define('IDEAL_MAXIMUM_AMOUNT', 999999999999);
+
+/**
+ * Implements hook_menu().
+ */
+function ideal_menu() {
+  $items['ideal/return'] = array(
+    'title' => 'iDEAL return page',
+    'page callback' => 'ideal_return',
+    'access callback' => 'ideal_return_access',
+    'type' => MENU_CALLBACK,
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_cron().
+ */
+function ideal_cron() {
+  iDEALPaymentMethodController::checkPendingPayments();
+  iDEALPaymentMethodController::updateExpiredPayments();
+}
+
+/**
+ * Implements hook_entity_load().
+ */
+function ideal_entity_load(array $entities, $entity_type) {
+  if ($entity_type == 'payment_method') {
+    $pmids = array();
+    foreach ($entities as $payment_method) {
+      if ($payment_method->controller instanceof iDEALPaymentMethodController) {
+        $pmids[] = $payment_method->pmid;
+      }
+    }
+    if ($pmids) {
+      $query = db_select('ideal_payment_method')
+        ->fields('ideal_payment_method')
+        ->condition('pmid', $pmids);
+      $result = $query->execute();
+      while ($data = $result->fetchAssoc()) {
+        $payment_method = $entities[$data['pmid']];
+        $payment_method->controller_data = (array) $data;
+        unset($payment_method->controller_data['pmid']);
+      }
+    }
+  }
+  elseif ($entity_type == 'payment') {
+    $pids = array();
+    foreach ($entities as $payment) {
+      if ($payment->method->controller instanceof iDEALPaymentMethodController) {
+        $pids[] = $payment->pid;
+      }
+    }
+    if ($pids) {
+      $query = db_select('ideal_payment')
+        ->fields('ideal_payment')
+        ->condition('pid', $pids);
+      $result = $query->execute();
+      while ($data = $result->fetchAssoc()) {
+        $payment = $entities[$data['pid']];
+        $payment->method_data = (array) $data;
+        unset($payment->method_data['pid']);
+        $payment->method_data['updated'] = (int) $payment->method_data['updated'];
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_ACTION().
+ */
+function ideal_payment_method_insert(PaymentMethod $payment_method) {
+  if ($payment_method->controller instanceof iDEALPaymentMethodController) {
+    $values = array_merge($payment_method->controller_data += $payment_method->controller->controller_data_defaults, array(
+      'pmid' => $payment_method->pmid,
+    ));
+    drupal_write_record('ideal_payment_method', $values);
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_ACTION().
+ */
+function ideal_payment_insert(Payment $payment) {
+  if ($payment->method->controller instanceof iDEALPaymentMethodController) {
+    $values = array_merge($payment->method_data += ideal_method_data_default(), array(
+      'pid' => $payment->pid,
+    ));
+    drupal_write_record('ideal_payment', $values);
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_ACTION().
+ */
+function ideal_payment_method_update(PaymentMethod $payment_method) {
+  if ($payment_method->controller instanceof iDEALPaymentMethodController) {
+    $values = array_merge($payment_method->controller_data += $payment_method->controller->controller_data_defaults, array(
+      'pmid' => $payment_method->pmid,
+    ));
+    drupal_write_record('ideal_payment_method', $values, 'pmid');
+    cache_clear_all('ideal_issuers_' . $payment_method->pmid, 'cache');
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_ACTION().
+ */
+function ideal_payment_update(Payment $payment) {
+  if ($payment->method->controller instanceof iDEALPaymentMethodController) {
+    $values = array_merge($payment->method_data += ideal_method_data_default(), array(
+      'pid' => $payment->pid,
+    ));
+    drupal_write_record('ideal_payment', $values, 'pid');
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_ACTION().
+ */
+function ideal_payment_method_delete($entity) {
+  if ($entity->controller instanceof iDEALPaymentMethodController) {
+    db_delete('ideal_payment_method')
+      ->condition('pmid', $entity->pmid)
+      ->execute();
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_ACTION().
+ */
+function ideal_payment_delete(Payment $payment) {
+  if ($payment->method->controller instanceof iDEALPaymentMethodController) {
+    db_delete('ideal_payment')
+      ->condition('pid', $payment->pid)
+      ->execute();
+  }
+}
+
+/**
+ * Implements hook_views_api().
+ */
+function ideal_views_api() {
+  return array(
+    'api' => '2',
+  );
+}
+
+/**
+ * Implements
+ * PaymentMethodController::payment_configuration_form_elements_callback.
+ */
+function ideal_payment_configuration_form_elements(array $element, array &$form_state) {
+  $payment = $form_state['payment'];
+
+  $elements['issuer_id'] = array(
+    '#type' => 'select',
+    '#title' => t('Choose your bank'),
+    '#options' => $payment->method->controller->issuerOptions($payment->method),
+    '#required' => TRUE,
+  );
+  $elements['return'] = array(
+    '#markup' =>  t('You will automatically return to @site_name after completing the transaction.', array(
+      '@site_name' => variable_get('site_name', 'Drupal'),
+    )),
+  );
+
+  return $elements;
+}
+
+/**
+ * Implements
+ * PaymentMethodController::payment_configuration_form_elements_callback
+ * magic validate callback.
+ */
+function ideal_payment_configuration_form_elements_validate(array $element, array &$form_state) {
+  $values = drupal_array_get_nested_value($form_state['values'], $element['#parents']);
+  $form_state['payment']->method_data['issuer_id'] = $values['issuer_id'];
+}
+
+/**
+ * Implements
+ * PaymentMethodController::payment_method_configuration_form_elements_callback.
+ */
+function ideal_payment_method_configuration_form_elements(array $element, array &$form_state) {
+  $payment_method = $form_state['payment_method'];
+  $controller_data = $payment_method->controller_data;
+
+  $elements['expiration_period'] = array(
+    '#type' => 'select',
+    '#title' => t('Expiration period'),
+    '#options' => array(
+      180 => t('3 minutes'),
+      240 => t('4 minutes'),
+      300 => t('5 minutes'),
+      600 => t('10 minutes'),
+      900 => t('15 minutes'),
+      1200 => t('20 minutes'),
+      1800 => t('30 minutes'),
+      2400 => t('40 minutes'),
+      3000 => t('50 minutes'),
+      3600 => t('1 hour'),
+    ),
+    '#default_value' => isset($controller_data['expiration_period']) ? $controller_data['expiration_period'] : 900,
+    '#required' => TRUE,
+  );
+  $elements['merchant'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Merchant'),
+  );
+  $elements['merchant']['merchant_id'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Merchant ID'),
+    '#default_value' => isset($controller_data['merchant_id']) ? $controller_data['merchant_id'] : '',
+    '#maxlength' => 9,
+    '#size' => 9,
+    '#required' => TRUE,
+  );
+  $elements['merchant']['sub_id'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Sub ID'),
+    '#default_value' => isset($controller_data['merchant_sub_id']) ? $controller_data['merchant_sub_id'] : '',
+    '#maxlength' => 6,
+    '#size' => 6,
+  );
+  $elements['merchant']['private_key_path'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Path to private key file'),
+    '#default_value' => isset($controller_data['merchant_private_key_path']) ? $controller_data['merchant_private_key_path'] : '',
+    '#maxlength' => 255,
+    '#required' => TRUE,
+  );
+  $elements['merchant']['private_key_password'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Private key password'),
+    '#default_value' => isset($controller_data['merchant_private_key_password']) ? $controller_data['merchant_private_key_password'] : '',
+    '#description' => t('The password will be stored in the database as plain text.'),
+    '#maxlength' => 255,
+  );
+  $elements['merchant']['public_certificate_path'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Path to public certificate file'),
+    '#default_value' => isset($controller_data['merchant_public_certificate_path']) ? $controller_data['merchant_public_certificate_path'] : '',
+    '#maxlength' => 255,
+    '#required' => TRUE,
+  );
+  $elements['acquirer'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Acquirer'),
+  );
+  $elements['acquirer']['url'] = array(
+    '#type' => 'textfield',
+    '#title' => t('iDEAL server URL'),
+    '#default_value' => isset($controller_data['acquirer_url']) ? $controller_data['acquirer_url'] : '',
+    '#maxlength' => 255,
+    '#required' => TRUE,
+  );
+  $elements['acquirer']['public_certificate_path'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Path to public certificate file'),
+    '#default_value' => isset($controller_data['acquirer_public_certificate_path']) ? $controller_data['acquirer_public_certificate_path'] : '',
+    '#maxlength' => 255,
+    '#required' => TRUE,
+  );
+
+  return $elements;
+}
+
+/**
+ * Implements
+ * PaymentMethodController::payment_method_configuration_form_elements_callback
+ * magic validate callback.
+ */
+function ideal_payment_method_configuration_form_elements_validate(array $element, array &$form_state) {
+  $form_errors = form_get_errors();
+  $values = drupal_array_get_nested_value($form_state['values'], $element['#parents']);
+  $payment_method = $form_state['payment_method'];
+  $payment_method->controller_data['expiration_period'] = $values['expiration_period'];
+  $payment_method->controller_data['merchant_id'] = $values['merchant']['merchant_id'];
+  $payment_method->controller_data['merchant_sub_id'] = $values['merchant']['sub_id'];
+  $payment_method->controller_data['merchant_private_key_path'] = $values['merchant']['private_key_path'];
+  $payment_method->controller_data['merchant_private_key_password'] = $values['merchant']['private_key_password'];
+  $payment_method->controller_data['merchant_public_certificate_path'] = $values['merchant']['public_certificate_path'];
+  $payment_method->controller_data['acquirer_url'] = $values['acquirer']['url'];
+  $payment_method->controller_data['acquirer_public_certificate_path'] = $values['acquirer']['public_certificate_path'];
+
+  // Merchant ID.
+  if (preg_match('#[^\da-z]#i', $values['merchant']['merchant_id'])) {
+    form_error($element['merchant']['merchant_id'], t('The merchant ID must be alphanumeric.'));
+  }
+  // Merchant sub ID.
+  if (preg_match('#[\D]#i', $values['merchant']['sub_id'])) {
+    form_error($element['merchant']['sub_id'], t('The merchant sub ID must be numeric.'));
+  }
+  // Merchant private key and password.
+  try {
+    $payment_method->controller->merchantPrivateKey($payment_method);
+  }
+  catch (PaymentException $e) {
+    form_error($element['merchant']['private_key_path'], $e->getMessage());
+  }
+  // Merchant public certificate.
+  try {
+    $payment_method->controller->publicCertificate($payment_method, 'merchant');
+  }
+  catch (PaymentException $e) {
+    form_error($element['merchant']['public_certificate_path'], $e->getMessage());
+  }
+  // Merchant private key and public certificate.
+  $errors = form_get_errors();
+  if (!isset($errors[implode('][', $element['merchant']['private_key_path']['#parents'])]) && !isset($errors[implode('][', $element['merchant']['public_certificate_path']['#parents'])])) {
+    $data = '';
+    $signature = NULL;
+    openssl_sign($data, $signature, $payment_method->controller->merchantPrivateKey($payment_method));
+    $pair = (bool) openssl_verify($data, $signature, $payment_method->controller->publicCertificate($payment_method, 'merchant'));    
+    if (!$pair) {
+      form_error($element['merchant']['private_key_path'], t('The merchant private key and merchant public certificate are no pair.'));
+      form_error($element['merchant']['public_certificate_path'], t('The merchant public certificate and merchant private key are no pair.'));
+    }
+  }
+
+  // Acquirer URL.
+  if (!valid_url($values['acquirer']['url'], TRUE)) {
+    form_error($element['acquirer']['url'], t('The iDEAL server URL is invalid.'));
+  }
+  // Acquirer public certificate.
+  try {
+    $payment_method->controller->publicCertificate($payment_method, 'acquirer');
+  }
+  catch (PaymentException $e) {
+    form_error($element['acquirer']['public_certificate_path'], $e->getMessage());
+  }
+
+  // Merchant and acquirer public certificates.
+  $errors = form_get_errors();
+  if (!isset($errors[implode('][', $element['merchant']['public_certificate_path']['#parents'])]) && !isset($errors[implode('][', $element['acquirer']['public_certificate_path']['#parents'])])) {
+    if ($payment_method->controller->publicCertificate($payment_method, 'merchant') == $payment_method->controller->publicCertificate($payment_method, 'acquirer')) {
+      drupal_set_message(t('The merchant and acquirer public certificates are identical. This is possible, but unusual. Are you sure these settings are correct?'), 'warning');
+    }
+  }
+
+  // If all configuration appears correct, send a request to the acquirer URL
+  // to check if it points to a (working) iDEAL server. If it does, we should
+  // get an error response.
+  if (!array_diff_key(is_array(form_get_errors()) ? form_get_errors() : array(), is_array($form_errors) ? $form_errors : array())) {
+    $response = drupal_http_request($values['acquirer']['url'], array(
+      'headers' => array(
+        'content-type' => 'text/xml; charset="UTF-8"',
+      ),
+      'method' => 'POST',
+    ));
+    if (isset($response->error)) {
+      form_error($element['acquirer']['url'], t('Could not connect to the server (!message).', array(
+        '!message' => $response->error,
+      )));
+    }
+    else {
+      $dom = new \DOMDocument();
+      $controller = $payment_method->controller;
+      if (!@$dom->loadXML($response->data)) {
+        form_error($element['acquirer']['url'], t('The server does not return valid XML.'));
+      }
+      elseif (!$dom->schemaValidate(drupal_get_path('module', 'ideal') .'/' . $controller::IDEAL_XML_SCHEMA_PATH)) {
+        form_error($element['acquirer']['url'], t('The server does not return iDEAL messages.'));
+      }
+    }
+  }
+}
+
+/**
+ * Process a user who just returned from his issuer's website after a transaction.
+ *
+ * @return NULL
+ */
+function ideal_return() {
+  $payment = ideal_return_payment_load();
+  if (payment_status_is_or_has_ancestor($payment->getStatus()->status, PAYMENT_STATUS_PENDING)) {
+    /** @var iDEALPaymentMethodController $controller */
+    $controller = $payment->method->controller;
+    if ($controller->statusUpdate($payment)) {
+      entity_save('payment', $payment);
+    }
+  }
+  $payment->finish();
+}
+
+/**
+ * Access callback for the return URL.
+ *
+ * @return boolean
+ */
+function ideal_return_access() {
+  if (isset($_GET['ec'])) {
+    if ($payment = ideal_return_payment_load()) {
+      return $payment->method_data['entrance_code'] == $_GET['ec'];
+    }
+  }
+  return FALSE;
+}
+
+/**
+ * Loads a payment for the return callback based on GET data.
+ *
+ * @return Payment|false
+ */
+function ideal_return_payment_load() {
+  static $payment = FALSE;
+
+  if (!$payment && isset($_GET['trxid'])) {
+    $pid = db_query("SELECT pid FROM {ideal_payment} WHERE transaction_id = :transaction_id", array(
+      ':transaction_id' => $_GET['trxid'],
+    ))->fetchField();
+    if ($pid) {
+      $payment = entity_load_single('payment', $pid);
+    }
+  }
+  return $payment;
+}
+
+/**
+ * Return Payment::method_data default data for iDEALPaymentMethodController
+ * payments.
+ *
+ * @return array
+ */
+function ideal_method_data_default() {
+  return array(
+    'consumer_account_number' => '',
+    'consumer_bic' => '',
+    'consumer_city' => '',
+    'consumer_iban' => '',
+    'consumer_name' => '',
+    'entrance_code' => '',
+    'issuer_authentication_url' => '',
+    'issuer_id' => '',
+    'transaction_id' => '',
+    'updated' => 0,
+  );
+}
+
+/**
+ * Implements Payment::finish_callback.
+ *
+ * This context callback is implemented to accommodate iDEAL 7.x-2.x
+ * transactions that were upgraded to Payment 7.x-1.x payments. It does and
+ * cannot do anything really useful, because iDEAL 7.x-3.x is no Payment
+ * context.
+ */
+function ideal_finish_updated_payment() {
+  drupal_goto('<front>');
+}

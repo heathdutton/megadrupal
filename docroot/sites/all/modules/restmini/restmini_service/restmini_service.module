@@ -1,0 +1,338 @@
+<?php
+/**
+ * @file
+ * Drupal RestMini Service module.
+ */
+
+
+/**
+ * Builds routes based on hook_restmini_service() implementation.
+ *
+ * Uses variable restmini_service_base_routes as base path for all services.
+ *
+ * Implements hook_menu().
+ *
+ * @see restmini_service_router()
+ *
+ * @return array
+ */
+function restmini_service_menu() {
+  // Get base paths defined available (for all services).
+  $defined_base_routes = restmini_service_base_routes();
+
+  $routes = array();
+
+  // Get new (un-cached) services list, because if that cache isnt being flushed before the hook_menu invocation we would produce an 'old' menu.
+  if (($baseRoutes = RestMiniService::registry(TRUE))) {
+    foreach ($baseRoutes as $route_name => $services) {
+
+      $route = $defined_base_routes[$route_name];
+      $n_path_arguments = count(explode('/', $route)) + 2; // 2 ~ service name, endpoint name.
+
+      foreach ($services as $service_name => $endpoints) {
+        foreach ($endpoints as $endpoint_name => $methods) {
+          // We only set one set of menu hooks per endpoint, because the router has to detect http method anyway.
+          foreach ($methods as $method) {
+            if (!empty($method['enabled'][0])) {
+
+              // Registers function callback (restmini_service_router) instead of the actual Class::method (RestMiniService::router) callback,
+              // to prevent errors in modules that expect menu callbacks to be functions.
+
+              // Menu system doesn't seem to check user_access for these routes.
+              // And furthermore we must be able to defined required permission per service endpoint _method_, not only endpoint,
+              // because CRUD operations may well require other (stricter) permission than index/retrieve operations.
+              // Thus we check in restmini_service_router() instead.
+
+              // Without path args.
+              $routes[$route . '/' . $service_name . '/' . $endpoint_name] = array(
+                'page callback' => 'restmini_service_router',
+                'page arguments' => array($route_name, $service_name, $endpoint_name),
+                'access callback' => TRUE,
+                'type' => MENU_CALLBACK,
+              );
+              // Without any number of path args.
+              $routes[$route . '/' . $service_name . '/' . $endpoint_name . '/%'] = array(
+                'page callback' => 'restmini_service_router',
+                'page arguments' => array($route_name, $service_name, $endpoint_name, $n_path_arguments), // Start at that index.
+                'access callback' => TRUE,
+                'type' => MENU_CALLBACK,
+              );
+              break;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Admin pages.
+  $routes['admin/config/restmini/service'] = array(
+    'title' => 'Service settings',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('restmini_service_admin_form'),
+    'access arguments' => array('administer site configuration'),
+    'file' => 'admin/restmini_service.admin.inc',
+    'type' => MENU_LOCAL_TASK,
+    'weight' => -20,
+  );
+  $routes['admin/config/restmini/service_endpoints'] = array(
+    'title' => 'Registered endpoints',
+    'page callback' => 'restmini_service_admin_endpoints',
+    'access arguments' => array('administer site configuration'),
+    'file' => 'admin/restmini_service.admin.inc',
+    'type' => MENU_LOCAL_TASK,
+    'weight' => -19,
+  );
+
+  return $routes;
+}
+
+/**
+ * Sends status header, a JSON object (conditionally), and exits.
+ *
+ * Status 404 may be used for two purposes in a REST context: a) to tell that an endpoint doesn't exist at all,
+ * and b) to tell that some data doesn't exist.
+ * The Drupal menu system will automatically return 404 for a) a non-existent endpoint.
+ * Whereas this function should only be used for b) - 'No Results'-like - scenarios.
+ *
+ *  If $status is empty, status will be according to request method and whether payload is empty (NULL) or not:
+ *  - GET: 200 if payload, otherwise 404
+ *  - POST|PUT: 201 if payload, otherwise 204
+ *  - DELETE: 200 if payload, otherwise 204
+ *
+ *  Response will count as an error will be passed on to restmini_service_error(), with status code 500, if:
+ *  - payload is boolean false
+ *  - unsupported HTTP request method
+ *  - status code 301 or 302 without a redirect_location
+ *  - status code <200 or >500
+ *
+ * Inappropriate use of status codes will be logged to watchdog, unless turned off on the module's admin page
+ * (variable: restmini_service_log_bad_response).
+ *
+ * If $payload is an object, it's length won't be checked; so if it's empty, that won't be detected.
+ *
+ * jQuery.ajax(): empty objects and null (error or payload) may not exist at all in final jQuery.ajax() response.
+ *
+ * @code
+ * // Response object passed, if error or request explicitly asked for response info wrapper (and not status 204, 301, 303 or 304):
+ * {
+ *   success: true|false,
+ *   no_results: true|false
+ *   error: false,
+ *   message: $message,
+ *   payload: $payload
+ * }
+ * // The request may ask for response info wrapper in two ways:
+ * // - send 'X-Rest-Service-Response-Info-Wrapper: 1' header
+ * RestMiniClient::make('http://ser.ver', '/rest/service/some_service/some_endpoint', array('headers' => array('X-Rest-Service-Response-Info-Wrapper' => 1)))->get()->result();
+ * // - send GET var _service_response_info_wrapper=1
+ * RestMiniClient::make('http://ser.ver', '/rest/service/some_service/some_endpoint')->get(NULL, array('_service_response_info_wrapper' => 1))->result();
+ * @endcode
+ *
+ * @see RestMiniService::respond()
+ *
+ * @param mixed $payload
+ *   NULL|empty string: evaluates to no payload.
+ *   FALSE: evaluates to error.
+ * @param integer $status
+ *   Status <200 or >599 is considered an error and will be passed to restmini_service_error().
+ *   Default: zero (~ request considered successful, except if GET and $payload:NULL).
+ * @param string $message
+ *   Ignored if status 204, 301, 303 or 304.
+ *   Default: empty.
+ * @param string $redirect_location
+ *   Ignored unless $status is 301 or 302.
+ *   Default: empty.
+ */
+function restmini_service_respond($payload, $status = 0, $message = '', $redirect_location = '') {
+  // Unfortunately this prevents overriding RestMiniService::respond(), because this function cannot call static::.
+  RestMiniService::respond($payload, $status, $message, $redirect_location);
+}
+
+/**
+ * Sends status header, a JSON object (optional), and exits.
+ *
+ * Service implementations should use this function in cases where they don't provide error handling by themselves.
+ *
+ * If non-empty $message or $code: sends JSON-encoded error object.
+ *
+ * @code
+ * // Response object passed when $code or $message is non-empty:
+ * {
+ *   success: false,
+ *   no_results: true,
+ *   error: true,
+ *   error_code: 7913,
+ *   error_message: 'Message that ought not expose sensitive system details or data.'
+ * }
+ * @endcode
+ *
+ * @see RestMiniService::error()
+ *
+ * @param Exception|string|mixed $log
+ *   Non-empty will be logged to watchdog.
+ *   Default: NULL.
+ * @param integer $status
+ *   Default: 500 (also if value isn't 4xx or 5xx).
+ * @param string $message
+ *   Non-empty will be passed back to requestor in JSON response.
+ *   Don't expose sensitive system details or data in the message.
+ *   Default: empty.
+ * @param integer $code
+ *   Non-empty will be passed back to requestor in JSON response.
+ *   Default: zero.
+ */
+function restmini_service_error($log, $status = 500, $message = '', $code = 0) {
+  // Unfortunately this prevents overriding RestMiniService::error(), because this function cannot call static::.
+  RestMiniService::error($log, $status, $message, $code);
+}
+
+/**
+ * For internal purposes only; routes service request to first enabled service endpoint method callback.
+ *
+ * Menu callback, used as a relay for RestMiniService::router() to prevent errors in modules that expect menu callbacks to be functions.
+ *
+ * @see RestMiniService::router()
+ *
+ * @param string $route_name
+ * @param string $service_name
+ * @param string $endpoint_name
+ * @param mixed $any_number_of_path_args...
+ */
+function restmini_service_router($route_name, $service_name, $endpoint_name, $any_number_of_path_args = NULL) {
+  RestMiniService::router(func_get_args());
+}
+
+/**
+ * Get service base paths as path-by-name array.
+ *
+ * @return array
+ */
+function restmini_service_base_routes() {
+  // The base routes variable (restmini_service_base_routes) is a newline-separated list of [name]|path.
+  // When used, it will be unpacked to an array of paths by names.
+  // Since the variable isn't used at runtime
+  // - but only when the module builds it's service registry, and when the menu system invokes hook_menu() -
+  // the simple text format is preferable (makes it easier to set the var in Features modules etc).
+  $base_routes = variable_get('restmini_service_base_routes', array());
+  if ($base_routes) {
+    $pairs = explode("\n", str_replace("\r", '', $base_routes));
+    $base_routes = array();
+    foreach ($pairs as $value) {
+      $name_path = explode('|', $value);
+      $base_routes[$name_path[0]] = $name_path[1];
+    }
+  }
+  return $base_routes;
+}
+
+/**
+ * Add or update base path.
+ *
+ * @param string $name
+ * @param string $path
+ * @param boolean $update
+ *   Truthy: update path if a base route by $name name already exists.
+ *   Default: FALSE (~ abort and return FALSE if $name is already in use).
+ * @return boolean
+ *   FALSE on error.
+ */
+function restmini_service_add_base_route($name, $path, $update = FALSE) {
+  // Check name.
+  if ($name === '' || strlen($name) > RestMiniService::NAME_MAXLENGTH || !preg_match(RestMiniService::MACHINE_NAME_REGEX, $name)) {
+    drupal_set_message(t(
+      'Suggested base route name @name is empty or longer than !le or not a valid machine name.',
+      array('@name' => $name, '!le' => RestMiniService::NAME_MAXLENGTH),
+      array('context' => 'module:restmini_service')
+    ), 'error');
+    return FALSE;
+  }
+
+  // Fix and check path.
+  // Remove leading slash.
+  if ($path{0} === '/') {
+    $path = substr($path, 1);
+  }
+  // Remove traling slash.
+  if ($path{strlen($path) - 1} === '/') {
+    $path = substr($path, 0, strlen($path) - 1);
+  }
+  if ($path === '' || $path === '/') {
+    drupal_set_message(t(
+      'Suggested base route (name @name) path @path is empty or /.',
+      array('@name' => $name, '@path' => $path),
+      array('context' => 'module:restmini_service')
+    ), 'error');
+    return FALSE;
+  }
+  // Replace wildcard * by % (common error).
+  if (strpos($path, '*') !== FALSE) {
+    drupal_set_message(t(
+      'Suggested base route (name @name) path @path contains wrong wildcard * - replaced it/them with %',
+      array('@name' => $name, '@path' => $path),
+      array('context' => 'module:restmini_service')
+    ), 'warning');
+    $path = str_replace('*', '%', $path);
+  }
+  if (path_is_admin($path)) {
+    drupal_set_message(t(
+      'Suggested base route (name @name) path @path matches an admin page path.',
+      array('@name' => $name, '@path' => $path),
+      array('context' => 'module:restmini_service')
+    ), 'error');
+    return FALSE;
+  }
+
+  if (!($base_routes = restmini_service_base_routes())) {
+    // Set the new newline-separated setting.
+    variable_set('restmini_service_base_routes', $name . '|' . $path);
+    return TRUE;
+  }
+
+  // Updating name is not an option.
+  if (in_array($path, $base_routes, TRUE)) {
+    drupal_set_message(t(
+      'Suggested base route (name @name) path @path is a dupe.',
+      array('@name' => $name, '@path' => $path),
+      array('context' => 'module:restmini_service')
+    ), 'error');
+    return FALSE;
+  }
+
+  // Updating path _is_ an option.
+  if (array_key_exists($name, $base_routes)) {
+    if (!$update) {
+      drupal_set_message(t(
+        'Suggested base route (path @path) name @name is already in use.',
+        array('@name' => $name, '@path' => $path),
+        array('context' => 'module:restmini_service')
+      ), 'error');
+      return FALSE;
+    }
+    $base_routes[$name] = $path;
+    drupal_set_message(t(
+      'Updated base route name @name path to @path.',
+      array('@name' => $name, '@path' => $path),
+      array('context' => 'module:restmini_service')
+    ));
+  }
+  else {
+    $base_routes[$name] = $path;
+    drupal_set_message(t(
+      'Added base route name @name, path @path.',
+      array('@name' => $name, '@path' => $path),
+      array('context' => 'module:restmini_service')
+    ));
+  }
+
+  // Pack array to newline-separated list of [name]|[path] rows.
+  foreach ($base_routes as $name => &$value) {
+    $value = $name . '|' . $value;
+  }
+  unset($value); // Iteration ref.
+
+  // Set the new newline-separated setting.
+  variable_set('restmini_service_base_routes', join("\n", $base_routes));
+
+  return TRUE;
+}

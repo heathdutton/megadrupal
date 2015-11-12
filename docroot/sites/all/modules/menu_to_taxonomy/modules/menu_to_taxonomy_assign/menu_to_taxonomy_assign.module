@@ -1,0 +1,603 @@
+<?php
+
+/**
+ * @file
+ * Assigns term references on nodes to terms previously synced with menu links.
+ */
+
+require_once DRUPAL_ROOT . '/' . drupal_get_path('module', 'menu_to_taxonomy') . '/modules/menu_to_taxonomy_assign/menu_to_taxonomy_assign.admin.inc';
+require_once DRUPAL_ROOT . '/' . drupal_get_path('module', 'menu_to_taxonomy') . '/modules/menu_to_taxonomy_assign/menu_to_taxonomy_assign.batch.inc';
+
+/**
+ * Implements hook_menu().
+ */
+function menu_to_taxonomy_assign_menu() {
+  $items['admin/menu_to_taxonomy/reassign/%/%'] = array(
+    'title'            => 'Reassign term references',
+    'access arguments' => array('administer site configuration'),
+    'page callback'    => 'drupal_get_form',
+    'page arguments'   => array('menu_to_taxonomy_assign_reassign_form', 3, 4),
+    'type'             => MENU_SUGGESTED_ITEM,
+    'file'             => 'menu_to_taxonomy_assign.admin.inc',
+  );
+  return $items;
+}
+
+/**
+ * Implements hook_permission().
+ */
+function menu_to_taxonomy_assign_permission() {
+  return array(
+    'override auto-assign' => array(
+      'title' => t('Override auto-assign'),
+      'description' => t('Override automatic assignment of terms in term reference fields.'),
+    ),
+  );
+}
+
+/**
+ * Implements hook_entity_insert().
+ *
+ * Runs after hook_node_insert (and thus menu_link_insert) has already run.
+ */
+function menu_to_taxonomy_assign_entity_insert($entity, $type) {
+  if ($type == 'node') {
+    // Upon adding a new node, assign term references.
+    _menu_to_taxonomy_assign_save($entity);
+  }
+}
+
+/**
+ * Implements hook_entity_update().
+ *
+ * Runs after hook_node_update (and thus menu_link_update) has already run.
+ */
+function menu_to_taxonomy_assign_entity_update($entity, $type) {
+  if ($type == 'node') {
+    // Upon updating a node, assign term references.
+    _menu_to_taxonomy_assign_save($entity);
+  }
+}
+
+/**
+ * Implements hook_menu_link_update().
+ *
+ * Runs after menu_node_menu_link_update() has already run (due to module
+ * weight).
+ */
+function menu_to_taxonomy_assign_menu_link_update($link) {
+  // Make sure we are not updating a node (in which case we will save during
+  // hook_entity_update() instead).
+  if (empty($link['saving_a_node'])) {
+    // This will run if we edit a menu link through the menu link
+    // administration screen (as opposed to editing a node).
+    $node = menu_node_get_node($link['mlid']);
+    if (empty($node)) {
+      return;
+    }
+    // When a menu link is updated, assign new term references.
+    _menu_to_taxonomy_assign_save($node);
+    // If the link now points elsewhere, remove the linked term from the old
+    // node.
+    if (!empty($link['menu_to_taxonomy_assign_old_nid']) && $node->nid != $link['menu_to_taxonomy_assign_old_nid']) {
+      $old_node = node_load($link['menu_to_taxonomy_assign_old_nid']);
+      _menu_to_taxonomy_assign_save($old_node);
+    }
+  }
+}
+
+/**
+ * Implements hook_menu_link_insert().
+ *
+ * Runs after menu_node_menu_link_update() has already run (due to module
+ * weight).
+ */
+function menu_to_taxonomy_assign_menu_link_insert($link) {
+  // Make sure we are not updating a node (in which case we will save during
+  // hook_entity_insert() instead).
+  if (empty($link['saving_a_node'])) {
+    $node = menu_node_get_node($link['mlid']);
+    if (empty($node)) {
+      return;
+    }
+    // When a menu link is added, assign new term references.
+    _menu_to_taxonomy_assign_save($node);
+  }
+}
+
+/**
+ * Implements hook_taxonomy_term_delete().
+ *
+ * Takes care of orphaned term references when terms are deleted.
+ */
+function menu_to_taxonomy_assign_taxonomy_term_delete($term) {
+  // Call to base module.
+  if (_menu_to_taxonomy_record_exists($term->tid)) {
+    // Find all the taxonomy reference fields.
+    $fields = field_info_fields();
+    foreach ($fields as $field) {
+      if ($field['type'] != 'taxonomy_term_reference') {
+        continue;
+      }
+      _menu_to_taxonomy_assign_delete_references($term->tid, $field['field_name']);
+    }
+  }
+}
+
+/**
+ * Helper function which deletes all references to a term for a specific field.
+ *
+ * @param int $tid
+ *   Taxonomy term ID.
+ * @param string $field_name
+ *   Field name.
+ */
+function _menu_to_taxonomy_assign_delete_references($tid, $field_name) {
+  $query = db_select('field_data_' . $field_name, 'f')
+    ->fields('f', array(
+      'entity_type',
+      'entity_id',
+      $field_name . '_tid',
+    ))
+    ->leftJoin('taxonomy_term_data', 't', 't.tid=f.' . $field_name . '_tid')
+    ->condition('t.tid', $tid)
+    ->orderBy('f.entity_id', 'ASC');
+
+  // First collect all the tids that exist for this field on the entities.
+  $result = $query->execute();
+  foreach ($result as $target) {
+    $entities = entity_load($target->entity_type, array($target->entity_id));
+    $entity = array_shift($entities);
+    if (!$entity) {
+      continue;
+    }
+    foreach ($entity->{$field_name} as $language => $items) {
+      foreach ($items as $index => $term) {
+        if ($term['tid'] == $target->{$field_name . '_tid'}) {
+          // Remove term reference.
+          unset($entity->{$field_name}[$language][$index]);
+          // Save updated node.
+          entity_save($target->entity_type, $entity);
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Find out which node this link used to be linked to before being updated.
+ *
+ * This piece of code will run before the link is updated in
+ * menu_node_menu_link_update().
+ *
+ * @see menu_link_save
+ */
+function menu_to_taxonomy_assign_menu_link_alter(&$link) {
+  if (empty($link['mlid'])) {
+    return;
+  }
+  $node = menu_node_get_node($link['mlid']);
+  if (!empty($node->nid)) {
+    // Remember the Node ID this menu link used to point to (in case we are
+    // now pointing this menu link elsewhere).
+    $link['menu_to_taxonomy_assign_old_nid'] = $node->nid;
+  }
+}
+
+/**
+ * Updates any term references that refer to the menu links to this node.
+ *
+ * @param object $node
+ *   The node object.
+ * @param string $only_field_name
+ *   Only update this field name (if defined). Can also be NULL.
+ */
+function _menu_to_taxonomy_assign_save($node, $only_field_name = NULL) {
+  // Add the terms to all term reference fields in this node.
+  $fields = field_info_instances('node', $node->type);
+  $wrapper = entity_metadata_wrapper('node', $node);
+
+  // Mock up a simple node with only auto-assigned term reference fields.
+  // @see https://www.urbaninsight.com/2011/10/24/saving-nodes-fields-without-saving-node-itself
+  // "Saving node's fields without saving the node itself"
+  $simple_node = new stdClass();
+  $simple_node->nid = $node->nid;
+  $simple_node->vid = $node->vid;
+  $simple_node->type = $node->type;
+  // Loop through the fields.
+  foreach ($fields as $field_name => $field) {
+    // Work around this bug: https://www.drupal.org/node/1483736
+    $field_info = field_info_field($field_name);
+    $type = $field_info['type'];
+    if ($type == 'file' || $type == 'image') {
+      $simple_node->{$field_name} = $node->{$field_name};
+    }
+
+    // Update the term reference fields if needed.
+    if (empty($field['menu_to_taxonomy_assign_auto_assign'])) {
+      continue;
+    }
+    if (isset($only_field_name) && $field['field_name'] != $only_field_name) {
+      continue;
+    }
+    // Check if the node has the auto-assign checkbox enabled for any field
+    // instances.
+    if (_menu_to_taxonomy_assign_get_auto_assign_value($field['field_id'], $node->type, $node->nid) !== FALSE) {
+      // Get terms to set.
+      $set_tids = _menu_to_taxonomy_assign_get_terms_for_field($field_name, $node);
+      if (!empty($set_tids)) {
+        // Set all terms to be referenced on the original node object.
+        $wrapper->{$field_name}->set($set_tids);
+      }
+
+      // Get the value of the newly changed term reference field from the
+      // (now updated) node object.
+      if (isset($node->{$field_name})) {
+        $simple_node->{$field_name} = $node->{$field_name};
+      }
+    }
+  }
+
+  // Save the auto-assignable term reference fields for the node.
+  field_attach_presave('node', $simple_node);
+  field_attach_update('node', $simple_node);
+
+  // Update the taxonomy index entries with the new values, as taxonomy.module
+  // doesn't do so during field_attach_update().
+  taxonomy_delete_node_index($node);
+  taxonomy_build_node_index($node);
+}
+
+/**
+ * Helper function which gets synced terms for any menu links to this node.
+ *
+ * @param object $node
+ *   The node to use.
+ *
+ * @return array
+ *   The terms, indexed by vocabulary ID.
+ */
+function _menu_to_taxonomy_assign_get_terms($node) {
+  // Get all menu links for this node.
+  $menu_links = menu_node_get_links($node->nid);
+  $terms = array();
+  if (empty($menu_links)) {
+    return $terms;
+  }
+  foreach ($menu_links as $link) {
+    // Cast object to array.
+    $link = (array) $link;
+    // Call to base module to find out which vocabularies are allowed on this
+    // term reference.
+    $vocabularies_to_update = _menu_to_taxonomy_get_vocabularies_to_update($link);
+    // Get current matching term IDs.
+    foreach ($vocabularies_to_update as $vid) {
+      // Find out the Term ID for this menu link or the parent link located at
+      // max depth if max depth is set.
+      $tid = _menu_to_taxonomy_get_tid_for_link_or_max_depth_parent($link, $vid);
+      // This is one of the terms we are assigning.
+      if (!empty($tid)) {
+        $terms[$vid][] = $tid;
+      }
+    }
+  }
+  return $terms;
+}
+
+/**
+ * Gets the term ID for a given menu link and vocabulary.
+ *
+ * Falls back to a suitable ancestor if the depth of the given menu link exceeds
+ * the vocabulary maximum depth.
+ *
+ * @param object $link
+ *   Menu link
+ *
+ * @param int $vid
+ *   Vocabulary ID to search in.
+ *
+ * @return int
+ *   Taxonomy term ID.
+ */
+function _menu_to_taxonomy_get_tid_for_link_or_max_depth_parent($link, $vid) {
+  // Get vocabulary max depth
+  $max_depth = variable_get(_menu_to_taxonomy_build_variable('max_depth', $vid), 0);
+
+  // If this link is deeper than the vocabulary maximum depth, load the parent
+  // link at max depth.
+  if ($max_depth > 0 && $link['depth'] > $max_depth) {
+    $link = menu_link_load($link['p' . $max_depth]);
+  }
+  if (!isset($link['mlid'])) {
+    return FALSE;
+  }
+
+  return _menu_to_taxonomy_get_tid($link['mlid'], $vid);
+}
+
+/**
+ * Helper function which assigns terms to field.
+ *
+ * @param string $field_name
+ *   The name of the field.
+ * @param object $node
+ *   The node to get terms for.
+ */
+function _menu_to_taxonomy_assign_get_terms_for_field($field_name, $node) {
+  // Get terms for any menu links to this node.
+  $terms = _menu_to_taxonomy_assign_get_terms($node);
+
+  // Find out which vocabularies are allowed on this field.
+  $info = field_info_field($field_name);
+  $allowed_vids = array();
+  foreach ($info['settings']['allowed_values'] as $tree) {
+    if ($vocabulary = taxonomy_vocabulary_machine_name_load($tree['vocabulary'])) {
+      $allowed_vids[] = $vocabulary->vid;
+    }
+  }
+  // Loop through all terms which match this menu link (every vocabulary
+  // can have one of these).
+  $set_tids = array();
+  foreach ($allowed_vids as $vid) {
+    if (empty($terms[$vid])) {
+      continue;
+    }
+    foreach ($terms[$vid] as $tid) {
+      $term = taxonomy_term_load($tid);
+      if (empty($term->status)) {
+        // Don't assign unpublished terms.
+        continue;
+      }
+      // Log this term as one of the terms to be referenced.
+      $set_tids[] = $tid;
+    }
+  }
+  return $set_tids;
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function menu_to_taxonomy_assign_form_alter(&$form, &$form_state, $form_id) {
+  if ($form_id == 'field_ui_field_edit_form') {
+    $field = $form['#field'];
+    $instance = $form['#instance'];
+    // Only alter this for term references on nodes.
+    if ($field['type'] != 'taxonomy_term_reference' || $instance['entity_type'] != 'node') {
+      return;
+    }
+    $form['instance']['menu_to_taxonomy_assign_auto_assign'] = array(
+      '#type' => 'checkbox',
+      '#title' => t('Allow automatic term assignment'),
+      '#description' => t('Show a checkbox on this field allowing automatic assignment of terms based on synchronized menu items.'),
+      '#default_value' => !empty($form['#instance']['menu_to_taxonomy_assign_auto_assign']),
+      // Other modules use -15. This puts this option just below.
+      '#weight' => -14,
+    );
+    $path = 'admin/menu_to_taxonomy/reassign/' . $instance['bundle'] . '/' . $instance['field_name'];
+    $destination = drupal_get_destination();
+    $form['instance']['menu_to_taxonomy_assign_auto_assign_default'] = array(
+      '#type' => 'checkbox',
+      '#title' => t('Assign terms automatically by default.'),
+      '#description' => t('With this option, the "auto-assign" checkbox will be checked by default for users with the "override auto-assign" permission. For other users the checkbox and term reference widget will be hidden, and auto-assign will be turned on, unless it was already turned off.') . ' ' . l(t('Click here to automatically re-assign this field instance on all existing nodes.'), $path, array(
+        'query' => array(
+          'token' => drupal_get_token($path),
+          'destination' => $destination['destination'],
+        ),
+      )),
+      '#default_value' => !empty($form['#instance']['menu_to_taxonomy_assign_auto_assign_default']),
+      '#weight' => -13,
+      '#states' => array(
+        'visible' => array(
+          'input[name="instance[menu_to_taxonomy_assign_auto_assign]"]' => array('checked' => TRUE),
+        ),
+      ),
+    );
+    // Add validation handler.
+    $form['#validate'][] = 'menu_to_taxonomy_assign_validate_auto_assign';
+  }
+}
+
+/**
+ * Handles validation for Field edit form.
+ */
+function menu_to_taxonomy_assign_validate_auto_assign(&$form, &$form_state) {
+  if ($form_state['values']['instance']['menu_to_taxonomy_assign_auto_assign'] == 1) {
+    if ($form_state['values']['field']['cardinality'] != '-1') {
+      // Check that this is a multiple field.
+      form_set_error('instance][menu_to_taxonomy_assign_auto_assign', t('In order to allow automatic term assignment, the "number of values" for this field must be set to "Unlimited".'));
+    }
+    if ($form_state['values']['instance']['required'] == 1) {
+      // Check that the field is not required. Making it required is problematic
+      // if we cannot find a menu link to "auto-assign".
+      form_set_error('instance][menu_to_taxonomy_assign_auto_assign', t('In order to allow automatic term assignment, the term reference field must not be required.'));
+    }
+  }
+}
+
+/**
+ * Implements hook_field_attach_form().
+ *
+ * Adds the 'auto-assign' checkbox to node fields where the field instance's
+ * settings demand it.
+ */
+function menu_to_taxonomy_assign_field_attach_form($entity_type, $entity, &$form, &$form_state, $langcode) {
+  if ($entity_type == 'node') {
+    $node_types = field_info_bundles('node');
+    foreach ($node_types as $node_type => $value) {
+      if ($node_type != $entity->type) {
+        continue;
+      }
+      foreach (field_info_instances('node', $node_type) as $instance) {
+        if (!empty($instance['menu_to_taxonomy_assign_auto_assign'])) {
+          $field_name = $instance['field_name'];
+          $field_id = $instance['field_id'];
+          // Find current auto-assign value if node already exists.
+          $nid = isset($entity->nid) ? $entity->nid : NULL;
+          $default_value = _menu_to_taxonomy_assign_get_auto_assign_value($field_id, $node_type, $nid);
+          $form[$field_name]['menu_to_taxonomy_assign_auto'] = array(
+            '#type' => 'checkbox',
+            '#title' => t('Auto-assign term'),
+            '#description' => t('Check this box this if you want to automatically assign the term synced to the menu link for this node.'),
+            '#default_value' => $default_value,
+          );
+          if (!user_access('override auto-assign')) {
+            $form[$field_name]['#access'] = FALSE;
+
+          }
+          // Find the select dropdown. Usually $name should end up being 'und'.
+          foreach ($form[$field_name] as $name => $value) {
+            if (!empty($value['#type']) && $value['#type'] == 'select') {
+              break;
+            }
+            $name = FALSE;
+          }
+          if ($name) {
+            $form[$field_name][$name]['#states'] = array(
+              'disabled' => array(
+                'input[name="' . check_plain($field_name) . '[menu_to_taxonomy_assign_auto]"]' => array('checked' => TRUE),
+              ),
+            );
+          }
+
+          $form[$field_name]['#menu_to_taxonomy_assign_auto_field_id'] = $field_id;
+          $menu_to_taxonomy_assign = TRUE;
+        }
+      }
+    }
+    // The checkbox (form element) needs to be added here in the $form array,
+    // to have it right after/below the field it belongs to. Adding our own
+    // submit callback here only if it's really needed, ie. when we do have a
+    // field that should have an 'auto-assign' checkbox besides it.
+    if (!empty($menu_to_taxonomy_assign)) {
+      if (!isset($form['#submit'])) {
+        $form['#submit'] = array();
+      }
+      $form['#submit'][] = 'menu_to_taxonomy_assign_field_attach_form_submit';
+    }
+  }
+}
+
+/**
+ * Stores whether a Node term reference field has an auto-assigned term ID.
+ *
+ * @see menu_to_taxonomy_assign_field_attach_form
+ */
+function menu_to_taxonomy_assign_field_attach_form_submit($form, &$form_state) {
+  // This submit callback is executed for both the node add and edit forms. When
+  // it's executed for the node add form, there is no nid (entity id) available
+  // yet, since the {node} table has not been written into yet.
+  //
+  // So we store the state of all the user's checkboxes into a drupal_static()
+  // cache and write our own data to the DB after node save (hook_node_insert()
+  // or hook_node_update()). This array is keyed by the field_id, while the
+  // values hold the checkbox states.
+  $node_field_autoassign = array();
+  foreach (element_children($form) as $field_name) {
+    if (isset($form[$field_name]['#menu_to_taxonomy_assign_auto_field_id'])) {
+      $node_field_autoassign[$form[$field_name]['#menu_to_taxonomy_assign_auto_field_id']] = $form_state['values'][$field_name]['menu_to_taxonomy_assign_auto'];
+      unset($form_state['values'][$field_name]['menu_to_taxonomy_assign']);
+    }
+  }
+
+  // Add checkbox value (if set) to our cache - NID is arbitrary.
+  if (!empty($node_field_autoassign)) {
+    array_push(drupal_static('menu_to_taxonomy_assign', array()), array(
+      'fields' => $node_field_autoassign,
+    ));
+  }
+}
+
+/**
+ * Implements hook_field_attach_insert().
+ *
+ * Before hook_node_insert as we already want to have inserted this information
+ * when by the time we run that.
+ */
+function menu_to_taxonomy_assign_field_attach_insert($entity_type, $entity) {
+  if ($entity_type == 'node' && user_access('override auto-assign')) {
+    _menu_to_taxonomy_assign_save_cached($entity);
+  }
+}
+
+/**
+ * Implements hook_field_attach_update().
+ *
+ * Before hook_node_update as we already want to have inserted this information
+ * when by the time we run that.
+ */
+function menu_to_taxonomy_assign_field_attach_update($entity_type, $entity) {
+  if ($entity_type == 'node') {
+    _menu_to_taxonomy_assign_save_cached($entity);
+  }
+}
+
+/**
+ * Writes the cached data of checkboxes to the DB after a new node is saved.
+ */
+function _menu_to_taxonomy_assign_save_cached($node) {
+  // Set a flag in the menu link to remember we are still saving a node.
+  $node->menu['saving_a_node'] = TRUE;
+
+  if (!user_access('override auto-assign')) {
+    // Do not save to database. Use default instead.
+    return;
+  }
+
+  foreach (drupal_static('menu_to_taxonomy_assign', array()) as $node_instance) {
+    foreach ($node_instance['fields'] as $field_id => $assign_auto_state) {
+      db_merge('menu_to_taxonomy_assign_auto')
+        ->key(array(
+          'field_id' => $field_id,
+          'nid' => $node->nid,
+        ))
+        ->fields(array('assign_auto' => $assign_auto_state ? 1 : 0))
+        ->execute();
+    }
+  }
+}
+
+/**
+ * Finds out whether a field must be auto-assigned on a certain node.
+ *
+ * @param int $field_id
+ *   The Field ID.
+ * @param string $node_type
+ *   The node type.
+ * @param int $nid
+ *   The Node ID (if not supplied, get default).
+ *
+ * @return bool
+ *   Whether a field must be auto-assigned (for a node, if applicable).
+ */
+function _menu_to_taxonomy_assign_get_auto_assign_value($field_id, $node_type, $nid = NULL) {
+  // Get field info.
+  $info = field_info_field_by_id($field_id);
+  // Get field instance info for this node type.
+  $instance = field_info_instance('node', $info['field_name'], $node_type);
+  if (empty($instance['menu_to_taxonomy_assign_auto_assign'])) {
+    // Auto-assign not allowed.
+    return FALSE;
+  }
+
+  // Try to get data from database if a node has been specified.
+  if (isset($nid)) {
+    $assign_auto = db_select('menu_to_taxonomy_assign_auto', 'm')
+      ->fields('m', array('assign_auto'))
+      ->condition('field_id', $field_id)
+      ->condition('nid', $nid)
+      ->execute()
+      ->fetchField();
+    if ($assign_auto !== FALSE) {
+      return (bool) $assign_auto;
+    }
+  }
+
+  // Use field default.
+  if (!empty($instance['menu_to_taxonomy_assign_auto_assign_default'])) {
+    return TRUE;
+  }
+  else {
+    return FALSE;
+  }
+}

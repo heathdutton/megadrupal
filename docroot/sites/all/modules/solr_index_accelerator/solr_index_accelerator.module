@@ -1,0 +1,546 @@
+<?php
+
+/**
+ * @file
+ *   Solr index accelerator, provides a cache for improved indexing speeds.
+ * @author Axis12 Ltd <technical@axitwelve.com>
+ *
+ * @todo
+ */
+/**
+ * Implements hook_node_insert().
+ * @param type $node
+ */
+function solr_index_accelerator_node_insert($node) {
+  solr_index_accelerator_entity_update($node);
+}
+/**
+ * Implements hook_node_presave().
+ */
+function solr_index_accelerator_node_presave($node) {
+  solr_index_accelerator_node_update($node);
+}
+/**
+ * Implements hook_node_update().
+ * @param type $node
+ */
+function solr_index_accelerator_node_update($entity) {
+  $type = 'node';
+  module_load_include('inc', 'apachesolr', 'apachesolr.index');
+  if (apachesolr_entity_should_index($entity, $type)) {
+    $id = $entity->nid;
+    $vid = $entity->vid;
+    $bundle = $entity->type;
+
+    // Check status callback before sending to the index
+    $status_callbacks = apachesolr_entity_get_callback($type, 'status callback');
+
+    $status = TRUE;
+    if (is_array($status_callbacks)) {
+      foreach ($status_callbacks as $status_callback) {
+        if (is_callable($status_callback)) {
+          // by placing $status in front we prevent calling any other callback
+          // after one status callback returned false
+          $status = $status && $status_callback($id, $type);
+        }
+      }
+    }
+
+    // Delete the entity from our index if the status callback returns FALSE
+    if (!$status) {
+      solr_index_accelerator_entity_delete($entity, $type);
+      return;
+    }
+
+    $env_id = apachesolr_default_environment();
+    $indexer_table = apachesolr_get_indexer_table($type);
+    // Our tables are the same as apachesolr's with a slight name change
+    $indexer_table = str_replace('apachesolr_index', 'solr_index_accelerator', $indexer_table);
+    $solr_doc = solr_index_accelerator_index_entity_to_document($entity, $env_id);
+    // If we haven't seen this entity before it may not be there, so merge
+    // instead of update.
+    db_merge($indexer_table)
+      ->key(array(
+      'entity_type' => $type,
+      'entity_id' => $id,
+    ))
+      ->fields(array(
+      'bundle' => $bundle,
+      'status' => 1,
+      'changed' => REQUEST_TIME,
+      'data' => serialize($solr_doc[0]),
+    ))
+      ->execute();
+
+    return $solr_doc;
+  }
+}
+
+/**
+ * @todo Please document this function.
+ * @see http://drupal.org/node/1354
+ */
+function solr_index_accelerator_node_delete($node) {
+  solr_index_accelerator_entity_delete($node, 'node');
+}
+/**
+ * Implements hook_entity_delete().
+ * @param type $entity
+ * @param type $entity_type
+ */
+function solr_index_accelerator_entity_delete($entity, $entity_type) {
+  module_load_include('inc', 'apachesolr', 'apachesolr.index');
+  $env_id = apachesolr_default_environment();
+  // Delete the entity's entry from a fictional table of all entities.
+  $entity_id = $entity->nid;
+
+  $indexer_table = apachesolr_get_indexer_table($entity_type);
+  // Our tables are the same as apachesolr's with a slight name change
+  $indexer_table = str_replace('apachesolr_index', 'solr_index_accelerator', $indexer_table);
+  db_delete($indexer_table)
+    ->condition('entity_type', $entity_type)
+    ->condition('entity_id', $entity_id)
+    ->execute();
+}
+
+/**
+ * Modified version of apachesolr_index_entity_to_documents this removes the
+ *  secondary entity_load as we already have the object
+ * @global type $user
+ * @param type $item
+ * @param type $env_id
+ * @return type
+ */
+function solr_index_accelerator_index_entity_to_document($item, $env_id) {
+
+  // Always build the content for the index as an anonynmous user to avoid
+  // exposing restricted fields and such.
+  global $user;
+  drupal_save_session(FALSE);
+  $saved_user = $user;
+  // Should indexing take place using anon ( default )
+  // or as another user
+  $uid = variable_get('apachesolr_index_user', 0);
+  if ($uid == 0) {
+    $user = drupal_anonymous_user();
+  }
+  else {
+    // TODO Convert "user_load" to "user_load_multiple" if "$uid" is other than a uid.
+    // To return a single user object, wrap "user_load_multiple" with "array_shift" or equivalent.
+    // Example: array_shift(user_load_multiple(array(), $uid))
+    $user = user_load($uid);
+  }
+  // Pull out all of our pertinent data.
+  $entity_type = 'node';
+  $entity_id = $item->nid;
+  $vid = $item->vid;
+  $bundle = $item->type;
+  // TRUE on reset to bypass static caching and not blow out our memory limit.
+  $entity = $item;
+
+  // Create a new document, and do the bare minimum on it.
+  $document = _apachesolr_index_process_entity_get_document($entity, $bundle);
+
+  //Get the callback array to add stuff to the document
+  $callbacks = apachesolr_entity_get_callback($entity_type, 'document callback', $bundle);
+  $documents = array();
+  foreach ($callbacks as $callback) {
+    // Call a type-specific callback to add stuff to the document.
+    $documents = array_merge($documents, $callback($document, $entity, $entity_type, $env_id));
+  }
+
+  //do this for all possible documents that were returned by the callbacks
+  foreach ($documents as $document) {
+    // Call an all-entity hook to add stuff to the document.
+    module_invoke_all('apachesolr_index_document_build', $document, $entity, $entity_type, $env_id);
+
+    // Call a type-specific hook to add stuff to the document.
+    module_invoke_all('apachesolr_index_document_build_' . $entity_type, $document, $entity, $env_id);
+
+    // Final processing to ensure that the document is properly structured.
+    // All records must have a label field, which is used for user-friendly labeling.
+    if (empty($document->label)) {
+      $document->label = '';
+    }
+
+    // All records must have a "content" field, which is used for fulltext indexing.
+    // If we don't have one, enter an empty value.  This does mean that the entity
+    // will not be fulltext searchable.
+    if (empty($document->content)) {
+      $document->content = '';
+    }
+
+    // All records must have a "teaser" field, which is used for abbreviated
+    // displays when no highlighted text is available.
+    if (empty($document->teaser)) {
+      $document->teaser = truncate_utf8($document->content, 300, TRUE);
+    }
+
+    // Add additional indexing based on the body of each record.
+    apachesolr_index_add_tags_to_document($document, $document->content);
+  }
+
+  // Now allow modules to alter each other's additions for maximum flexibility.
+
+  // Hook to allow modifications of the retrieved results
+  foreach (module_implements('apachesolr_index_documents_alter') as $module) {
+    $function = $module . '_apachesolr_index_documents_alter';
+    $function($documents, $entity, $entity_type, $env_id);
+  }
+
+  // Restore the user.
+  $user = $saved_user;
+  drupal_save_session(TRUE);
+
+  return $documents;
+}
+
+/**
+ * @todo Please document this function.
+ * @see http://drupal.org/node/1354
+ */
+function solr_index_accelerator_prime_cache() {
+  // Grab all the cache data for the apachesolr cache tables
+  foreach (entity_get_info() as $type => $entity_info) {
+    if (isset($entity_info['apachesolr']) && ($entity_info['apachesolr']['indexable'])) {
+      $indexer_table = apachesolr_get_indexer_table($type);
+      // Our tables are the same as apachesolr's with a slight name change
+      $indexer_table = str_replace('apachesolr_index', 'solr_index_accelerator', $indexer_table);
+      $result = db_select($indexer_table)
+        ->orderBy('changed', 'desc')
+        ->execute()
+        ->fetchAll(PDO::FETCH_ASSOC);
+      while ($row = db_fetch_array($result)) {
+        print_r($row);
+        die();
+      }
+
+    }
+  }
+}
+/**
+ * Override of apachesolr cron action
+ *
+ * @param type $form
+ * @param array $form_state
+ */
+function solr_index_accelerator_action_form_cron_submit($form, &$form_state) {
+  if (!empty($form_state['build_info']['args'][0])) {
+    $env_id = $form_state['build_info']['args'][0];
+  }
+  else {
+    $env_id = apachesolr_default_environment();
+  }
+  // $form_state['storage'] must be unset for redirection to occur. Otherwise
+  // $form_state['rebuild'] is automatically set and this form will be
+  // rebuilt.
+  unset($form_state['storage']);
+  $form_state['redirect'] = 'admin/config/apachesolr';
+  solr_index_accelerator_index($env_id);
+  drupal_set_message(t('Apachesolr cron succesfully executed'));
+}
+
+/**
+ * @todo Please document this function.
+ * @see http://drupal.org/node/1354
+ */
+function solr_index_accelerator_form_alter(&$form, &$form_state, $form_id) {
+
+  switch ($form_id) {
+    //If stats can not be retreived then the index can not be contacted
+    case "apachesolr_index_action_form":
+      // Override default apachesolr submit handler
+      $form['action']['cron']['#submit'][0] = 'solr_index_accelerator_action_form_cron_submit';
+      $form['action']['#weight'] = -1;
+      $form['action']['solr_index_accelerator_use_cache'] = array(
+        '#value' => t('<strong>Solr index accelerator is </strong><span style="color:#008E48">On</span>'),
+        '#weight' => -4,
+      );
+      $form['solr_index_accelerator_advanced'] = array(
+        '#type' => 'fieldset',
+        '#title' => t('Enterprise search cache - Advanced'),
+        '#weight' => 0,
+        '#collapsible' => TRUE,
+        '#collapsed' => TRUE,
+      );
+      $form['solr_index_accelerator_advanced']['prime_cache'] = array(
+        '#type' => 'submit',
+        '#value' => t('Prime search cache'),
+        '#submit' => array('solr_index_accelerator_prime_cache'),
+      );
+      break;
+    case "apachesolr_index_config_form":
+//        $form['fc_action']['reset'] = array(
+//          '#prefix' => '<div>',
+//          '#suffix' => '</div>',
+//          '#type' => 'submit',
+//          '#value' => t('Prime cache queue'),
+//          '#submit' => array('apachesolr_index_action_form_reset_submit'),
+//        );
+
+      break;
+  }
+}
+
+
+/**
+ * Port of @see apachesolr_cron
+ *
+ * @param type $env_id
+ * @return type
+ */
+function solr_index_accelerator_index($env_id = NULL) {
+  if (empty($env_id)) {
+    $env_id = apachesolr_default_environment();
+  }
+  // Indexes in read-only mode do not change the index, so will not update, delete, or optimize during cron.
+  if (apachesolr_environment_variable_get($env_id, 'apachesolr_read_only', APACHESOLR_READ_WRITE) == APACHESOLR_READ_ONLY) {
+    return;
+  }
+  module_load_include('inc', 'apachesolr', 'apachesolr.index');
+
+  // For every entity type that requires extra validation
+  // Drupal 6 node only
+  $bundles = apachesolr_get_index_bundles($env_id, 'node');
+
+  // If we're not checking any bundles of this entity type, just skip them all.
+  if (empty($bundles)) {
+    return;
+  }
+
+  $callbacks = apachesolr_get_index_callbacks();
+  if (isset($callbacks['node']['cron_check'])) {
+    $callback = $callbacks['node']['cron_check'];
+    call_user_func($callback);
+  }
+
+  try {
+    $solr = apachesolr_get_solr($env_id);
+    // Optimize the index (by default once a day).
+    $optimize_interval = variable_get('apachesolr_optimize_interval', 60 * 60 * 24);
+    $last = variable_get('apachesolr_last_optimize', 0);
+    if ($optimize_interval && (APACHESOLR_REQUEST_TIME - $last > $optimize_interval)) {
+      $solr->optimize(FALSE, FALSE);
+      variable_set('apachesolr_last_optimize', APACHESOLR_REQUEST_TIME);
+      apachesolr_set_last_index_updated($env_id, APACHESOLR_REQUEST_TIME);
+    }
+    // Only clear the cache if the index changed.
+    // TODO: clear on some schedule if running multi-site.
+    $updated = apachesolr_get_last_index_updated($env_id);
+    if ($updated > 0) {
+      $solr->clearCache();
+      // Re-populate the luke cache.
+      $solr->getLuke();
+      // TODO: an admin interface for setting this.  Assume for now 5 minutes.
+      if (APACHESOLR_REQUEST_TIME - $updated >= variable_get('apachesolr_cache_delay', 300)) {
+        // Clear the updated flag.
+        apachesolr_set_last_index_updated($env_id);
+      }
+    }
+  }
+  catch (Exception $e) {
+    watchdog('Apache Solr', nl2br(check_plain($e->getMessage())) . ' in apachesolr_cron', NULL, WATCHDOG_ERROR);
+  }
+
+  // We can safely process the apachesolr_cron_limit nodes at a time without a
+  // timeout or out of memory error.
+  $limit = variable_get('apachesolr_cron_limit', 50);
+  solr_index_accelerator_index_entities($env_id, $limit);
+}
+
+/**
+ * Override of @see apachesolr_index_entities
+ *
+ * @param type $env_id
+ * @param type $limit
+ * @return type
+ */
+function solr_index_accelerator_index_entities($env_id, $limit) {
+  $documents_submitted = 0;
+  $entity_type = 'node';
+  // With each pass through the callback, retrieve the next group of nids.
+  $rows = apachesolr_index_get_entities_to_index($env_id, $entity_type, $limit);
+  $documents = array();
+  foreach ($rows as $row) {
+    $row_documents = solr_index_accelerator_index_entities_document($row, $entity_type, $env_id);
+    $documents = array_merge($documents, $row_documents);
+  }
+  $indexed = apachesolr_index_send_to_solr($env_id, $documents);
+  if ($indexed !== FALSE) {
+    $documents_submitted += count($documents);
+    $index_position = apachesolr_get_last_index_position($env_id, $entity_type);
+    $max_changed = $index_position['last_changed'];
+    $max_entity_id = $index_position['last_entity_id'];
+    foreach ($rows as $row) {
+      if (!empty($row->status)) {
+        if ($row->changed > $max_changed) {
+          $max_changed = $row->changed;
+        }
+        if ($row->entity_id > $max_entity_id) {
+          $max_entity_id = $row->entity_id;
+        }
+      }
+    }
+    apachesolr_set_last_index_position($env_id, $entity_type, $max_changed, $max_entity_id);
+    apachesolr_set_last_index_updated($env_id, APACHESOLR_REQUEST_TIME);
+  }
+  return $documents_submitted;
+}
+
+/**
+ * @todo Please document this function.
+ * @see http://drupal.org/node/1354
+ */
+function solr_index_accelerator_index_entities_document($row, $entity_type, $env_id) {
+  $documents = array();
+  if (!empty($row->status)) {
+    // Let any module exclude this entity from the index.
+    $build_document = TRUE;
+    foreach (module_implements('apachesolr_exclude') as $module) {
+      $exclude = module_invoke($module, 'apachesolr_exclude', $row->entity_id, $entity_type, $row, $env_id);
+      // If the hook returns TRUE we should exclude the entity
+      if (!empty($exclude)) {
+        $build_document = FALSE;
+      }
+    }
+    foreach (module_implements('apachesolr_' . $entity_type . '_exclude') as $module) {
+      $exclude = module_invoke($module, 'apachesolr_' . $entity_type . '_exclude', $row->entity_id, $row, $env_id);
+      // If the hook returns TRUE we should exclude the entity
+      if (!empty($exclude)) {
+        $build_document = FALSE;
+      }
+    }
+    if ($build_document) {
+      $documents = array_merge($documents, solr_index_accelerator_index_entity_to_documents($row, $env_id));
+    }
+  }
+  else {
+    // Delete the entity from our index if the status callback returned 0
+    apachesolr_remove_entity($env_id, $row->entity_type, $row->entity_id);
+  }
+  return $documents;
+}
+
+
+/**
+ * Override @see apachesor_index_entity_to_documents
+ *
+ * @global type $user
+ * @param type $item
+ * @param type $env_id
+ * @return boolean
+ */
+function solr_index_accelerator_index_entity_to_documents($item, $env_id) {
+  $documents = array();
+  $indexer_table = apachesolr_get_indexer_table('node');
+  // Our tables are the same as apachesolr's with a slight name change
+  $indexer_table = str_replace('apachesolr_index', 'solr_index_accelerator', $indexer_table);
+
+  // Lookup in solr_index_accelerator_index_cache
+  $sql = 'Select * from %s where entity_id = %s';
+  $result = db_query($sql, $indexer_table, $item->entity_id);
+  if ($result->num_rows) {
+    while ($row = db_fetch_array($result)) {
+      $documents[] = unserialize($row['data']);
+    }
+  }
+  else {
+    // Pull out all of our pertinent data.
+    $entity_type = $item->entity_type;
+    $id = $item->entity_id;
+    $bundle = $item->bundle;
+
+    // TRUE on reset to bypass static caching and not blow out our memory limit.
+    $entity = node_load($item->entity_id, NULL, TRUE);
+
+    if (empty($entity)) {
+      // If the object failed to load, just stop.
+      return FALSE;
+    }
+    $documents = solr_index_accelerator_node_update($entity);
+  }
+  return $documents;
+
+}
+
+/**
+ * @todo Please document this function.
+ * @see http://drupal.org/node/1354
+ */
+function solr_index_accelerator_apachesolr_index_batch_alter($batch) {
+  $batch['operations'][0][0] = 'solr_index_accelerator_apachesolr_index_batch_index_entities';
+}
+
+/**
+ * Batch Operation Callback
+ *
+ * @param $env_id
+ *   The machine name of the environment
+ * @param $total_limit
+ *   The total number of items to index across all batches
+ * @param $context
+ */
+function solr_index_accelerator_apachesolr_index_batch_index_entities($env_id, $total_limit = NULL, &$context) {
+  module_load_include('inc', 'apachesolr', 'apachesolr.index');
+  if (empty($context['sandbox'])) {
+    try {
+      // Get the $solr object
+      $solr = apachesolr_get_solr($env_id);
+      // If there is no server available, don't continue.
+      if (!$solr->ping()) {
+        throw new Exception(t('No Solr instance available during indexing.'));
+      }
+    }
+    catch (Exception $e) {
+      watchdog('Apache Solr', $e->getMessage(), NULL, WATCHDOG_ERROR);
+      return FALSE;
+    }
+
+    $status = apachesolr_index_status($env_id);
+    $context['sandbox']['progress'] = 0;
+    $context['sandbox']['submitted'] = 0;
+
+    // How many items do we want to index? All or a limited set of items
+    if (empty($total_limit)) {
+      $context['sandbox']['max'] = $status['remaining'];
+    }
+    else {
+      $context['sandbox']['max'] = $total_limit;
+    }
+  }
+
+  // We can safely process the apachesolr_cron_limit nodes at a time without a
+  // timeout or out of memory error.
+  $limit = variable_get('apachesolr_cron_limit', 50);
+
+  // Reduce the limit for our final batch if we would be processing more than had been requested
+  if ($limit + $context['sandbox']['progress'] > $context['sandbox']['max']) {
+    $limit = $context['sandbox']['max'] - $context['sandbox']['progress'];
+  }
+
+  if ($context['sandbox']['max'] >= $context['sandbox']['progress'] + $limit) {
+    $context['sandbox']['progress'] += $limit;
+  }
+  else {
+    $context['sandbox']['progress'] = $context['sandbox']['max'];
+  }
+  $context['sandbox']['submitted'] += solr_index_accelerator_index_entities($env_id, $limit);
+
+  $arguments = array(
+    '@current' => $context['sandbox']['progress'],
+    '@total' => $context['sandbox']['max'],
+    '@submitted' => $context['sandbox']['submitted'],
+  );
+  $context['message'] = t('Inspected @current of @total entities. Submitted @submitted documents to Solr', $arguments);
+
+  // Inform the batch engine that we are not finished, and provide an
+  // estimation of the completion level we reached.
+  $context['finished'] = empty($context['sandbox']['max']) ? 1 : $context['sandbox']['progress'] / $context['sandbox']['max'];
+
+  // Put the total into the results section when we're finished so we can
+  // show it to the admin.
+  if ($context['finished']) {
+    $context['results']['count'] = $context['sandbox']['progress'];
+    $context['results']['submitted'] = $context['sandbox']['submitted'];
+  }
+}

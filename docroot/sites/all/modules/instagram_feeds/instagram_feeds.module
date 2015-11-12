@@ -1,0 +1,1429 @@
+<?php
+/**
+ * @file
+ * Code for the Instagram Feeds feature.
+ */
+
+include_once 'instagram_feeds.features.inc';
+
+define('INSTAGRAM_FEEDS_BASE_URL', 'https://api.instagram.com/v1');
+define('INSTAGRAM_FEEDS_USERS_VOCABULARY_NAME', 'instagram_users');
+define('INSTAGRAM_FEEDS_TAGS_VOCABULARY_NAME', 'instagram_hashtags');
+define('INSTAGRAM_FEEDS_SETTINGS_NODE_TYPE', 'instagram_feed');
+define('INSTAGRAM_FEEDS_FEEDS_NODE_TYPE', 'instagram_url');
+define('INSTAGRAM_FEEDS_IMAGE_NODE_TYPE', 'instagram_media_item');
+define('INSTAGRAM_FEEDS_FEED_ID', 'instagram_feed');
+define('INSTAGRAM_FEEDS_WYSIWYG_PERMISSION', 'insert instagram feeds');
+
+
+/**
+ * Implements hook_menu().
+ */
+function instagram_feeds_menu() {
+  $items = array();
+
+  $items['admin/config/services/instagram'] = array(
+    'title' => 'Instagram Settings',
+    'description' => 'Setting for Instagram Feeds module',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('instagram_feeds_settings'),
+    'access arguments' => array('administer site configuration'),
+    'file' => 'includes/instagram_feeds.admin.inc',
+  );
+  $items['node/%node/import'] = array(
+    'title' => 'Import',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('instagram_feeds_import_tab_form', 1),
+    'access callback' => 'instagram_feeds_access',
+    'access arguments' => array('import', 1),
+    'file' => 'includes/instagram_feeds.pages.inc',
+    'type' => MENU_LOCAL_TASK,
+    'weight' => 10,
+  );
+
+  return $items;
+}
+
+
+/**
+ * Implements hook_help().
+ */
+function instagram_feeds_help($path, $arg) {
+  $output = '';
+  switch ($path) {
+    case 'admin/help#instagram_feeds':
+      $output = file_get_contents(drupal_get_path('module', 'instagram_feeds') . '/README.txt');
+      break;
+  }
+  if (!empty($output)) {
+    if (module_exists('markdown')) {
+      return filter_xss_admin(module_invoke('markdown', 'filter', 'process', 0, -1, $output));
+    }
+    else {
+      return '<pre>' . check_plain($output) . '</pre>';
+    }
+  }
+}
+
+
+/**
+ * Implements hook_permission().
+ */
+function instagram_feeds_permission() {
+  return array(
+    INSTAGRAM_FEEDS_WYSIWYG_PERMISSION => array(
+      'title' => t('Insert Instagram Feeds'),
+      'description' => t('Allows to insert the Instagram Feed in wysiwyg editors.'),
+    ),
+  );
+}
+
+
+/**
+ * Get user object from Instagram using username.
+ *
+ * @param string $username
+ *   Instagram username
+ *
+ * @return combine
+ *   FALSE if no users found or user object with user id.
+ */
+function instagram_feeds_get_instagram_user($username) {
+  $user = FALSE;
+  $client_id = variable_get('instagram_feeds_client_id', '');
+
+  // Getting response from Instagram server.
+  $response = drupal_http_request(INSTAGRAM_FEEDS_BASE_URL . '/users/search?q=' . $username . '&client_id='
+      . $client_id);
+  if ('OK' == $response->status_message && isset($response->data)) {
+    $data = drupal_json_decode($response->data);
+    $user = (object) $data['data'][0];
+  }
+
+  return $user;
+}
+
+
+/**
+ * Implements hook_taxonomy_term_presave().
+ */
+function instagram_feeds_taxonomy_term_presave($term) {
+  if (INSTAGRAM_FEEDS_USERS_VOCABULARY_NAME == $term->vocabulary_machine_name
+      && (!isset($term->field_instf_uid[LANGUAGE_NONE]) || !count($term->field_instf_uid[LANGUAGE_NONE]))
+      && $user = instagram_feeds_get_instagram_user($term->name)) {
+    $term->field_instf_uid[LANGUAGE_NONE][0]['value'] = $user->id;
+  }
+}
+
+
+/**
+ * Custom node form validation handler.
+ */
+function instagram_feeds_form_instagram_feed_node_form_validate($form, &$form_state) {
+  if (!count($form_state['values']['field_instf_hash_tags'][LANGUAGE_NONE])
+      && !count($form_state['values']['field_instf_user'][LANGUAGE_NONE])) {
+    form_set_error('field_instf_hash_tags',
+        t('Both fields "Instagram User" and "Instagram Hash Tags" can not be empty.')
+    );
+  }
+}
+
+
+/**
+ * Implements hook_node_presave().
+ */
+function instagram_feeds_node_presave($node) {
+  if (INSTAGRAM_FEEDS_SETTINGS_NODE_TYPE == $node->type) {
+    if (isset($node->field_instf_color_transparent) && 1 == $node->field_instf_color_transparent) {
+      foreach ($node->field_instf_color[LANGUAGE_NONE] as $key => $value) {
+        $node->field_instf_color[LANGUAGE_NONE][$key]['rgb'] = '#';
+      }
+    }
+  }
+}
+
+
+/**
+ * Implements hook_feeds_after_parse().
+ */
+function instagram_feeds_feeds_after_parse(FeedsSource $source, FeedsParserResult $result) {
+  if ('InstagramFeedsPluginsPager' == $source->importer->config['fetcher']['plugin_key']) {
+    $mappings = _instagram_feeds_plugins_get_fields_mappings($source);
+    $images_count = $source->state(FEEDS_FETCH)->item_count;
+    $max_images = $source->importer->fetcher->config['number_of_images'];
+    $url = $source->config['InstagramFeedsPluginsPager']['source'];
+    if (!isset($images_count[$url])) {
+      $images_count[$url] = 0;
+    }
+    $conditions = instagram_feeds_get_all_conditions($url);
+
+    $items_count = $new_items_count = count($result->items);
+    if (isset($mappings['user']) && isset($mappings['tag']) && isset($mappings['thumb_url'])) {
+      if (!$conditions || ($max_images && $max_images <= $images_count[$url])) {
+        $result->items = array();
+      }
+      else {
+        // There are usernames filters in Instagram Feed settings.
+        $users = $user_tids = array();
+        $useful_tags = instagram_feeds_get_all_needed_tags();
+        if (!empty($conditions->user_names)) {
+          $users = explode(',', $conditions->user_names);
+          $user_tids = explode(',', $conditions->user_tids);
+        }
+        foreach ($result->items as $key => $item) {
+          // If username is not in conditions, delete this item from import.
+          if (count($users) && !in_array($item[$mappings['user']['source']], $users)) {
+            unset($result->items[$key]);
+          }
+          elseif (count($users)) {
+            // If username in conditions but user is in the black list.
+            $user_key = array_search($item[$mappings['user']['source']], $users);
+            $isblackuser = taxonomy_term_load($user_tids[$user_key]);
+            if ('black' == $isblackuser->field_instf_blacklist_type[LANGUAGE_NONE][0]['value']) {
+              unset($result->items[$key]);
+            }
+          }
+          if (!instagram_feeds_check_url($item[$mappings['thumb_url']['source']])) {
+            unset($result->items[$key]);
+          }
+          $tags = $item[$mappings['tag']['source']];
+          $result->items[$key][$mappings['tag']['source']] = array_values(array_intersect($tags, $useful_tags));
+        }
+        // Reset array keys if some items where deleted (filtered).
+        $new_items_count = count($result->items);
+        if ($new_items_count != $items_count) {
+          $result->items = array_values($result->items);
+        }
+
+        // If number of items more than max allowed.
+        if ($max_images && $max_images < $images_count[$url] + $new_items_count) {
+          $result->items = array_slice($result->items, 0, $max_images - $images_count[$url]);
+        }
+      }
+    }
+    if (drupal_is_cli()) {
+      echo 'Instagram Feeds: Images import is in progress...', "\n";
+    }
+  }
+}
+
+
+/**
+ * Return an array of tids for needed hash tags.
+ */
+function instagram_feeds_get_all_needed_tags() {
+  $result = &drupal_static(__FUNCTION__);
+  if (!isset($result)) {
+    $result = array();
+    $conditions = instagram_feeds_get_all_conditions();
+    if (count($conditions)) {
+      foreach ($conditions as $feed) {
+        if (!empty($feed->tid)) {
+          $result[$feed->tid] = strtolower($feed->name);
+        }
+      }
+    }
+  }
+  return $result;
+}
+
+
+/**
+ * Return an associative array of url with keyword that need for filtering.
+ *
+ * @param string $url
+ *   Instagram URL.
+ *
+ * @return mixed
+ *   associative array in source urls in keys and objects with filter params in
+ *   values if $url not set,
+ *   boolean FALSE if $url is set and not found object with found $url and
+ *   params if $url is set and found in array of objects.
+ */
+function instagram_feeds_get_all_conditions($url = '', $only_active = TRUE) {
+  $feeds_list = &drupal_static(__FUNCTION__);
+  if (!isset($feeds_list)) {
+    $client_id = variable_get('instagram_feeds_client_id', '');
+    $access_token = variable_get('instagram_feeds_access_token', '');
+    if (empty($client_id) || empty($access_token)) {
+      drupal_set_message(t('Please setup @url settings from Instagram API.',
+          array('@url' => l(t('Instagram Feeds'), 'admin/config/services/instagram'))), 'error');
+    }
+
+    $subquery = db_select('field_data_field_instf_hash_tags', 'tags');
+    $subquery->addField('tags', 'field_instf_hash_tags_tid', 'tid');
+    $subquery->leftJoin('field_data_field_instf_user', 'iuser', 'iuser.entity_id = tags.entity_id');
+    $subquery->leftJoin('field_data_field_instf_marker', 'a', 'tags.entity_id = a.entity_id');
+    $subquery->isNull('iuser.field_instf_user_tid');
+    $subquery->condition('tags.bundle', INSTAGRAM_FEEDS_SETTINGS_NODE_TYPE);
+
+    // SELECT feeds by tags.
+    $q = db_select('taxonomy_term_data', 'tags');
+    $q->fields('tags', array('tid', 'name'));
+    $q->innerJoin('field_data_field_instf_hash_tags', 'htags', 'htags.field_instf_hash_tags_tid = tags.tid');
+    $q->leftJoin('field_data_field_instf_marker', 'archived',
+        'htags.bundle = archived.bundle AND htags.entity_id = archived.entity_id');
+    $q->leftJoin('field_data_field_instf_user', 'iuser', 'iuser.entity_id = htags.entity_id');
+    $q->leftJoin('taxonomy_term_data', 'users', 'users.tid = iuser.field_instf_user_tid');
+    $q->addExpression("GROUP_CONCAT(DISTINCT iuser.field_instf_user_tid ORDER BY iuser.field_instf_user_tid)",
+        'user_tids'
+    );
+    $q->addExpression("GROUP_CONCAT(DISTINCT users.name ORDER BY users.tid)", 'user_names');
+    $q->addExpression("CONCAT('" . INSTAGRAM_FEEDS_BASE_URL . "/tags/', tags.name, '/media/recent?client_id="
+        . $client_id . "')", 'source');
+    $q->condition('htags.bundle', INSTAGRAM_FEEDS_SETTINGS_NODE_TYPE);
+    if ($only_active) {
+      $subquery->condition('a.field_instf_marker_value', 0);
+      $q->condition('archived.field_instf_marker_value', 0);
+    }
+    $q->condition(db_or()->isNull('iuser.field_instf_user_tid')->condition('tags.tid', $subquery, 'NOT IN'));
+    $q->groupBy('htags.field_instf_hash_tags_tid');
+    $q->orderBy('tags.name');
+    $feeds_list = $q->execute()->fetchAllAssoc('source');
+
+    // SELECT feeds by usernames.
+    $q = db_select('taxonomy_term_data', 'tusers');
+    $q->addField('htags', 'field_instf_hash_tags_tid', 'tid');
+    $q->addExpression("CONCAT(NULL)", 'name');
+    $q->addField('tusers', 'tid', 'user_tids');
+    $q->addField('tusers', 'name', 'user_names');
+    $q->innerJoin('field_data_field_instf_user', 'iuser', 'tusers.tid = iuser.field_instf_user_tid');
+    $q->innerJoin('field_data_field_instf_uid', 'uid',
+        "uid.entity_type = 'taxonomy_term' AND tusers.tid = uid.entity_id");
+    if ($only_active) {
+      $q->leftJoin('field_data_field_instf_marker', 'archived', 'iuser.bundle = archived.bundle'
+          . ' AND iuser.entity_id = archived.entity_id AND archived.field_instf_marker_value = 0');
+    }
+    $q->leftJoin('field_data_field_instf_hash_tags', 'htags', 'iuser.entity_id = htags.entity_id');
+    $q->addExpression("CONCAT('" . INSTAGRAM_FEEDS_BASE_URL
+        . "/users/', CAST(uid.field_instf_uid_value AS CHAR(25)), '/media/recent?access_token="
+        . $access_token . "')", 'source');
+    $q->condition('iuser.bundle', INSTAGRAM_FEEDS_SETTINGS_NODE_TYPE);
+    $q->isNull('htags.field_instf_hash_tags_tid');
+    $q->groupBy('iuser.field_instf_user_tid');
+    $q->orderBy('tusers.name');
+    $feeds_users_list = $q->execute()->fetchAllAssoc('source');
+
+    // Remove the intersecting users from hashtags type urls.
+    foreach ($feeds_list as $source => $tag_feed) {
+      if (!empty($tag_feed->user_names)) {
+        $user_tids = explode(',', $tag_feed->user_tids);
+        $user_names = explode(',', $tag_feed->user_names);
+        foreach ($feeds_users_list as $user_feed) {
+          $user_key = array_search($user_feed->user_names, $user_names);
+          if ($user_key !== FALSE) {
+            unset($user_tids[$user_key], $user_names[$user_key]);
+          }
+        }
+        if (count($user_tids)) {
+          $feeds_list[$source]->user_tids = implode(',', $user_tids);
+          $feeds_list[$source]->user_names = implode(',', $user_names);
+        }
+        else {
+          unset($feeds_list[$source]);
+        }
+      }
+    }
+    $feeds_list += $feeds_users_list;
+  }
+
+  if (!empty($url)) {
+    if (isset($feeds_list[$url])) {
+      return $feeds_list[$url];
+    }
+    else {
+      return FALSE;
+    }
+  }
+  return $feeds_list;
+}
+
+
+/**
+ * Returns existing feeds urls objects.
+ *
+ * @return array
+ *   An associative array of existing feeds.
+ */
+function instagram_feeds_get_existing_feeds() {
+  return db_select('feeds_source', 'f')
+      ->fields('f')
+      ->condition('f.id', INSTAGRAM_FEEDS_FEED_ID)
+      ->execute()->fetchAllAssoc('source');
+}
+
+
+/**
+ * Implements hook_cron().
+ */
+function instagram_feeds_cron() {
+  $job = instagram_feeds_get_tasks();
+  $queue = DrupalQueue::get('instagram_feeds_queue');
+  foreach ($job as $task) {
+    $queue->createItem($task);
+  }
+}
+
+
+/**
+ * Creates tasks for instagram_feeds_cron() and for batch operations.
+ *
+ * @param string $delta
+ *   Node nid for creating (if not exist) tasks for this settings. If not set
+ *   all tasks will be created.
+ *
+ * @return array
+ *   An array with jobs.
+ */
+function instagram_feeds_get_tasks($delta = NULL) {
+  $job = array();
+  $nids_to_delete = array();
+  $images_to_delete = array();
+  $existing = instagram_feeds_get_existing_feeds();
+  $existing_urls = array_keys($existing);
+  $must_have = instagram_feeds_get_all_conditions();
+  $missed_imgs = variable_get('instagram_feeds_missed_imgs', array());
+
+  if (is_null($delta)) {
+    $must_have_urls = array_keys($must_have);
+    $urls_to_delete = array_diff($existing_urls, $must_have_urls);
+  }
+  else {
+    $must_have_urls = instagram_feeds_urls_from_feed($delta);
+    $urls_to_delete = array();
+  }
+  $urls_to_create = array_diff($must_have_urls, $existing_urls);
+  if (count($urls_to_delete)) {
+    foreach ($urls_to_delete as $url_to_delete) {
+      $nids_to_delete[] = $existing[$url_to_delete]->feed_nid;
+    }
+  }
+  if (is_null($delta)) {
+    $expiration_time = variable_get('instagram_feeds_items_expiration_time', 2592000);
+    $limit_imgs_per_feed = variable_get('instagram_feeds_limit_imgs_per_feed', 0);
+    if ($expiration_time || $limit_imgs_per_feed) {
+      $feeds_nids = array();
+      if (count($existing)) {
+        foreach ($existing as $feed) {
+          $feeds_nids[] = $feed->feed_nid;
+        }
+      }
+      $images_to_delete = _instagram_feeds_get_images_to_delete($expiration_time, $feeds_nids);
+      // Delete unnecessary images.
+      if (count($images_to_delete)) {
+        $items_to_delete_array = array_chunk($images_to_delete, 50);
+        foreach ($items_to_delete_array as $items_to_delete_chunk) {
+          $job[] = array(
+            'type' => 'delete_items',
+            'data' => $items_to_delete_chunk,
+          );
+        }
+      }
+    }
+    $remove_unused_terms = variable_get('instagram_feeds_remove_unused_terms',
+        min(array(1, max($expiration_time, $limit_imgs_per_feed))));
+    if (($expiration_time || $limit_imgs_per_feed) && $remove_unused_terms) {
+      $terms_to_delete = _instagram_feeds_get_taxonomy_terms_to_delete();
+      // Delete unnecessary terms.
+      if (count($terms_to_delete)) {
+        $items_to_delete_array = array_chunk($terms_to_delete, 50);
+        foreach ($items_to_delete_array as $items_to_delete_chunk) {
+          $job[] = array(
+            'type' => 'delete_taxonomy_terms',
+            'data' => $items_to_delete_chunk,
+          );
+        }
+      }
+    }
+  }
+  // Try to import missed images again.
+  if (count($missed_imgs) && is_null($delta)) {
+    foreach ($missed_imgs as $id => $feed) {
+      $job[] = array(
+        'type' => 'import_attempt_images',
+        'data' => array(
+          'items' => array_values($feed['items']),
+          'id' => $id,
+        ),
+      );
+    }
+  }
+  // Try to import missed images for current Instagram Feeds settings
+  // (with batch operations).
+  elseif (!is_null($delta) && isset($missed_imgs[INSTAGRAM_FEEDS_FEED_ID . '__' . $delta]['items'])) {
+    $job[] = array(
+      'type' => 'import_attempt_images',
+      'data' => array(
+        'items' => array_values($missed_imgs[INSTAGRAM_FEEDS_FEED_ID . '__' . $delta]['items']),
+        'id' => INSTAGRAM_FEEDS_FEED_ID . '__' . $delta,
+      ),
+    );
+  }
+  // Delete unnecessary Feeds URLs.
+  if (count($nids_to_delete)) {
+    $job[] = array(
+      'type' => 'delete_feeds_urls',
+      'data' => $nids_to_delete,
+    );
+  }
+  // Create the necessary URLs for importing images from Instagram.
+  if (count($urls_to_create)) {
+    foreach ($urls_to_create as $url_to_create) {
+      $job[] = array(
+        'type' => 'create_node',
+        'data' => $must_have[$url_to_create],
+      );
+    }
+  }
+  // Manage Instagram blocks: delete unnecessary, create new Instagram blocks
+  // if needed.
+  $job[] = array(
+    'type' => 'check_block_deltas',
+    'data' => $delta,
+  );
+  return $job;
+}
+
+
+/**
+ * Deletes old (not needed) Feeds URLs or create new needed Feeds URL (by cron).
+ *
+ * @param array $job
+ *   contains '#operation' and '#data' values;
+ */
+function instagram_feeds_queue($job, &$context = array()) {
+  switch ($job['type']) {
+    case 'delete_feeds_urls':
+      $context['message'] = t('Removing unnecessary URLs');
+      $data = $job['data'];
+      node_delete_multiple($data);
+      foreach ($data as $nid) {
+        // Remove from schedule.
+        $job = array(
+          'type' => INSTAGRAM_FEEDS_FEED_ID,
+          'id' => $nid,
+        );
+        JobScheduler::get('feeds_source_import')->remove($job);
+      }
+      db_delete('feeds_source')
+          ->condition('id', INSTAGRAM_FEEDS_FEED_ID)
+          ->condition('feed_nid', $data, 'IN')
+          ->execute();
+      break;
+
+    case 'delete_items':
+      $context['message'] = t('Removing old Instagram Items');
+      node_delete_multiple($job['data']);
+      break;
+
+    case 'delete_taxonomy_terms':
+      $context['message'] = t('Remove unused users that are not in blacklist, and unused hash tags.');
+      foreach ($job['data'] as $tid) {
+        taxonomy_term_delete($tid);
+      }
+      break;
+
+    case 'create_node':
+      $data = $job['data'];
+      if ($data->name) {
+        $t_tokens = array('@type' => t('Hash Tag'), '@name' => $data->name);
+      }
+      else {
+        $t_tokens = array('@type' => t('Instagram User'), '@name' => $data->user_names);
+      }
+      $existing = instagram_feeds_get_existing_feeds();
+      if (!isset($existing[$data->source])) {
+        $node = (object) array(
+          'title' => 'Instagram URL / ' . ($data->name ? 'Tags / ' . $data->name : 'Users / ' . $data->user_names),
+          'type' => INSTAGRAM_FEEDS_FEEDS_NODE_TYPE,
+          'language' => LANGUAGE_NONE,
+        );
+        $context['message'] = t('Create URL for @type "@name"', $t_tokens);
+        node_object_prepare($node);
+        $node->uid = 1;
+        $node->feeds['InstagramFeedsPluginsPager']['source'] = $data->source;
+        node_save($node);
+      }
+      else {
+        $context['message'] = t('URL for @type "@name" already created.', $t_tokens);
+      }
+      break;
+
+    case 'import_attempt_images':
+      if (variable_get('instagram_feeds_download_attempts', 0)) {
+        $context['message'] = t('Attempt importing of missed images.');
+        list($id, $feed_nid) = explode('__', $job['data']['id']);
+        $source = feeds_source($id, $feed_nid);
+        if (!lock_acquire("feeds_source_{$source->id}_{$source->feed_nid}", 60.0)) {
+          throw new FeedsLockException(t('Cannot acquire lock for source @id / @feed_nid.', array(
+            '@id' => $source->id,
+            '@feed_nid' => $source->feed_nid,
+          )));
+        }
+
+        try {
+          $parser_result = new FeedsParserResult($job['data']['items']);
+          $parser_result->link = $source->config['InstagramFeedsPluginsPager']['source'];
+          // Process.
+          $source->importer->processor->process($source, $parser_result);
+        }
+        catch (Exception $e) {
+          // Do nothing.
+        }
+        lock_release("feeds_source_{$source->id}_{$source->feed_nid}");
+        unset($source);
+
+        if (isset($e)) {
+          throw $e;
+        }
+      }
+      else {
+        $context['message'] = t('Cleaning an array of missed images..');
+      }
+      break;
+
+    case 'check_block_deltas':
+      $context['message'] = t('Check whether there are the necessary blocks.');
+      instagram_feeds_create_blocks($job['data']);
+      break;
+
+    default:
+      if (function_exists($job['type'])) {
+        call_user_func_array($job['type'], array($job['data'], $context));
+      }
+      else {
+        $args = array('%function' => $job['type']);
+        $context['message'] = t('Can not perform the job %function.', $args);
+        watchdog('instagram_feeds', 'Can not find a function %function to run job.', $args, WATCHDOG_NOTICE);
+      }
+      break;
+  }
+  if (drupal_is_cli() && isset($context['message']) && !empty($context['message'])) {
+    echo 'Instagram Feeds: ', $context['message'], "\n";
+  }
+}
+
+
+/**
+ * Implements hook_cron_job_scheduler_info().
+ *
+ * Compare queue names with key names in instagram_feeds_cron_queue_info().
+ */
+function instagram_feeds_cron_job_scheduler_info() {
+  $info = array();
+  $info['instagram_feeds_queue'] = array(
+    'queue name' => 'instagram_feeds_queue',
+  );
+  return $info;
+}
+
+
+/**
+ * Implements hook_cron_queue_info().
+ */
+function instagram_feeds_cron_queue_info() {
+  $queues = array();
+  $queues['instagram_feeds_queue'] = array(
+    'worker callback' => 'instagram_feeds_queue',
+    'time' => 240,
+  );
+  return $queues;
+}
+
+
+/**
+ * Implements hook_cron_queue_info_alter().
+ *
+ * Run instagram_feeds_queue before feeds queues run.
+ */
+function instagram_feeds_cron_queue_info_alter(&$queues) {
+  $queue = array('instagram_feeds_queue' => $queues['instagram_feeds_queue']);
+  unset($queues['instagram_feeds_queue']);
+  $queues = array_merge($queue, $queues);
+  $queues['feeds_source_import']['time'] = 300;
+}
+
+
+/**
+ * Implements hook_block_info().
+ */
+function instagram_feeds_block_info() {
+  $blocks = array();
+  $deltas = variable_get('instagram_feeds_block_ids', array());
+  foreach ($deltas as $delta) {
+    $config = instagram_feeds_block_get_config($delta);
+    if (NODE_PUBLISHED == $config['status']) {
+      $blocks[$delta] = array(
+        'info' => $config['admin_title'],
+        'cache' => DRUPAL_NO_CACHE,
+      );
+    }
+  }
+  return $blocks;
+}
+
+
+/**
+ * Implements hook_block_view().
+ */
+function instagram_feeds_block_view($delta = '') {
+  $block = array();
+  $config = instagram_feeds_block_get_config($delta);
+  $path = drupal_get_path('module', 'instagram_feeds');
+  $colorbox_path = drupal_get_path('module', 'colorbox');
+  if (NODE_PUBLISHED == $config['status']) {
+    $border_color = $config['border']['color'];
+    $block['content']['#markup'] = instagram_feeds_views_get_view_result($config);
+    $inline_css = '.instagram-feeds-content-' . $config['delta'] . ' .inst-image {border-width: ';
+    $inline_css .= $config['border']['width'] . 'px; border-color: ' . $border_color . ';}';
+    $inline_css .= '.instagram-feeds-content-' . $config['delta'] . ' {background: ' . $border_color . ';}';
+    $inline_css .= '.image-hover-' . $config['delta'] . ', .image-hover-' . $config['delta'];
+    $inline_css .= ' * {font-size: ' . $config['font']['size'] . 'px; ';
+    $inline_css .= 'font-family: ' . $config['font']['family'] . ' !important; ';
+    $inline_css .= 'color: ' . $config['font']['color'] . '; ';
+    $inline_css .= '}';
+    $block['content']['#attached'] = array(
+      'css' => array(
+        $colorbox_path . '/styles/default/colorbox_style.css',
+        $path . '/css/instagram_feeds.css',
+        array('data' => $inline_css, 'type' => 'inline'),
+      ),
+      'js' => array(
+        $path . '/js/instagram_feeds.js',
+        array(
+          'data' => 'Drupal.behaviors.initColorboxDefaultStyle = function() {}',
+          'type' => 'inline',
+        ),
+      ),
+    );
+
+    // Add contextual links for this block.
+    $block['content']['#contextual_links']['node'] = array('node', array($delta));
+  }
+  return $block;
+}
+
+
+/**
+ * Returns the configuration for the requested block delta.
+ *
+ * @param string $delta
+ *   string The delta that uniquely identifies the block in the block system. If
+ *   not specified, the default configuration will be returned.
+ *
+ * @return array
+ *   An associative array of configuration options.
+ */
+function instagram_feeds_block_get_config($delta = NULL) {
+  $config = array(
+    'delta' => $delta,
+    'admin_title' => '',
+    'status' => 0,
+    'columns' => 1,
+  );
+  if ($delta) {
+    $configs = &drupal_static(__FUNCTION__);
+    if (isset($configs[$delta])) {
+      $config = $configs[$delta];
+    }
+    else {
+      // Get the block configuration options.
+      $node = node_load($config['delta']);
+      if ($node) {
+        $config['admin_title'] = $node->title;
+        $config['status'] = $node->status;
+        $config['favorites'] = $node->field_instf_favorites[LANGUAGE_NONE][0]['value'];
+        if (isset($node->field_instf_hash_tags[LANGUAGE_NONE])
+            && count($node->field_instf_hash_tags[LANGUAGE_NONE])) {
+          foreach ($node->field_instf_hash_tags[LANGUAGE_NONE] as $term) {
+            $config['tags'][] = $term['tid'];
+          }
+        }
+        else {
+          $config['tags'] = array('all');
+        }
+        if (isset($node->field_instf_user[LANGUAGE_NONE]) && count($node->field_instf_user[LANGUAGE_NONE])) {
+          foreach ($node->field_instf_user[LANGUAGE_NONE] as $term) {
+            $config['users'][] = $term['tid'];
+          }
+        }
+        else {
+          $config['users'] = array();
+        }
+        $config['rows'] = $node->field_instf_rows[LANGUAGE_NONE][0]['value'];
+        $config['columns'] = $node->field_instf_columns[LANGUAGE_NONE][0]['value'];
+        $config['thumb_size'] = $node->field_instf_thumb_size[LANGUAGE_NONE][0]['value'];
+        $config['border']['width'] = $node->field_instf_border_width[LANGUAGE_NONE][0]['value'];
+        $config['border']['color'] = '#' == $node->field_instf_color[LANGUAGE_NONE][0]['rgb'] ? 'rgba(0,0,0,0)' :
+            $node->field_instf_color[LANGUAGE_NONE][0]['rgb'];
+        $config['font']['size'] = $node->field_instf_font_size[LANGUAGE_NONE][0]['value'];
+        $config['font']['color'] = $node->field_instf_font_color[LANGUAGE_NONE][0]['rgb'];
+        switch ($node->field_instf_font_family[LANGUAGE_NONE][0]['value']) {
+          case 'georgia':
+            $font_family = 'Georgia, serif';
+            break;
+
+          case 'tahoma':
+            $font_family = 'Tahoma, Geneva, sans-serif';
+            break;
+
+          case 'serif':
+            $font_family = '"Times New Roman", Times, serif';
+            break;
+
+          case 'sans-serif':
+            $font_family = 'Arial, Helvetica, sans-serif';
+            break;
+
+          default:
+            $font_family = 'inherit';
+            break;
+        }
+        $config['font']['family'] = $font_family;
+        $config['popup_info'] = array();
+        if ($node->field_instf_display_on_popup) {
+          foreach ($node->field_instf_display_on_popup[LANGUAGE_NONE] as $element) {
+            $config['popup_info'][] = '[' . $element['value'] . ']';
+          }
+        }
+      }
+      $configs[$delta] = $config;
+    }
+  }
+  return $config;
+}
+
+
+/**
+ * Custom altering and rendering the views view 'instagram_feeds_content'.
+ *
+ * @param array $config
+ *   An associative array of options for Instagram Feed.
+ *
+ * @return string
+ *   A rendered (markup) view result.
+ */
+function instagram_feeds_views_get_view_result($config) {
+  $args = array(
+    implode(',', $config['tags']),
+    implode(',', $config['users']),
+  );
+  $view = views_get_view('instagram_feeds_content');
+  if (is_object($view)) {
+    $view->init_display();
+    $view->display_handler->options['pager']['options']['items_per_page'] = $config['rows'] * $config['columns'];
+    $view->display_handler->options['fields']['colorbox']['custom_gid'] = 'gallery_' . $config['delta'];
+    $popup_likes_area = '';
+    $pupup_footer_area = '[ops]';
+    $view->display_handler->options['fields']['colorbox']['caption'] = '';
+    if (count($config['popup_info'])) {
+      if (in_array('[body]', $config['popup_info'])) {
+        $view->display_handler->options['fields']['colorbox']['caption'] = '<span class="image-hover-'
+            . $config['delta'] . '">[body]</span>';
+      }
+      if (in_array('[field_instf_like_count]', $config['popup_info'])) {
+        $popup_likes_area .= '<div class="likes">[field_instf_like_count]</div>';
+      }
+      if (in_array('[field_instf_comments_count]', $config['popup_info'])) {
+        $popup_likes_area .= '<div class="comments">[field_instf_comments_count]</div>';
+      }
+      if (in_array('[field_instf_user]', $config['popup_info'])) {
+        $pupup_footer_area = '<span class="image-hover-' . $config['delta'] . '">[field_instf_user]</span>[ops]';
+      }
+    }
+    // Add likes and comments counters.
+    if (!empty($popup_likes_area)) {
+      $view->display_handler->options['fields']['colorbox']['popup'] .= '<div class="instagram-counts">'
+          . $popup_likes_area . '</div>';
+    }
+    // Add footer of popup (username and flag).
+    $view->display_handler->options['fields']['colorbox']['popup'] .= '<div class="instagram-footer">'
+        . $pupup_footer_area . '</div>';
+    // Wrap content of popup.
+    $view->display_handler->options['fields']['colorbox']['popup'] = '<div class="instagram-popup">'
+        . $view->display_handler->options['fields']['colorbox']['popup'] . '</div>';
+    $view->display_handler->options['style_options']['row_class'] .= ' instagram-' . $config['thumb_size'];
+    $view->display_handler->options['css_class'] .= ' instagram-feeds-content-' . $config['delta'];
+    $view->instagram_config = $config;
+    return $view->preview('default', $args);
+  }
+  else {
+    return '';
+  }
+}
+
+
+/**
+ * Implements hook_proprocess_views_view_unformatted().
+ */
+function instagram_feeds_preprocess_views_view_unformatted(&$vars) {
+  if ('instagram_feeds_content' == $vars['view']->name && 'default' == $vars['view']->current_display) {
+    $view = $vars['view'];
+    $config = $view->instagram_config;
+    foreach ($view->result as $id => $row) {
+      if ($id % $config['columns'] === 0) {
+        $vars['classes'][$id][] = 'new-row';
+      }
+      $vars['classes_array'][$id] = isset($vars['classes'][$id]) ? implode(' ', $vars['classes'][$id]) : '';
+    }
+  }
+}
+
+
+/**
+ * Implements hook_preprocess_views_view_field().
+ */
+function instagram_feeds_preprocess_views_view_field(&$vars) {
+  global $user;
+  global $base_path;
+
+  if ('instagram_feeds_content' == $vars['view']->name && 'default' == $vars['view']->current_display) {
+    switch ($vars['field']->field) {
+      case 'ops':
+        if (!$user->uid && module_exists('flag_anonymous')) {
+          $flag = flag_get_flag('flag_as_inappropriate');
+          $vars['field']->last_render = $flag->theme($flag->is_flagged($vars['row']->nid) ? 'unflag' :
+              'flag', $vars['row']->nid);
+        }
+        break;
+
+      case 'field_instf_image_url':
+        $vars['field']->last_render = '<span class="instf-standard-img" style="background: url('
+            . $vars['field']->original_value . ');">&nbsp;</span>';
+        break;
+
+      case 'field_instf_thumb_url':
+        $img_removed_src = $base_path . drupal_get_path('module', 'instagram_feeds')
+          . '/images/image_removed.svg';
+        $vars['field']->last_render = '<img src="' . $vars['field']->original_value . '" alt="" onerror="this.src=\''
+            . $img_removed_src . '\'" data-empty="' . $img_removed_src . '" />';
+        break;
+    }
+  }
+}
+
+
+/**
+ * Implements hook_views_query_alter().
+ */
+function instagram_feeds_views_query_alter(&$view, &$query) {
+  if ('instagram_feeds_content' == $view->name && 'default' == $view->current_display) {
+    switch ($view->instagram_config['favorites']) {
+      // Sorting by Favorites (favorites first).
+      case 1:
+        foreach ($view->query->orderby as $key => $sorting_field) {
+          if ('node_sticky' == $sorting_field['field']) {
+            unset($view->query->orderby[$key]);
+            $view->query->orderby = array_merge(array($sorting_field), $view->query->orderby);
+          }
+        }
+        break;
+
+      // Show Only Favorites images.
+      case 2:
+        $view->query->where[1]['conditions'][] = array(
+          'field' => 'node.sticky',
+          'value' => 0,
+          'operator' => '<>',
+        );
+        break;
+    }
+  }
+}
+
+
+/**
+ * Implements hook_api_tokens_info().
+ */
+function instagram_feeds_api_tokens_info() {
+  $tokens = array();
+
+  $tokens['instagram'] = array(
+    'title' => t('Instagram'),
+    'description' => t('Renders Instagram block.'),
+  );
+
+  return $tokens;
+}
+
+
+/**
+ * Defines Instagram API token handler.
+ */
+function instagram_feeds_apitoken_instagram($nid, $pos = 'none') {
+  $block = block_load('instagram_feeds', $nid);
+  if (!isset($block->title)) {
+    $block->title = '<none>';
+  }
+  $block = _block_get_renderable_array(_block_render_blocks(array($block)));
+  $id = 'instagram_feeds_' . $nid;
+  $block[$id]['#theme_wrappers'] = array('instagram_feeds');
+  $block[$id]['#pos'] = $pos;
+  return drupal_render($block);
+}
+
+
+/**
+ * Implements hook_theme().
+ */
+function instagram_feeds_theme() {
+  $theme = array();
+
+  $theme['instagram_feeds'] = array(
+    'render element' => 'element',
+  );
+
+  return $theme;
+}
+
+
+/**
+ * Returns HTML for an Instagram block.
+ */
+function theme_instagram_feeds($vars) {
+  $output = '';
+  if (isset($vars['element']['#markup'])) {
+    $output .= '<div class="block-instagram-feeds pos-' . $vars['element']['#pos']
+        . '">' . $vars['element']['#markup'] . '</div>';
+  }
+  return $output;
+}
+
+
+/**
+ * Implements hook_wysiwyg_editor_settings_alter().
+ */
+function instagram_feeds_wysiwyg_editor_settings_alter(&$settings, $context) {
+  if ('ckeditor' == $context['profile']->editor) {
+    $settings['entities'] = FALSE;
+  }
+}
+
+
+/**
+ * Implements hook_wysiwyg_plugin().
+ */
+function instagram_feeds_wysiwyg_plugin($editor, $version) {
+  static $set;
+  if (user_access(INSTAGRAM_FEEDS_WYSIWYG_PERMISSION)) {
+    $path = drupal_get_path('module', 'instagram_feeds') . '/plugins/ckeditor';
+    if (!$set) {
+      $query = db_select('node', 'N');
+      $query->leftJoin('field_data_field_instf_rows', 'R', 'N.nid = R.entity_id');
+      $query->leftJoin('field_data_field_instf_columns', 'C', 'N.nid = C.entity_id');
+      $query->leftJoin('field_data_field_instf_thumb_size', 'S', 'N.nid = S.entity_id');
+      $query->leftJoin('field_data_field_instf_border_width', 'B', 'N.nid = B.entity_id');
+      $query->leftJoin('field_data_field_instf_favorites', 'F', 'N.nid = F.entity_id');
+      $query->addField('R', 'field_instf_rows_value', 'rows');
+      $query->addField('C', 'field_instf_columns_value', 'cols');
+      $query->addField('S', 'field_instf_thumb_size_value', 'size');
+      $query->addField('B', 'field_instf_border_width_value', 'border');
+      $query->addField('F', 'field_instf_favorites_value', 'type');
+      $data = $query->fields('N', array('nid', 'title'))
+        ->condition('N.status', 1)
+        ->condition('N.type', INSTAGRAM_FEEDS_SETTINGS_NODE_TYPE)
+        ->orderBy('title')
+        ->execute()
+        ->fetchAllAssoc('nid');
+      $langs = array(
+        'title' => t('Select an Instagram Feed'),
+        'feed' => t('Name of Feed'),
+        'type' => t('Type of Feed:'),
+        'layout' => t('Feed Layout:'),
+        'size' => t('Thumbnail Size:'),
+        'col' => t('1 column'),
+        'cols' => t('@count columns'),
+        'row' => t('1 row'),
+        'rows' => t('@count rows'),
+        'create' => t('Create a new feed'),
+        'pos' => t('Position'),
+        'none' => t('None'),
+        'left' => t('Left'),
+        'center' => t('Center'),
+        'right' => t('Right'),
+        'type0' => t('All Images'),
+        'type1' => t('Favorites First'),
+        'type2' => t('Favorites Only'),
+        'fake' => t('Instagram Feed'),
+        'broken' => t('Instagram Feed (broken)'),
+      );
+      drupal_add_js(array('Instagram' => array('data' => $data, 'langs' => $langs)), 'setting');
+      drupal_add_css($path . '/plugin.css');
+      $set = TRUE;
+    }
+    switch ($editor) {
+      case 'ckeditor':
+        return array(
+          'instagram' => array(
+            'path' => $path,
+            'buttons' => array(
+              'instagram_button' => t('Instagram'),
+            ),
+            'load' => TRUE,
+          ),
+        );
+    }
+  }
+}
+
+
+/**
+ * Implements hook_flag().
+ *
+ * Publish or unpublish node if user flags / unflags image as inappropriate.
+ */
+function instagram_feeds_flag($op, $flag, $content_id, $account, $fcid) {
+  if ('flag_as_inappropriate' == $flag->name && 'flag' == $op) {
+    $archived = flag_load('image_archived');
+    if ($archived && $archived->is_flagged($content_id)) {
+      $archived->flag('unflag', $content_id, $account, TRUE);
+    }
+  }
+}
+
+
+/**
+ * Menu access callback.
+ *
+ * @param string $action
+ *   The action to be performed. Possible values are:
+ *   - import
+ * @param mixed $param
+ *   Node object or FeedsImporter id.
+ *
+ * @return bool
+ *   TRUE If user have access to import Instagram images, FALSE otherwise.
+ */
+function instagram_feeds_access($action, $param) {
+  if (!in_array($action, array('import'))) {
+    // If $action is not one of the supported actions, we return access denied.
+    return FALSE;
+  }
+
+  $importer_id = NULL;
+
+  if (is_string($param)) {
+    $importer_id = $param;
+  }
+  elseif ($param->type && INSTAGRAM_FEEDS_SETTINGS_NODE_TYPE == $param->type) {
+    $importer_id = $param->nid;
+  }
+
+  // Check for permissions if feed id is present, otherwise return FALSE.
+  if ($importer_id) {
+    if (user_access('administer feeds')) {
+      return TRUE;
+    }
+  }
+  return FALSE;
+}
+
+
+/**
+ * Creates blocks from Instagram Feeds.
+ *
+ * @param string $delta
+ *   node nid for creating (if not exist) block for this settings. If not set
+ *   all blocks will be created.
+ */
+function instagram_feeds_create_blocks($delta = NULL) {
+  $existing_deltas = variable_get('instagram_feeds_block_ids', array());
+  $must_have_deltas = db_select('node', 'n')->fields('n', array('nid'))->condition('n.status', 1)
+          ->condition('n.type', INSTAGRAM_FEEDS_SETTINGS_NODE_TYPE)->orderBy('n.nid')->execute()->fetchCol();
+  $deltas_to_delete = array_diff($existing_deltas, $must_have_deltas);
+  if (count($deltas_to_delete)) {
+    db_delete('block')
+        ->condition('module', 'instagram_feeds')
+        ->condition('delta', $deltas_to_delete, 'IN')
+        ->execute();
+    db_delete('block_role')
+        ->condition('module', 'instagram_feeds')
+        ->condition('delta', $deltas_to_delete, 'IN')
+        ->execute();
+    cache_clear_all();
+    $existing_deltas = array_diff($existing_deltas, $deltas_to_delete);
+  }
+  if (is_null($delta)) {
+    $new_deltas = array_diff($must_have_deltas, $existing_deltas);
+    if (count($new_deltas) || count($deltas_to_delete)) {
+      variable_set('instagram_feeds_block_ids', $must_have_deltas);
+      cache_clear_all();
+    }
+  }
+  elseif (!in_array($delta, $existing_deltas)) {
+    $existing_deltas[] = $delta;
+    sort($existing_deltas);
+    variable_set('instagram_feeds_block_ids', $existing_deltas);
+    cache_clear_all();
+  }
+  elseif (count($deltas_to_delete)) {
+    variable_set('instagram_feeds_block_ids', $existing_deltas);
+    cache_clear_all();
+  }
+}
+
+
+/**
+ * Creates an array of feeds urls from Instagram Feed.
+ *
+ * @param string $nid
+ *   Node nid.
+ */
+function instagram_feeds_urls_from_feed($nid) {
+  $urls = &drupal_static(__FUNCTION__);
+  if (!isset($urls)) {
+    $urls = array();
+  }
+  if (!isset($urls[$nid])) {
+    $config = instagram_feeds_block_get_config($nid);
+    $must_have = instagram_feeds_get_all_conditions();
+    if (count($config['tags'])) {
+      $client_id = variable_get('instagram_feeds_client_id', '');
+      $terms = taxonomy_term_load_multiple($config['tags']);
+      foreach ($terms as $term) {
+        $url = INSTAGRAM_FEEDS_BASE_URL . '/tags/' . $term->name . '/media/recent?client_id=' . $client_id;
+        if (isset($must_have[$url])) {
+          $urls[$nid][] = $url;
+        }
+      }
+    }
+    if (count($config['users'])) {
+      $access_token = variable_get('instagram_feeds_access_token', '');
+      $terms = taxonomy_term_load_multiple($config['users']);
+      foreach ($terms as $term) {
+        $url = INSTAGRAM_FEEDS_BASE_URL . '/users/' . $term->field_instf_uid[LANGUAGE_NONE][0]['value']
+              . '/media/recent?access_token=' . $access_token;
+        if (isset($must_have[$url])) {
+          $urls[$nid][] = $url;
+        }
+      }
+    }
+  }
+  return $urls[$nid];
+}
+
+
+/**
+ * Batch API worker callback.
+ *
+ * @param array $urls
+ *   An array of URLs to import.
+ * @param array $context
+ *   Batch context.
+ */
+function instagram_feeds_batch_import(array $urls, &$context) {
+  $existing_feeds = instagram_feeds_get_existing_feeds();
+  foreach ($urls as $url) {
+    if (isset($existing_feeds[$url]->feed_nid)) {
+      $tmp = str_replace(INSTAGRAM_FEEDS_BASE_URL . '/', '', $url);
+      $url_parts = explode('/', $tmp);
+      $type = ('users' == $url_parts[0]) ? 'user' : 'tag';
+      $context['message'] = t('Importing data for %type %value.', array('%type' => $type, '%value' => $url_parts[1]));
+      try {
+        $context['finished'] = feeds_source(INSTAGRAM_FEEDS_FEED_ID, $existing_feeds[$url]->feed_nid)->import();
+      }
+      catch (Exception $e) {
+        drupal_set_message($e->getMessage(), 'error');
+      }
+    }
+  }
+}
+
+
+/**
+ * Implements hook_form_alter().
+ */
+function instagram_feeds_form_alter(&$form, &$form_state, $form_id) {
+  switch ($form_id) {
+    case 'system_cron_settings':
+      $options = array(900, 1800, 3600, 10800, 21600, 43200, 86400, 604800);
+      $form['cron']['cron_safe_threshold']['#options'] = array(
+        0 => t('Never'),
+      ) + drupal_map_assoc($options, 'format_interval');
+      break;
+
+    case 'instagram_feed_node_form':
+      $form['#validate'] = array_merge(array('instagram_feeds_form_instagram_feed_node_form_validate'),
+          $form['#validate']);
+      $form['additional_settings']['#weight'] = 200;
+      $form['actions']['#attributes']['class'][] = 'clearfix';
+      $form['actions']['delete']['#access'] = FALSE;
+      if (isset($form['actions']['preview_changes'])) {
+        $form['actions']['preview_changes']['#access'] = FALSE;
+      }
+      $form['actions']['submit']['#value'] = t('Apply');
+      if (empty($form['nid']['#value'])) {
+        $form['field_instf_marker'][LANGUAGE_NONE]['#access'] = FALSE;
+      }
+      $form['#attached']['css'][] = drupal_get_path('module', 'instagram_feeds') . '/css/instagram_feeds.css';
+      $form['field_instf_rows'][LANGUAGE_NONE]['#title_display'] = 'after';
+      $form['field_instf_rows']['#attributes']['class'][] = 'top-padding-0';
+      $form['field_instf_columns'][LANGUAGE_NONE]['#title_display'] = 'after';
+      $form['field_instf_columns']['#attributes']['class'][] = 'top-padding-0';
+      $form['field_instf_border_width'][LANGUAGE_NONE]['#title'] = 'px';
+      $form['field_instf_border_width'][LANGUAGE_NONE]['#title_display'] = 'after';
+      $form['field_instf_border_width']['#attributes']['class'][] = 'top-padding-0';
+      $form['field_instf_color']['#attributes']['class'][] = 'top-padding-0';
+      $form['field_instf_color']['#weight'] = 32;
+      $form['field_instf_color']['#states'] = array(
+        'invisible' => array(
+          ':input[name="field_instf_color_transparent"]' => array('checked' => TRUE),
+        ),
+      );
+      $form['field_instf_color'][LANGUAGE_NONE][0]['rgb']['#title_display'] = 'invisible';
+      $col = max(array_keys($form['field_instf_columns'][LANGUAGE_NONE]['#options']));
+      $row = max(array_keys($form['field_instf_rows'][LANGUAGE_NONE]['#options']));
+      $form['#fieldgroups']['group_feed_dimensions']->format_settings['instance_settings']['description'] = '('
+          . t('Max !n images', array('!n' => $col * $row)) . ')';
+      $form['field_instf_color_transparent'] = array(
+        '#type' => 'checkbox',
+        '#title' => t('Transparent'),
+        '#default_value' => ('#' == $form['field_instf_color'][LANGUAGE_NONE][0]['rgb']['#default_value']) ? 1 : 0,
+        '#weight' => 31,
+      );
+      if ('#' == $form['field_instf_color'][LANGUAGE_NONE][0]['rgb']['#default_value']) {
+        $form['field_instf_color'][LANGUAGE_NONE][0]['rgb']['#value'] = '#000000';
+      }
+      $form['#groups']['group_thumbnail_border']->children[] = 'field_instf_color_transparent';
+      $form['#group_children']['field_instf_color_transparent'] = 'group_thumbnail_border';
+      break;
+  }
+}
+
+
+/**
+ * Implements hook_field_group_pre_render().
+ */
+function instagram_feeds_field_group_pre_render_alter(&$element, $group, & $form) {
+  if (INSTAGRAM_FEEDS_SETTINGS_NODE_TYPE == $group->bundle && 'group_instagram_sources' == $group->group_name
+      && 'form' == $group->mode) {
+    $element['#title'] = $element['#title'] . ' <span title="This field is required." class="form-required">*</span>';
+  }
+}
+
+
+/**
+ * Helper function to get all images nids that must be deleted.
+ *
+ * Return images nids that must be deleted when instagram feeds cron
+ * will be run.
+ *
+ * @param string $expiration_time
+ *   unix time. Number of seconds (1 month by default)
+ * @param array $feeds_nids
+ *   an array of feeds_nids for wich needs to remove old images.
+ *
+ * @return array()
+ *   an array of term tids.
+ */
+function _instagram_feeds_get_images_to_delete($expiration_time = 2592000, $feeds_nids = array()) {
+  $result = array();
+  $limit_imgs_per_feed = variable_get('instagram_feeds_limit_imgs_per_feed', 0);
+  if (!is_array($feeds_nids)) {
+    $feeds_nids = array($feeds_nids);
+  }
+  if ($expiration_time) {
+    $result = db_select('node', 'n')
+        ->fields('n', array('nid'))
+        ->condition('n.type', INSTAGRAM_FEEDS_IMAGE_NODE_TYPE)
+        ->condition('created', time() - $expiration_time, '<=')
+        ->range(0, 500)
+        ->execute()
+        ->fetchCol();
+  }
+  if ($limit_imgs_per_feed && count($feeds_nids)) {
+    $source = feeds_source(INSTAGRAM_FEEDS_FEED_ID);
+    $config = $source->importer->getConfig();
+    if (isset($config['fetcher']['config']['number_of_images']) && $config['fetcher']['config']['number_of_images']) {
+      $select_limit = (integer) $config['fetcher']['config']['number_of_images'] * 2;
+    }
+    else {
+      $select_limit = 50;
+    }
+    foreach ($feeds_nids as $feed_nid) {
+      $query = db_select('feeds_item', 'fi');
+      $query->innerJoin('node', 'n', 'fi.entity_id = n.nid AND fi.entity_type = :type', array(':type' => 'node'));
+      $query->innerJoin('field_data_field_instf_created', 'd',
+          'fi.entity_id = d.entity_id AND d.entity_type = :type AND d.bundle = :bundle',
+          array(':type' => 'node', ':bundle' => INSTAGRAM_FEEDS_IMAGE_NODE_TYPE));
+      $query->addField('n', 'nid', 'nid');
+      $query->condition('n.sticky', NODE_NOT_STICKY);
+      $query->condition('fi.feed_nid', $feed_nid);
+      $query->orderBy('d.field_instf_created_value', 'DESC');
+      $query->range($limit_imgs_per_feed, $select_limit);
+      $result = array_merge($result, $query->execute()->fetchCol());
+    }
+  }
+  return array_unique($result);
+}
+
+
+/**
+ * Helper function to get all taxonomy terms tids for terms.
+ *
+ * Return tids for taxonomy terms that must be deleted when instagram feeds
+ * cron will be run.
+ *
+ * @return array()
+ *   An array of term tids.
+ */
+function _instagram_feeds_get_taxonomy_terms_to_delete() {
+  $q = db_select('taxonomy_term_data', 'td');
+  $q->innerJoin('taxonomy_vocabulary', 'v', 'td.vid = v.vid AND v.machine_name IN(:vocabularies)',
+      array(':vocabularies' => array(INSTAGRAM_FEEDS_USERS_VOCABULARY_NAME, INSTAGRAM_FEEDS_TAGS_VOCABULARY_NAME)));
+  $q->leftJoin('field_data_field_instf_blacklist_type', 's',
+      'td.tid = s.entity_id AND s.entity_type = :type AND s.bundle = :bundle',
+      array(':type' => 'taxonomy_term', ':bundle' => INSTAGRAM_FEEDS_USERS_VOCABULARY_NAME));
+  $q->leftJoin('taxonomy_index', 'tn', 'td.tid = tn.tid');
+  $q->addField('td', 'tid');
+  $q->isNull('tn.tid');
+  $or = db_or()
+      ->condition('s.field_instf_blacklist_type_value', 'normal')
+      ->isNull('s.field_instf_blacklist_type_value');
+  $q->condition($or);
+  $q->range(0, 1000);
+  $result = $q->execute()->fetchCol();
+  return $result;
+}
+
+
+/**
+ * Implements hook_menu_local_tasks_alter().
+ */
+function instagram_feeds_menu_local_tasks_alter(&$data, $router_item, $root_path) {
+  if (strpos($router_item['path'], 'node/%') === 0 && (isset($router_item['page_arguments'][0]->type)
+      && INSTAGRAM_FEEDS_SETTINGS_NODE_TYPE == $router_item['page_arguments'][0]->type
+      || isset($router_item['page_arguments'][1]->type)
+      && INSTAGRAM_FEEDS_SETTINGS_NODE_TYPE == $router_item['page_arguments'][1]->type)) {
+    foreach ($data['tabs'][0]['output'] as $key => $tab) {
+      if ('node/%/view' == $tab['#link']['path'] || 'node/node%/view' == $tab['#link']['path']) {
+        unset($data['tabs'][0]['output'][$key]);
+        $data['tabs'][0]['output'] = array_values($data['tabs'][0]['output']);
+        break;
+      }
+    }
+  }
+}
+
+
+/**
+ * Implements hook_node_view().
+ */
+function instagram_feeds_node_view($node, $view_mode, $langcode) {
+  $args = arg();
+  if (INSTAGRAM_FEEDS_SETTINGS_NODE_TYPE == $node->type && 'node' == $args[0] && count($args) <= 2) {
+    drupal_goto('node/' . $node->nid . '/edit');
+  }
+}
+
+
+/**
+ * Check if URL to image is available.
+ */
+function instagram_feeds_check_url($url) {
+  $headers = @get_headers($url);
+  if (strpos($headers[0], '200') === FALSE) {
+    return FALSE;
+  }
+  return TRUE;
+}

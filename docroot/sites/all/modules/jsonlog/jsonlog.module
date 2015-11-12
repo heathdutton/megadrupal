@@ -1,0 +1,338 @@
+<?php
+/**
+ * @file
+ * JSONlog module.
+ */
+
+
+/**
+ * Default max. length of a log entry, in kilobytes.
+ *
+ * @type integer
+ */
+define('JSONLOG_TRUNCATE_DEFAULT', 64);
+
+/**
+ * Adds this module's setting fields to the system logging settings form.
+ *
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * Function body relayed to include file, because it's lengthy.
+ *
+ * @see _jsonlog_form_system_logging_settings_alter()
+ *
+ * @param array &$form
+ * @param array &$form_state
+ */
+function jsonlog_form_system_logging_settings_alter(&$form, &$form_state) {
+  module_load_include('inc', 'jsonlog');
+  return _jsonlog_form_system_logging_settings_alter($form, $form_state);
+}
+
+/**
+ * @param array $form
+ * @param array $form_state
+ */
+function jsonlog_form_system_logging_settings_validate($form, $form_state) {
+  $values =& $form_state['values'];
+
+  // Non-empty truncate must be non-negative integer.
+  if ($values['jsonlog_truncate'] !== '' && ($value = trim($values['jsonlog_truncate'])) !== '') {
+    if (!preg_match('/^\d+$/', $value)) {
+      form_set_error(
+        'jsonlog_truncate',
+        t('\'@field\' is not a non-negative integer.', array('@field' => t('Truncate events to')))
+      );
+    }
+  }
+}
+
+/**
+ * Custom submit handler for the system logging settings form.
+ *
+ * @param array $form
+ * @param array $form_state
+ */
+function jsonlog_form_system_logging_settings_submit($form, &$form_state) {
+  module_load_include('inc', 'jsonlog');
+
+  $values =& $form_state['values'];
+
+  $fields = array(
+    'jsonlog_severity_threshold',
+    'jsonlog_truncate',
+    'jsonlog_siteid',
+    'jsonlog_dir',
+    'jsonlog_file_time',
+  );
+
+  foreach ($fields as $name) {
+    // Trim all values.
+    $values[$name] = trim($values[$name]);
+  }
+  if (!$values['jsonlog_truncate']) {
+    $values['jsonlog_truncate'] = 0;
+  }
+  if (!$values['jsonlog_dir']) {
+    $values['jsonlog_dir'] = jsonlog_default_dir();
+  }
+
+  // Tags.
+  if (($values['jsonlog_tags'] = $v = trim($values['jsonlog_tags'])) !== '') {
+    $v = str_replace(array("\r", "\n"), '', $v);
+    if ($v !== '') {
+      if ($v{0} === ',') {
+        $v = substr($v, 1);
+      }
+      if ($v !== '') {
+        if ($v{strlen($v) - 1} === ',') {
+          $v = substr($v, 0, strlen($v) - 1);
+        }
+      }
+      if (strpos($v, ',')) {
+        $v = preg_replace('/ *, */', ',', $v);
+      }
+    }
+    $values['jsonlog_tags'] = trim($v);
+  }
+
+  // Test.
+  if ($values['jsonlog_test_filing'] && $values['jsonlog_siteid'] && $values['jsonlog_dir'] && $values['jsonlog_file_time']) {
+    module_load_include('inc', 'jsonlog');
+    jsonlog_test_filing($values['jsonlog_dir'] . '/' . $values['jsonlog_siteid']
+      . ($values['jsonlog_file_time'] == 'none' ? '' : ('.' . date($values['jsonlog_file_time']))) . '.json.log');
+  }
+  // Don't ever save that field.
+  unset($form_state['input']['jsonlog_test_filing'], $values['jsonlog_test_filing']);
+}
+
+/**
+ * Logs any watchdog call - at or above a certain severity threshold - as JSON
+ * to a custom log file.
+ *
+ * Default severity threshold: warning.
+ *
+ * Prefers server environment variables for Drupal conf variables.
+ * Any jsonlog conf variable may be overridden by a 'drupal_[jsonlog variable]'
+ * server environment var.
+ *
+ *  JSON fields (watchdog standard fields are not explained here):
+ *  - \@timestamp: ISO-8601 milliseconds timestamp instead of watchdog's native
+ *    seconds timestamp
+ *  - \@version: (always) 1
+ *  - message_id: jsonlog site ID + unique padding
+ *  - site_id: (default) server's hostname + database name + database prefix
+ *    (if any)
+ *  - tags: comma-separated list; becomes array
+ *  - type
+ *  - severity
+ *  - method: HTTP request method, or 'cli' (if drush)
+ *  - request_uri
+ *  - referer
+ *  - uid
+ *  - username: name of current user, or empty
+ *  - client_ip: equivalent to watchdog standard 'ip' field
+ *  - link
+ *  - variables: watchdog standard, except null if empty
+ *  - trunc: null if the log entry as a whole doesn't exceed the json_truncate
+ *    setting; otherwise array of original length, truncated length
+ *
+ * Implements hook_watchdog().
+ *
+ * @param array $log_entry
+ */
+function jsonlog_watchdog(array $log_entry) {
+  static $_threshold, $_site_id, $_canonical, $_file, $_truncate, $_severity, $_tags;
+
+  // Don't load more settings than threshold, in case current entry isn't
+  // sufficiently severe.
+  if (!$_threshold) {
+    // A threshold of zero (emergency) wouldnt make sense in the real world,
+    // so no reason to check by type (boolean).
+    if (!($_threshold = getenv('drupal_jsonlog_severity_threshold'))) {
+      $_threshold = variable_get('jsonlog_severity_threshold', WATCHDOG_WARNING);
+    }
+  }
+  // Severity is upside down; less is more.
+  if ($log_entry['severity'] > $_threshold) {
+    return;
+  }
+
+  // Load the rest of the settings.
+  if (!$_site_id) {
+    // Site ID: Try server environment var before Drupal conf. var.
+    if (!($_site_id = getenv('drupal_jsonlog_siteid'))) {
+      if (!($_site_id = variable_get('jsonlog_siteid'))) {
+        module_load_include('inc', 'jsonlog');
+        variable_set('jsonlog_siteid', $_site_id = jsonlog_default_site_id());
+      }
+    }
+
+    // Canonical site identifier across site instances.
+    if (!($_canonical = getenv('drupal_jsonlog_canonical'))) {
+      $_canonical = variable_get('jsonlog_canonical', '');
+    }
+
+    // Dir.
+    if (!($dir = getenv('drupal_jsonlog_dir'))) {
+      if (!($dir = variable_get('jsonlog_dir'))) {
+        module_load_include('inc', 'jsonlog');
+        if (($dir = jsonlog_default_dir())) {
+          variable_set('jsonlog_dir', $dir);
+        }
+        else {
+          error_log('Drupal jsonlog, site ID[' . $_site_id . '], failed to establish server\'s default log dir.');
+        }
+      }
+    }
+
+    // File timestamp.
+    if (!($file_time = getenv('drupal_jsonlog_file_time'))) {
+      $file_time = variable_get('jsonlog_file_time', 'Ymd');
+    }
+    $_file = $dir . '/' . $_site_id . ($file_time == 'none' ? '' : ('.' . date($file_time))) . '.json.log';
+
+    // Truncation: Try server environment var before Drupal conf. var.
+    if (($_truncate = getenv('drupal_jsonlog_truncate')) === FALSE) {
+      $_truncate = variable_get('jsonlog_truncate', JSONLOG_TRUNCATE_DEFAULT);
+    }
+    if ($_truncate) {
+      // Kb to bytes.
+      $_truncate *= 1024;
+      // Substract estimated max length of everything but message content.
+      $_truncate -= 768;
+      // Message will get longer when JSON encoded, because of hex encoding of
+      // <>&" chars.
+      $_truncate *= 7 / 8;
+    }
+
+    $_severity = array(
+      'emergency',
+      'alert',
+      'critical',
+      'error',
+      'warning',
+      'notice',
+      'info',
+      'debug',
+    );
+
+    // Tags: append Drupal conf. var to server env. var.
+    $tags_server = ($tags = getenv('drupal_jsonlog_tags')) !== FALSE ? $tags : '';
+    $tags_site = variable_get('jsonlog_tags', '');
+    if ($tags_server) {
+      $tags = $tags_server;
+      if ($tags_site) {
+        $tags .= ',' . $tags_site;
+      }
+    }
+    else {
+      $tags = $tags_site;
+    }
+    if ($tags) {
+      $_tags = explode(',', $tags);
+    }
+  }
+
+
+  // Create the entry.
+
+  $entry = new stdClass();
+
+  $truncation = NULL;
+
+  if (($message = $log_entry['message'])) {
+
+    // Replace variables.
+    if (($variables = $log_entry['variables'])) {
+      // Doesnt use format_string() because we don't want HTML placeholder tags.
+      foreach ($variables as $key => $value) {
+        if ($key[0] != '!') {
+          $variables[$key] = check_plain($value);
+        }
+      }
+      $message = strtr($message, $variables);
+      unset($variables);
+    }
+
+    // Strip tags if message starts with < (Inspect logs in tag).
+    if ($message{0} === '<') {
+      $message = strip_tags($message);
+    }
+
+    // Escape null byte.
+    $message = str_replace("\0", '_NUL_', $message);
+
+    // Truncate message.
+    // Deliberately multibyte length.
+    if ($_truncate && ($le = strlen($message)) > $_truncate) {
+      // Truncate multibyte safe until ASCII length is equal to/less than max.
+      // byte length.
+      $truncation = array(
+        $le,
+        strlen($message = drupal_truncate_bytes($message, (int) $_truncate))
+      );
+    }
+  }
+
+  $entry->message = $message;
+  unset($message);
+
+  // Use a milliseconds timestamp instead of watchdog()'s seconds timestamp.
+  $millis = round(microtime(TRUE) * 1000);
+  $seconds = (int) floor($millis / 1000);
+  $millis -= $seconds * 1000;
+  $millis = str_pad($millis, 3, '0', STR_PAD_LEFT);
+  $entry->{'@timestamp'} = substr(gmdate('c', $seconds), 0, 19) . '.' . $millis . 'Z';
+
+  $entry->{'@version'} = 1;
+  $entry->message_id = uniqid($_site_id, TRUE);
+  $entry->site_id = $_site_id;
+  $entry->canonical = $_canonical;
+  $entry->tags = $_tags;
+
+  $entry->type = 'drupal';
+  $entry->subtype = $log_entry['type'];
+
+  $entry->severity = $_severity[$log_entry['severity']];
+
+  $entry->method = !empty($_SERVER['REQUEST_METHOD']) ? $_SERVER['REQUEST_METHOD'] : 'cli';
+  $entry->request_uri = $log_entry['request_uri'];
+  $entry->referer = $log_entry['referer'];
+
+  $entry->uid = $uid = $log_entry['uid'];
+  $entry->username = $uid && !empty($GLOBALS['user']->name) ? $GLOBALS['user']->name : '';
+
+  $entry->client_ip = $log_entry['ip'];
+
+  // If link is an integer (or 'integer') it may be an event/error code;
+  // the Inspect module exploits link for that purpose.
+  if (!($link = $log_entry['link'])) {
+    $entry->link = NULL;
+    $entry->code = 0;
+  }
+  elseif (ctype_digit($link)) {
+    $entry->link = NULL;
+    $entry->code = (int) $link;
+  }
+  else {
+    $entry->link = strip_tags($link);
+    $entry->code = 0;
+  }
+
+  // Since message/variables replacement was implemented, variables will always
+  // be empty. A bit silly to keep the variables property at all then, but for
+  // backwards compatibility - and the fact that folks might expect the
+  // property to exist because it's part the of the hook_watchdog() properties
+  // - we keep setting it.
+  $entry->variables = NULL;
+
+  $entry->trunc = $truncation;
+
+
+  // File append, using lock (write, doesn't prevent reading).
+  // If failure: log filing error to web server's default log.
+  if (!file_put_contents($_file, "\n" . drupal_json_encode($entry), FILE_APPEND | LOCK_EX)) {
+    error_log('Drupal jsonlog, site ID[' . $_site_id . '], failed to write to file[' . $_file . '].');
+  }
+}

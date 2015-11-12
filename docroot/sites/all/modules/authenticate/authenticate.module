@@ -1,0 +1,800 @@
+<?php
+
+define('DEBUG', false);
+define('AUTH_PAGE_REFRESH', 7);
+
+// add action include for sending mail when report completed
+module_load_include('inc', 'authenticate', 'auth_actions');
+
+/**
+ * Implements hook_help().
+().
+ */
+function authenticate_help($path, $arg) {
+  switch ($path) {
+    case 'admin/help#authenticate':
+      $output = t('<p>The document authentication process involves splitting up the content of the document and performing numerous web searches on 
+    the pieces. If possible matches are found, the full page content of these matches is retrieved from the net and each page is 
+    compared against the full text of this document.</p><p>Depending on how close a match the document and the matched page are, a comparison 
+    score is calculated. The URLs with content that are considered a good match (i.e. a score above the limit defined by the site administrator)
+    are then reported along with their comparison score.</p><p>This entire process can take up to 30 minutes to complete. Once you submit, this
+    page will refresh to show the updated progress. You may also navigate away form this page and simply return at any time to view the progress 
+    or see the results if they are available. An email will also be sent to the user who submitted the document once the results are available.</p>
+    <p>Enabling the Actions module provides a template for a pre-canned email action as well as the ability to add addtional email notification actions.</p>');
+      return $output;
+  }
+}
+
+/**
+ * Implements hook_permission().
+().
+ *    - easy way is to do this in each API module; but this way they are kept in same access control group
+ *    - go through system table and pull each enabled Auth API based on module name
+ *    - then get API name from first word of "description" field
+ *
+ *    A bit cludgy, but then API modules don't need to do it and we get them all together on access control page
+ */
+function authenticate_permission() {
+  // get enabled APIs
+  $results = db_query("SELECT * FROM {system} WHERE name LIKE '%_auth' AND status = :status", array(':status' => 1));
+  
+  foreach ($results as $api) {
+    $info = unserialize($api->info);
+    $desc_words = explode(" ", $info['description']);
+    $perms[$desc_words[0] . ' authenticate documents'] = array('title' => t($desc_words[0]) . ' ' . t('authenticate documents'));
+  }
+
+  return $perms;
+}
+
+/**
+ * Implements hook_menu()
+().
+ * The menu path 'node/$nid/auth' shows various states of Authentication page
+ *    either used to fire off results or display results as a tab on node page.
+ */
+function authenticate_menu() {
+  $items = array();
+
+  $items['node/%node/auth'] = array(
+    'title' => 'Authenticate',
+    'page callback' => '_auth_landing',
+    'access callback' => 'auth_access',
+    'access arguments' => array(1),
+    'type' => MENU_LOCAL_TASK,
+    'weight' => 10,
+  );
+  $items['node/%node/auth/general'] = array(
+    'title' => 'General',
+    'access callback' => 'auth_access',
+    'access arguments' => array(1),
+    'type' => MENU_DEFAULT_LOCAL_TASK,
+  );
+
+  $items['auth/process'] = array(
+    'title' => 'Authenticate Process',
+    'page callback' => '_auth_process',
+    'access arguments' => array('access content'),
+    'type' => MENU_CALLBACK,
+  );
+
+  $items['admin/config/services/authenticate'] = array(
+    'title' => 'Authenticate',
+    'description' => 'Settings for Authentication module.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('authenticate_admin_settings'),
+    'access arguments' => array('administer site configuration'),
+    'type' => MENU_NORMAL_ITEM,
+  );
+
+  return $items;
+}
+
+function auth_access($node) {
+  global $user;
+  $enabled = variable_get('authenticate_' . $node->type, 0);
+  if (!$enabled) {
+    return false;
+  }
+
+  $perms = authenticate_permission();
+  if (!count($perms)) {
+    return false;
+  }
+  foreach ($perms as $perm) {
+    if (user_access($perm['title'], $user)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * @todo Please document this function.
+ * @see http://drupal.org/node/1354
+ */
+function authenticate_admin_settings($form, &$form_state) {
+  // system settings  
+  $form['AuthenticateSystemSettings'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Authenticate System Settings'),
+    '#collapsible' => false,
+  );
+  $form['AuthenticateSystemSettings']['auth_chunk_window_size'] = array(
+    '#type' => 'textfield',
+    '#title' => t("Chunk Word Size"),
+    '#default_value' => variable_get('auth_chunk_window_size', 10),
+    '#description' => t("This defines the size of the phrases that are passed to the search engine for verification. The larger this
+      number, the less likely a match is to be found. The smaller the number the more false matches will be found and more processing
+      time is required."),
+  );
+  $form['AuthenticateSystemSettings']['auth_chunk_window_step'] = array(
+    '#type' => 'textfield',
+    '#title' => t("Chunk Word Step"),
+    '#default_value' => variable_get('auth_chunk_window_step', 4),
+    '#description' => t("This defines the step size that is used for the sliding window for creating phrases sent to search engine. The larger this
+      number, the less likely a match is to be found. The smaller the number, the processing time is required."),
+  );
+  $form['AuthenticateSystemSettings']['auth_min_compare'] = array(
+    '#type' => 'textfield',
+    '#title' => t("Minimum Compare Rating"),
+    '#default_value' => variable_get('auth_min_compare', 50),
+    '#description' => t("This defines the minimum comparison rating between the node content and the searched paged that is requried before the URL will be considered a 
+      possbile match."),
+  );
+
+  // Blank fieldset to hold settings for various search aPI modules to alter
+  $form['AuthSearchAPISettings'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Search API Settings'),
+    '#collapsible' => true,
+    '#collapsed' => true,
+  );
+
+  return system_settings_form($form);
+}
+
+/*
+ *   Add form alter for node type config forms so we can
+ *   enable authentication on only specific node types.
+ */
+/**
+ * @todo Please document this function.
+ * @see http://drupal.org/node/1354
+ */
+function authenticate_form_node_type_form_alter(&$form, &$form_state) {
+  $form['workflow']['authenticate'] = array(
+    '#type' => 'checkbox',
+    '#title' => t("Plagiarism Checker"),
+    '#default_value' => variable_get('authenticate_' . $form['#node_type']->type, 0),
+    '#description' => t('Check this box to enable submitting this node type for authetication.'),
+  );
+}
+
+// pull our precanned action for the list so we can't create additional ones
+/**
+ * @todo Please document this function.
+ * @see http://drupal.org/node/1354
+ */
+function authenticate_form_system_actions_manage_form_alter(&$form, &$form_state) {
+  foreach ($form['parent']['action']['#options'] as $key => $option) {
+    if (stristr($option, 'Authenticate: Send notification to submitter')) {
+      unset($form['parent']['action']['#options'][$key]);
+    }
+  }
+}
+
+/**
+ * Menu callback to select different search engines.
+ */
+function auth_submit($form, &$form_state) {
+  if ($api) {
+    $form_state['redirect'] = _auth_show($node, $api);
+  }
+  drupal_access_denied();
+}
+
+/* callback handler to display Authenitate node view page
+ *  depending on state in authenticate table we can do 3 thigns here:
+ *     1.  if no entry in table        - set entry and display throbber with msg about submit - and fire off AJAX call to start processing
+ *     2.  if entry but not processed  - show throbber with different msg and maybe progress report
+ *     3.  if processed                - display results (urls and compares)
+ */
+function _auth_show(&$node, $api) {
+  global $user;
+  $path = drupal_get_path('module', 'authenticate');  
+
+  $refresh = AUTH_PAGE_REFRESH;
+
+  $apil = strtolower($api);
+
+  //lets add this to $node to ease function calls
+  $node->auth_api = $apil;
+
+  // resubmit
+  if ($_GET['r']) { // add this for refresh case so we don't resubmit again  
+    // should only be 1; but something might have crashed and messed things up
+    $aids = db_query("SELECT aid FROM {authenticate} WHERE nid = :nid AND api = :api", array(':nid' => $node->nid, ':api' => $apil)); 
+    foreach ($aids as $aid) {
+      db_delete('authenticate')
+        ->condition('aid', $aid->aid)
+        ->execute();
+      db_delete('authenticate_results')
+        ->condition('aid', $aid->aid)
+        ->execute();
+    }                  
+    // to remove the r=1 so we don't keep resubmitting when we do page refreshes.
+    drupal_goto($_GET['q']); 
+  }
+
+  if ($_POST['confirm']) {
+    $processed = 2; // start the processing
+  }
+  else {
+    $processed = db_query("SELECT completed FROM {authenticate} WHERE nid = :nid AND api = :api", array(':nid' => $node->nid, ':api' => $apil))->fetchField();
+    if ($processed === false) {
+      $processed = 3; // landing page
+    }
+    elseif (!$processed) {
+      $processed = 0; // entry created but not completed - show status
+    }
+    else {
+      $processed = 1; // done, show results
+    }
+  }
+
+  $node->auth_processed = $processed;
+
+  // do status messaging by calling API's status update function
+  if ($processed == 0 || $processed == 1) {
+    call_user_func($api . '_auth_status', $node);
+  }
+
+  // handle various STATES of search process:
+//    3 - no entry yet so show confirmation page to get started
+//    2 - start the process by placing entry into authenticate table
+//    0 - running
+//    1 - completed - show results
+//  We also need to support 2 different API types; 
+//    - std search engines (yahoo, google) where we do the crunching
+//    - self contained (ithenticate) where we don't do the crunching - just submit, get status, show results
+//  States 3, 2 and 0 are the same for both api types
+
+  switch ($processed) {
+    case 3: // confirmation page
+      $output = drupal_get_form('_auth_confirm_page', $node, $api);
+      break;
+
+    case 2: // nothing has been done yet for this node
+      // lets clean existing entries - shouldn't be any; but if something crashed earlier it is possible.
+      //db_query("DELETE FROM {authenticate} WHERE aid=%d",$aid); 
+      //db_query("DELETE FROM {authenticate_results} WHERE aid=%d",$aid);
+
+      // insert new authenticate table entry
+      $aid = db_insert('authenticate')
+        ->fields(array(
+          'nid' => $node->nid,
+          'api' => $apil,
+          'vid' => $node->vid,
+          'uid' => $user->uid,
+          'started' => time(),
+        ))
+        ->execute();
+      
+      watchdog('authenticate', '%api analysis started for %nodetitle', array('%api' => $api, '%nodetitle' => $node->title), WATCHDOG_NOTICE);
+
+      // send values to AJAX call to start search process
+      $settings = array(
+        'authenticate_url' => url('auth/process'),
+        'authenticate_nid' => $node->nid,
+        'authenticate_aid' => $aid,
+        'authenticate_api' => $apil,
+      );
+      drupal_add_js($settings, array('type' => 'setting', 'scope' => JS_DEFAULT));
+      drupal_add_js($path . '/authenticate.js');
+      
+      // set page to refresh every 30 seconds
+      $auth_refresh = array(
+        '#type' => 'html_tag',
+        '#tag' => 'meta',
+        '#attributes' => array(
+          'content' =>  $refresh,
+          'http-equiv' => 'refresh',
+        ));
+      drupal_add_html_head($auth_refresh, 'authenticate_page_refresh');
+
+      $output = '
+        <div id="auth-results"><img src="' . base_path() . $path . '/ajax-loader.gif" title="Loading...">
+        <div class="auth-message">' . t('<p>Document is being submitted for analysis. Please 
+        check back in a few minutes by refreshing this page or selecting the tab above.</p>') .
+        '</div>
+        </div>';
+      break;
+
+    case 0: // started but not done
+      // set page to refresh every 30 seconds
+      $auth_refresh = array(
+        '#type' => 'html_tag',
+        '#tag' => 'meta',
+        '#attributes' => array(
+          'content' =>  $refresh,
+          'http-equiv' => 'refresh',
+        ));
+      drupal_add_html_head($auth_refresh, 'authenticate_page_refresh');
+      
+      $output = '
+        <div id="auth-results"><img src="' . base_path() . $path . '/ajax-loader.gif" title="Loading...">
+        <div class="auth-message">' . t('
+          <p>Document has been submitted for analysis but results are not yet available. Please 
+          check back in a few minutes by refreshing this page or selecting the tab above.</p>
+          <p>If 30 minutes has passed and your results are not yet available it is possible that there may 
+          have been a server issue during this time. If you would like to resubmit this document please !resubmit. <strong>NOTE:
+          This will delete analysis results for the existing revision.</strong></p><p>If this issue persists; you may also want to notify the site 
+          administrator.</p>', array('!resubmit' => l("click here to resubmit", "node/" . $node->nid . "/auth/" . $apil, array('query' => array('r' => 1))))) .
+        '</div>
+        </div>';
+      break;
+
+    case 1: // show results
+      // fetch our auth entry and attach to node object
+      $auth_entry = db_query("SELECT * FROM {authenticate} WHERE nid = :nid AND api = :api", array(':nid' => $node->nid, ':api' => $apil))->fetchObject();
+      $node->auth_entry = $auth_entry;
+
+      $output = '
+        <div class="auth-message">' .
+          t('<p>The current revision number for this document is: %cvid</p>
+          <p>The revision number used for authentication analysis is: %avid</p>', array('%cvid' => $node->vid, '%avid' => $auth_entry->vid)) .
+        '</div>';
+
+      if ($node->vid != $auth_entry->vid) {
+        $output .= t('<p>The revision of this document used for the authentication analysis is not the current revision. If you would 
+        like to resubmit this document please !resubmit. <strong>NOTE: This will delete analysis results for the existing revision.</strong></p>',  
+          array('!resubmit' => l("click here to resubmit", "node/" . $node->nid . "/auth/" . $apil, array('query' => array('r' => 1)))));
+      }
+      else {
+        $output .= t('<p>If you would like to resubmit this document please !resubmit. <strong>NOTE: This will delete analysis results for the existing revision.</strong></p>',  
+          array('!resubmit' => l("click here to resubmit", "node/" . $node->nid . "/auth/" . $apil, array('query' => array('r' => 1)))));
+      }
+
+      // add any API specific output here
+      $output .= call_user_func($api . '_auth_results', $node);
+  }
+
+  return $output;
+}
+
+/* AJAX Handler that does the processing of the search and compare
+ *  - gets called from the auth_submit function if the search and process submission has not been done
+ *
+ *   param   - takes in NID/VID from AJAX POST
+ *
+ *   return  - calls API's process routine (which could be STD one coded below)
+ *           -
+ *
+ *   REV 2   - modify to support std and custom api types
+ */
+function _auth_process() {
+  global $user, $variables;
+
+  drupal_set_time_limit(0); // let's make sure PHP doesn't timeout on us.
+
+  $aid = $_POST['authenticate_aid'];
+  $api = $_POST['authenticate_api'];
+
+  // load our node and clean it
+  $node = node_load($_POST['authenticate_nid']);
+  // load entire PAGE not just the body
+  $node->cleaned_body = _auth_clean_html(drupal_render(node_view($node, 'full')));
+
+  // call API's processing function
+  $result = call_user_func($api . '_auth_crunch', $node);
+
+  // if API returns FALSE we should set that there were errors
+  if ($result === FALSE) {
+    db_update('authenticate')
+      ->fields(array(
+        'errors' => 1,
+      ))
+      ->condition('aid', $aid)
+      ->execute();
+    watchdog('authenticate', t('Problem during %api authetication of %nodetitle',  
+      array('%api' => $api, '%nodetitle' => $node->title . ", node/" . $node->nid)), WATCHDOG_ERROR);
+  }
+
+  // set in DB that we are all done
+  db_update('authenticate')
+    ->fields(array(
+      'completed' => time(),
+    ))
+    ->condition('aid', $aid)
+    ->execute();
+  watchdog('authenticate', '%api analysis completed for %nodetitle', array('%api' => $api, '%nodetitle' => $node->title), WATCHDOG_NOTICE);
+
+  // set up variables to use in actions emails
+  $variables['auth_submitter_name'] = $user->name;
+  $variables['auth_submitter_mail'] = $user->mail;
+  $variables['auth_report_path'] = url("node/$node->nid/auth", array('query' => null, 'fragment' => null, 'absolute' => TRUE));
+
+  // send action emails:
+//    - precanned: email to user who initiated the search
+//    - and others that are created as actions
+  // template of precanned and adding new ones can be done at /admin/build/actions
+
+  // make sure that our precanned action exists
+  $precanned = db_query("SELECT aid FROM {actions} WHERE callback = :callback", array(':callback' => 'authenticate_report_notify_submitter_action'))->fetchField();
+  if (!$precanned) {
+    _auth_create_precanned_action();
+  }
+
+  $results = db_query("SELECT aid FROM {actions} WHERE callback LIKE '%:callback'", array(':callback' => 'authenticate_%'));
+  foreach ($results as $action) {
+    $action_ids[] = $action->aid;
+  }
+  if ($action_ids) { 
+    // need to add array() or action params don't get added in - i think this is a core bug!! 
+    actions_do($action_ids, $node, array()); 
+  }
+
+  exit;
+}
+
+/*  Standard Crunching routine to use with STD type API's such as Yahoo and Google
+ *     - api module needs to make call to this if it wants to use this
+ *     - CUSTOM API modules need to do at least do: set authenticate.processed to 1 when done
+ *
+ *   param   - takes in cleaned up node_view of node
+ *
+ *   return  - fills authenticate_results table with url/compare results
+ *           - sets authenticate.processed to 1 when finished so that _show routine will know to pull results
+ *
+ */
+function _auth_std_crunch($node) {
+  drupal_set_time_limit(0); // let's make sure PHP doesn't timeout on us.
+
+  $aid = $_POST['authenticate_aid'];
+  $api = $_POST['authenticate_api'];
+
+  $body = $node->cleaned_body; // not really the BODY anymore; now we use entire node_view
+
+  $chunks = _auth_chunk_string($body);
+
+  $alldata = array();
+  $errors = array();
+
+  // insert into db number of chunks found so we can use in status update
+  db_update('authenticate')
+    ->fields(array(
+      'chunks' => count($chunks),
+    ))
+    ->condition('aid', $aid)
+    ->execute();
+
+  // this part does all the chunk searches - so takes a long time
+  $matching_urls = array();
+  $errors_found = false;
+  foreach ($chunks as $key => $chunk) {
+    $search_results = call_user_func($api . '_auth_dosearch', $chunk);
+    if (!is_array($search_results)) {
+      $errors[] = $search_results; // lets build array of errors and then unique them so we dont flood watchdog 
+      $errors_found = true;
+    }
+    else {
+      $matching_urls = array_merge($matching_urls, array_unique($search_results));
+    }
+
+    // lets write some info to db so we can give status updates
+    // - how many urls have been matched
+    // - if there have been errors
+    db_update('authenticate')
+      ->fields(array(
+          'errors' => (int)$errors_found,
+          'matches' => count($matching_urls),
+          'current_chunk' => $key,
+        ))
+      ->condition('aid', $aid)
+      ->execute();
+  }
+  db_update('authenticate')
+    ->fields(array(
+      'status' => 1,
+    ))
+    ->condition('aid', $aid)
+    ->execute();
+
+  // watchdog a unique list of any errors found
+  if (count($errors)) {
+    $errors = array_unique($errors);
+    foreach ($errors as $error) {
+      watchdog('authenticate', t('Problem during %api authetication of %nodetitle with error: %error',  
+        array('%api' => $api, '%nodetitle' => $node->title . ', node/' . $node->nid, '%error' => $error)), array(), WATCHDOG_WARNING);
+    }
+  }
+
+  // if we found any matches; let's load those pages and do a comparison to our content
+  if (count($matching_urls)) {
+    $alldata['matching_urls'] = array_unique($matching_urls);
+    unset($matching_urls);
+
+    // scrape each matching URL and compare against our content   - this section takes the most time
+    // and store compare results which exceed our compare limit into db
+    foreach ($alldata['matching_urls'] as $key => $url) {
+      if (substr($url, -4) == ".pdf") {
+        continue; // as long as a Google cached value for PDF we use that - but in case there isnt, no sense parsing .pdf     
+      }
+      //if (substr($url,-4) == ".rtf") continue;
+      $scraped_page = _auth_retrieve_webpage($url);
+      $compare = _auth_text_compare($body, $scraped_page);
+      if ($compare > variable_get('auth_min_compare', 50)) {
+        $id = db_insert('authenticate_results')
+          ->fields(array(
+            'aid' => $aid,
+            'url' => $alldata['matching_urls'][$key],
+            'compare' => $compare,
+            'created' => REQUEST_TIME,
+          ))
+          ->execute();
+      }
+      db_update('authenticate')
+        ->fields(array(
+          'current_url' => $key,
+        ))
+        ->condition('aid', $aid)
+        ->execute();
+    }
+  }
+  return;
+}
+
+/*  Standard Status Update routine to use with STD type API's such as Yahoo and Google
+ *     - api module needs to make call to this if it wants to use this
+ *     - called from _auth_show to show status results for case = 0 or 1 (i.e. when crunching or when done)
+ *
+ *   Custom API's can set any status drupal_set_messages() they like
+ *
+ *   param   - &$node object
+ *           - $api
+ *
+ *   return  - just does drupal_set_message's
+ *
+ */
+function _auth_std_status(&$node) {
+  $apil = $node->auth_api;
+  $processed = $node->auth_processed;
+
+  // fetch our auth entry
+  $result = db_query("SELECT * FROM {authenticate} WHERE nid = :nid AND api = :api", array(':nid' => $node->nid, ':api' => $apil))->fetchObject();
+
+  if ($chunks && !$processed) {
+    drupal_set_message("The document has been split into " . $result->chunks . "and search process has started", 'status');
+  }
+  else {
+    drupal_set_message(t("The document was split into %chunks chunks", array('%chunks' => $result->chunks)), 'status');
+  }
+
+  if (!$result->status) {
+    if ($result->matches) {
+      drupal_set_message(t("%matches candidate URLs have been found - but still looking", array('%matches' => $result->matches)), 'status');
+    }
+    if ($processed == 0) {
+      drupal_set_message(t("Processing chunk %chunk", array('%chunk' => $result->current_chunk)), 'status');
+    }
+  }
+  else {
+    if ($result->matches && !$processed) {
+      drupal_set_message(t("%matches candidate URLs were found - scraping process has started", array('%matches' => $result->matches)), 'status');
+    }
+    else {
+      drupal_set_message(t("%matches candidate URLs were found.", array('%matches' => $result->matches)), 'status');
+    }
+
+    $count = db_query("SELECT count(aid) FROM {authenticate_results} WHERE aid = :aid ORDER BY compare DESC", array(':aid' => $result->aid))->fetchField();
+    if ($count && !$processed) {
+      drupal_set_message(t("%count matching pages have a compare value that exceeds minimum - but still looking", array('%count' => $count)), 'status');
+    }
+    else {
+      drupal_set_message(t("%count matching pages have a compare value that exceeds minimum", array('%count' => $count)), 'status');
+    }
+
+    if (!$processed) {
+      drupal_set_message(t("Processing URL %current_url", array('%current_url' => $result->current_url)), 'status');
+    }
+  }
+  if ($processed == 1) {
+    drupal_set_message(t("Total analysis time = %atime", array('%atime' => gmdate("H:i:s", ($result->completed - $result->started)))), 'status');
+  }
+
+  if ($result->errors) {
+    drupal_set_message(t("Search errors were encountered. This may or may not hinder overall search results. Check admin logs for more information."), 'error');
+  }
+}
+
+
+/* Std API routine to return the results of a search
+ *   General format is pass it the $node object which has been prelaoded with some info we will need
+ *   and then return the output string
+ */
+function _auth_std_results($node) {
+  $results = db_query("SELECT * FROM {authenticate_results} ar LEFT JOIN {authenticate} a ON a.aid = ar.aid WHERE a.aid = :aid ORDER BY compare DESC", 
+    array(':aid' => $node->auth_entry->aid));
+
+  // if no results       
+  if (!$results) {
+    return '<div class="auth-message"><br><p>' . t('Search is complete. No matches have been found against this document.') . '</p></div>';
+  }
+
+  $output = t('<p>Compare scores range from 0 to 100. A score of 0 represents very little matching content whereas 
+    a score of 100 represents significant duplicated content.</p>');
+
+  // and if results - lets print them out in a nice table
+  $header = array(
+    array('data' => t('URL')),
+    array('data' => t('Compare Score')),
+  );
+  foreach ($results as $result) {
+    $row = array();
+    $row[] = l($result->url, $result->url, array('attributes' => array('target' => '_blank')));
+    $row[] = $result->compare;
+    $rows[] = $row;
+    $vid = $result->vid;
+  }
+
+  $output .= theme('table', array('header' => $header, 'rows' => $rows));
+
+  return $output;
+}
+
+/* slices the $body (string) into a sliding window of word chunks
+ *     use the following parameters that may be defined in admin->config->authenticate
+ *       N - size of window
+ *       M - size of step  - (use 1 for now)
+ *
+ *     $return = array of words (1:N), (1+M:1+N+M), (1+2M:1+N+2M), ....
+ */
+function _auth_chunk_string($body) {
+  $n = variable_get('auth_chunk_window_size', 10);
+  $m = variable_get('auth_chunk_window_step', 4);
+
+  $words = explode(" ", $body);    
+  // likely not doing anything now that we clean html better
+  $words = array_filter($words, '_auth_array_word_clean'); 
+
+  $chunks = array();
+  $num_words = count($words);
+  $num_chunks = ceil($num_words / $m);
+  for ($i = 1; $i < $num_words; $i += $m) {
+    $chunks[] = join(" ", array_slice($words, $i, $n));
+  }
+
+  if (DEBUG) {
+    $chunks = array_slice($chunks, 1, 1);
+  }
+
+  return $chunks;
+}
+
+// filter empty cells (and ones with . only from an array
+function _auth_array_word_clean(&$word) {
+  if ($word != "" && $word != ".") {
+    return 1;
+  }
+}
+
+function _auth_clean_html($body) {
+  module_load_include('inc', 'authenticate', 'simple_html_dom');
+  $html = str_get_html($body);
+  return $html->plaintext;
+}
+
+// pull the contents of a web page for comparison to node content
+//    - uses Simple HTML DOM class to scrape and convert HTML to text
+//    - returns a cleaned up string of the contents of the web page
+function _auth_retrieve_webpage($url) {
+  $ch = curl_init($url);
+
+  // used to spoof that coming from a real browser so we don't get blocked by some sites
+  $useragent = "Mozilla/5.0 (Windows; U; Windows NT 5.1; en-US; rv:1.8.1.1) Gecko/20061204 Firefox/2.0.0.1";
+
+  curl_setopt($ch, CURLOPT_USERAGENT, $useragent);
+  curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 4);
+  curl_setopt($ch, CURLOPT_TIMEOUT, 8);
+  curl_setopt($ch, CURLOPT_LOW_SPEED_TIME, 10);
+  curl_setopt($ch, CURLOPT_HEADER, 0);
+  curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+
+  $content = curl_exec($ch);
+  curl_close($ch);
+
+  return _auth_clean_html($content);
+}
+
+/* use PERL Text::Compare class to compare 2 text strings
+ *    - requires PERL executable to be installed on server and that Apache process has execute privelages
+ *    - a better approac would be to use php_perl module but at this time this is not available for PHP 5.2
+ *
+ *     return $compare: fpoint number ranging from 0 to 1 based on closeness of the 2 text strings
+ */
+function _auth_text_compare($text1, $text2) {
+  $path = realpath(drupal_get_path('module', 'authenticate'));
+
+  // these get picked up from PHP PEAR Library for Text_Diff class 
+  // make sure your PHP include path to includes your PEAR folder   
+  include_once 'Text/Diff.php';
+  include_once 'Text/Diff/Renderer.php';
+  include_once 'Text/Diff/Renderer/inline.php';
+
+  // PEAR's Inline Diff Engine for Compare
+  assert_options(ASSERT_ACTIVE, 0); // turn off assertion testing that gets done in native.php PEAR class
+  $diff = new Text_Diff('auto', array(array($text1), array($text2)));
+  $renderer = new Text_Diff_Renderer_inline();
+  if (isset($node_diff['format'])) {
+    $formatter->show_header = $node_diff['format']['show_header'];
+  }
+  $formatter_output = $renderer->render($diff);
+  $formatter_output = preg_replace(array("'<ins[^>]*?>.*?</ins>'si", "'<del[^>]*?>.*?</del>'si"), "###", $formatter_output);
+  $matches = explode("###", $formatter_output);
+
+  // remove empty and small phrase matches
+  $matches = array_filter($matches, '_auth_array_remove_small'); // this leaves us with an array of phrases that are longer than 3 words each
+
+  // calculate compare score based on size of the phrase on number that occur
+  foreach ($matches as $match) {
+    $match_count = count(preg_split("'[\s]+'", trim($match)));
+    if ($match_count > 30) {
+      $msum['30'] += 70;
+    }
+    if ($match_count <= 30 && $match_count > 20) {
+      $msum['20'] += 50;
+    }
+    if ($match_count <= 20 && $match_count > 10) {
+      $msum['10'] += 20;
+    }
+    if ($match_count <= 10) {
+      $msum['5'] += 5;
+    }
+  }
+
+  $msum['30'] = min($msum['30'], 90);
+  $msum['20'] = min($msum['20'], 80);
+  $msum['10'] = min($msum['10'], 60);
+  $msum['5'] = min($msum['5'], 20);
+
+  $compare = min(100, array_sum($msum));
+
+  return $compare;
+}
+
+// filter empty cells (and ones with . only from an array
+function _auth_array_remove_small(&$word) {
+  if ($word != "" && $word != "." && count(preg_split("'[\s]+'", trim($word))) > 5) {
+    return 1;
+  }
+}
+
+function _auth_confirm_page($form, $form_state, $node, $api) {
+  return confirm_form(null, t('Are you sure you want to submit for ') . $api . t(' authentication the document: %title?', 
+    array('%title' => $node->title)), 'node/' . $node->nid, 
+    t('<p>The document authentication process involves splitting up the content of the document and performing numerous web searches on 
+    the pieces. If possible matches are found, the full page content of these matches is retrieved from the net and each page is 
+    compared against the full text of this document.</p><p>Depending on how close a match the document and the matched page are, a comparison 
+    score is calculated. The URLs with content that are considered a good match (i.e. a score above the limit defined by the site administrator)
+    are then reported along with their comparison score.</p><p>This entire process can take up to 30 minutes to complete. Once you submit, this
+    page will refresh to show the updated progress. You may also navigate away form this page and simply return at any time to view the progress 
+    or see the results if they are available. An email will also be sent to the user who submitted the document once the results are available.</p>'), 
+    t('Submit'), 
+    t('Cancel'));
+}
+
+function _auth_landing() {
+  drupal_set_title("Authenticate");
+  return t('
+    <p>Pick an API type from the above tabs. This will be the Search Engine used to perform the authentication of your docuemnt. If there are no 
+    tabs listed above you must add at least one Search API plugin module and enable it at the !module_admin.</p>
+    <p>The document authentication process involves splitting up the content of the document and performing numerous web searches on 
+    the pieces. If possible matches are found, the full page content of these matches is retrieved from the net and each page is 
+    compared against the full text of this document.</p><p>Depending on how close a match the document and the matched page are, a comparison 
+    score is calculated. The URLs with content that are considered a good match (i.e. a score above the limit defined by the site administrator)
+    are then reported along with their comparison score.</p><p>This entire process can take up to 30 minutes to complete. Once you submit, this
+    page will refresh to show the updated progress. You may also navigate away form this page and simply return at any time to view the progress 
+    or see the results if they are available. An email will also be sent to the user who submitted the document once the results are available.</p>',  
+    array('!module_admin' => l('module admin page', 'admin/modules')));
+}

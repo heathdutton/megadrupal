@@ -1,0 +1,496 @@
+<?php
+/**
+ * @file
+ * Sends Webform results to HubSpot's Forms API.
+ */
+
+define('HUBSPOT_CLIENT_ID', '734f89bf-1b88-11e1-829a-3b413536dd4c');
+define('HUBSPOT_SCOPE', 'leads-rw contacts-rw offline');
+
+/**
+ * Implements hook_menu().
+ */
+function hubspot_menu() {
+  $items['admin/config/services/hubspot'] = array(
+    'title' => 'HubSpot integration settings',
+    'description' => 'Set up HubSpot integration and leads insertion.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('hubspot_admin_settings'),
+    'access arguments' => array('administer site configuration'),
+    'type' => MENU_NORMAL_ITEM,
+    'file' => 'hubspot.admin.inc',
+  );
+
+  $items['hubspot/oauth'] = array(
+    'title' => 'HubSpot OAuth redirect',
+    'description' => 'Collects OAuth tokens.',
+    'page callback' => 'hubspot_oauth_connect',
+    'access arguments' => array('administer site configuration'),
+    'type' => MENU_CALLBACK,
+    'file' => 'hubspot.admin.inc',
+  );
+
+  // Node HubSpot forms.
+  $items['node/%webform_menu/webform/hubspot'] = array(
+    'title' => 'HubSpot',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('hubspot_form_settings', 1),
+    'access callback' => 'node_access',
+    'access arguments' => array('update', 1),
+    'weight' => 10,
+    'type' => MENU_LOCAL_TASK,
+    'file' => 'hubspot.settings.inc',
+  );
+
+  return $items;
+}
+
+/**
+ * Refreshes HubSpot OAuth Access Token when expired.
+ */
+function hubspot_oauth_refresh() {
+  $data = array(
+    'refresh_token' => variable_get('hubspot_refresh_token'),
+    'client_id' => HUBSPOT_CLIENT_ID,
+    'grant_type' => 'refresh_token',
+  );
+
+  $data = drupal_http_build_query($data);
+
+  $options = array(
+    'headers' => array(
+      'Content-Type' => 'application/x-www-form-urlencoded; charset=utf-8',
+    ),
+    'method' => 'POST',
+    'data' => $data,
+  );
+
+  $return = drupal_http_request('https://api.hubapi.com/auth/v1/refresh', $options);
+
+  if ($return->code == '200') {
+    $return_data = json_decode($return->data, TRUE);
+
+    $hubspot_access_token = $return_data['access_token'];
+    variable_set('hubspot_access_token', $hubspot_access_token);
+
+    $hubspot_refresh_token = $return_data['refresh_token'];
+    variable_set('hubspot_refresh_token', $hubspot_refresh_token);
+
+    $hubspot_expires_in = $return_data['expires_in'];
+    variable_set('hubspot_expires_in', $hubspot_expires_in);
+
+    return TRUE;
+  }
+  else {
+    drupal_set_message(t('Refresh token failed with Error Code "%code: %status_message". Reconnect to your Hubspot
+      account.'), 'error', FALSE);
+    watchdog('hubspot', 'Refresh token failed with Error Code "%code: %status_message". Visit the Hubspot module
+      settings page and reconnect to your Hubspot account.', array(
+      '%code' => $return->code,
+      '%status_message' => $return->status_message,
+    ), WATCHDOG_INFO);
+
+    return FALSE;
+  }
+}
+
+/**
+ * Implements hook_mail().
+ */
+function hubspot_mail($key, &$message, $params) {
+  $message['subject'] = t('HubSpot leads insertion error');
+
+  switch ($key) {
+    case 'http_error':
+      $message['body'][] = t('When attempting to submit the form "@form" to HubSpot, a HTTP error occurred.', array(
+        '@form' => $params['node_title'],
+      ));
+      break;
+
+    case 'hub_error':
+      $message['body'][] = t('Upon submitting the Webform "@form" to HubSpot, an error was returned.', array(
+        '@form' => $params['node_title'],
+      ));
+      break;
+  }
+
+  $message['body'][] = t('Error message: @message', array('@message' => $params['errormsg']));
+  $message['body'][] = t('HubSpot POST URL: @url', array('@url' => $params['hubspot_url']));
+  $message['body'][] = t('To adjust the debugging settings, visit @url', array(
+    '@url' => url('admin/config/content/hubspot', array('absolute' => TRUE))
+  ));
+}
+
+/**
+ * Implements hook_page_build().
+ *
+ * Injects the HubSpot JavaScript tracking code into the page footer, just
+ * before </body>.
+ */
+function hubspot_page_build(&$page) {
+  $page['page_bottom']['hubspot_code'] = array(
+    '#type' => 'markup',
+    '#markup' => variable_get('hubspot_log_code', ''),
+  );
+}
+
+/**
+ * Implements hook_permission().
+ */
+function hubspot_permission() {
+  return array('see recent hubspot leads' => array(
+    'title' => t('See recent HubSpot leads'),
+    'description' => t("View the recent leads block when it's enabled."),
+    'restrict access' => TRUE),
+  );
+}
+
+/**
+ * Implements hook_block_info().
+ */
+function hubspot_block_info() {
+  $blocks = array();
+
+  $blocks['hubspot_recent'] = array(
+    'info' => t('HubSpot Recent Leads'),
+    'properties' => array('administrative' => TRUE),
+  );
+
+  return $blocks;
+}
+
+/**
+ * Implements hook_block_view().
+ */
+function hubspot_block_view($delta = '') {
+  $block = array();
+
+  switch ($delta) {
+    case 'hubspot_recent':
+      if (!user_access('see recent hubspot leads')) {
+        return;
+      }
+      $block['subject'] = t('HubSpot Recent Leads');
+
+      $leads = hubspot_get_recent();
+
+      // This part of the HubSpot API returns HTTP error codes on failure, with no message
+      if (!empty($leads['Error']) || $leads['HTTPCode'] != 200) {
+        $block['content'] = t('An error occurred when fetching the HubSpot leads data: @error', array(
+          '@error' => !empty($leads['Error']) ? $leads['Error'] : $leads['HTTPCode'],
+        ));
+
+        return $block;
+      }
+      elseif (empty($leads['Data'])) {
+        $block['content'] = t('No leads to show.');
+        return $block;
+      }
+
+      $block['content'] = array(
+        '#theme' => 'item_list',
+        '#items' => array(),
+        '#type' => 'ul',
+      );
+
+      foreach ($leads['Data']->contacts as $lead) {
+        foreach ($leads['Data']->contacts as $lead) {
+          // Note that $lead->insertedAt is in ms, not seconds, since the epoch.
+          $block['content']['#items'][] = l($lead->properties->firstname->value . ' ' .
+            $lead->properties->lastname->value, $lead->{'profile-url'}) . ' ' . t('(@time ago)', array(
+              '@time' => format_interval(time() - floor($lead->addedAt / 1000))
+            ));
+        }
+      }
+
+      break;
+  }
+
+  return $block;
+}
+
+/**
+ * Gets the most recent HubSpot leads.
+ *
+ * @param int $n
+ *   The number of leads to fetch.
+ *
+ * @see http://docs.hubapi.com/wiki/Searching_Leads
+ *
+ * @return array
+ */
+function hubspot_get_recent($n = 5) {
+  $access_token = variable_get('hubspot_access_token', '');
+  $n = intval($n);
+
+  if (empty($access_token)) {
+    return array('Error' => t('This site is not connected to a HubSpot Account.'));
+  }
+
+  $result = drupal_http_request("https://api.hubapi.com/contacts/v1/lists/recently_updated/contacts/recent?access_token={$access_token}&count={$n}");
+  if ($result->code == 401) {
+    $refresh = hubspot_oauth_refresh();
+    if ($refresh) {
+      $access_token = variable_get('hubspot_access_token', '');
+      $result = drupal_http_request("https://api.hubapi.com/contacts/v1/lists/recently_updated/contacts/recent?access_token={$access_token}&count={$n}");
+    }
+  }
+
+  return array(
+    'Data' => json_decode($result->data),
+    'Error' => isset($result->error) ? $result->error : '',
+    'HTTPCode' => $result->code
+  );
+}
+
+/**
+ * Implements hook_webform_submission_insert().
+ *
+ * Intercepts the WebForm submission and send it off to HubSpot.
+ */
+function hubspot_webform_submission_insert($node, $submission) {
+  // Get the Webform version
+  $webform_path = drupal_get_path('module', 'webform') . '/webform.info';
+  $webform_info = drupal_parse_info_file($webform_path);
+
+  $matches = array();
+
+  if (preg_match('/^(\d+\.x-)?(\d+)\..*$/', $webform_info['version'], $matches)) {
+    $webform_major_version = $matches[2];
+  }
+
+  if ($submission->is_draft == 1) {
+    return;
+  }
+
+  $hubspot_portalid = variable_get('hubspot_portalid', '');
+  $hubspot_form_guid = db_query_range("SELECT hubspot_guid FROM {hubspot} h WHERE h.nid = :nid", 0, 1, array(
+    ':nid' => $node->nid,
+  ))->fetchField();
+
+  if (empty($hubspot_portalid) || empty($hubspot_form_guid)) {
+    return;
+  }
+
+  $fields = array();
+
+  // These fields must be submitted with each request.
+  $hs_context = array(
+    'hutk' => isset($_COOKIE['hubspotutk']) ? $_COOKIE['hubspotutk'] : '',
+    'ipAddress' => ip_address(),
+    'pageName' => $node->title,
+    'pageUrl' => url('node/' . $node->nid, array('absolute' => TRUE)),
+  );
+
+  $fields['hs_context'] = drupal_json_encode($hs_context);
+
+  foreach ($node->webform['components'] as $data_id => $data) {
+    // Skip if there is no data
+    if (!isset($submission->data[$data_id])) {
+      continue;
+    }
+    else {
+      // Get the component value (submission structure differs from Webform 3 and 4).
+      // https://drupal.org/node/1609324#submission-structure
+      $component_data = $webform_major_version <= 3 ? $submission->data[$data_id]['value'] : $submission->data[$data_id];
+    }
+
+    $sql = "SELECT hubspot_field FROM {hubspot} h WHERE h.nid = :nid AND h.hubspot_guid = :guid AND h.webform_field = :webform_field";
+
+    if ($data['type'] == 'addressfield' && module_exists('addressfield_tokens')) {
+      $addressfield_fields = addressfield_tokens_components();
+      $addressfield_data = unserialize($component_data[0]);
+
+      foreach ($addressfield_fields as $addressfield_key => $addressfield_values) {
+        $result = db_query($sql, array(':nid' => $node->nid, ':guid' => $hubspot_form_guid, ':webform_field' => $data['form_key'] . '_' . $addressfield_key))->fetchField();
+
+        $result = db_query_range($sql, 0, 1, array(
+          ':nid' => $node->nid,
+          ':guid' => $hubspot_form_guid,
+          ':webform_field' => $data['form_key'] . '_' . $addressfield_key,
+        ))->fetchField();
+
+        if ($result && $result != '--donotmap--') {
+          $fields[$result] = $addressfield_data[$addressfield_key];
+        }
+      }
+    }
+    else {
+      $result = db_query_range($sql, 0, 1, array(
+        ':nid' => $node->nid,
+        ':guid' => $hubspot_form_guid,
+        ':webform_field' => $data['form_key'],
+      ))->fetchField();
+
+      if ($result && $result != '--donotmap--') {
+        if (count($component_data) > 1) {
+          $fields[$result] = '';
+          foreach ($component_data as $value) {
+            if (!empty($fields[$result])) {
+              $fields[$result] .= ';' . $value;
+            }
+            else {
+              $fields[$result] .= $value;
+            }
+          }
+        }
+        elseif (isset($component_data[0])) {
+          $fields[$result] = $component_data[0];
+        }
+      }
+    }
+  }
+
+  $result = hubspot_insert_lead($hubspot_portalid, $hubspot_form_guid, $fields);
+
+  if ($result['HTTPCode'] == '204') {
+    watchdog('hubspot', 'Webform "%form" results succesfully submitted to HubSpot. Post: @post - Response: @msg', array(
+      '@post' => strip_tags($result['POST']),
+      '@msg' => strip_tags($result['Data']),
+      '%form' => $node->title,
+    ), WATCHDOG_INFO);
+  }
+  elseif (!empty($result['Error'])) {
+    watchdog('hubspot', 'HTTP error when submitting HubSpot data from Webform "%form": @error', array(
+      '@error' => $result['Error'],
+      '%form' => $node->title,
+    ), WATCHDOG_ERROR);
+
+    if (variable_get('hubspot_debug_on', 0)) {
+      drupal_mail('hubspot', 'http_error', variable_get('hubspot_debug_email', variable_get('site_mail', '')), language_default(), array(
+        'errormsg' => $result['Error'],
+        'hubspot_url' => $hubspot_url,
+        'node_title' => $node->title,
+      ), variable_get('site_mail', ''));
+    }
+  }
+  else {
+    watchdog('hubspot', 'HubSpot error when submitting Webform "%form": @error', array(
+      '@error' => $result['Data'],
+      '%form' => $node->title,
+    ), WATCHDOG_ERROR);
+
+    if (variable_get('hubspot_debug_on', 0)) {
+      drupal_mail('hubspot', 'hub_error', variable_get('hubspot_debug_email', variable_get('site_mail', '')), language_default(), array(
+        'errormsg' => $result['Data'],
+        'hubspot_url' => $hubspot_url,
+        'node_title' => $node->title,
+      ), variable_get('site_mail', ''));
+    }
+  }
+}
+
+/**
+ * Executes the HubSpot API POST to insert a lead.
+ *
+ * @param string $portal_id
+ *   HubSpot Portal ID to submit to.
+ * @param string $form_guid
+ *   HubSpot-provided Form API GUID to submit to.
+ * @param array $fields
+ *   Form fields, such as name and contact info.
+ *
+ * @return array
+ *   An associative array containing:
+ *   - Data: The response returned from drupal_http_request().
+ *   - Error: The HTTP error message from drupal_http_request().
+ *   - HTTPCode: The HTTP response code of the request.
+ */
+function hubspot_insert_lead($portal_id, $form_guid, $fields) {
+  $str_post = drupal_http_build_query($fields);
+
+  // Send POST data.
+  $result = drupal_http_request('https://forms.hubspot.com/uploads/form/v2/' . $portal_id . '/' . $form_guid, array(
+    'headers' => array(
+      'Content-Type' => 'application/x-www-form-urlencoded',
+    ),
+    'method' => 'POST',
+    'data' => $str_post,
+  ));
+
+  return array(
+    'Data' => isset($result->data) ? $result->data : '',
+    'Error' => isset($result->error) ? $result->error : '',
+    'HTTPCode' => $result->code,
+    'POST' => $str_post,
+  );
+}
+
+/**
+ * Implements hook_help().
+ */
+function hubspot_help($path, $arg) {
+  $output = '';
+  switch ($path) {
+    case 'admin/help#hubspot':
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t('The HubSpot module provides leads integration with the HubSpot API, allowing forms created
+        with the Webform module to submit their data to HubSpot for leads tracking. It also allows you to easily embed
+        the HubSpot JavaScript tracking code in your site to track the visits of each lead. Further information is
+        available in the Drupal <a href="http://drupal.org/node/1195370">handbook pages for this module.</a>') . '</p>';
+      $output .= '<h3>' . t('Creating a HubSpot Webform') . '</h3>';
+      $output .= '<p>' . t("To have a Webform's data sent to HubSpot for leads tracking, complete the following steps:")
+        . '</p>';
+      $output .= '<ol>';
+      $output .= '<li>' . t('Connect to your HubSpot account from the HubSpot settings page (links below).') . '</li>';
+      $output .= '<li>' . t('From the Webform tab of any webform you will now see the HubSpot "subtab" link below. Click
+       on that link.') . '</li>';
+      $output .= '<li>' . t('On that page you will see a dropdown listing all of your HubSpot forms (set up from
+        HubSpot.com). Select the form you want to map to this Webform.') . '</li>';
+      $output .= '<li>' . t('Finally, just go through each Webform fields and map them to the HubSpot form fields
+        available in each dropdown. Click save and you\'re done!') . '</li>';
+      $output .= '</ol>';
+      $output .= '<p>' . t('The Webform will now automatically send any submissions directly to HubSpot form you
+        configured.') . '</p>';
+      $output .= '<h3>' . t('HubSpot Javascript tracking code') . '</h3>';
+      $output .= '<p>' . t('HubSpot supports using a JavaScript tracking system to analyze potential leads on your site.
+        You can get the JavaScript code from your HubSpot settings, under External Site Traffic Logging, and paste it
+        into the HubSpot integration settings page in Drupal to have it automatically included on every page.') . '</p>';
+      break;
+
+    case 'node/%/webform/hubspot':
+      $output .= '<p>' . t("To post this form's results to HubSpot you will need to select the HubSpot form and map the
+        webform fields to the available HubSpot fields.") . '</p>';
+      break;
+  }
+  return $output;
+}
+
+/**
+ * Gets the list of forms from HubSpot via the API.
+ */
+function _hubspot_get_forms() {
+  $access_token = variable_get('hubspot_access_token', '');
+
+  if (empty($access_token)) {
+    return array('error' => t('This site is not connected to a HubSpot Account.'));
+  }
+
+  $request = drupal_http_request("https://api.hubapi.com/contacts/v1/forms?access_token={$access_token}");
+
+  if ($request->code == 401) {
+    $refresh = hubspot_oauth_refresh();
+    if ($refresh) {
+      $access_token = variable_get('hubspot_access_token', '');
+      $request = drupal_http_request("https://api.hubapi.com/contacts/v1/forms?access_token={$access_token}");
+    }
+  }
+
+  return array('value' => drupal_json_decode($request->data));
+}
+
+/**
+ * Returns the default value for the given arguments.
+ */
+function _hubspot_default_value($nid, $hubspot_guid = NULL, $webform_field = NULL) {
+  if (empty($hubspot_guid)) {
+    return db_query_range("SELECT hubspot_guid FROM {hubspot} h WHERE h.nid = :nid", 0, 1, array(':nid' => $nid))->fetchField();
+  }
+  else {
+    return db_query_range("SELECT hubspot_field FROM {hubspot} h WHERE h.nid = :nid AND h.hubspot_guid = :guid AND h.webform_field = :webform_field", 0, 1, array(
+      ':nid' => $nid,
+      ':guid' => $hubspot_guid,
+      ':webform_field' => $webform_field,
+    ))->fetchField();
+  }
+}

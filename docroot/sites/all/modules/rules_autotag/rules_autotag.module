@@ -1,0 +1,232 @@
+<?php
+
+/**
+ * Extract terms.
+ *
+ * @param $text
+ *   The text being parsed by the extractor.
+ * @param $vocabulary
+ *   Vocabulary defining terms which should be extracted.
+ *
+ * @return
+ *   An array of tids.
+ */
+function rules_autotag_extract($text, $vocabulary) {
+  $extracted_tids = array();
+  $terms = rules_autotag_get_term_names($vocabulary);
+
+  $text = rules_autotag_clean_text($text);
+  $text_tokens = array_flip(rules_autotag_split_text($text));
+
+  $matchings_term_splits = array_intersect_key($terms, $text_tokens);
+
+  // Loops over all matched splits and checks if a term name consists
+  // of multiple splits. If so, an additional text parsing for the whole
+  // term name is performed.
+  foreach ($matchings_term_splits as $results) {
+    foreach ($results as $result) {
+      $tid = $result['tid'];
+      if (!in_array($tid, $extracted_tids)) {
+        if ($result['splitted']) {
+          if (strpos($text, $result['original_term_name']) !== FALSE) {
+            $extracted_tids[] = $tid;
+          }
+        }
+        else {
+          $extracted_tids[] = $tid;
+        }
+      }
+    }
+  }
+  return $extracted_tids;
+}
+
+/**
+ * Returns an array of terms, keyed by splitted term names.
+ *
+ * The structure can be modified with hook_rules_autotag_terms_alter()
+ * implementations.
+ */
+function rules_autotag_get_term_names($vocabulary) {
+  $terms = &drupal_static(__FUNCTION__ . ':terms', array());
+
+  if (!isset($terms[$vocabulary->vid])) {
+    $terms[$vocabulary->vid] = array();
+    $result = db_select('taxonomy_term_data', 't')
+      ->fields('t')
+      ->condition('t.vid', $vocabulary->vid)
+      ->addTag('rules_autotag_terms')
+      ->execute();
+
+    foreach ($result as $term) {
+      rules_autotag_build_names_array($terms[$vocabulary->vid], $term->name, $term->tid);
+    }
+
+    drupal_alter('rules_autotag_terms', $terms[$vocabulary->vid], $vocabulary);
+  }
+  return $terms[$vocabulary->vid];
+}
+
+/**
+ * Helper function for generating the term names array.
+ *
+ * @param $terms
+ *   An array of terms, where the new name is going to be added.
+ * @param $name
+ *   The name (term name, synonym, ...) to add.
+ * @param $tid
+ *   The corresponding term id.
+ */
+function rules_autotag_build_names_array(&$terms, $name, $tid) {
+  $name = rules_autotag_clean_term($name);
+  $name_splits = rules_autotag_split_text($name);
+  foreach ($name_splits as $split) {
+    $terms[$split][] = array(
+      'tid' => $tid,
+      'splitted' => (count($name_splits) > 1) ? TRUE : FALSE,
+      'original_term_name' => $name,
+    );
+  }
+}
+
+/**
+ * Converts term names to lower case.
+ */
+function rules_autotag_clean_term($text) {
+  return drupal_strtolower($text);
+}
+
+/**
+ * Removes tags from a text and converts it to lower case.
+ * Additionally content from CDATA tags is extracted and added to the text.
+ */
+function rules_autotag_clean_text($text) {
+  $text = preg_replace('/<!\[CDATA\[(.*?)\]\]>/is', '$1', $text);
+  // strip_tags() does not introduce any white space for concatenated tags.
+  // Example: "<h1>Hello</h1>Body text here." would become "HelloBody text here."
+  $text = preg_replace('/(<[^>]+>)/', '$1 ', $text);
+  $text = strip_tags($text);
+  $text = drupal_strtolower($text);
+  $text = trim($text);
+  return $text;
+}
+
+/**
+ * Splits a given text and into separate words and returns them as array.
+ *
+ * @param string $text
+ *   The text to split, UTF-8 encoded.
+ */
+function rules_autotag_split_text($text) {
+  // We want to split around words, symbols and numbers, therefore we use
+  // unicode character properties to detect marks, punctuation, separators and
+  // other characters we want to ignore.
+  // See http://www.php.net/manual/en/regexp.reference.unicode.php
+  // Filter out any remaining empty strings after the split.
+  return array_filter(preg_split("/[\pC\pM\pP\pZ]+/u", $text));
+}
+
+/**
+ * Implements hook_rules_autotag_terms_alter().
+ */
+function rules_autotag_rules_autotag_terms_alter(&$terms, $vocabulary) {
+  // Adds synonyms to terms array structure.
+  if (module_exists('synonyms')) {
+    $fields = synonyms_synonyms_fields($vocabulary);
+    if (empty($fields)) {
+      return;
+    }
+    // In case there is only one text field, directly query the database which
+    // is much more efficient.
+    if (count($fields) == 1) {
+      $field_name = $fields[0];
+      $field = field_info_field($field_name);
+      if (isset($field['type']) && $field['type'] == 'text' && isset($field['storage']['type']) && $field['storage']['type'] == 'field_sql_storage') {
+        rules_autotag_synonyms_merge_text_field($terms, $vocabulary, $field);
+        return;
+      }
+    }
+    // Else we have to use the Synonyms API and load each term separately.
+    rules_autotag_synonyms_merge_synonyms($terms, $vocabulary);
+  }
+}
+
+/**
+ * Helper function that queries a single text field and merges the results into
+ * the $terms array.
+ *
+ * This function bypasses the Synonyms API, but is much more efficient, as an
+ * entity load of each term is avoided.
+ */
+function rules_autotag_synonyms_merge_text_field(&$terms_array, $vocabulary, $field) {
+  $storage_info = $field['storage']['details']['sql'][FIELD_LOAD_CURRENT];
+  $keys = array_keys($storage_info);
+  $table = array_pop($keys);
+  $value_field = $storage_info[$table]['value'];
+
+  $query = db_select($table, 's');
+  $query ->join('taxonomy_term_data', 'd', 'd.tid = s.entity_id');
+  $result = $query->fields('s', array('entity_id', $value_field))
+    ->condition('d.vid', $vocabulary->vid)
+    ->execute();
+  foreach ($result as $row) {
+    rules_autotag_build_names_array($terms_array, $row->{$value_field}, $row->entity_id);
+  }
+}
+
+/**
+ * Helper function that loads all synonyms for the terms and merges it into the
+ * $term array.
+ *
+ * This function uses the Synonyms API. So all features from the Synonyms module
+ * are supported, but loading can take a while for a huge vocabulary.
+ */
+function rules_autotag_synonyms_merge_synonyms(&$terms_array, $vocabulary) {
+  $tids = array();
+  // Extract all the term ids from the list
+  foreach ($terms_array as $names) {
+    foreach ($names as $name) {
+      $tids[$name['tid']] = $name['tid'];
+    }
+  }
+  $terms = taxonomy_term_load_multiple($tids);
+  foreach ($terms as $term) {
+    $synonyms = synonyms_get_term_synonyms($term);
+    foreach ($synonyms as $synonym) {
+      rules_autotag_build_names_array($terms_array, $synonym['value'], $term->tid);
+    }
+  }
+}
+
+/**
+ * Matches a given text against a vocabulary and returns an equal term.
+ *
+ * This is largely a copy of rules_autotag_extract() with the difference that
+ * the text has to exactly match a term name (or synonym).
+ *
+ * @param string $text
+ *   The text to match.
+ * @param object $vocabulary
+ *   Vocabulary defining terms which should be compared.
+ *
+ * @return int|FALSE
+ *   The term ID or FALSE if no equal term exists in the vocabulary.
+ */
+function rules_autotag_exact_match($text, $vocabulary) {
+  $terms = rules_autotag_get_term_names($vocabulary);
+
+  $text = rules_autotag_clean_text($text);
+  $text_tokens = array_flip(rules_autotag_split_text($text));
+
+  $matchings_term_splits = array_intersect_key($terms, $text_tokens);
+
+  // Search for an exactly matching term name and return that immediately.
+  foreach ($matchings_term_splits as $results) {
+    foreach ($results as $result) {
+      if ($result['original_term_name'] == $text) {
+        return $result['tid'];
+      }
+    }
+  }
+  return FALSE;
+}

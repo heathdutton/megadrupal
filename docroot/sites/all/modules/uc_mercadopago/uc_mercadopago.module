@@ -1,0 +1,321 @@
+<?php
+
+function uc_mercadopago_menu() {
+  // Always accessible, helps for testing while site is offline.
+  $items['uc_mercadopago/ipn'] = array(
+    'title' => 'MercadoPago IPN',
+    'page callback' => 'uc_mercadopago_ipn',
+    'access callback' => TRUE,
+    'type' => MENU_CALLBACK,
+    'file' => 'uc_mercadopago.pages.inc',
+  );
+  // Callback functions for MercadoPago payments
+  $items['uc_mercadopago/complete/%uc_order'] = array(
+    'title' => 'Mercadopago payment complete',
+    'page callback' => 'uc_mercadopago_complete',
+    'page arguments' => array(2),
+    'access arguments' => array('access content'),
+    'type' => MENU_CALLBACK,
+    'file' => 'uc_mercadopago.pages.inc',
+  );
+  $items['uc_mercadopago/cancel'] = array(
+    'title' => 'MercadoPago payment canceled',
+    'page callback' => 'uc_mercadopago_cancel',
+    'access arguments' => array('access content'),
+    'type' => MENU_CALLBACK,
+    'file' => 'uc_mercadopago.pages.inc',
+  );
+
+  return $items;
+}
+
+/**
+* Implements hook_form_alter().
+*/
+function uc_mercadopago_form_alter(&$form, &$form_state, $form_id) {
+  if ($form_id == 'uc_cart_checkout_form') {
+    $js_settings['ucMercadoPago']['country'] = variable_get('uc_mercadopago_country', 'MLA');
+    $form['#attached']['js'][] = drupal_get_path('module', 'uc_mercadopago') . '/uc_mercadopago.js';
+    $form['#attached']['js'][] = array(
+      'data' => $js_settings,
+      'type' => 'setting'
+    );
+  }
+}
+
+/**
+ * Implements hook_uc_payment_method().
+ */
+function uc_mercadopago_uc_payment_method() {
+
+  drupal_add_css(drupal_get_path('module', 'uc_mercadopago') . '/uc_mercadopago.css');
+
+  $title = t('Credit card');
+  $title .= '<br />';
+  $title .= '<span class="uc-mercadopago-payment-methods"></span>';
+
+  $methods[] = array(
+    'id' => 'mercadopago',
+    'name' => t('MercadoPago'),
+    'title' => $title,
+    'review' => t('MercadoPago'),
+    'desc' => t('Redirect users to submit payments through MercadoPago.'),
+    'callback' => 'uc_payment_method_mercadopago',
+    'redirect' => 'uc_mercadopago_form',
+    'weight' => 1,
+    'checkout' => FALSE,
+    'no_gateway' => TRUE,
+  );
+
+  return $methods;
+}
+
+function uc_mercadopago_form($form, &$form_state, $order) {
+
+  switch (variable_get('uc_mercadopago_country', 'MLA')) {
+    case 'MLA':
+      $currency = 'ARS';
+      break;
+    case 'MLB':
+      $currency = 'BRL';
+      break;
+    case 'MLM':
+      $currency = 'MXN';
+      break;
+    case 'MLA':
+      $currency = 'VEF';
+      break;
+  }
+
+  if (variable_get('uc_mercadopago_submit_method', 'single') == 'itemized') {
+    // List individual items.
+    $items = array();
+    $attributes = array();
+
+    foreach ($order->products as $item) {
+      // PayPal will only display the first two...
+      if (!empty($item->data['attributes']) && count($item->data['attributes']) > 0) {
+        foreach ($item->data['attributes'] as $name => $setting) {
+          $attributes[] = $name . ': ' . implode(', ', (array)$setting);
+        }
+      }
+
+      $title = $item->title;
+      if (count($attributes)) {
+        $title .= ' (' . implode(', ', $attributes) . ')';
+      }
+
+      $items[] = array(
+        'title' => $title,
+        'quantity' => (float) $item->qty,
+        'id' =>  $item->model,
+        'unit_price' => (float) $item->price,
+        "currency_id" => $currency,
+      );
+
+    }
+
+    // Apply discounts (negative amount line items). For example, this handles
+    // line items created by uc_coupon.
+    $discount = 0;
+
+    foreach ($order->line_items as $item) {
+      if ($item['amount'] < 0) {
+        // The minus sign is not an error! The discount amount must be positive.
+        $discount -= $item['amount'];
+      }
+    }
+
+    if ($discount != 0) {
+      // @TODO: See how to add this information
+    }
+  }
+  else {
+    // List the whole cart as a single item to account for fees/discounts.
+    $items[] = array(
+      'title' => t('Order @order_id at !store', array('@order_id' => $order->order_id, '!store' => uc_store_name())),
+      'quantity' => 1,
+      'unit_price' => (float) $order->order_total,
+      "currency_id" => $currency,
+    );
+  }
+
+  libraries_load('mercadopago');
+
+  $mp = new MP(variable_get('uc_mercadopago_client_id', ''), variable_get('uc_mercadopago_client_secret', ''));
+
+  if (variable_get('uc_mercadopago_server', 'sandbox') == 'sandbox') {
+    $mp->sandbox_mode(TRUE);
+  }
+  else {
+    $mp->sandbox_mode(FALSE);
+  }
+
+  $preference = array(
+    "items" => $items,
+    'back_urls' => array(
+        'success' => url('uc_mercadopago/complete/' . $order->order_id, array('absolute' => TRUE)),
+        'failure' => url('uc_mercadopago/cancel', array('absolute' => TRUE)),
+        'pending' => url('uc_mercadopago/complete/' . $order->order_id, array('absolute' => TRUE)),
+    ),
+    'payer' => array(
+      'email' => $order->primary_email,
+    ),
+    'external_reference' => $order->order_id,
+  );
+
+  $preferenceResult = $mp->create_preference($preference);
+
+  if (variable_get('uc_mercadopago_server', 'sandbox') == 'sandbox') {
+    $init_point = $preferenceResult['response']['sandbox_init_point'];
+  }
+  else {
+    $init_point = $preferenceResult['response']['init_point'];
+  }
+
+  $js_onreturn = '(function(){function $MPBR_load(){window.$MPBR_loaded !== true && (function(){var s = document.createElement("script");s.type = "text/javascript";s.async = true;
+      s.src = ("https:"==document.location.protocol?"https://www.mercadopago.com/org-img/jsapi/mptools/buttons/":"http://mp-tools.mlstatic.com/buttons/")+"render.js";
+      var x = document.getElementsByTagName(\'script\')[0];x.parentNode.insertBefore(s, x);window.$MPBR_loaded = true;})();}
+      window.$MPBR_loaded !== true ? (window.attachEvent ? window.attachEvent(\'onload\', $MPBR_load) : window.addEventListener(\'load\', $MPBR_load, false)) : null;})();';
+  $form['#attached']['js'] = array(
+    drupal_get_path('module', 'uc_mercadopago') . '/uc_mercadopago.js',
+    $js_onreturn => array('type' => 'inline', 'scope' => 'footer'),
+  );
+
+  $form['actions'] = array('#type' => 'actions');
+  $form['actions']['submit'] = array(
+    '#markup' => l(variable_get('uc_mercadopago_checkout_button', t('Submit Order')), $init_point, array('attributes' => array('mp-mode'=> variable_get('uc_mercadopago_mode', 'modal'), 'name' => 'MP-Checkout'))),
+  );
+
+  return $form;
+}
+
+/**
+ * Implements hook_libraries_info().
+ */
+function uc_mercadopago_libraries_info() {
+  // This array key lets Libraries API search for 'sites/all/libraries/example'
+  // directory, which should contain the entire, original extracted library.
+  $libraries['mercadopago'] = array(
+    // Only used in administrative UI of Libraries API.
+    'name' => 'Mercadopago SDK-PHP',
+    'vendor url' => 'https://github.com/mercadopago/sdk-php',
+    'download url' => 'https://github.com/mercadopago/sdk-php/archive/master.zip',
+    // Optional: If, after extraction, the actual library files are contained in
+    // 'sites/all/libraries/example/lib', specify the relative path here.
+    'path' => 'lib',
+    // Specify arguments for the version callback. By default,
+    // libraries_get_version() takes a named argument array:
+    'version arguments' => array(
+      'file' => 'lib/mercadopago.php',
+      'pattern' => '@\s+const\s+version\s+=\s+\"([0-9a-zA-Z\.-]+)\"@',
+      'lines' => 20,
+      'cols' => 80,
+    ),    // Default list of files of the library to load. Important: Only specify
+    // third-party files belonging to the library here, not integration files of
+    // your module.
+    'files' => array(
+      // For PHP libraries, specify include files here, still relative to the
+      // library path.
+      'php' => array(
+        'mercadopago.php',
+      ),
+    ),
+  );
+
+  return $libraries;
+}
+
+/**
+ * Handles Mercadopago payment method.
+ */
+function uc_payment_method_mercadopago($op, &$order) {
+  switch ($op) {
+    case 'order-view':
+      return ;
+
+    case 'settings':
+      $library = libraries_detect('mercadopago');
+
+      $form['uc_mercadopago_country'] = array(
+        '#type' => 'select',
+        '#title' => t('Country'),
+        '#description' => t('This will be used on some screens to pull specific information from each country API URL.'),
+        '#options' => array(
+          'MLA' => t('Argentina'),
+          'MLB' => t('Brazil'),
+          'MLM' => t('Mexico'),
+          'MLV' => t('Venezuela'),
+        ),
+        '#default_value' => variable_get('uc_mercadopago_country', 'MLA'),
+      );
+      $form['uc_mercadopago_client_id'] = array(
+        '#type' => 'textfield',
+        '#title' => t('Client ID'),
+        '#required' => TRUE,
+        '#description' => t('Get your client ID from mercadopago for either <a target="_blank" href="https://www.mercadopago.com/mla/herramientas/aplicaciones">Argentina</a>, <a target="_blank" href="https://www.mercadopago.com/mlb/ferramentas/aplicacoes">Brasil</a>, <a target="_blank" href="https://www.mercadopago.com/mlm/herramientas/aplicaciones">Mexico</a> or <a target="_blank" href="https://www.mercadopago.com/mlv/herramientas/aplicaciones">Venezuela</a>.'),
+        '#default_value' => variable_get('uc_mercadopago_client_id', ''),
+      );
+      $form['uc_mercadopago_client_secret'] = array(
+        '#type' => 'textfield',
+        '#title' => t('Client Secret'),
+        '#required' => TRUE,
+        '#description' => t('Get your client secret from mercadopago for either <a target="_blank" href="https://www.mercadopago.com/mla/herramientas/aplicaciones">Argentina</a>, <a target="_blank" href="https://www.mercadopago.com/mlb/ferramentas/aplicacoes">Brasil</a>, <a target="_blank" href="https://www.mercadopago.com/mlm/herramientas/aplicaciones">Mexico</a> or <a target="_blank" href="https://www.mercadopago.com/mlv/herramientas/aplicaciones">Venezuela</a>.'),
+        '#default_value' => variable_get('uc_mercadopago_client_secret', ''),
+      );
+      $form['uc_mercadopago_server'] = array(
+        '#type' => 'select',
+        '#title' => t('API server'),
+        '#description' => t('You can test MercadoPago with its <a target="_blank" href="https://developers.mercadopago.com/sandbox">Sandbox</a> server.'),
+        '#options' => array(
+          'sandbox' => t('Sandbox'),
+          'live' => t('Live'),
+        ),
+        '#default_value' => variable_get('uc_mercadopago_server', 'sandbox'),
+      );
+      $form['uc_mercadopago_checkout_button'] = array(
+        '#type' => 'textfield',
+        '#title' => t('Order review submit button text'),
+        '#description' => t('Mercadopago specific text for the submit button on the order review page.'),
+        '#default_value' => variable_get('uc_mercadopago_checkout_button', t('Submit Order')),
+      );
+      $form['uc_mercadopago_mode'] = array(
+        '#type' => 'select',
+        '#title' => t('Checkout mode'),
+        '#description' => t('Choose the type of <a href="!dev_uri">checkout flow</a> you would like to use with MercadoPago.', array('!dev_uri' => 'https://developers.mercadopago.com/documentacion/render#resources-open-checkout')),
+        '#options' => array(
+          'modal' => t('Modal'),
+          'popup' => t('Pop-up'),
+          'blank' => t('New page or tab'),
+          'redirect' => t('Redirect to mercadopago'),
+        ),
+        '#default_value' => variable_get('uc_mercadopago_mode', 'modal'),
+      );
+      $form['uc_mercadopago_cancel_return_url'] = array(
+        '#type' => 'textfield',
+        '#title' => t('Cancel return URL'),
+        '#description' => t('Specify the path customers who cancel their MercadoPago payment will be directed to when they return to your site.'),
+        '#default_value' => variable_get('uc_mercadopago_cancel_return_url', 'cart'),
+        '#size' => 32,
+        '#field_prefix' => url(NULL, array('absolute' => TRUE)) . (variable_get('clean_url', 0) ? '' : '?q='),
+      );
+      $form['uc_mercadopago_submit_method'] = array(
+        '#type' => 'radios',
+        '#title' => t('Mercadopago cart submission method'),
+        '#options' => array(
+          'single' => t('Submit the whole order as a single line item.'),
+          'itemized' => t('Submit an itemized order showing each product and description.'),
+        ),
+        '#default_value' => variable_get('uc_mercadopago_submit_method', 'single'),
+        '#disabled' => TRUE,
+        '#description' => t('This option is disabled because the API does not currently support this feature yet, although it may be implemented in the future. See the following <a href="https://groups.google.com/d/msg/mercadopago-developers/gTIdiRa0X34/_Sza64-0Qp8J">developer groups\' post</a>.'),
+      );
+      $form['uc_mercadopago_debug_ipn'] = array(
+        '#type' => 'checkbox',
+        '#title' => t('Show debug info in the logs for Instant Payment Notifications.'),
+        '#default_value' => variable_get('uc_mercadopago_debug_ipn', FALSE),
+      );
+
+      return $form;
+  }
+}

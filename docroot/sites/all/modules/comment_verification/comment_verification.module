@@ -1,0 +1,238 @@
+<?php
+
+/**
+ * @file
+ * Require anonymous commenters to verify their email address.
+ *
+ * While enabled, comments submitted by anonymous users on selected content
+ * types are held in
+ */
+
+/**
+ * Implements hook_menu().
+ */
+function comment_verification_menu() {
+  $items = array();
+
+  // This is the link that gets sent in anon emails.
+  $items['comment/verify/%/%'] = array(
+    'title' => 'Verify signature',
+    'page callback' => 'comment_verification_page',
+    'page arguments' => array(2, 3),
+    'access arguments' => array('post comments'),
+    'type' => MENU_CALLBACK,
+  );
+
+  $items['admin/config/comment_verification'] = array(
+    'title' => 'Anonymous comment verification',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('comment_verification_admin_form'),
+    'access arguments' => array('administer site configuration'),
+    'type' => MENU_NORMAL_ITEM,
+    'file' => 'comment_verification.admin.inc',
+  );
+
+  return $items;
+}
+
+/**
+ * Verifies a link sent to an email address provided by an anonymous commenter.
+ *
+ * After verification, if anon users have rights to publish comments without
+ * approval, publish the comment. Otherwise, put it into the moderation queue.
+ * The commenter is redirected to the node the comment is on.
+ *
+ * If verification fails, the visitor is redirected to the site homepage.
+ *
+ * If comment_anon_register_prompt is true, the commenter will be shown a link
+ * suggesting they register an account.
+ *
+ * @param $cavid
+ *   DB primary key for the comment_verification table
+ * @param $hash
+ *   Hash code generated, stored, and emailed when the anon comment was created
+ */
+function comment_verification_page($cavid, $hash) {
+  $rawcomment = db_select('comment_verification', 'a')
+    ->fields('a')
+    ->condition('cavid', $cavid, '=')
+    ->condition('hash', $hash, '=')
+    ->execute()
+    ->fetchAssoc();
+
+  if ($rawcomment) {
+    $comment = unserialize($rawcomment['edit']);
+
+    // Save the comment to drupal comment tables.
+    comment_submit($comment);
+    comment_save($comment);
+
+    drupal_set_message(t('Thank you, your email address has been verified'));
+
+    if (variable_get('comment_anon_register_prompt', FALSE)) {
+      drupal_set_message(t('Consider <a href="/user/register">joining this site</a> to make commenting easier in the future!'));
+    }
+    // we're done with this stored comment; clear it out.
+    db_delete('comment_verification')
+      ->condition('cavid', $cavid, '=')
+      ->condition('hash', $hash, '=')
+      ->execute();
+
+    drupal_goto('node/' . check_plain($comment->nid));
+  }
+  else {
+    drupal_set_message(t('This verification link is either not valid or has expired'), 'warning');
+    drupal_goto('');
+  }
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function comment_verification_form_alter(&$form, $form_state, $form_id) {
+
+  // Replace anonymous user the default submit function of the comment form.
+  if (substr($form_id, 0, 13) == 'comment_node_') {
+    global $user;
+    if (!$user->uid) {
+      $node = node_load($form['nid']['#value']);
+
+      if ($form_id == "comment_node_{$node->type}_form") {
+        if (_cav_enabled($node->type)) {
+          $default_submit_index = array_search('comment_form_submit', $form['#submit']);
+          $form['#submit'][$default_submit_index] = '_comment_anon_form_submit';
+          if (isset($form['actions']['submit']['#submit'])) {
+            // Before finding a better way, unset the comment_access submit for
+            // anonymous users.
+            unset($form['actions']['submit']['#submit']);
+          }
+        }
+      }
+    }
+  }
+
+  // Add a checkbox to content type forms.
+  elseif ($form_id == 'node_type_form') {
+    $form['comment']['comment_verification_label'] = array(
+      '#prefix' => '<div><strong>',
+      '#value' => t('Anonymous comment verification:'),
+      '#suffix' => '</strong></div>',
+      '#weight' => 39,
+    );
+    $form['comment']['comment_verification_enabled'] = array(
+      '#type' => 'checkbox',
+      '#title' => t('Require email verification of anonymous comments on this content type.'),
+      '#default_value' => variable_get('comment_verification_enabled_' . $form['#node_type']->type, FALSE),
+      '#description' => t('First of all, assign "Post comments" right to anonymous user. Anonymous commenting for this content type must be set to <em>Anonymous posters must leave their contact information</em> for this to have an effect.'),
+      '#weight' => 40,
+    );
+  }
+}
+
+
+/**
+ * Implements hook_cron().
+ *
+ * clean out entries that have been awaiting verification too long
+ */
+function comment_verification_cron() {
+  db_delete('comment_verification')
+    ->condition('timestamp', time() - variable_get('comment_verification_timer'), '<')
+    ->execute();
+}
+
+/**
+ * Overrides the default comment submission function for anon commenters.
+ *
+ * Stores the whole serialized form submission in the comment_verification
+ * database table until the link sent in the email is clicked
+ *
+ * @param $form
+ *   The comment form
+ * @param $form_state
+ *   The comment form state, including the values that will be stored
+ */
+function _comment_anon_form_submit($form, &$form_state) {
+
+  $node = node_load($form_state['values']['nid']);
+  $destination = drupal_get_destination();
+  // Before processing the comment, check the email and see if it belong to a
+  // registered user. Send error message and request to login if the email
+  // belong to a registered user.
+  $taken = db_select('users', 'u')
+    ->fields('u')
+    ->condition('mail', $form_state['values']['mail'], '=')
+    ->execute()
+    ->fetchAssoc();
+  if ($taken) {
+    $form_state['values'] = array();
+    $form_state['rebuild'] = TRUE;
+    form_set_error('mail', t('The email you used belongs to a registered user. Would you like to <a href="@login">Login</a> or <a href="@register">Register</a>?',
+      array(
+        '@login' => url('user/login', array('query' => $destination)),
+        '@register' => url('user/register', array('query' => $destination)),
+      )
+    ));
+    return;
+  }
+
+  $comment = comment_form_submit_build_comment($form, $form_state);
+
+  if (user_access('post comments') && (user_access('administer comments') || $node->comment == COMMENT_NODE_OPEN)) {
+    if (user_is_anonymous()) {
+      user_cookie_save(
+        array_intersect_key(
+          $form_state['values'],
+          array_flip(array('name', 'mail', 'homepage'))
+        )
+      );
+      if (comment_anon_hold($form_state['comment'])) {
+        drupal_set_message(t('Please confirm the email address.'));
+        drupal_goto('node/' . $node->nid);
+      }
+    }
+  }
+}
+
+/**
+ * Send verification mail.
+ */
+function comment_anon_hold($edit) {
+  $hash = md5($edit->nid . time() . drupal_get_hash_salt());
+  // Remove the forword slash since it is part of Base64 code.
+  $cavid = db_insert('comment_verification')
+    ->fields(array(
+      'hash' => $hash,
+      'timestamp' => time(),
+      'edit' => serialize($edit),
+    ))->execute();
+
+  $edit->cavid = $cavid;
+  $edit->hash = $hash;
+  drupal_mail('comment_verification', 'verify', $edit->mail, language_default(), array('edit' => $edit));
+  return TRUE;
+}
+
+/**
+ * Implements hook_mail().
+ */
+function comment_verification_mail($key, &$message, $params) {
+  if ($key == 'verify') {
+    $variables['!verify_link'] = url('comment/verify/' . $params['edit']->cavid . '/' .  $params['edit']->hash, array('absolute' => TRUE));
+    $message['subject'] = token_replace(variable_get('comment_verification_email_subject', 'Please verify your email for [site:name]'), $variables);
+    $prebody = token_replace(variable_get('comment_verification_email_body', t('!verify_link')), $variables);
+    $message['body'][] = t($prebody, $variables);
+  }
+}
+
+/**
+ * Checks if anon comment verification is active for a content type.
+ *
+ * Anon content verification is active if anon users have rights to post
+ * comments, it has been enabled by an admin for this type, and anon commenters
+ * are required to leave their contact info.
+ */
+function _cav_enabled($type) {
+  $anon = user_load(0);
+  return (user_access('post comments', $anon) || user_access('post comments without approval', $anon)) && variable_get('comment_verification_enabled_' . $type, FALSE) && (variable_get('comment_anonymous_' . $type, 0) == COMMENT_ANONYMOUS_MUST_CONTACT);
+}

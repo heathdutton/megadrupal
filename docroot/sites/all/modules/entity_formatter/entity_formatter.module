@@ -1,0 +1,481 @@
+<?php
+/**
+ * @file
+ * Entity Formatter module.
+ */
+
+
+/**
+ * Create formatter classes for an entity type.
+ *
+ * @param string $entity_type
+ *   Entity type to create wrappers for
+ * @param array|null $bundles
+ *   Bundles to create wrappers for. Defaults to all bundles.
+ * @param string|null $module_name
+ *   Module name for the output module. Defaults to "wrappers_custom"
+ * @param string $destination
+ *   Directory for the output module.
+ *   Defaults to sites/all/modules/custom, if exists.
+ *   Otherwise, defaults to sites/all/modules.
+ */
+function entity_formatter_make_formatters($entity_type, $bundles = NULL, $module_name = NULL, $destination = NULL, $force = NULL) {
+  $entity_info = entity_get_info($entity_type);
+  if (empty($entity_info)) {
+    watchdog('entity_formatter', 'Entity type @type does not exist.', array('@type' => $entity_type));
+    return;
+  }
+
+  if (empty($bundles)) {
+    $entity_info = entity_get_info($entity_type);
+    $bundles = array_keys($entity_info['bundles']);
+  }
+  if (empty($module_name)) {
+    $module_name = 'entity_formatter_classes';
+  }
+  if (empty($destination)) {
+    $destination = entity_formatter_determine_destination();
+  }
+
+  $new_module = FALSE;
+
+  if (!empty($bundles) && !empty($module_name) && !empty($destination)) {
+    if (!module_exists($module_name)) {
+      $module_dir = entity_formatter_make_module($module_name, $destination);
+      $new_module = TRUE;
+    }
+    else {
+      $module_dir = drupal_get_path('module', $module_name);
+      entity_formatter_increment_version($module_dir . '/' . $module_name . '.info');
+    }
+
+    $base_class_dependencies = array('entity_formatter');
+
+    foreach ($bundles as $bundle) {
+      // Update class file with missing methods.
+      $class_filenames = entity_formatter_make_class($entity_type, $bundle, $module_dir, $force);
+
+      foreach ($class_filenames as $class_file) {
+        // Update info file to include new files.
+        // Can't use destination because class file may not be in requested
+        // module if it already existed in another module.
+        $class_module_dir = preg_replace('/\/includes\/' . $entity_type . '\/[A-z]+\.php$/', '', $class_file);
+        $class_module_name = preg_replace('/^.*\/([A-z_]+)$/', '$1', $class_module_dir);
+
+        $info_file = file_get_contents($class_module_dir . '/' . $class_module_name . '.info');
+        $relative_class_file = str_replace($class_module_dir . '/', '', $class_file);
+
+        foreach ($base_class_dependencies as $dependency) {
+          if (!preg_match('/dependencies\[\]\s*=\s*' . $dependency. '/', $info_file)) {
+            $info_file .= "\n" . 'dependencies[] = ' . $dependency;
+          }
+        }
+
+        if (!preg_match('/files\[\]\s*=\s*' . preg_quote($relative_class_file, '/') . '/', $info_file)) {
+          $info_file .= "\n" . 'files[] = ' . $relative_class_file;
+        }
+        file_put_contents($class_module_dir . '/' . $class_module_name . '.info', $info_file);
+      }
+    }
+    // If I just created a new module, but didn't end up writing any classes to it,
+    // clean the module up.
+    if ($new_module && !file_exists($module_dir . '/includes') && !module_exists($module_name)) {
+      unlink($module_dir . '/' . $module_name . '.info');
+      unlink($module_dir . '/' . $module_name . '.module');
+      drupal_rmdir($module_dir);
+    }
+
+    // Rebuild registry to pick up new classes
+    registry_rebuild();
+    cache_clear_all();
+  }
+}
+
+/**
+ * Create an empty stub module.
+ *
+ * @param $module_name
+ * @param $destination
+ *
+ * @return string
+ *   Module directory
+ */
+function entity_formatter_make_module($module_name, $destination) {
+  // Create module directory.
+  $module_directory = $destination . '/' . $module_name;
+  file_prepare_directory($module_directory, FILE_CREATE_DIRECTORY|FILE_MODIFY_PERMISSIONS);
+
+  // Create .info file
+  $info_filename = $module_directory . '/' . $module_name . '.info';
+  if (!file_exists($info_filename)) {
+    $info_contents = file_get_contents(drupal_get_path('module', 'entity_formatter') . '/code_templates/entity_formatter_custom.info.txt');
+    file_put_contents($info_filename, $info_contents);
+  }
+  elseif (variable_get('entity_formatter_increment_version', TRUE)) {
+    entity_formatter_increment_version($info_filename);
+  }
+
+  // Create module file
+  $module_filename = $module_directory . '/' . $module_name . '.module';
+  if (!file_exists($module_filename)) {
+    $module_contents = file_get_contents(drupal_get_path('module', 'entity_formatter') . '/code_templates/entity_formatter_custom.module.txt');
+    file_put_contents($module_filename, $module_contents);
+  }
+
+  return $module_directory;
+}
+
+/**
+ * Create or update a class file for an entity bundle. Will add missing
+ * field methods if the class already exists.
+ *
+ * @param $entity_type
+ * @param $bundle
+ * @param $module_dir
+ * @param $force
+ *
+ * @return array
+ *   Class filepath or FALSE if error
+ */
+function entity_formatter_make_class($entity_type, $bundle, $module_dir, $force) {
+  $class_filenames = $class_filename = $class = '';
+
+  // Determine how this class should be named.
+  $class_name = entity_formatter_determine_class_name($entity_type, $bundle);
+
+  // Prepare a Class stub.
+  $class_stub = entity_formatter_prepare_class($class_name, $entity_type);
+
+  // Prepare all methods for all fields.
+  $methods = entity_formatter_prepare_field_methods($entity_type, $bundle);
+
+
+  // If this class already exists in another module, ignore requested module
+  // and update existing class.
+  if (class_exists($class_name)) {
+    $class = new ReflectionClass($class_name);
+    $class_filename = _entity_formatter_get_relative_path(getcwd(), $class->getFileName());
+  }
+  else {
+    // Build the class_filename based on given module name.
+    $includes_directory = $module_dir . '/includes';
+    file_prepare_directory($includes_directory, FILE_CREATE_DIRECTORY|FILE_MODIFY_PERMISSIONS);
+    $entity_includes_dir = $includes_directory . '/' . $entity_type;
+    $class_filename = $entity_includes_dir . '/' . $class_name . '.php';
+  }
+
+  // Write a new class if it does _not_ exist yet or when we got the force option.
+  if (!file_exists($class_filename) || $force) {
+    file_prepare_directory($entity_includes_dir, FILE_CREATE_DIRECTORY|FILE_MODIFY_PERMISSIONS);
+    file_put_contents($class_filename, $class_stub);
+    $new = TRUE;
+  }
+
+  // Read the class file and append new methods.
+  if (file_exists($class_filename)) {
+    include_once $class_filename;
+    $class_stub = file_get_contents($class_filename);
+
+    if (!empty($methods)) {
+      foreach ($methods as $method_name => $method) {
+        if ((!method_exists($class_name, $method_name) || $force) && !empty($method)) {
+          $class_stub = preg_replace('/\}$/', $method . "\n\n}\n", trim($class_stub));
+          file_put_contents($class_filename, $class_stub);
+        }
+      }
+    }
+    drupal_set_message(t('@action class: @class', array('@action' => ($new) ? t('Created') : t('Updated'), '@class' => $class_filename)), 'success');
+    $class_filenames[] = $class_filename;
+  }
+
+  return $class_filenames;
+}
+
+/**
+ * Generate a stub class for a given entity type and bundle.
+ *
+ * @param $entity_type
+ * @param $bundle
+ *
+ * @return string
+ *   Class file contents as string
+ */
+function entity_formatter_prepare_class($class_name, $entity_type) {
+  $class_contents = file_get_contents(drupal_get_path('module', 'entity_formatter') . '/code_templates/entity_formatter_custom.php.txt');
+
+  $replacements = array(
+    'class_name' => $class_name,
+    'parent_class' => 'EfEntityFormatter',
+    'entity_type' => $entity_type,
+  );
+
+  $class_contents = entity_formatter_replace_tokens($replacements, $class_contents);
+
+  return $class_contents;
+}
+
+/**
+ * Query fields on entity bundle and generate methods for
+ * them. Methods are defined templates/methods/XXXX.txt,
+ * where the resulting method name is XXXXFieldName()
+ *
+ * @param $entity_type
+ * @param $bundle
+ * @return array
+ *   array of method names => method string
+ */
+function entity_formatter_prepare_field_methods($entity_type, $bundle) {
+  $methods = array();
+
+  $bundle_fields = field_info_instances($entity_type, $bundle);
+
+  foreach ($bundle_fields as $field_name => $instance) {
+    $short_field_name = preg_replace('/^field_/', '', $field_name);
+    $camelized_field_name = entity_formatter_camelize($short_field_name);
+    $field_info = field_info_field($field_name);
+
+    $method_templates = file_scan_directory(drupal_get_path('module', 'entity_formatter') . '/code_templates/methods', '//', array('recurse' => FALSE));
+    foreach ($method_templates as $template) {
+      if (!is_dir($template->uri)) {
+        $methods[str_replace('FIELD', $camelized_field_name, $template->name)] = entity_formatter_build_method_from_template($template->uri, $field_info);
+      }
+    }
+  }
+
+  return $methods;
+}
+
+/**
+ * Build a field method from the template file.
+ *
+ * @param $template_file
+ * @param $field_info
+ *
+ * @return string
+ */
+function entity_formatter_build_method_from_template($template_file, $field_info) {
+  $short_field_name = preg_replace('/^field_/', '', $field_info['field_name']);
+  $camelized_field_name = entity_formatter_camelize($short_field_name);
+
+  $method = file_get_contents($template_file);
+  $replacements = array();
+  $replacements['field_name_camelized'] = $camelized_field_name;
+  $replacements['field_name'] = $field_info['field_name'];
+
+  $replacements['formatter_class'] = entity_formatter_get_formatter_class($field_info['type']);
+  $replacements['formatter_multivalue'] = ($field_info['cardinality'] > 1 || $field_info['cardinality'] == -1) ? 'TRUE' : 'FALSE';
+
+  $method = entity_formatter_replace_tokens($replacements, $method);
+  return $method;
+}
+
+/**
+ * Replace all tokens in field templates and class templates.
+ *
+ * @param $replacements
+ * @param $source
+ *
+ * @return string
+ */
+function entity_formatter_replace_tokens($replacements, $source) {
+  foreach ($replacements as $token => $replacement) {
+    $source = _entity_formatter_replace_token($token, $replacement, $source);
+  }
+  return $source;
+}
+
+/**
+ * Generate a class name for entity type and bundle.
+ *
+ * @param $entity_type
+ * @param $bundle
+ * @return string
+ */
+function entity_formatter_determine_class_name($entity_type, $bundle) {
+  if (!is_null($bundle)) {
+    $camel_bundle = str_replace(' ', '', ucwords(str_replace('_', ' ', $bundle)));
+  }
+  else {
+    $camel_bundle = '';
+  }
+  $camel_entity = str_replace(' ', '', ucwords(str_replace('_', ' ', $entity_type)));
+  return $camel_bundle. $camel_entity . 'Formatter';
+}
+
+/**
+ * Returns the best available formatter class for a given field type.
+ *
+ * @param $field_info
+ * @return string
+ *   The determined formatter class
+ */
+function entity_formatter_get_formatter_class($field_type) {
+  $field_type_mapping = entity_formatter_field_type_mapping();
+  $formatter_class = $field_type_mapping[$field_type];
+  return $formatter_class;
+}
+
+/**
+ * Builds a mapping array which contains the formatter classes for each available field-type.
+ *
+ * The mapping array can be altered by implementing hook_entity_formatter_field_type_mapping_alter
+ *
+ * @return array
+ */
+function entity_formatter_field_type_mapping() {
+  $field_type_mapping = &drupal_static(__FUNCTION__);
+
+  if (isset($field_type_mapping)) {
+    // Mapping array was already built once. Return it.
+    return $field_type_mapping;
+  }
+
+  $field_types = field_info_field_types();
+
+  foreach ($field_types as $field_type_name => $field_type) {
+    switch($field_type_name) {
+      case 'text':
+      case 'text_long':
+      case 'text_with_summary':
+        $field_type_mapping[$field_type_name] = 'EfTextFormatter';
+        break;
+
+      case 'list_boolean':
+      case 'list_float':
+      case 'list_integer':
+      case 'list_text':
+        $field_type_mapping[$field_type_name] = 'EfListFormatter';
+        break;
+
+      case 'image':
+        $field_type_mapping[$field_type_name] = 'EfImageFormatter';
+        break;
+
+      case 'file':
+        $field_type_mapping[$field_type_name] = 'EfFileFormatter';
+        break;
+
+      case 'link_field':
+        $field_type_mapping[$field_type_name] = 'EfLinkFormatter';
+        break;
+
+      case 'datetime':
+      case 'date':
+      case 'datestamp':
+      $field_type_mapping[$field_type_name] = 'EfDateFormatter';
+        break;
+
+      case 'entityreference':
+      case 'taxonomy_term_reference':
+      case 'field_collection':
+      case 'paragraphs':
+        $field_type_mapping[$field_type_name] = 'EfEntityReferenceFormatter';
+        break;
+
+      case 'addressfield':
+        $field_type_mapping[$field_type_name] = 'EfAddressFieldFormatter';
+        break;
+
+      case 'viewfield':
+        $field_type_mapping[$field_type_name] = 'EfViewFieldFormatter';
+        break;
+
+      default:
+        $field_type_mapping[$field_type_name] = 'EfFieldFormatter';
+        break;
+    }
+  }
+
+  drupal_alter('entity_formatter_field_type_mapping', $field_type_mapping);
+
+  return $field_type_mapping;
+}
+
+/**
+ * Increment the version number in an .info file.
+ *
+ * @param $info_filename
+ */
+function entity_formatter_increment_version($info_filename) {
+  if (file_exists($info_filename)) {
+    $info_contents = file_get_contents($info_filename);
+    $info_contents = preg_replace('/(version\s*=\s*\d+\.x-\d+).(\d+)/e', '"$1." . ("$2" + 1)', $info_contents);
+    file_put_contents($info_filename, $info_contents);
+  }
+}
+
+/**
+ * Determine module destination from options and defaults.
+ *
+ * @return string
+ */
+function entity_formatter_determine_destination() {
+  if (file_exists('sites/all/modules/custom')) {
+    $destination = 'sites/all/modules/custom';
+  }
+  else {
+    $destination = 'sites/all/modules';
+  }
+  return $destination;
+}
+
+/**
+ * CamelCase a string by replacing _ with a subsequent upper case letter.
+ *
+ * @param $string
+ * @param bool $lowercase_inital
+ *   Lowercase the first letter of the result string.
+ *
+ * @return string
+ */
+function entity_formatter_camelize($string, $lowercase_inital = FALSE) {
+  $string = str_replace(' ', '', ucwords(str_replace('_', ' ', $string)));
+  if ($lowercase_inital) {
+    $string = lcfirst($string);
+  }
+  return $string;
+}
+
+/**
+ * Change a CamelCase into _ with a subsequent lower case letter.
+ *
+ * @param $string
+ *
+ * @return string
+ */
+function entity_formatter_decamelize($string) {
+  $string = lcfirst($string);
+  $decamel = create_function('$s', 'return "_" . strtolower($s[1]);');
+  return preg_replace_callback('/([A-Z])/', $decamel, $string);
+}
+
+/**
+ * Replace a token in the file templates.
+ *
+ * @param $token
+ * @param $replacement
+ * @param $source
+ * @return string
+ */
+function _entity_formatter_replace_token($token, $replacement, $source) {
+  return preg_replace('/\{\{\s*' . $token . '\s*\}\}/', $replacement, $source);
+}
+
+/**
+ * Get the relative path between two complete paths.
+ *
+ * @param $from
+ * @param $to
+ * @param string $ps
+ *
+ * @return string
+ */
+function _entity_formatter_get_relative_path($from, $to, $ps = DIRECTORY_SEPARATOR) {
+  $ar_from = explode($ps, rtrim($from, $ps));
+  $ar_to = explode($ps, rtrim($to, $ps));
+  while (count($ar_from) && count($ar_to) && ($ar_from[0] == $ar_to[0])) {
+    array_shift($ar_from);
+    array_shift($ar_to);
+  }
+  return str_pad("", count($ar_from) * 3, '..'.$ps).implode($ps, $ar_to);
+}

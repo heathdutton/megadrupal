@@ -1,0 +1,396 @@
+<?php
+
+/**
+ * @file
+ * Main file for the achiever module.
+ */
+
+/**
+ * Observer activity event.
+ *
+ * Whenever an achiever activity is stored to the database, achiever notifies
+ * all global observers with an event whose type has this key.
+ */
+define('ACHIEVER_OBSERVER_ACTIVITY', 'achiever:activity');
+
+/**
+ * Observer achievement event.
+ *
+ * Whenever an achiever achievement is stored to the database, achiever notifies
+ * all global observers with an event whose type has this key.
+ */
+define('ACHIEVER_OBSERVER_ACHIEVEMENT', 'achiever:achievement');
+
+/**
+ * In-memory achievements cache key.
+ */
+define('ACHIEVER_CACHE_ACHIEVEMENTS', 'achiever_cache_achievements');
+
+/**
+ * In-session achievements notifications key.
+ */
+define('ACHIEVER_SESSION_UNLOCKED_ACHIEVEMENTS', 'achiever_session_unlocked_achievements');
+
+/**
+ * Implements hook_observer_info().
+ */
+function achiever_observer_info() {
+  $observers = array(new AchieverActivityObserver());
+  $achievements = achiever_get_achievements();
+
+  return array_merge($observers, $achievements);
+}
+
+/**
+ * Implements hook_ctools_plugin_directory()
+ */
+function achiever_ctools_plugin_directory($module, $plugin) {
+  if (in_array($module, array('ctools', 'page_manager'))) {
+    return 'plugins/' . $plugin;
+  }
+
+  return null;
+}
+
+/**
+ * Implements hook_theme().
+ */
+function achiever_theme($existing, $type, $theme, $path) {
+  $base = array(
+    'file' => 'theme.inc',
+    'path' => $path . '/theme',
+  );
+
+  return array(
+    'achiever_achievements' => array(
+      'variables' => array('achievements' => array(), 'account' => null),
+      'template' => 'achiever-achievements',
+    ) + $base,
+    'achiever_achievement' => array(
+      'variables' => array('achievement' => null, 'account' => null),
+      'template' => 'achiever-achievement',
+    ) + $base,
+    'achiever_achievement_group' => array(
+      'variables' => array('achievement' => null, 'account' => null),
+      'template' => 'achiever-achievement-group',
+    ) + $base,
+    'achiever_notifier' => array(
+      'variables' => array('achievements' => array(), 'account' => null),
+      'template' => 'achiever-notifier',
+    ) + $base
+  );
+}
+
+/**
+ * Implements hook_preprocess_HOOK() for html theme.
+ */
+function achiever_preprocess_html(&$vars) {
+  global $user;
+
+  // Check if there are achievements to notify the user about.
+  $achievements = achiever_get_achievement_notifications(TRUE);
+
+  if (!empty($achievements)) {
+    drupal_page_is_cacheable(FALSE);
+
+    $vars['page']['page_bottom']['achiever'] = array(
+      '#markup' => theme('achiever_notifier', array('achievements' => $achievements, 'account' => $user))
+    );
+  }
+}
+
+// Helpers
+// -----------------------------------------------------------------------------
+
+/**
+ * Gets the configured achievements.
+ *
+ * @return AchieverAchievement[]
+ *  An array of achievements configured in the site.
+ */
+function achiever_get_achievements() {
+  return module_invoke_all('achiever_achievements_info');
+}
+
+/**
+ * Registers an activity to the database.
+ *
+ * @param array $keys
+ *  An array of key, value pairs to build the activity namespace.
+ * @param string $type
+ *  The activity type.
+ * @param string $variant
+ *  The activity variant.
+ * @param float $value
+ *  The activity value.
+ * @param null|mixed $data
+ *  The activity data, if it exists.
+ * @param null|object $account
+ *  The activity author object. If null the current logged in user will be used.
+ * @throws Exception
+ */
+function achiever_register_activity($keys, $type, $variant = null, $value = null, $data = null, $account = null) {
+  global $user;
+
+  // Give modules to opportunity to modify the activity before it's inserted.
+  $activity = array(
+    'keys' => &$keys,
+    'type' => &$type,
+    'variant' => &$variant,
+    'value' => &$value
+  );
+
+  $context = array(
+    'data' => $data,
+    'account' => $account
+  );
+
+  drupal_alter('achiever_activity', $activity, $context);
+
+  // Anonymous users do not have their activity tracked.
+  if (empty($account->uid) && user_is_anonymous()) {
+    return;
+  }
+
+  $value = is_numeric($value) ? $value : 1.0;
+
+  // Store the activity.
+  $account = empty($account->uid) ? $user : $account;
+
+  $insert = db_insert('achiever_activity');
+
+  $fields = array(
+    'uid' => $account->uid,
+    'namespace' => achiever_build_namespace($keys),
+    'type' => $type,
+    'variant' => $variant,
+    'value' => $value,
+    'date' => time()
+  );
+
+  $insert
+    ->fields($fields)
+    ->execute()
+  ;
+
+  // Notify the observers.
+  $activity = new AchieverActivity($fields['uid'], $fields['namespace'], $type, $variant, $value, $fields['date'], $data, $account);
+
+  observer_notify(ACHIEVER_OBSERVER_ACTIVITY, $activity);
+}
+
+/**
+ * Builds a consistent namespace from a set of keys.
+ *
+ * @param $keys
+ *  An array of key, value pairs used to build the namespace.
+ * @return string
+ *  The namespace string.
+ */
+function achiever_build_namespace($keys) {
+  ksort($keys);
+
+  $namespace = '';
+
+  foreach ($keys as $key => $value) {
+    $namespace .= $key . ':' . $value . ';';
+  }
+
+  return empty($namespace) ? '' : ';' . $namespace;
+}
+
+/**
+ * Gets the total activity count filtered by the given parameters.
+ *
+ * @param null|object $account
+ *  The user object from which the activity belongs to.
+ * @param $namespace
+ *  The namespace to get the activity from.
+ * @param array $types
+ *  A list of types.
+ * @param array $variants
+ *  A list of variants.
+ * @param null|int $from
+ *  The timestamp from which the count is to be made from.
+ * @param null|int $to
+ *  The timestamp to which the count is to be made to.
+ * @return int
+ *  The total results count.
+ */
+function achiever_get_activity_count($account = null, $namespace = '', $types = array(), $variants = array(), $from = null, $to = null) {
+  $select = db_select('achiever_activity', 'aa');
+
+  if (!empty($account)) {
+    $select->where('aa.uid = :uid', array(':uid' => $account->uid));
+  }
+
+  if (!empty($namespace)) {
+    $select->where('aa.namespace LIKE :namespace', array(':namespace' => $namespace));
+  }
+
+  if (!empty($types)) {
+    $select->where('aa.type IN (:types)', array(':types' => $types));
+  }
+
+  if (!empty($variants)) {
+    $select->where('aa.variant IN (:variants)', array(':variants' => $variants));
+  }
+
+  if (!empty($from)) {
+    $select->where('aa.date >= :from', array(':from' => $from));
+  }
+
+  if (!empty($to)) {
+    $select->where('aa.date <= :to', array(':to' => $to));
+  }
+
+  $select->addExpression('COUNT(aa.uid)', 'count');
+
+  return $select->execute()->fetchField();
+}
+
+
+/**
+ * Gets the sum of all values of the activities filtered by the given parameters.
+ *
+ * @param null|object $account
+ *  The user object from which the activity belongs to.
+ * @param $namespace
+ *  The namespace to get the activity from.
+ * @param array $types
+ *  A list of types.
+ * @param array $variants
+ *  A list of variants.
+ * @param null|int $from
+ *  The timestamp from which the count is to be made from.
+ * @param null|int $to
+ *  The timestamp to which the count is to be made to.
+ * @return int
+ *  The sum of all activities value.
+ */
+function achiever_get_activity_value($account = null, $namespace = '', $types = array(), $variants = array(), $from = null, $to = null) {
+  $select = db_select('achiever_activity', 'aa');
+
+  if (!empty($account)) {
+    $select->where('aa.uid = :uid', array(':uid' => $account->uid));
+  }
+
+  if (!empty($namespace)) {
+    $select->where('aa.namespace LIKE :namespace', array(':namespace' => $namespace));
+  }
+
+  if (!empty($types)) {
+    $select->where('aa.type IN (:types)', array(':types' => $types));
+  }
+
+  if (!empty($variants)) {
+    $select->where('aa.variant IN (:variants)', array(':variants' => $variants));
+  }
+
+  if (!empty($from)) {
+    $select->where('aa.date >= :from', array(':from' => $from));
+  }
+
+  if (!empty($to)) {
+    $select->where('aa.date <= :to', array(':to' => $to));
+  }
+
+  $select->addExpression('SUM(aa.value)', 'value');
+
+  return $select->execute()->fetchField();
+}
+
+/**
+ * Gets a user's achievements.
+ *
+ * @param null|object $account
+ *  The user object from which the achievements belong to.
+ * @return array
+ *  An array of achievement database achievement record objects keyed by
+ *  the achievements keys.
+ */
+function achiever_get_user_achievements($account = null) {
+  global $user;
+
+  $accounts = &drupal_static(ACHIEVER_CACHE_ACHIEVEMENTS, FALSE);
+
+  if (empty($account)) {
+    $account = $user;
+  }
+
+  if (empty($accounts[$account->uid])) {
+    $sql = "
+      SELECT *
+      FROM {achiever_achievements}
+      WHERE uid = :uid
+    ";
+
+    $params = array(
+      ':uid' => $account->uid
+    );
+
+    $accounts[$account->uid] = db_query($sql, $params)->fetchAllAssoc('achievement');
+  }
+
+  return $accounts[$account->uid];
+}
+
+/**
+ * Handles the notification to the user of an achievement unlock.
+ *
+ * @param $account
+ *  The user account to be notified.
+ * @param AchieverAchievement $achievement
+ *  The achievement that has been unlocked.
+ *
+ * @see achiever_get_achievement_notifications().
+ */
+function achiever_achievement_notify($account, AchieverAchievement $achievement) {
+  global $user;
+
+  // Bailout if the achievement was not unlocked by the current user.
+  if ($user->uid != $account->uid) return;
+
+  // Store the notification in the session for later notification.
+  if (empty($_SESSION[ACHIEVER_SESSION_UNLOCKED_ACHIEVEMENTS])) {
+    $_SESSION[ACHIEVER_SESSION_UNLOCKED_ACHIEVEMENTS] = array();
+  }
+
+  $_SESSION[ACHIEVER_SESSION_UNLOCKED_ACHIEVEMENTS][] = $achievement;
+}
+
+/**
+ * Gets pending user achievement notifications.
+ *
+ * @param bool $purge
+ *  TRUE to purge the achievement notifications after returning the results.
+ * @return AchieverAchievement[]
+ *  The pending user achievements.
+ *
+ * @see achiever_achievement_notify().
+ */
+function achiever_get_achievement_notifications($purge = FALSE) {
+  $achievements = array();
+
+  if (!empty($_SESSION[ACHIEVER_SESSION_UNLOCKED_ACHIEVEMENTS])) {
+    $achievements = $_SESSION[ACHIEVER_SESSION_UNLOCKED_ACHIEVEMENTS];
+  }
+
+  if ($purge) {
+    unset($_SESSION[ACHIEVER_SESSION_UNLOCKED_ACHIEVEMENTS]);
+  }
+
+  return $achievements;
+}
+
+/**
+ * Transforms a string into a "proper" CSS class.
+ *
+ * @param $string
+ *  The string to be transformed
+ * @return string
+ *  The string ready to be used as a CSS class.
+ */
+function achiever_css_identifier($string) {
+  return strtolower(preg_replace('/([A-Z])/', '-$1', lcfirst($string)));
+}

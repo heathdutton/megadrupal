@@ -1,0 +1,613 @@
+<?php
+
+/**
+ * @file
+ * Provides BillysBilling functionality.
+ */
+
+module_load_include('inc', 'billysbilling', 'billysbilling.field');
+
+use BillysBilling\Client\Billy_Client;
+use BillysBilling\Client\Billy_Request;
+use BillysBilling\Exception\Billy_Exception;
+use BillysBilling\Contacts\Billy_Contact;
+use BillysBilling\Contacts\Billy_ContactRepository;
+use BillysBilling\Products\Billy_Product;
+use BillysBilling\Products\Billy_ProductsRepository;
+use BillysBilling\Billy_EntityRepository;
+use BillysBilling\Invoices\Billy_Invoice;
+use BillysBilling\Invoices\Billy_InvoiceLine;
+use BillysBilling\Invoices\Billy_InvoicesRepository;
+use BillysBilling\BankPayments\Billy_BankPaymentRepository;
+use BillysBilling\BankPayments\Billy_BankPayment;
+
+/**
+ * Implements hook_menu().
+ */
+function billysbilling_menu() {
+  $items = array();
+
+  $items['admin/commerce/orders/%commerce_order/billysbilling'] = array(
+     'title' => 'BillysBilling',
+     'page callback' => 'billysbilling_pagecallback',
+     'page arguments' => array(3),
+     'access arguments' => array('create invoice with billysbilling'),
+     'type' => MENU_LOCAL_TASK,
+     'weight' => 1,
+     'parent' => 'admin/commerce/orders/%commerce_order',
+   );
+
+  $items['admin/config/services/billysbilling'] = array(
+    'title' => 'BillysBilling',
+    'description' => 'Manage BillysBilling Settings.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('billysbilling_admin_settings'),
+    'access arguments' => array('administer billysbilling'),
+    'file' => 'billysbilling.admin.inc',
+    'type' => MENU_NORMAL_ITEM,
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_confirm().
+ */
+function billysbilling_create_invoice_confirm($form, &$form_state, $order) {
+  $form['order_id'] = array('#type' => 'value', '#value' => $order->order_id);
+  return confirm_form($form, 
+    t('Are you sure you want to invoice order @id?', array('@id' => $order->order_id)),
+    'admin/commerce/orders/' . $order->order_id,
+    t('Are you sure you want to invoice order @id in BillysBilling?', array('@id' => $order->order_id)),
+    t('Invoice'),
+    t('Cancel')
+  );
+}
+
+/**
+ * Implements hook_confirm_submit().
+ */
+function billysbilling_create_invoice_confirm_submit($form, &$form_state) {
+  if ($form_state['values']['confirm']) {
+    $order = commerce_order_load($form_state['values']['order_id']);
+    $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+
+    if ($billysbilling_invoice_id = billysbilling_create_invoice($order)) {
+      $message = t('Successfully invoiced order @order_id as invoice id @invoice_id', array('@order_id' => $order->order_id, '@invoice_id' => $order_wrapper->billysbilling_invoice_id->value()));
+    }
+    else {
+      $message = t('An error occured while trying to invoice order @order_id as invoice id @invoice_id', array('@order_id' => $order->order_id, '@invoice_id' => $order_wrapper->billysbilling_invoice_id->value()));
+    }
+    watchdog('billysbilling', $message);
+    drupal_set_message($message);
+  }
+}
+
+/**
+ * Page call back.
+ */
+function billysbilling_pagecallback($order) {
+  // Initiate API Client. Not actually used, but validates page.
+  // @todo: Should this maybe be part of an access callback to just 403?
+  try {
+    $api_request = billysbilling_get_api_request();
+  }
+  catch (Exception $e) {
+    drupal_set_message($e->getMessage(), 'error');
+    return '<p>' . t('Please review the !link', array('!link' => l(t('settings for BillysBilling'), 'admin/config/services/billysbilling'))) . '.</p>';
+  }
+
+  /** @var EntityDrupalWrapper $wrapper */
+  $wrapper = entity_metadata_wrapper('commerce_order', $order);
+
+  // Order state should be higher at least checkout complete.
+  // @todo: Support a method to alter these states (for systems like ERPAL.)
+  if (in_array($wrapper->get('state')->value(), array('cart', 'checkout'))) {
+    return t('Order @order_id has order status "@status" and could not be invoiced.', array('@order_id' => $order->order_id, '@status' => $wrapper->state->value()));
+  }
+
+  // If the order does not have an API ID, set up form to create remote invoice.
+  $api_id = $wrapper->get('billysbilling_invoice_id')->value();
+  if (!$api_id) {
+    return drupal_get_form('billysbilling_create_invoice_confirm', $order);
+  }
+
+  $link = billysbilling_get_invoice_link($api_id);
+  if (!$link) {
+    return array(
+      '#markup' => '<p>' . t('This invoice does not exist in BillysBilling. You can delete the invoice number on the edit page and try again.') . '</p>',
+    );
+  }
+  else {
+    $output = '<p>' . t('Order @order_id has been invoiced as !invoice_id in BillysBilling. At the moment payments must be manually handled directly in BillysBilling.', array(
+        '@order_id' => $order->order_id,
+        '!invoice_id' => l($order->order_id, $link)
+      )) . '</p>';
+    $output .= '<p>' . t('!link', array('!link' => l(t('Invoice'), $link))) . '</p>';
+    return array(
+      '#markup' => $output,
+    );
+  }
+}
+
+/**
+ * Implements hook_libraries_info().
+ */
+function billysbilling_libraries_info() {
+  $libraries = array();
+  $libraries['billysbilling-php'] = array(
+    'name' => 'BillysBilling',
+    'vendor url' => 'https://github.com/lsolesen/billysbilling',
+    'version' => 'master',
+    'xautoload' => function($adapter) {
+      /** @var \Drupal\xautoload\Adapter\LocalDirectoryAdapter $adapter */
+      $adapter->composerJson('composer.json');
+    }
+  );
+  return $libraries;
+}
+
+/**
+ * Implements hook_permission().
+ */
+function billysbilling_permission() {
+  return array(
+    'create invoice with billysbilling' => array(
+    'title' => t('use billysbilling'),
+    'description' => t('Make it possible to create invoices using BillysBilling'),
+    ),
+    'administer billysbilling' => array(
+    'title' => t('administer billysbilling'),
+    'description' => t('Administer API keys for BillysBilling'),
+    ),
+  );
+}
+
+/**
+ * Implements hook_field_access().
+ */
+function billysbilling_field_access($op, $field, $entity_type, $entity, $account) {
+  $fields = array('invoice', 'product', 'contact');
+  foreach ($fields as $name) {
+    if ($field['field_name'] == 'billysbilling_' . $name . '_id') {
+      // Only allow admins to edit field value.
+      return user_access('administer billysbilling', $account);
+    }
+  }
+  return TRUE;
+}
+
+/**
+ * Get a Billy_Client object
+ *
+ * Object for communication with the the Billys Billing server.
+ *
+ * @throws Exception
+ * @return Billy_Client
+ */
+function billysbilling_get_api_client() {
+  try {
+    $request = billysbilling_get_api_request();
+    return new Billy_Client($request);
+  }
+  catch (Billy_Exception $e) {
+    throw $e;
+  }
+}
+
+/**
+ * Get a Billy_Client object
+ *
+ * Object for communication with the the Billys Billing server.
+ *
+ * @throws Exception
+ * @return Billy_Request
+ */
+function billysbilling_get_api_request() {
+  $library = libraries_detect('billysbilling-php');
+  if ($library['installed']) {
+    libraries_load('billysbilling-php');
+
+    if (!variable_get('billysbilling_api_key', '')) {
+      // @todo: Provide link to admin settings form.
+      throw new Exception(t('You must set an API key in order to use BillysBilling', array()));
+    }
+
+    return new Billy_Request(variable_get('billysbilling_api_key', ''));
+  }
+  else {
+    throw new Exception(t('BillysBilling library not installed'));
+  }
+}
+
+/**
+ * Returns a specified entity repository for API interaction.
+ *
+ * @param string $class_name Class name, including namespace.
+ * @return Billy_EntityRepository|null
+ */
+function billysbilling_get_api_repository($class_name) {
+  // Initiate API Client.
+  try {
+    $api_request = billysbilling_get_api_request();
+    return new $class_name($api_request);
+  }
+  catch (Exception $e) {
+    drupal_set_message($e->getMessage(), 'error');
+    return null;
+  }
+}
+
+/**
+ * Implements hook_commerce_checkout_complete().
+ */
+function billysbilling_commerce_checkout_complete($order) {
+  // When the checkout is complete, we can create the invoice.
+  // TODO This works, but will not be invoked until beta or RC.
+  // billysbilling_create_invoice($order);
+}
+
+/**
+ * Syncs a contact with BillysBilling
+ *
+ * @param integer $profile_id Drupal Commerce Contact Profile ID
+ * @param string  $email
+ *
+ * @return string Billys Billing Contact ID 
+ */
+function billysbilling_sync_contact($profile_id, $email) {
+  /** @var Billy_ContactRepository $repository */
+  $repository = billysbilling_get_api_repository('\BillysBilling\Contacts\Billy_ContactRepository');
+  if ($repository === null) {
+    return null;
+  }
+
+  /** @var EntityDrupalWrapper $customer_profile */
+  $customer_profile = entity_metadata_wrapper('commerce_customer_profile', $profile_id);
+
+  $address = $customer_profile->get('commerce_customer_address')->value();
+
+  // Name normalization.
+  $name = $address['name_line'];
+  if (!$name) {
+    $name = $address['first_name'] . ' ' . $address['last_name'];
+  }
+
+  // Phone isn't something handled by Commerce by default
+  $phone = '';
+  if ($customer_profile->__isset('field_customer_phone')) {
+    $phone = $customer_profile->get('field_customer_phone')->value();
+  }
+
+  // @todo: This will probably end up becoming an object of its own.
+  $persons = array(
+    array(
+      'name' => $name,
+      'email' => $email,
+    )
+  );
+
+  // Create or update the contact.
+  $current_api_id = $customer_profile->get('billysbilling_contact_id')->value();
+
+  if ($current_api_id) {
+    $contact = $repository->getSingle($current_api_id);
+  }
+  else {
+    $contact = new Billy_Contact();
+  }
+
+  $contact
+    ->setName($name)
+    ->set('phone', $phone)
+    ->setCountryID($address['country'])
+    ->set('street', $address['thoroughfare'])
+    ->set('cityText', $address['locality'])
+    ->set('stateText', $address['administrative_area'])
+    ->set('zipcodeText', $address['postal_code'])
+    ->set('contactNo', $profile_id)
+    ->set('contactPersons', $persons);
+
+  try {
+    if ($current_api_id) {
+      // Update existing
+      $repository->update($contact);
+      return $contact->getID();
+    }
+    else {
+      // Create contact
+      $created_contact = $repository->create($contact);
+      $customer_profile->get('billysbilling_contact_id')->set($created_contact->getID());
+      $customer_profile->save();
+      return $created_contact->getID();
+    }
+  }
+  catch (Exception $e) {
+    drupal_set_message($e->getMessage(), 'error');
+    return null;
+  }
+}
+
+/**
+ * Syncs a product with BillysBilling
+ *
+ * @param integer $product_id Drupal Commerce Product Id
+ *
+ * @return string Billys Billing Product ID 
+ */
+function billysbilling_sync_product($product_id) {
+  /** @var Billy_ProductsRepository $repository */
+  $repository = billysbilling_get_api_repository('\BillysBilling\Products\Billy_ProductsRepository');
+  if ($repository === null) {
+    return null;
+  }
+
+  /** @var EntityDrupalWrapper $product */
+  $product = entity_metadata_wrapper('commerce_product', $product_id);
+
+  $price = $product->get('commerce_price')->value();
+
+  // If the price has no value, skip.
+  if (empty($price['amount'])) {
+    return FALSE;
+  }
+
+  $prices[] = array(
+    'currencyId' => $price['currency_code'],
+    // Return unitPrice in float.
+    'unitPrice' => commerce_currency_amount_to_decimal($price['amount'], $price['currency_code']),
+  );
+
+  $current_api_id = $product->get('billysbilling_product_id')->value();
+
+  if ($current_api_id) {
+    $api_product = $repository->getSingle($current_api_id);
+  }
+  else {
+    $api_product = new Billy_Product();
+  }
+
+  $api_product
+    ->setName($product->get('title')->value())
+    // @todo Give each product type the chance to have different Account and VAT IDs.
+    // @todo These are hardcoded at the moment.
+    ->setAccount(variable_get('billysbilling_state_account_id'))
+    ->setProductNo($product_id)
+    ->setSalesTaxRuleset(variable_get('billysbilling_vat_model_id'))
+    // Should this be ID or SKU?
+    ->set('prices', $prices);
+
+  try {
+    if ($current_api_id) {
+      // Update existing
+      $repository->update($api_product);
+      return $api_product->getID();
+    }
+    else {
+      // Create contact
+      $created_product = $repository->create($api_product);
+      $product->get('billysbilling_product_id')->set($created_product->getID());
+      $product->save();
+      return $created_product->getID();
+    }
+  }
+  catch (Exception $e) {
+    drupal_set_message($e->getMessage(), 'error');
+    return null;
+  }
+}
+
+/**
+ * Creates an invoice in BillysBilling
+ *
+ * @param object $order Drupal Commerce Order Object
+ *
+ * @return string BillysBilling Invoice ID
+ */
+function billysbilling_create_invoice($order) {
+  /** @var Billy_InvoicesRepository $repository */
+  $repository = billysbilling_get_api_repository('\BillysBilling\Invoices\Billy_InvoicesRepository');
+  if ($repository === null) {
+    return null;
+  }
+
+  /** @var EntityDrupalWrapper $wrapper */
+  $wrapper = entity_metadata_wrapper('commerce_order', $order);
+
+  /** @var EntityDrupalWrapper $billing_profile */
+  $billing_profile = $wrapper->get('commerce_customer_billing');
+  $billysbilling_contact_id = billysbilling_sync_contact($billing_profile->getIdentifier(), $wrapper->get('mail')->value());
+
+  // If syncing of the contact failed, so should invoice generation.
+  if (!$billysbilling_contact_id) {
+    // @todo: Should a message be displayed?
+    return false;
+  }
+
+  $billys_line_item = array();
+
+  /** @var EntityDrupalWrapper $line_item_wrapper */
+  foreach ($wrapper->get('commerce_line_items') as $line_item_wrapper) {
+    $billysbilling_product_id = NULL;
+    $priority = 0;
+    $line_item = $line_item_wrapper->value();
+
+    switch ($line_item_wrapper->getBundle()) {
+      case 'product':
+        $billysbilling_product_id = billysbilling_sync_product($line_item_wrapper->get('commerce_product')->raw());
+        break;
+      case 'shipping':
+        $billysbilling_product_id = variable_get('billysbilling_shipping_product_id', NULL);
+        $priority = 50;
+        // TODO Handle empty product id for shipping.
+        break;
+      case 'commerce_coupon':
+      case 'commerce_discount':
+        $billysbilling_product_id = variable_get('billysbilling_discount_product_id', NULL);
+        $priority = 30;
+        break;
+    }
+
+    if (!$billysbilling_product_id) {
+      continue;
+    }
+
+    $unit_price = $line_item_wrapper->get('commerce_unit_price')->value();
+    $unit_price_no_tax = 0;
+    $product_discount = 0;
+
+    foreach ($unit_price['data']['components'] as $component) {
+      if (strpos($component['name'], 'tax|') === FALSE) {
+        if ($component['price']['amount'] < 0) {
+          // Assume that negative value is a discount.
+          $product_discount += $line_item->quantity * $component['price']['amount'];
+        }
+        else {
+          $unit_price_no_tax += $component['price']['amount'];
+        }
+      }
+    }
+
+    $invoice_line = new Billy_InvoiceLine();
+    $invoice_line->setProductID($billysbilling_product_id)
+      ->setQuantity($line_item_wrapper->get('quantity')->value())
+      ->set('priority', $priority)
+      ->setDescription($line_item_wrapper->get('line_item_label')->value())
+      ->setUnitPrice(commerce_currency_amount_to_decimal($unit_price_no_tax, $unit_price['currency_code']));
+
+    // Adds product discounts to the line items.
+    // Should only be used when coupon rules fires before tax calculations.
+    if ($product_discount < 0) {
+      // Treats the discounts.
+      $invoice_line->set('discountMode', 'cash');
+      $invoice_line->set('discountValue', commerce_currency_amount_to_decimal(-1 * $product_discount, $unit_price['currency_code']));
+      // @todo: Why aren't discount line items populating this on line item?
+      if (!$line_item_wrapper->get('line_item_label')->value()) {
+        // @todo: This is a static title. No discount_load function?
+        $invoice_line->set('discountText', commerce_discount_line_item_title());
+      }
+    }
+
+    $billys_line_item[] = $invoice_line->toArray();
+  }
+
+  // Create the invoice.
+  $contact_message = t('Order #@order_id.', array('@order_id' => $order->order_id)) . ' ' . variable_get('billysbilling_invoice_message', t('Thanks for shopping with us.'));
+
+  $entry_date = new DateTime();
+  $entry_date->setTimestamp($wrapper->get('changed')->value());
+
+  $new_invoice = new Billy_Invoice();
+  $new_invoice->setType('invoice')
+    ->setContactID($billysbilling_contact_id)
+    ->setContactMessage($contact_message)
+    ->setEntryDate($entry_date)
+    ->setPaymentTermsDays(8)
+    // @todo ... currency.
+    ->setCurrencyID('DKK')
+    ->set('lines', $billys_line_item);
+
+  if (variable_get('billysbilling_invoice_approved', false)) {
+    $new_invoice->setApproved();
+  }
+
+  try {
+    $created_invoice = $repository->create($new_invoice);
+    $billysbilling_invoice_id = $created_invoice->getID();
+    // Create the payment.
+    billysbilling_sync_payment_on_order($order, $billysbilling_invoice_id);
+  }
+  catch (Billy_Exception $e) {
+    $billysbilling_invoice_id = NULL;
+  }
+
+  // Save id to the entity.
+  $wrapper->get('billysbilling_invoice_id')->set($billysbilling_invoice_id);
+  $wrapper->save();
+
+  return $billysbilling_invoice_id;
+}
+
+/**
+ * Utility function to create the order's payment at Billy's Billing.
+ *
+ * It's hard to tell what payment to transfer, since it depends on the payment
+ * method. We try to find the proper one.
+ *
+ * @todo: Long description needs clarification.
+ *
+ * @param $api_id
+ * @return bool|string
+ */
+function billysbilling_get_invoice_link($api_id) {
+  /** @var Billy_InvoicesRepository $repository */
+  $repository = billysbilling_get_api_repository('\BillysBilling\Invoices\Billy_InvoicesRepository');
+  if ($repository === null) {
+    return false;
+  }
+
+  try {
+    $invoice = $repository->getSingle($api_id);
+    return $invoice->getDownloadURL();
+  }
+  catch (Billy_Exception $e) {
+    watchdog('billysbilling', 'Invoice ' . $api_id . ' does not exist in BB.', array(), WATCHDOG_ERROR);
+    return false;
+  }
+}
+
+/**
+ * @param $order
+ * @param $invoice_id
+ * @return null|void
+ */
+function billysbilling_sync_payment_on_order($order, $invoice_id) {
+  /** @var Billy_BankPaymentRepository $repository */
+  $repository = billysbilling_get_api_repository('\BillysBilling\BankPayments\Billy_BankPaymentRepository');
+  if ($repository === null) {
+    return null;
+  }
+
+  $valid_payment_status = array(
+    COMMERCE_CREDIT_AUTH_ONLY,
+    COMMERCE_CREDIT_CAPTURE_ONLY,
+    COMMERCE_CREDIT_AUTH_CAPTURE,
+    COMMERCE_PAYMENT_STATUS_PENDING, // Should pending be listed on accepted status list?
+    COMMERCE_PAYMENT_STATUS_SUCCESS,
+  );
+  $payments = commerce_payment_transaction_load_multiple(array(), array('order_id' => $order->order_id));
+  foreach ($payments as $key => $payment) {
+    if (!in_array($payment->status, $valid_payment_status)) {
+      unset($payments[$key]);
+    }
+  }
+
+  if (empty($payments)) {
+    // No payments, end here.
+    return;
+  }
+
+  // Sync the last payment.
+  $payment = end($payments);
+  // TODO Should not be on the state_account but on a payment account.
+
+  $entry_date = new DateTime();
+  $entry_date->setTimestamp($payment->created);
+
+  $bank_payment = new Billy_BankPayment();
+  $bank_payment->setEntryDate($entry_date)
+    ->set('cashAmount', $payment->amount)
+    ->set('cashAccountId', variable_get('billysbilling_state_account_id'))
+    ->set('associations', array(
+      'subjectReference' => 'invoice:' . $invoice_id
+    ));
+
+
+  try {
+    $created_payment = $repository->create($bank_payment);
+  }
+  catch (Billy_Exception $e) {
+    $status = drupal_json_decode($e->json_body);
+    watchdog('billysbilling', 'Failed creating payments on invoice, reason was: %reason', array('%reason' => $status['error']), WATCHDOG_ERROR);
+  }
+}

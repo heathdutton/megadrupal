@@ -1,0 +1,303 @@
+<?php
+
+/**
+ * @file
+ * Defines a menu link field type.
+ */
+
+require_once dirname(__FILE__) . '/menu_link.field.inc';
+
+
+/**
+ * Name of the fixed Menu link field.
+ *
+ * This module provides one Menu link field by default. This field cannot be
+ * deleted and its storage backend is restricted to field_sql_storage. This way
+ * other modules can use its database table {field_data_menu_link}, to include
+ * the {menu_links} table in entity queries.
+ */
+define('MENU_LINK_DEFAULT_FIELD', 'menu_link');
+
+/**
+ * Implements hook_help().
+ */
+function menu_link_help($path, $arg) {
+  switch ($path) {
+    case 'admin/help#menu_link':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t("The Menu link module defines a menu link field type for the Field module. A menu link field may be used to place links into a menu that link to it's entity. See the <a href='@field-help'>Field module help page</a> for more information about fields.", array('@field-help' => url('admin/help/field'), '@filter-help' => url('admin/help/filter'))) . '</p>';
+      return $output;
+  }
+}
+
+
+
+/**
+ * Load multiple menu links, access checked and link translated for rendering.
+ *
+ * This function should never be called from within node_load() or any other
+ * function used as a menu object load function since an infinite recursion may
+ * occur.
+ *
+ * @param $mlids array
+ *   An array of menu link IDs.
+ * @param $conditions array
+ *   An associative array of conditions on the {menu_links}
+ *   table, where the keys are the database fields and the values are the
+ *   values those fields must have.
+ *
+ * @return
+ *   An array of menu links indexed by mlid.
+ *
+ * @see menu_link_load()
+ *
+ * @todo Remove this function when http://drupal.org/node/1034732 lands.
+ */
+function menu_link_load_multiple(array $mlids, array $conditions = array()) {
+  $query = db_select('menu_links', 'ml', array('fetch' => PDO::FETCH_ASSOC));
+  $query->leftJoin('menu_router', 'm', 'm.path = ml.router_path');
+  $query->fields('ml');
+  // Weight should be taken from {menu_links}, not {menu_router}.
+  $query->addField('ml', 'weight', 'link_weight');
+  $query->fields('m');
+
+  if (!empty($mlids)) {
+    $query->condition('ml.mlid', $mlids, 'IN');
+  }
+  if (!empty($conditions)) {
+    foreach ($conditions as $field => $value) {
+      $query->condition('ml.' . $field, $value);
+    }
+  }
+
+  $items = array();
+  foreach ($query->execute() as $item) {
+    $item['weight'] = $item['link_weight'];
+    $items[$item['mlid']] = $item;
+    _menu_link_translate($items[$item['mlid']]);
+  }
+  return $items;
+}
+
+/**
+ * Delete multiple menu links.
+ *
+ * @param $mlids array
+ *   An array of menu link IDs.
+ * @param $force boolean
+ *   Forces deletion. Internal use only, setting to TRUE is discouraged.
+ *
+ * @see menu_link_delete()
+ *
+ * @todo Remove this function when http://drupal.org/node/1034732 lands.
+ */
+function menu_link_delete_multiple(array $mlids, $force = FALSE) {
+  if (!empty($mlids)) {
+    $query = db_select('menu_links')
+      ->fields('menu_links')
+      ->condition('mlid', $mlids, 'IN');
+    if (!$force) {
+      // Exclude links belonging to system module except if they are marked
+      // updated (generated during update from Drupal 5).
+      $query->condition(db_or()->condition('module', 'system', '<>')->condition('updated', 0, '<>'));
+    }
+    $links_to_delete = $query->execute()->fetchAllAssoc('mlid', PDO::FETCH_ASSOC);
+
+    if (!empty($links_to_delete)) {
+      $links_with_children = array();
+      $parent_mlids = array();
+      $affected_menus = array();
+      foreach ($links_to_delete as $item) {
+        if ($item['has_children']) {
+          $links_with_children[$item['mlid']] = $item['mlid'];
+        }
+        $parent_mlids[$item['plid']] = $item['plid'];
+        $affected_menus[$item['menu_name']] = $item['menu_name'];
+      }
+      $parent_mlids = array_diff_key($parent_mlids, array(0 => 0) + array_keys($links_to_delete));
+
+      // Re-parent any children to it's closest parent that is not deleted.
+      if (!empty($links_with_children)) {
+        $children = menu_link_load_multiple(array(), array('plid' => $links_with_children));
+        foreach ($children as $item) {
+          while (isset($links_to_delete[$item['plid']])) {
+            $item['plid'] = $links_to_delete[$item['plid']]['plid'];
+          }
+          menu_link_save($item);
+        }
+      }
+
+      db_delete('menu_links')->condition('mlid', array_keys($links_to_delete), 'IN')->execute();
+
+      foreach ($links_to_delete as $item) {
+        // Notify modules we have deleted the item.
+        module_invoke_all('menu_link_delete', $item);
+
+        // Update the has_children status of the parent.
+        _menu_update_parental_status($item);
+      }
+
+      // Update the has_children status of parents of deleted links.
+      // @todo fix query und use this instead of _menu_update_parental_status($item);
+      /*if (!empty($parent_mlids)) {
+        $exists_query = db_select('menu_links', 'child')
+          ->fields('child', array('mlid'))
+          ->condition('child.hidden', 0)
+          ->where('child.plid = parent.mlid')
+          ->where('child.menu_name = parent.menu_name')
+          ->range(0, 1);
+
+        db_update('menu_links', 'parent')
+          ->fields(array('has_children' => 0))
+          ->condition('has_children', 1)
+          ->condition('mlid', $parent_mlids, 'IN')
+          ->notExists($exists_query)
+          ->execute();
+      }*/
+
+      // Clear caches.
+      foreach ($affected_menus as $menu_name) {
+        menu_cache_clear($menu_name);
+      }
+      _menu_clear_page_cache();
+    }
+  }
+}
+
+
+
+/**
+ * Implements hook_menu_delete().
+ */
+function menu_link_menu_delete($menu) {
+  // Menu should not be removed from settings of menu_link field instances; menus
+  // have a machine name so they can be recreated. Non existant menus won't be
+  // available in the field widgets.
+}
+
+/**
+ * Implements hook_menu_link_alter().
+ *
+ * @see http://drupal.org/node/1087888
+ *   Add $prior_link to hook_menu_link_update().
+ */
+function menu_link_menu_link_alter($item = NULL) {
+  static $existing_item;
+  if (isset($item)) {
+    $existing_item = FALSE;
+    if (isset($item['mlid'])) {
+      if ($existing_item = db_query("SELECT * FROM {menu_links} WHERE mlid = :mlid", array(':mlid' => $item['mlid']))->fetchAssoc()) {
+        $existing_item['options'] = unserialize($existing_item['options']);
+      }
+    }
+
+    if ($existing_item['module'] == 'menu_link') {
+
+    }
+  }
+  return $existing_item;
+}
+
+/**
+ * Implements hook_menu_link_update().
+ *
+ * Synchronize menu_link fields with the updated menu link.
+ */
+function menu_link_menu_link_update($item) {
+  $prior_item = menu_link_menu_link_alter();
+
+  if ($item['module'] == 'menu_link' && empty($item['menu_link_field_save'])) {
+    static $entity_paths;
+
+    if (empty($entity_paths)) {
+      $entity_get_info = entity_get_info();
+      foreach ($entity_get_info as $entity_type => $entity_info) {
+        if (isset($entity_info['path'])) {
+          $entity_path = str_replace('%' . $entity_type, '%', $entity_info['path']);
+          $entity_paths[$entity_path] = $entity_type;
+        }
+      }
+    }
+
+    if (isset($entity_paths[$item['router_path']])) {
+      // Get entity type
+      $entity_type = $entity_paths[$item['router_path']];
+      // Get path to entity without wildcard
+      $router_path = str_replace('%','',$item['router_path']);
+      // Get Entity ID
+      $entity_id = str_replace($router_path, '', $item['link_path']);
+      // Load entity
+      $entity = array_shift(entity_load($entity_type, array($entity_id)));
+      // Get bundle
+      list( , , $bundle) = entity_extract_ids($entity_type, $entity);
+
+      $save_entity = FALSE;
+      foreach (field_info_instances($entity_type, $bundle) as $instance) {
+        $field_name = $instance['field_name'];
+        $field = field_info_field($field_name);
+        if ($field['module'] == 'menu_link') {
+
+          // Check if field exist on this entity
+          if (isset($entity->{$field_name}) && !empty($entity->{$field_name})) {
+            // Check if content is the same as current path for each language
+            foreach ($entity->{$field_name} as $lang => $items) {
+              // for each contents of fields
+              foreach ($items as $i => $field_item) {
+                // Check if it's current item
+                if ($field_item['mlid'] == $item['mlid']) {
+                  // So give it updated options
+                  foreach ($entity->{$field_name}[$lang][$i] as $option_name => $option_value) {
+                    $entity->{$field_name}[$lang][$i][$option_name] = $item[$option_name];
+                  }
+                  $save_entity = TRUE;
+                  break; // We found item in field content so break to next field
+                }
+              }
+            }
+          }
+        }
+      }
+
+      // Entity has been edited so save it
+      if ($save_entity) {
+        entity_save($entity_type, $entity);
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_menu_link_delete().
+ *
+ * Remove link from all menu_link fields. Note that this module disables the
+ * possibility to delete menu links through the Admin > Structure > Menus
+ * interface that are used in a menu_link field (by storing menu links under its
+ * own module instead of system). So this hook may not be neccessary at all.
+ */
+function menu_link_menu_link_delete($item) {
+  if ($item['module'] == 'menu_link' && empty($item['menu_link_field_save'])) {
+    // TODO
+  }
+}
+
+/**
+ * Implements hook_field_update_forbid().
+ */
+function menu_link_field_update_forbid($field, $prior_field, $has_data) {
+  if ($field['field_name'] == MENU_LINK_DEFAULT_FIELD) {
+    if (!empty($field['settings']['link_path_field'])) {
+      throw new FieldUpdateForbiddenException(t('The link path cannot not be exposed for the ":menu_link_field" field.', array(':menu_link_field' => MENU_LINK_DEFAULT_FIELD)));
+    }
+  }
+}
+
+/**
+ * Implementation of hook_views_api().
+ */
+function menu_link_views_api() {
+  return array(
+    'api' => 3,
+    'path' => drupal_get_path('module', 'menu_link'),
+  );
+}

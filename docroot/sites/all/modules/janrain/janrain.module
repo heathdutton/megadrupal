@@ -1,0 +1,282 @@
+<?php
+/**
+ * @file
+ * Janrain core module file.
+ */
+
+// Early load resources since Drupal's module loading semantics are wack.
+if (!class_exists('JanrainSdk')) {
+  try {
+    require_once __DIR__ . '/lib/JanrainPhpSdk.phar';
+  }
+  catch (Exception $e) {
+    // This really can only be triggered by invalid file permissions or
+    // unsupported PHP versions.
+    watchdog_exception('janrain', $e, NULL, array(), WATCHDOG_EMERGENCY);
+  }
+}
+if (!class_exists('Guzzle\\Http\\Client')) {
+  require_once __DIR__ . '/lib/guzzle.phar';
+}
+require_once __DIR__ . '/lib/DrupalAdapter.php';
+
+/**
+ * Implements hook_boot().
+ *
+ * Since Drupal can cache everything, we have to initialize at boot to make sure
+ * the session has THIS request's data.
+ */
+function janrain_boot() {
+  // Initialize the sdk.
+  $adapter = DrupalAdapter::fromDrupal();
+  $sdk = JanrainSdk::forAdapter($adapter);
+  $sdk->getConfig()->setLoginPage();
+}
+
+/**
+ * Implements hook_init().
+ */
+function janrain_init() {
+  // Load SDK.
+  $sdk = JanrainSdk::instance();
+
+  // Load other files.
+  module_load_include('php', 'janrain', 'includes/identity');
+
+  if (_janrain_is_login_only()) {
+    module_load_include('php', 'janrain', 'includes/login');
+    $sdk->addFeatureByName('EngageApi');
+  }
+  else {
+    // Disable visitor-initiated account creation via Drupal
+    // (admins may still create accounts, but they should do so in Capture).
+    variable_set('user_register', USER_REGISTER_ADMINISTRATORS_ONLY);
+    module_load_include('php', 'janrain', 'includes/registration');
+    $sdk->addFeatureByName('CaptureApi');
+  }
+  // Add logged in status to behaviors.
+  // Add clean url to behaviors.
+  drupal_add_js(array(
+    'janrain' => array(
+      'user_is_logged_in' => intval(user_is_logged_in()),
+      'clean_url' => (int) variable_get('clean_url', '0'),
+    ),
+  ), 'setting');
+}
+
+/**
+ * Implements hook_services_resources().
+ */
+function janrain_services_resources() {
+  if (_janrain_is_login_only()) {
+    module_load_include('php', 'janrain', 'includes/login_services');
+  }
+  else {
+    module_load_include('php', 'janrain', 'includes/registration_services');
+  }
+  return _janrain_services_resources();
+}
+
+/**
+ * Helper to determine Login-only semantics.
+ */
+function _janrain_is_login_only() {
+  $janrain_product = variable_get('janrain_product', DrupalAdapter::SKU_SOCIAL_LOGIN);
+  return DrupalAdapter::SKU_SOCIAL_LOGIN == $janrain_product;
+}
+
+/**
+ * Helper to clean up sessions after Janrain login attempts.
+ * @todo-3.1 Move to sdk
+ */
+function _janrain_clear_session($remove_tokens = FALSE) {
+  if ($remove_tokens) {
+    unset($_SESSION['janrain']);
+    return;
+  }
+  unset(
+    $_SESSION['janrain']['identifiers'],
+    $_SESSION['janrain']['name'],
+    $_SESSION['janrain']['email']
+  );
+}
+
+/**
+ * Implements hook_user_logout().
+ * @todo-3.1 move into sdk
+ */
+function janrain_user_logout($account) {
+  DrupalAdapter::dropSessionItem();
+}
+
+/**
+ * Implements hook_form_user_login_alter().
+ */
+function janrain_form_user_login_alter(&$form, &$form_state) {
+  $form['name']['#required'] = FALSE;
+  $form['pass']['#required'] = FALSE;
+  // Capture login that failed.
+  if (DrupalAdapter::getSessionItem('accessToken')) {
+    $form['name']['#default_value'] = DrupalAdapter::getSessionItem('name');
+    // Add submit handler.
+    $form['#submit'][] = 'janrain_form_user_login_form_submit';
+  }
+  array_unshift($form['#validate'], 'janrain_login_validate');
+}
+
+/**
+ * Implements hook_ctools_plugin_api().
+ */
+function janrain_ctools_plugin_api($owner, $api) {
+  if ($owner == 'services' && $api == 'services') {
+    $out = array(
+      'version' => 3,
+      'path' => drupal_get_path('module', 'janrain') . '/includes',
+    );
+    if (_janrain_is_login_only()) {
+      $out['file'] = 'login_services.php';
+    }
+    else {
+      $out['file'] = 'registration_services.php';
+    }
+    return $out;
+  }
+}
+
+/**
+ * Implements hook_default_services_endpoint().
+ *
+ * from service export
+ */
+function janrain_default_services_endpoint() {
+  $endpoint = new stdClass();
+  $endpoint->debug = FALSE;
+  $endpoint->disabled = FALSE; /* Edit this to true to make a default endpoint disabled initially */
+  $endpoint->api_version = 3;
+  $endpoint->name = 'janrain';
+  $endpoint->server = 'rest_server';
+  $endpoint->path = 'janrain';
+  $endpoint->authentication = array(
+    'services' => 'services',
+  );
+  $endpoint->server_settings = array(
+    'formatters' => array(
+      'bencode' => FALSE,
+      'json' => TRUE,
+      'jsonp' => FALSE,
+      'php' => FALSE,
+      'xml' => FALSE,
+      'yaml' => FALSE,
+    ),
+    'parsers' => array(
+      'application/json' => TRUE,
+      'application/vnd.php.serialized' => FALSE,
+      'application/x-www-form-urlencoded' => TRUE,
+      'application/xml' => FALSE,
+      'multipart/form-data' => FALSE,
+      'text/xml' => FALSE,
+      'application/x-yaml' => FALSE,
+    ),
+  );
+  $endpoint->resources = array(
+    'login' => array(
+      'actions' => array(
+        'token' => array('enabled' => '1'),
+      ),
+    ),
+    'registration' => array(
+      'actions' => array(
+        'code' => array('enabled' => '1'),
+        'session_token' => array('enabled' => '1'),
+        'profile_update' => array('enabled' => '1'),
+      ),
+    ),
+  );
+  $endpoint->debug = 0;
+  $endpoints = array($endpoint);
+  return $endpoints;
+}
+
+/**
+ * Get the version of the module.
+ */
+function janrain_version() {
+  $composer = json_decode(file_get_contents(__DIR__ . '/composer.json'));
+  return $composer->version;
+}
+
+/**
+ * Implements hook_menu().
+ */
+function janrain_menu() {
+  $menu = array();
+  $menu['admin/config/people/janrain'] = array(
+    'title' => 'Janrain',
+    'description' => 'Integrate Janrain social login, registration, single sign on, and social sharing capabilities into your drupal site.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('janrain_config_form'),
+    'access arguments' => array('administer site configuration'),
+    'type' => MENU_NORMAL_ITEM,
+  );
+  $menu['admin/config/people/janrain/information'] = array(
+    'title' => 'Information',
+    'type' => MENU_DEFAULT_LOCAL_TASK,
+    'access arguments' => array('administer site configuration'),
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('janrain_config_form'),
+    'weight' => 100,
+  );
+  return $menu;
+}
+
+/**
+ * Render the settings form.
+ */
+function janrain_config_form($form, &$form_state) {
+  // Get CMS Adapter.
+  $settings = JanrainSdk::instance()->getConfig();
+  $form['drupal_info'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Drupal Information'),
+    '#weight' => 0,
+    '#collapsible' => FALSE,
+  );
+  $f = &$form['drupal_info'];
+
+  // Expose server config.
+  $f['os'] = array(
+    '#markup' => '<p><strong>OS:</strong>&nbsp;' . PHP_OS . '</p>',
+  );
+  $f['php'] = array(
+    '#markup' => '<p><strong>PHP Version:</strong>&nbsp;' . PHP_VERSION . '</p>',
+  );
+  $f['drupal'] = array(
+    '#markup' => '<p><strong>Drupal Version:</strong>&nbsp;' . VERSION . '</p>',
+  );
+  $f['module'] = array(
+    '#markup' => '<p><strong>Module Version:</strong>&nbsp;' . janrain_version() . '</p>',
+  );
+
+  $form['janrain_info'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Janrain SDK Settings'),
+    '#description' => t('Use this information to check Janrain configuration settings.  These settings are provided by the Janrain platform to assist in troubleshooting and configuration.'),
+    '#collapsible' => FALSE,
+    '#collapsed' => FALSE,
+  );
+  // Expose Janrain config.
+  foreach ($settings as $k => $v) {
+    // Anonymize secrets.
+    if (in_array($k, array('apiKey', 'capture.clientSecret'))) {
+      $v = preg_replace('|[0-9a-zA-Z]|', '*', $v);
+    }
+
+    // Clean up the json-encoded value for legibility.
+    $v = str_replace('\\/', '/', json_encode($v));
+    $form['janrain_info'][strtolower($k)] = array(
+      '#markup' => sprintf('<p><strong>%s:</strong>&nbsp;%s</p>', filter_xss($k), $v),
+    );
+  }
+
+  return $form;
+}

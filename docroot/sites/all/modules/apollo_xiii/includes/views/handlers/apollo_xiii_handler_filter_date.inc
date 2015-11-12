@@ -1,0 +1,37 @@
+<?php
+
+/**
+ * @file
+ * Definition of apollo_xiii_handler_filter_date.
+ */
+
+/**
+ * Filter to handle dates stored as a timestamp.
+ *
+ * @ingroup views_filter_handlers
+ */
+class apollo_xiii_handler_filter_date extends views_handler_filter_date {
+
+  /**
+   * Convert the date to make the operation work as espected.
+   */
+  public function op_simple($field) {
+    $value = intval(strtotime($this->value['value']));
+    $this->query->add_where($this->options['group'], $field, $value, $this->operator);
+  }
+
+  /**
+   * Retrive the list of available operators.
+   */
+  public function operators() {
+    $operators = parent::operators();
+    // Remove no coded operators.
+    $coded_operators = array('<', '<=', '=', '!=', '>=', '>');
+    foreach ($operators as $operator => $operator_info) {
+      if (!in_array($operator, $coded_operators)) {
+        unset($operators[$operator]);
+      }
+    }
+    return $operators;
+  }
+}
