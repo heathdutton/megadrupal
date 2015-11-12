@@ -1,0 +1,191 @@
+<?php
+/**
+ * @file
+ * This file is the main module file for Email Auto Login
+ *
+ * The integration with Drupal comes on hook_mail_alter.
+ */
+
+/**
+ * Implements hook_menu().
+ */
+function email_auto_login_menu() {
+  $items = array();
+
+  $items['admin/config/system/email_auto_login'] = array(
+    'title' => 'Email Auto Login',
+    'description' => 'Configure settings for Email Auto Login',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('email_auto_login_settings_form'),
+    'access arguments' => array('administer site configuration'),
+    'file' => 'email_auto_login.admin.inc',
+    'type' => MENU_NORMAL_ITEM,
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_mail_alter().
+ */
+function email_auto_login_mail_alter(&$message) {
+  $user = user_load_by_mail($message['to']);
+
+  // Don't add tokens for admin, anonymous or blocked.
+  if (!isset($user->uid) || $user->uid == 1 || $user->status == 0) {
+    return;
+  }
+
+  $token = _email_auto_login_generate_token($user);
+
+  foreach ($message['body'] as &$body) {
+    $body = _email_auto_login_add_token($body, $token);
+  }
+}
+
+/**
+ * Implements hook_init().
+ */
+function email_auto_login_init() {
+  if (isset($_GET['l']) && user_is_anonymous()) {
+
+    // In case cron is broken, let's make sure we've invalidated old tokens.
+    _email_auto_login_invalidate();
+
+    $token = $_GET['l'];
+
+    $uid = db_select('email_auto_login_tokens', 'e')
+      ->fields('e', array('uid'))
+      ->condition('e.token', $token)
+      ->execute()
+      ->fetchField();
+
+    $user = user_load($uid);
+
+    db_delete('email_auto_login_tokens')
+      ->condition('token', $token)
+      ->execute();
+
+    $form_state['uid'] = $user->uid;
+
+    // Don't allow admin or blocked users to login using this method.
+    if ($user->uid != 1 && $user->status == 1) {
+      user_login_submit(array(), $form_state);
+
+      // Move destination to next query.
+      $query = drupal_get_destination();
+      unset($_GET['destination']);
+
+      // Reload the current page after login to avoid access denied page.
+      drupal_goto(current_path(), array('query' => $query));
+    }
+  }
+}
+
+/**
+ * Implements hook_cron().
+ */
+function email_auto_login_cron() {
+  _email_auto_login_invalidate();
+}
+
+/**
+ * Invalidates all existing tokens.
+ */
+function _email_auto_login_invalidate() {
+  $timeout = variable_get('user_password_reset_timeout', 24 * 60 * 60);
+
+  db_delete('email_auto_login_tokens')
+    ->condition('created', REQUEST_TIME - variable_get('email_auto_login_expiration_time', $timeout), '<')
+    ->execute();
+}
+
+/**
+ * Generates and saves to database a secure token.
+ *
+ * @param object $account
+ *   User object.
+ *
+ * @return string
+ *   A secure token.
+ */
+function _email_auto_login_generate_token($account) {
+  $token = drupal_get_token($account->mail);
+
+  // The transaction opens here.
+  $txn = db_transaction();
+
+  try {
+    db_merge('email_auto_login_tokens')
+      ->key(array(
+        'uid' => $account->uid,
+        'token' => $token,
+      ))
+      ->fields(array(
+        'uid' => $account->uid,
+        'token' => $token,
+        'created' => REQUEST_TIME,
+      ))
+      ->execute();
+  }
+  catch (Exception $e) {
+    // Something went wrong somewhere, so roll back now.
+    $txn->rollback();
+    // Log the exception to watchdog.
+    watchdog_exception('email_auto_login', $e);
+  }
+
+  return $token;
+}
+
+/**
+ * Utility function to add a token to URLs we find in emails.
+ *
+ * @param string $body
+ *   HTML body of message.
+ * @param string $token
+ *   A secure token.
+ *
+ * @return string
+ *   HTML body of message with tokens.
+ */
+function _email_auto_login_add_token($body, $token) {
+  $parsed_base_url = parse_url($GLOBALS['base_url']);
+
+  $html_dom = filter_dom_load($body);
+  $links = $html_dom->getElementsByTagName('a');
+  foreach ($links as $link) {
+    $url = $link->getAttribute('href');
+    $url_link = parse_url($url);
+
+    // If link is internal.
+    if (isset($url_link['host']) && $url_link['host'] == $parsed_base_url['host']) {
+      // Should the path to be ignored?
+      if (!_email_auto_login_is_ignore_path($url_link['path'])) {
+        $url = url($url, array('query' => array('l' => $token)));
+        $link->setAttribute('href', $url);
+      }
+    }
+  }
+  return filter_dom_serialize($html_dom);
+}
+
+/**
+ * Should the path to be ignored?
+ *
+ * @param $path
+ *   The path to match.
+ * @return bool
+ *   Boolean value: TRUE if the path matches a pattern, FALSE otherwise.
+ */
+function _email_auto_login_is_ignore_path($path) {
+  // Delete first '/' from $path.
+  if ($path[0] == "/") {
+    $path = substr($path, 1);
+  }
+
+  $path = drupal_strtolower(drupal_get_path_alias($path));
+  $pages = drupal_strtolower(variable_get('email_auto_login_ignore_paths', 'user/reset/*'));
+
+  return drupal_match_path($path, $pages);
+}

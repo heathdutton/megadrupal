@@ -1,0 +1,478 @@
+<?php
+
+/**
+ * @file
+ * Provides a way to display blocks amongst the fields of entities.
+ */
+
+define('EBA_ALL_BUNDLES', '_eba_all_');
+
+/**
+ * Load all EBA configuration items, optionally matching the parameters.
+ */
+function eba_config_load_all($entity_type = NULL, $bundle = NULL) {
+  $blocks = &drupal_static('eba_configs', array());
+  $cid = $entity_type . ':' . $bundle;
+  if (!isset($blocks[$cid])) {
+    if ($cached = cache_get('eba_configs:' . $cid)) {
+      $blocks[$cid] = $cached->data;
+    }
+    else {
+      $query = db_select('eba_config', 'eba')
+        ->fields('eba', array());
+
+      if (isset($entity_type) || isset($bundle)) {
+        $filter = '';
+        if (isset($entity_type)) {
+          $filter .= '|' . $entity_type . ':';
+        }
+        if (isset($bundle)) {
+          $filter .= ':' . $bundle . '|';
+        }
+
+        // If both parameters are passed, return any set to appear on all bundles.
+        if (isset($entity_type) && isset($bundle)) {
+          $all_filter = '|' . $entity_type . '::' . EBA_ALL_BUNDLES . '|';
+
+          $or = db_or()
+            ->condition('bundles', '%' . db_like($all_filter) . '%', 'LIKE')
+            ->condition('bundles', '%' . db_like($filter) . '%', 'LIKE');
+          $query->condition($or);
+        }
+        else {
+          $query->condition('bundles', '%' . db_like($filter) . '%', 'LIKE');
+        }
+      }
+
+      $blocks[$cid] = array();
+      $result = $query->execute()
+        ->fetchAll();
+      foreach ($result as $block) {
+        $block->bundles = eba_unserialize_bundle_settings($block->bundles);
+        $blocks[$cid][$block->module][$block->delta] = $block;
+      }
+
+      cache_set('eba_configs:' . $cid, $blocks[$cid]);
+    }
+  }
+
+  return $blocks[$cid];
+}
+
+/**
+ * Load an EBA configuration item.
+ */
+function eba_config_load($module, $delta) {
+  $result = db_select('eba_config', 'eba')
+    ->fields('eba', array())
+    ->condition('module', $module)
+    ->condition('delta', $delta)
+    ->execute()
+    ->fetch();
+  if ($result) {
+    $result->bundles = eba_unserialize_bundle_settings($result->bundles);
+  }
+
+  return $result;
+}
+
+/**
+ * Unserialize the bundles settings.
+ */
+function eba_unserialize_bundle_settings($string) {
+  $bundles = array();
+  if (!empty($string)) {
+    $pairs = explode('|', trim($string, '|'));
+    foreach ($pairs as $pair) {
+      list($entity_type, $bundle) = explode('::', $pair);
+      $bundles[$entity_type][$bundle] = $bundle;
+    }
+  }
+  return $bundles;
+}
+
+/**
+ * Save a single EBA configuration item.
+ */
+function eba_config_save($config, $refresh = TRUE) {
+  if (is_object($config)) {
+    $config = (array) $config;
+  }
+
+  if (is_array($config['bundles'])) {
+    $string = '|';
+    if (!empty($config['bundles'])) {
+      foreach ($config['bundles'] as $entity_type => $bundles) {
+        foreach ($bundles as $bundle) {
+          $string .= '|' . $entity_type . '::' . $bundle;
+        }
+      }
+      $string .= '|';
+    }
+    $config['bundles'] = $string . '|';
+  }
+
+  db_merge('eba_config')
+    ->key(array(
+      'module' => $config['module'],
+      'delta' => $config['delta'],
+    ))
+    ->fields(array_intersect_key($config, array_fill_keys(array(
+      'respect_visibility',
+      'bundles',
+    ), TRUE)))
+    ->execute();
+
+  if ($refresh) {
+    drupal_static_reset('eba_configs');
+    cache_clear_all('eba_configs:', 'cache', TRUE);
+    field_cache_clear();
+  }
+}
+
+/**
+ * Delete an EBA configuration item.
+ */
+function eba_config_delete($module, $delta, $refresh = TRUE) {
+  db_delete('eba_config')
+    ->condition('module', $module)
+    ->condition('delta', $delta)
+    ->execute();
+
+  if ($refresh) {
+    drupal_static_reset('eba_configs');
+    cache_clear_all('eba_configs:', 'cache', TRUE);
+    field_cache_clear();
+  }
+}
+
+/**
+ * Implements hook_field_extra_fields().
+ */
+function eba_field_extra_fields() {
+  $return = array();
+
+  $blocks_by_modules = eba_config_load_all();
+  $bundles_info = field_info_bundles();
+
+  foreach ($blocks_by_modules as $module => $blocks) {
+    $module_info = module_invoke($module, 'block_info');
+    // Implementations of hook_block_info_alter() will be ignored, so modules
+    // should implement hook_field_extra_fields_alter() if necessary.
+    foreach ($blocks as $delta => $block) {
+      $block_info = $module_info[$delta];
+
+      foreach ($block->bundles as $entity_type => $block_bundles) {
+        if (isset($bundles_info[$entity_type])) {
+          if (in_array(EBA_ALL_BUNDLES, $block_bundles, TRUE)) {
+            $block_bundles = array_keys($bundles_info[$entity_type]);
+          }
+          foreach ($block_bundles as $bundle) {
+            if (isset($bundles_info[$entity_type][$bundle])) {
+              $return[$entity_type][$bundle]['display']['eba_' . $module . '-' . $delta] = array(
+                'label' => $block_info['info'],
+                'description' => $block_info['info'],
+                'weight' => isset($block_info['weight']) ? $block_info['weight'] : 30,
+              );
+            }
+          }
+        }
+      }
+    }
+  }
+
+  return $return;
+}
+
+/**
+ * Implements hook_entity_view_alter().
+ *
+ * This is a terrible, terrible hack that should not be necessary; taxonomy and
+ * some other entity types use fields, but don't implement  hook_entity_view().
+ * We have to ALTER those entity types after they're built. For the time being,
+ * we'll use a list of special cases to trigger this special handling.
+ *
+ * @see eba_entity_view_alter()
+ * @see https://drupal.org/files/1772204-d7-1.patch
+ */
+function eba_entity_view_alter(&$build, $entity_type) {
+  $view_mode = $build['#view_mode'];
+
+  // Check to make sure we have at least one block to display.
+  if ($blocks_by_module = eba_config_load_all($entity_type)) {
+    // If we've found an entity in the build array, gather field information.
+    if ($entity = _eba_extract_entity_from_build($build, $entity_type)) {
+      list(,, $bundle) = entity_extract_ids($entity_type, $entity);
+      $extra_fields = eba_field_extra_fields_get_display($entity_type, $bundle, $view_mode);
+      foreach ($extra_fields as $extra_key => $extra_info) {
+        if (strpos($extra_key, 'eba_') === 0) {
+          if (!empty($extra_fields[$extra_key]['visible'])) {
+            list($module, $delta) = explode('-', substr($extra_key, 4), 2);
+            $respect_visibility = $blocks_by_module[$module][$delta]->respect_visibility;
+            if ($block = eba_get_block($module, $delta, $respect_visibility)) {
+              $build[$extra_key] = $block;
+              $build[$extra_key]['#weight'] = $extra_fields[$extra_key]['weight'];
+              $build[$extra_key]['#eba_entity'] = $entity;
+              $build[$extra_key]['#eba_entity_type'] = $entity_type;
+            }
+          }
+        }
+      }
+    }
+    // If we didn't find the entity in the build array, let the user know.
+    else {
+      watchdog('eba', t('EBA could not find the entity in its build array. Block was not attached to entity of type %type', array('%type' => $entity_type)), WATCHDOG_WARNING);
+    }
+  }
+}
+
+/**
+ * Returns the display settings to use for pseudo-fields in a given view mode.
+ *
+ * Statically cached since this could be called many times with identical
+ * parameters on the same page (e.g. on entity listings).
+ */
+function eba_field_extra_fields_get_display($entity_type, $bundle, $view_mode) {
+  $cache = &drupal_static(__FUNCTION__, array());
+  if (!isset($cache[$entity_type][$bundle][$view_mode])) {
+    $cache[$entity_type][$bundle][$view_mode] = field_extra_fields_get_display($entity_type, $bundle, $view_mode);
+  }
+  return $cache[$entity_type][$bundle][$view_mode];
+}
+
+/**
+ * Extract an actual entity object from its $build array.
+ *
+ * This is a bit more complicated than it should be, since core entities,
+ * contrib entities, and contrib entities based on EntityAPI all store their
+ * junk in different slots of the build array. See
+ * http://drupal.org/node/1170198 and http://drupal.org/node/1772204.
+ *
+ * @param $build
+ *   A renderable array representing the entity content.
+ * @param $entity_type
+ *   The type of entity being rendered (i.e. node, user, comment).
+ */
+function _eba_extract_entity_from_build($build, $entity_type = NULL) {
+  $build_paths = eba_build_paths();
+
+  if (!empty($build_paths[$entity_type])) {
+    return $build[$build_paths[$entity_type]];
+  }
+  // EntityAPI often sticks stuff in here.
+  else if (!empty($build['#entity'])) {
+    return $build['#entity'];
+  }
+  // Other entities stick them here!
+  elseif (!empty($build['#' . $entity_type])) {
+    return $build['#' . $entity_type];
+  }
+
+  return FALSE;
+}
+
+/**
+ * Cached store of potential paths to entity within build per entity type.
+ */
+function eba_build_paths() {
+  $build_paths = &drupal_static(__FUNCTION__);
+  if (!isset($build_paths)) {
+    if ($cached = cache_get(__FUNCTION__)) {
+      $build_paths = $cached->data;
+    }
+    else {
+      $build_paths = array(
+        'user' => '#account',
+        'taxonomy_term' => '#term',
+      );
+      drupal_alter('eba_build_path', $build_paths);
+      cache_set(__FUNCTION__, $build_paths);
+    }
+  }
+  return $build_paths;
+}
+
+/**
+ * Retrieve the render array representation for the given block.
+ *
+ * @param $module
+ *   The module that provides the block.
+ * @param $delta
+ *   The block delta.
+ * @param bool $respect_visibility
+ *   Wheher to respect block visibility settings or not.
+ *
+ * @return array|null
+ *   A render array, suitable for passing to render(). If no block is
+ *   available, NULL is returned.
+ */
+function eba_get_block($module, $delta, $respect_visibility = FALSE) {
+  global $theme_key;
+
+  $result = db_select('block', 'b')
+    ->fields('b')
+    ->condition('b.module', $module)
+    ->condition('b.delta', $delta)
+    ->condition('b.theme', $theme_key)
+    ->addTag('block_load')
+    ->addTag('translatable')
+    ->execute();
+
+  $blocks = $result->fetchAll();
+  // If the block does not exist in the database yet return a stub block object.
+  if (empty($blocks)) {
+    $block = new stdClass();
+    $block->module = $module;
+    $block->delta = $delta;
+    $block->region = NULL;
+    $blocks = array($block);
+  }
+
+  if ($respect_visibility) {
+    foreach ($blocks as $block) {
+      // Set status to 1 manually, so block module may evaluate visibility.
+      $block->status = 1;
+    }
+    // Allow modules to modify the block list.
+    drupal_alter('block_list', $blocks);
+  }
+
+  if (!empty($blocks) && ($blocks = _block_render_blocks($blocks))) {
+    return _block_get_renderable_array(array_values($blocks));
+  }
+  return NULL;
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function eba_form_block_admin_configure_alter(&$form, &$form_state, $form_id) {
+  list($module, $delta) = $form_state['build_info']['args'];
+  $config = eba_config_load($module, $delta);
+
+  // @TODO Organise this form in a friendlier way. Tabs within tabs? Fieldsets?
+  $parent_element = array(
+    '#tree' => TRUE,
+    '#type' => 'fieldset',
+    '#title' => t('Entity bundles to display this block on'),
+    '#description' => t('Make this block display on every entity of the selected types. Note that once a block is set to display, it will instantly appear on all view modes of any entity of that type/bundle unless hidden through the \'Manage display\' fields interface for that entity type/bundle. Use that same interface to re-order this block amongst the entity\'s fields.'),
+  );
+
+  // Manually set #options so that they can appear grouped by entity type.
+  // Groupings are implemented as a label in the #prefix of the first checkbox
+  // option for each entity type.
+  $entity_info = entity_get_info();
+  foreach ($entity_info as $entity_type => $entity_type_info) {
+    if ($entity_type_info['fieldable'] && !empty($entity_type_info['bundles'])) {
+      $entity_type_label = empty($entity_type_info['label']) ? $entity_type : $entity_type_info['label'];
+
+      $potential_element = array(
+        '#type' => 'checkboxes',
+        '#title' => $entity_type_label,
+        '#options' => array(),
+        '#default_value' => $config && isset($config->bundles[$entity_type]) ? $config->bundles[$entity_type] : array(),
+      );
+
+      if (user_access('administer site configuration')) {
+        $all_key = EBA_ALL_BUNDLES;
+        $potential_element['#options'][$all_key] = '<em>' . t('Any @entity_type', array('@entity_type' => strtolower($entity_type_label))) . '</em>';
+      }
+
+      foreach ($entity_type_info['bundles'] as $bundle => $bundle_info) {
+        // Check the access if the bundle can be configured.
+        if (empty($bundle_info['admin'])) {
+          continue;
+        }
+
+        $access_args = array_intersect_key($bundle_info['admin'], drupal_map_assoc(array('access callback', 'access arguments')));
+        if (!isset($access_args['access callback'])) {
+          $access_args['access callback'] = 'user_access';
+        }
+        if (!isset($access_args['access arguments'])) {
+          $access_args['access arguments'] = ($access_args['access callback'] = 'user_access') ? array('administer site configuration') : array();
+        }
+
+        $access = FALSE;
+        if (is_bool($access_args['access callback']) || is_numeric($access_args['access callback'])) {
+          $access = (bool) $access_args['access callback'];
+        }
+        elseif ($access_args['access callback'] == 'user_access') {
+          $access = (count($access_args['access arguments']) == 1) ? user_access($access_args['access arguments'][0]) : user_access($access_args['access arguments'][0], $access_args['access arguments'][1]);
+        }
+        elseif (function_exists($access_args['access callback'])) {
+          $access = call_user_func_array($access_args['access callback'], $access_args['access arguments']);
+        }
+        if ($access) {
+          $potential_element['#options'][$bundle] = $bundle_info['label'];
+        }
+      }
+
+      if (!empty($potential_element['#options'])) {
+        $parent_element[$entity_type] = $potential_element;
+      }
+    }
+  }
+
+  // If there were no allowed options then do not make changes to the form.
+  $children = element_children($parent_element);
+  if (!empty($children)) {
+    $form['visibility']['eba'] = array(
+      '#type' => 'fieldset',
+      '#title' => t('Entity Block Attachment'),
+      '#collapsible' => TRUE,
+      '#collapsed' => TRUE,
+      '#group' => 'visibility',
+      '#weight' => 30,
+    );
+    $form['visibility']['eba']['eba_bundles'] = $parent_element;
+
+    $form['visibility']['eba']['eba_respect_visibility'] = array(
+      '#type' => 'checkbox',
+      '#title' => t('Respect block visibility settings'),
+      '#default_value' => $config ? $config->respect_visibility : FALSE,
+      '#description' => t('Only display the block on entities if it is not restricted by other visibility settings.'),
+    );
+
+    // The block configure form does not explicitly set its submission handler, so
+    // add it if necessary before our handler to $form['#submit'], or to the
+    // submit button if other modules have added submit callbacks to that.
+    if (isset($form['actions']['submit']['#submit'])) {
+      $form['actions']['submit']['#submit'][] = 'eba_form_block_admin_configure_submit';
+    }
+    if (!isset($form['#submit'])) {
+      $form['#submit'][] = 'block_admin_configure_submit';
+    }
+    $form['#submit'][] = 'eba_form_block_admin_configure_submit';
+  }
+}
+
+/**
+ * Additional submission callback for the block configuration form.
+ */
+function eba_form_block_admin_configure_submit($form, &$form_state) {
+  if (isset($form_state['values']['eba_bundles'])) {
+    $module = $form_state['values']['module'];
+    $delta = $form_state['values']['delta'];
+    $all_bundles = $form_state['values']['eba_bundles'];
+
+    foreach ($all_bundles as $entity_type => $bundles) {
+      $all_bundles[$entity_type] = array_values(array_filter($bundles));
+    }
+    $all_bundles = array_filter($all_bundles);
+
+    if (empty($all_bundles)) {
+      if ($config = eba_config_load($module, $delta)) {
+        eba_config_delete($module, $delta);
+      }
+    }
+    else {
+      $config = array(
+        'module' => $module,
+        'delta' => $delta,
+        'bundles' => $all_bundles,
+        'respect_visibility' => $form_state['values']['eba_respect_visibility'],
+      );
+      eba_config_save($config);
+    }
+  }
+}

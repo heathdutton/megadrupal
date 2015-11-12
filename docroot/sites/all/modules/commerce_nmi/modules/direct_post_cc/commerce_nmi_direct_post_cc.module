@@ -1,0 +1,181 @@
+<?php
+/**
+ * @file
+ * API functions and hook implementations for the Commerce NMI Direct Post -
+ * Credit Card module.
+ */
+
+use AllPlayers\NMI\Client;
+use AllPlayers\NMI\PaymentMethod\CreditCard;
+use AllPlayers\NMI\PaymentMethod\CustomerVault;
+use AllPlayers\NMI\Request\CustomerVault\Update;
+use AllPlayers\NMI\Request\CustomerVault\Delete;
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * Adds our submit handler to the payment settings form for an action if it is
+ * enabling the nmi_dp_cc payment method.
+ */
+function commerce_nmi_direct_post_cc_form_rules_ui_edit_element_alter(&$form, &$form_state, $form_id) {
+  if ('commerce_payment_enable_nmi_dp_cc' == $form_state['rules_element']->getElementName()) {
+    array_unshift($form['#submit'], 'commerce_nmi_direct_post_cc_settings_form_submit');
+    $form_state['build_info']['files']['commerce_nmi'] = array(
+      'type' => 'inc',
+      'module' => 'commerce_nmi_direct_post_cc',
+      'name' => 'includes/commerce_nmi_direct_post_cc.forms',
+    );
+  }
+}
+
+/**
+ * Callback to update a user's stored card data.
+ */
+function commerce_nmi_direct_post_cc_cardonfile_update($form, &$form_state, $payment_method, $card_data) {
+  $card = new CreditCard();
+  $card->setExpiration(new DateTime($form_state['values']['credit_card']['exp_year'] . '-' . $form_state['values']['credit_card']['exp_month']));
+
+  // Only set the card number if it has changed.
+  if ($form_state['values']['credit_card']['number'] != $form['credit_card']['number']['#default_value']) {
+    $card->number = $form_state['values']['credit_card']['number'];
+  }
+
+  // Build the request.
+  $request = new Update();
+  $request->id = $card_data->remote_id;
+  $request->username = $payment_method['settings']['username'];
+  $request->password = commerce_nmi_decrypt_password($payment_method['settings']['password']);
+  $request->setPaymentMethod($card);
+
+  $client = new Client();
+  $response = $client->transaction()->execute($request);
+
+  // If the request failed then we need to log the error.
+  if ($response['response_code'] != COMMERCE_NMI_RESPONSE_CODE_SUCCESS) {
+    watchdog('commerce_nmi', "An error was encountered while attempting to update a user's payment information: %error", array('%error' => $response['responsetext']), WATCHDOG_ERROR);
+
+    return FALSE;
+  }
+  else {
+    return TRUE;
+  }
+}
+
+/**
+ * Callback to delete a user's stored card data.
+ */
+function commerce_nmi_direct_post_cc_cardonfile_delete($form, &$form_state, $payment_method, $card_data) {
+  // Build the request.
+  $request = new Delete();
+  $request->id = $card_data->remote_id;
+  $request->username = $payment_method['settings']['username'];
+  $request->password = commerce_nmi_decrypt_password($payment_method['settings']['password']);
+
+  $client = new Client();
+  $response = $client->transaction()->execute($request);
+
+  // If the request failed then we need to log the error.
+  if ($response['response_code'] != COMMERCE_NMI_RESPONSE_CODE_SUCCESS) {
+    watchdog('commerce_nmi', "An error was encountered while attempting to delete a user's payment information: %error", array('%error' => $response['responsetext']), WATCHDOG_ERROR);
+
+    return FALSE;
+  }
+  else {
+    return TRUE;
+  }
+}
+
+/**
+ * Implements hook_form_alter().
+ *
+ * Makes sure the card on file storage option only appears if card on file has
+ * been enabled on the selected instance of the NMI direct post credit card
+ * payment method.
+ */
+function commerce_nmi_direct_post_cc_form_alter(&$form, &$form_state, $form_id) {
+  // If this is not a commerce checkout form then we do not care about it.
+  if (strpos($form_id, 'commerce_checkout_form_') !== 0) {
+    return;
+  }
+
+  // If the card on file storage option has not been added to the form then we
+  // do not have to worry about possibly hiding it.
+  if (!isset($form['commerce_payment']['payment_details']['credit_card']['cardonfile_store'])) {
+    return;
+  }
+
+  // If the selected payment method is not nmi direct post credit card then we
+  // do not want to mess with the payment form.
+  $payment_method = commerce_payment_method_instance_load($form['commerce_payment']['payment_method']['#default_value']);
+  if ($payment_method['method_id'] != 'nmi_dp_cc') {
+    return;
+  }
+
+  // If card on file has not been enabled for this payment method instance then
+  // we should hide the option and set it's value to not store the card.
+  if (empty($payment_method['settings']['cardonfile'])) {
+    $form['commerce_payment']['payment_details']['credit_card']['cardonfile_store'] = array(
+      '#type' => 'value',
+      '#value' => FALSE,
+    );
+  }
+}
+
+/**
+ * Callback to process a charge against a stored card.
+ */
+function commerce_nmi_direct_post_cc_cardonfile_charge($payment_method, $card_data, $order, $charge) {
+  // If the amount is zero then we do not want to process the payment.
+  if ($charge['amount'] == 0) {
+    // Create a transaction to log the skipped transaction and display a
+    // helpful message to the customer.
+    $transaction = commerce_payment_transaction_new('nmi_dp_cc', $order->order_id);
+    $transaction->amount = $charge['amount'];
+    $transaction->currency_code = $charge['currency_code'];
+    $transaction->status = COMMERCE_PAYMENT_STATUS_FAILURE;
+    $transaction->message = t('Invalid @amount; transaction not attempted.', array('@amount' => commerce_currency_format($charge['amount'], $charge['currency_code'])));
+    commerce_payment_transaction_save($transaction);
+
+    drupal_set_message('We encountered an error processing your transaction. Please contact us to resolve the issue.', 'error');
+    return FALSE;
+  }
+
+  // Build the payment method.
+  $payment = new CustomerVault();
+  $payment->customerVaultId = $card_data->remote_id;
+
+  // Build the request and add the payment method to it.
+  $request = commerce_nmi_create_sale_request($payment_method, $charge, $order);
+  $request->setPaymentMethod($payment);
+
+  // Attempt to process the transaction.
+  $client = new Client();
+  $response = $client->transaction()->execute($request);
+
+  // Prepare a transaction object to log the API response.
+  $transaction = commerce_payment_transaction_new('nmi_dp_cc', $order->order_id);
+  $transaction->instance_id = $payment_method['instance_id'];
+  $transaction->amount = $charge['amount'];
+  $transaction->currency_code = $charge['currency_code'];
+  $transaction->payload[time()] = $response;
+  $transaction->status = COMMERCE_PAYMENT_STATUS_SUCCESS;
+  $transaction->message = array('<b>' . $response['responsetext'] . '</b>');
+
+  // If a transaction id was returned then set it on the transaction.
+  if (isset($response['transactionid'])) {
+    $transaction->remote_id = $response['transactionid'];
+  }
+
+  // If the request failed then we need to set the status appropriatly and
+  // display a message to the user.
+  if ($response['response_code'] != COMMERCE_NMI_RESPONSE_CODE_SUCCESS) {
+    $transaction->status = COMMERCE_PAYMENT_STATUS_FAILURE;
+    drupal_set_message(t('We received the following error processing your transaction. Please enter your information again: %error', array('%error' => $response['responsetext'])), 'error');
+  }
+
+  // Format the message and save the transaction.
+  $transaction->message = implode('<br />', $transaction->message);
+  commerce_payment_transaction_save($transaction);
+
+  return ($response['response_code'] == COMMERCE_NMI_RESPONSE_CODE_SUCCESS);
+}

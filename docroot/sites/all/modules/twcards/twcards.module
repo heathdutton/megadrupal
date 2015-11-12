@@ -1,0 +1,194 @@
+<?php
+
+/**
+ * @file
+ * Twitter Cards module for handling Lead Generation card POSTs.
+ */
+
+/**
+ * Implements hook_menu().
+ */
+function twcards_menu() {
+  $items['twcards-lead-generation-card-endpoint'] = array(
+    'title' => 'Hello, Twitter robots',
+    'page callback' => 'twcards_lead_post_callback',
+    'access callback' => TRUE,
+    'type' => MENU_CALLBACK,
+  );
+  $items['admin/reports/twcards-leads'] = array(
+    'title' => 'Twitter Cards Leads Summary',
+    'description' => "View leads submitted by Twitter's lead generation cards",
+    'page callback' => 'twcards_leads_report',
+    'access arguments' => array('view twcards leads'),
+  );
+
+  return $items;
+}
+
+
+/**
+ * Implements hook_permission().
+ */
+function twcards_permission() {
+  return array(
+    'view twcards leads' => array(
+      'title' => t('View Twitter Cards Leads'),
+      'description' => t('View sensitive lead information submitted by Twitter lead-gen cards (including email address).'),
+    ),
+  );
+}
+
+/**
+ * Page callback for a listing of recent leads.
+ */
+function twcards_leads_report() {
+  // I added this page for automated testing. If someone needs a longer page
+  // please file a patch, ideally adding Views integration.
+  $leads = db_query("SELECT name, screen_name, mail, extra_data, created FROM {twcards_leads} ORDER BY twcid DESC LIMIT 10")->fetchAll(PDO::FETCH_ASSOC);
+
+  $rows = array();
+  foreach ($leads as $lead) {
+    // @todo: if it makes it easier to read, json_decode the extra_data.
+    $lead['created'] = format_date($lead['created'], 'short');
+    $rows[] = array_map('check_plain', $lead);
+  }
+
+  // Make a table for them.
+  $header = array(
+    t('Name'),
+    t('Screen name'),
+    t('Mail'),
+    t('Other data'),
+    t('Created'),
+  );
+  $output = theme('table', array(
+    'header' => $header,
+    'rows' => $rows,
+    'empty' => t('No leads recorded yet'))
+  );
+  return $output;
+}
+
+
+/**
+ * Page callback just to pass of data to the real function and print responses.
+ */
+function twcards_lead_post_callback() {
+  // Twitter allows GET, but prefers POSTs. Assigning GET to POST also makes
+  // development easier.
+  $twitter_lead = $_POST;
+  if (empty($_POST) && variable_get('twcards_allow_get_requests', FALSE)) {
+    $twitter_lead = $_GET;
+    unset($twitter_lead['q']);
+  }
+  $response = twcards_handle_lead($twitter_lead);
+  return $response;
+}
+
+/**
+ * Processes a lead from Twitter and respond.
+ *
+ * Handling a lead includes validating it and insert it into the database.
+ *
+ * @param array $posted_array
+ *   An array of data posted to the site. e.g. $_POST.
+ *
+ * @return string
+ *   A page
+ */
+function twcards_handle_lead($posted_array) {
+  // If the site has a salt, verify the incoming POST.
+  $salt = variable_get('twcards_salt_key', FALSE);
+  try {
+    if ($salt) {
+      if (twcards_validate_post_token($posted_array, $salt)) {
+        // If it's valid, insert it.
+        twcards_insert_lead($posted_array);
+      }
+      else {
+        watchdog('twcards', 'Data posted with a different md5 hash than calculated. Confirm that the hash is being sent and your salt is in synch in Drupal and on Twitter.');
+        drupal_access_denied();
+        return t("403 Access Denied");
+      }
+    }
+    else {
+      // @todo: consider doing more validation/flood control to prevent
+      // malicious use of this API.
+      // Twitter makes the salt optional, so if there's no salt set we should
+      // still store the data. It's a pretty bad idea not to use the salt.
+      twcards_insert_lead($posted_array);
+    }
+  }
+  catch (Exception $e) {
+    watchdog_exception('twcards', $e, array(), WATCHDOG_CRITICAL);
+    drupal_add_http_header('Status', '420 Enhance Your Calm');
+    return t("420 Enhance Your Calm");
+  }
+
+  return t("200 Thanks Twitter");
+}
+
+/**
+ * Inserts a lead to the database. Assumes md5 validation of the lead is done.
+ *
+ * @param array $posted_array
+ *   The array of data posted to the site.
+ *
+ * @throws PDOException
+ */
+function twcards_insert_lead($posted_array) {
+  $name = array_key_exists('name', $posted_array) ? $posted_array['name'] : '';
+  $screen_name = array_key_exists('screen_name', $posted_array) ? $posted_array['screen_name'] : '';
+  $mail = array_key_exists('mail', $posted_array) ? $posted_array['mail'] : '';
+  if (empty($name) || empty($screen_name) || empty($mail)) {
+    watchdog('twcards', "One or more of name, screen_name, or mail variables was not present. You may have used Twitter's tools to customize the post variables which is incompatible with this module.", array(), WATCHDOG_ERROR);
+  }
+  unset($posted_array['name']);
+  unset($posted_array['screen_name']);
+  unset($posted_array['mail']);
+  unset($posted_array['token']);
+  $fields = array(
+    'name' => $name,
+    'screen_name' => $screen_name,
+    'mail' => $mail,
+    'created' => REQUEST_TIME,
+  );
+  if (count($posted_array)) {
+    $fields['extra_data'] = json_encode($posted_array);
+  }
+  // Allow other modules to react to this data.
+  module_invoke_all('twcards_lead_inserted', $fields);
+  db_insert('twcards_leads')
+    ->fields($fields)
+    ->execute();
+}
+
+/**
+ * Validates the md5 signature for data posted to a site per Twitter's standard.
+ *
+ * @param array $posted_array
+ *   An array of posted data. Must contain at least a token element.
+ * @param string $salt
+ *   The secret salt used by Twitter and your site to hash the elements.
+ *
+ * @return bool
+ *   True if the md5 calculated by Drupal matches the one in the POSTed data.
+ */
+function twcards_validate_post_token($posted_array, $salt) {
+  //  Twitter will generate the hash token request in this manner:
+  //  MD5(comma separated strings, in alphabetic order of their keys + "," + shared salt)
+  //  For example, for a user with name="Jane Doe", screen_name="@jane_doe", email="jane.doe@gmail.com", and partner’s shared_salt="4sq12z_1j#2mfs",
+  //  The partner site can verify the request by checking if the passed token is same as:
+  //  MD5("jane_doe@gmail.com,Jane Doe,@jane_doe,4sq12z_1j#2mfs")
+  if (!array_key_exists('token', $posted_array)) {
+    return FALSE;
+  }
+  $twitter_token = $posted_array['token'];
+  unset($posted_array['token']);
+  ksort($posted_array);
+  $calculated_md5 = md5(implode($posted_array, ',') . ',' . $salt);
+  if ($calculated_md5 === $twitter_token) {
+    return TRUE;
+  }
+  return FALSE;
+}

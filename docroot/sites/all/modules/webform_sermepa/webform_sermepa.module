@@ -1,0 +1,624 @@
+<?php
+/**
+ * @file
+ * Provide sermepa component for webform.
+ */
+
+module_load_include('inc', 'webform_sermepa', 'components/sermepa');
+module_load_include('inc', 'webform', 'includes/webform.components');
+
+define('WEBFORM_SERMEPA_URL_TEST', 'https://sis-t.redsys.es:25443/sis/realizarPago');
+define('WEBFORM_SERMEPA_URL_LIVE', 'https://sis.sermepa.es/sis/realizarPago');
+define('WEBFORM_SERMEPA_URL_FINISH', 'sermepa/payment/finish');
+
+/**
+ * Implements hook_menu().
+ */
+function webform_sermepa_menu() {
+  $items = array();
+  $items[WEBFORM_SERMEPA_URL_FINISH] = array(
+    'title' => 'Transaction result',
+    'description' => 'Handles callback request from Sermepa',
+    'page callback' => '_webform_sermepa_pay_return',
+    'access callback' => TRUE,
+    'type' => MENU_CALLBACK,
+  );
+  return $items;
+}
+
+/**
+ * Gets node from TPV response.
+ */
+function _webform_sermepa_get_node($feedback) {
+  $ds_merchantdata = json_decode($feedback['Ds_MerchantData'], TRUE);
+  $nid = empty($ds_merchantdata['nid']) ? NULL : $ds_merchantdata['nid'];
+  $node = NULL;
+  if (!empty($nid)) {
+    $node = node_load($nid);
+  }
+  return $node;
+}
+
+/**
+ * Checks if is a valid payment.
+ */
+function _webform_sermepa_check_pay($feedback, $node) {
+  if (isset($feedback['Ds_Signature'])) {
+    $ds_signature = $feedback['Ds_Signature'];
+    if (!empty($_POST["Ds_SignatureVersion"]) && $_POST["Ds_SignatureVersion"] == "HMAC_SHA256_V1") {
+      module_load_include('inc', 'webform_sermepa', 'includes/apiRedsys');
+      $sha256 = new RedsysAPI;
+      $ds_parameters = $feedback["Ds_MerchantParameters"];
+      $signature = $sha256->decodeMerchantParameters($ds_parameters);
+      $feedback = json_decode($signature, true) + $_POST;
+    }
+    else {
+      $ds_amount = $feedback['Ds_Amount'];
+      $ds_order = $feedback['Ds_Order'];
+      $ds_merchantcode = $feedback['Ds_MerchantCode'];
+      $ds_currency = $feedback['Ds_Currency'];
+      $ds_response = $feedback['Ds_Response'];
+      $ds_merchantdata = json_decode($feedback['Ds_MerchantData'], TRUE);
+
+      $cid = NULL;
+      $nid = empty($node->nid) ? NULL : $node->nid;
+      $key = '';
+      if (!empty($node->webform['components'])) {
+        $webform_components = $node->webform['components'];
+        foreach ($webform_components as $component) {
+          $cid = $component['cid'];
+          if ($component['type'] == 'sermepa' && !empty($component['extra']['sermepa']['key'])) {
+            $key = $component['extra']['sermepa']['key'];
+            break;
+          }
+        }
+      }
+      $signature = strtoupper(sha1($ds_amount . $ds_order . $ds_merchantcode . $ds_currency . $ds_response . $key));
+    }
+    if ($ds_signature == $signature) {
+      if ($ds_response < 100) {
+        watchdog('webform_sermepa', 'Order @order_id accepted', array('@order_id' => intval($ds_order)));
+        $sid = empty($ds_merchantdata['sid']) ? NULL : $ds_merchantdata['sid'];
+        $unpaid = db_select('webform_submitted_data', 'wsd')
+          ->fields('wsd', array('data'))
+          ->condition('nid', $nid)
+          ->condition('sid', $sid)
+          ->condition('cid', $cid)
+          ->condition('no', 'status')
+          ->condition('data', 'unpaid')
+          ->execute()
+          ->rowCount();
+        if ($unpaid && !empty($sid) && !empty($cid) && !empty($nid)) {
+          module_load_include('inc', 'webform', 'includes/webform.submissions');
+          $submission = webform_get_submission($nid, $sid);
+          webform_submission_send_mail($node, $submission);
+          db_update('webform_submitted_data')
+            ->fields(array(
+              'data' => 'paid_tpv',
+            ))
+            ->condition('sid', $sid, '=')
+            ->condition('nid', $nid, '=')
+            ->condition('cid', $cid, '=')
+            ->condition('no', 'status', '=')
+            ->execute();
+          db_update('webform_submitted_data')
+            ->fields(array(
+              'data' => $ds_order,
+            ))
+            ->condition('sid', $sid, '=')
+            ->condition('nid', $nid, '=')
+            ->condition('cid', $cid, '=')
+            ->condition('no', 'order', '=')
+            ->execute();
+          db_update('webform_submitted_data')
+            ->fields(array(
+              'data' => $ds_amount,
+            ))
+            ->condition('sid', $sid, '=')
+            ->condition('nid', $nid, '=')
+            ->condition('cid', $cid, '=')
+            ->condition('no', 'amount', '=')
+            ->execute();
+        }
+        else {
+          watchdog('webform_sermepa', 'Unable to update the payment status to paid.', array(), WATCHDOG_ERROR);
+          watchdog('webform_sermepa', 'Unable to send mail with the order information.', array(), WATCHDOG_ERROR);
+        }
+        return TRUE;
+      }
+      else {
+        $text_code = _webform_sermepa_get_message_response($ds_response);
+        $message = t('Transaction error. Code: @code. @text_code', array('@code' => $ds_response, '@text_code' => $text_code));
+        drupal_set_message($message, 'error', FALSE);
+        watchdog('webform_sermepa', $message, array(), WATCHDOG_ERROR);
+      }
+      $message = t('Order @order_id DENIED', array('@order_id' => $ds_order));
+      drupal_set_message($message, 'error', FALSE);
+      watchdog('webform_sermepa', $message, array(), WATCHDOG_ERROR);
+      return FALSE;
+    }
+    else {
+      watchdog('webform_sermepa', 'The signatures not match.', array(), WATCHDOG_ERROR);
+    }
+  }
+  else {
+    watchdog('webform_sermepa', 'No signature returned.', array(), WATCHDOG_ERROR);
+  }
+  $message = t('Failed transaction attempt');
+  drupal_set_message($message, 'error', FALSE);
+  watchdog('webform_sermepa', $message, array(), WATCHDOG_ERROR);
+  return TRUE;
+}
+
+/**
+ * Callback function for transaction result menu item.
+ */
+function _webform_sermepa_pay_return() {
+  if (!empty($_REQUEST['Ds_Order'])) {
+    $feedback = $_GET + $_POST;
+    unset($feedback['q']);
+    $node = _webform_sermepa_get_node($feedback);
+    if (!empty($node)) {
+      if (_webform_sermepa_check_pay($feedback, $node)) {
+        $message = t('Successful payment. You will receive an email with the details of the service.');
+        drupal_set_message($message, 'status', FALSE);
+        $url_return = _webform_sermepa_component_get_field($node, 'sermepa', 'url_ok');
+        drupal_goto($url_return);
+      }
+      else {
+        $message = t('Unable to process the payment. Please, try it again.');
+        drupal_set_message($message, 'error', FALSE);
+        $url_return = _webform_sermepa_component_get_field($node, 'sermepa', 'url_ko');
+        drupal_goto($url_return);
+      }
+    }
+  }
+  $message = t('Fatal error. Unable to process any transaction information.');
+  watchdog('webform_sermepa', $message, array(), WATCHDOG_ERROR);
+  return '';
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function webform_sermepa_form_alter(&$form, &$form_state, $form_id) {
+  if (strpos($form_id, 'webform_client_form_') !== FALSE) {
+    if (strpos($form['#action'], 'edit')) {
+      $form['actions']['submit']['#value'] = t('Update');
+    }
+    else {
+      $webform_components = $form_state['webform']['component_tree']['children'];
+      foreach ($webform_components as $component) {
+        if ($component['type'] == 'sermepa') {
+          $input_amount = empty($component['extra']['sermepa']['input_amount']) ? '' : $component['extra']['sermepa']['input_amount'];
+          $settings = array(
+            'amount' => $input_amount,
+          );
+          drupal_add_js('window.history.forward();', 'inline');
+          drupal_add_js(array('webform_sermepa' => $settings), 'setting');
+          $form['#node']->webform['emails'] = array();
+          $form['actions']['submit']['#ajax']['callback'] = '_webform_sermepa_ajax_callback';
+          if (!empty($component['extra']['sermepa']['component_validation'])) {
+            $form['#validate'][] = '_webform_sermepa_component_validate';
+          }
+        }
+      }
+    }
+  }
+  elseif ($form_id == 'webform_components_form') {
+    $form['add']['add']['#validate'][] = '_webform_sermepa_add_validate';
+  }
+}
+
+/**
+ * Validation function for webform with sermepa component.
+ */
+function _webform_sermepa_component_validate($form, &$form_state) {
+  if ($php_code = _webform_sermepa_component_get_field($form['#node'], 'sermepa', 'component_validation')) {
+    if (module_exists('php')) {
+      php_eval('<?php ' . $php_code . ' ?>');
+    }
+    else {
+      eval($php_code);
+    }
+  }
+}
+
+/**
+ * Validation function for webform_components_form.
+ */
+function _webform_sermepa_add_validate($form, &$form_state) {
+  if ($form_state['values']['add']['type'] == 'sermepa') {
+    if (_webform_sermepa_component_exists($form['#node'], 'sermepa')) {
+      form_set_error('Sermepa component', t('Already exists a sermepa component in the webform'));
+    }
+  }
+}
+
+/**
+ * Ajax callback function for webform submit with sermepa component.
+ */
+function _webform_sermepa_ajax_callback(&$form, &$form_state) {
+  if (!empty($form_state['webform_completed'])) {
+    drupal_get_messages();
+    $form_tpv = drupal_get_form('_webform_sermepa_form', $form_state, $form['#node']->nid);
+    $form_id_selector = '#' . $form['#id'];
+    $commands = array();
+    $commands[] = ajax_command_invoke($form_id_selector . ' .form-submit', 'attr', array('disabled', 'disabled'));
+    $commands[] = ajax_command_remove('#webform-sermepa-form');
+    $commands[] = ajax_command_after($form_id_selector, drupal_render($form_tpv));
+    $commands[] = ajax_command_invoke('#webform-sermepa-form', 'submit');
+    return array('#type' => 'ajax', '#commands' => $commands);
+  }
+  else {
+    return $form;
+  }
+}
+
+/**
+ * Function that builds the sermepa form in order to send to TPV.
+ */
+function _webform_sermepa_form($form, &$form_state, $webform_state, $nid) {
+  global $base_url;
+  $url_callback = WEBFORM_SERMEPA_URL_FINISH;
+  $webform_components = $webform_state['webform']['component_tree']['children'];
+  $component_values = array();
+  foreach ($webform_components as $component) {
+    if ($component['type'] == 'sermepa') {
+      $component_values = $component['extra']['sermepa'];
+    }
+  }
+  if (!empty($component_values['transaction']) && $component_values['transaction'] == 'live') {
+    $url_tpv = WEBFORM_SERMEPA_URL_LIVE;
+  }
+  else {
+    $url_tpv = WEBFORM_SERMEPA_URL_TEST;
+  }
+
+  $mdata = array();
+  $mdata['sid'] = $webform_state['values']['details']['sid'];
+  $mdata['nid'] = $nid;
+
+  $submitted_data = $webform_state['input']['submitted'];
+
+  $name = _webform_sermepa_key_search($submitted_data, 'name');
+  $lastname = _webform_sermepa_key_search($submitted_data, 'lastname');
+
+  $name = empty($name) ? '' : $name;
+  $lastname = empty($lastname) ? '' : $lastname;
+
+  if (!empty($component_values['fixed_amount']) && $component_values['fixed_amount'] == 1) {
+    $amount = intval($component_values['input_amount']);
+  }
+  else {
+    $component_amount = $component_values['component_amount'];
+    $amount = _webform_sermepa_key_search($submitted_data, $component_amount);
+    if (strpos($amount, ',') !== FALSE) {
+      $amount = floatval(str_replace(',', '.', $amount));
+    }
+    if ($component_values['currency'] == 978) {
+      $amount = round($amount, 2) * 100;
+    }
+    else {
+      $amount = round($amount);
+    }
+  }
+
+  $ds_merchant_amount = $amount;
+  $ds_merchant_order = date('ymdHis') + 100000000000;
+  $ds_merchant_merchanturl = $base_url . '/' . $url_callback;
+  $ds_merchant_urlok = $base_url . '/' . $url_callback;
+  $ds_merchant_urlko = $base_url . '/' . $url_callback;
+  $ds_merchant_titular = $name . ' ' . $lastname;
+  $ds_merchant_name = $component_values['merchant_name'];
+  $ds_merchant_productdescription = $component_values['product_description'];
+  $ds_merchant_consumerlanguage = $component_values['language'];
+  $ds_merchant_currency = $component_values['currency'];
+  $ds_merchant_code = $component_values['fuc'];
+  $ds_merchant_terminal = $component_values['terminal'];
+  $ds_merchant_signature = $component_values['key'];
+  $ds_merchant_transactiontype = 0;
+  $ds_merchant_paymethods = 'T';
+  $ds_merchant_merchantdata = json_encode($mdata);
+
+  $encryption = $component_values['encryption'];
+  if ($encryption == 'sha1-enhanced') {
+    $message = $ds_merchant_amount . $ds_merchant_order . $ds_merchant_code . $ds_merchant_currency . $ds_merchant_transactiontype . $ds_merchant_merchanturl . $ds_merchant_signature;
+    $ds_merchant_merchantsignature = strtoupper(sha1($message));
+  }
+  elseif ($encryption == 'sha256') {
+    module_load_include('inc', 'webform_sermepa', 'includes/apiRedsys');
+    $sha256 = new RedsysAPI;
+    $sha256->setParameter("DS_MERCHANT_AMOUNT", $ds_merchant_amount);
+    $sha256->setParameter("DS_MERCHANT_ORDER", strval($ds_merchant_order));
+    $sha256->setParameter("DS_MERCHANT_MERCHANTCODE", $ds_merchant_code);
+    $sha256->setParameter("DS_MERCHANT_CURRENCY", $ds_merchant_currency);
+    $sha256->setParameter("DS_MERCHANT_TRANSACTIONTYPE", $ds_merchant_transactiontype);
+    $sha256->setParameter("DS_MERCHANT_TERMINAL", $ds_merchant_terminal);
+    $sha256->setParameter("DS_MERCHANT_MERCHANTURL", $ds_merchant_merchanturl);
+    $sha256->setParameter("DS_MERCHANT_URLOK", $ds_merchant_urlok);   
+    $sha256->setParameter("DS_MERCHANT_URLKO", $ds_merchant_urlko);
+    $params = $sha256->createMerchantParameters();
+    $ds_merchant_merchantsignature = $sha256->createMerchantSignature($ds_merchant_signature);
+    $ds_merchand_version = "HMAC_SHA256_V1"; 
+    $hidden_fields = array();
+    $hidden_fields['Ds_SignatureVersion'] = $ds_merchand_version;
+    $hidden_fields['Ds_MerchantParameters'] = $params;
+    $hidden_fields['Ds_Signature'] = $ds_merchant_merchantsignature;
+  }
+  else {
+    module_load_include('inc', 'webform_sermepa', 'includes/sha1');
+    $sha = new WebformSermepaSha1();
+    $message = $ds_merchant_amount . $ds_merchant_order . $ds_merchant_code . $ds_merchant_currency . $ds_merchant_signature;
+    $digest1 = $sha->hashString($message);
+    $ds_merchant_merchantsignature = strtoupper($sha->hashToString($digest1));
+  }
+  if ($encryption == 'sha1-enhanced' || $encryption == 'sha1') {
+    $hidden_fields = array();
+    $hidden_fields['Ds_Merchant_Amount'] = $ds_merchant_amount;
+    $hidden_fields['Ds_Merchant_Currency'] = $ds_merchant_currency;
+    $hidden_fields['Ds_Merchant_Order'] = $ds_merchant_order;
+    $hidden_fields['Ds_Merchant_ProductDescription'] = $ds_merchant_productdescription;
+    $hidden_fields['Ds_Merchant_Titular'] = $ds_merchant_titular;
+    $hidden_fields['Ds_Merchant_MerchantName'] = $ds_merchant_name;
+    $hidden_fields['Ds_Merchant_MerchantCode'] = $ds_merchant_code;
+    $hidden_fields['Ds_Merchant_MerchantURL'] = $ds_merchant_merchanturl;
+    $hidden_fields['Ds_Merchant_UrlOK'] = $ds_merchant_urlok;
+    $hidden_fields['Ds_Merchant_UrlKO'] = $ds_merchant_urlko;
+    $hidden_fields['Ds_Merchant_ConsumerLanguage'] = $ds_merchant_consumerlanguage;
+    $hidden_fields['Ds_Merchant_TransactionType'] = $ds_merchant_transactiontype;
+    $hidden_fields['Ds_Merchant_MerchantSignature'] = $ds_merchant_merchantsignature;
+    $hidden_fields['Ds_Merchant_Terminal'] = $ds_merchant_terminal;
+    $hidden_fields['Ds_Merchant_MerchantData'] = $ds_merchant_merchantdata;
+    $hidden_fields['Ds_Merchant_PayMethods'] = $ds_merchant_paymethods;
+  }
+
+  $form = array();
+  $form['#id'] = 'webform-sermepa-form';
+  $form['#action'] = $url_tpv;
+  foreach ($hidden_fields as $name => $value) {
+    $form[$name] = array(
+      '#type' => 'hidden',
+      '#value' => $value,
+    );
+  }
+  return $form;
+}
+
+/**
+ * Define components to Webform.
+ */
+function webform_sermepa_webform_component_info() {
+  $components = array();
+  $components['sermepa'] = array(
+    'label' => 'Sermepa TPV',
+    'description' => t('Sermepa Submission to replace the standar submit for this form'),
+    'features' => array(
+      'title_display' => FALSE,
+    ),
+  );
+  return $components;
+}
+
+/**
+ * Implements hook_permission().
+ */
+function webform_sermepa_permission() {
+  return array(
+    'update payment status' => array(
+      'title' => t('Update sermepa Payment Status'),
+    ),
+    'use sermepa testing' => array(
+      'title' => t('Use sermepa in Testing Mode'),
+    ),
+    'use sermepa php' => array(
+      'title' => t('Use sermepa PHP'),
+      'description' => t('Warning: Give to trusted roles only; this permission has security implications.'),
+    ),
+  );
+}
+
+/**
+ * Generate lists with filter components by types.
+ */
+function _webform_sermepa_filter_node_components(&$node, $types = array()) {
+  $webform_components = $node->webform['components'];
+  $list = array();
+  foreach ($webform_components as $component) {
+    if (in_array($component['type'], $types)) {
+      $list[$component['form_key']] = $component['name'];
+    }
+  }
+  return $list;
+}
+
+/**
+ * Checks if a component a type component exists.
+ */
+function _webform_sermepa_component_exists(&$node, $type) {
+  $webform_components = $node->webform['components'];
+  foreach ($webform_components as $component) {
+    if ($component['type'] == $type) {
+      return TRUE;
+    }
+  }
+  return FALSE;
+}
+
+/**
+ * Gets field value for a component type.
+ */
+function _webform_sermepa_component_get_field(&$node, $type, $field_name) {
+  $webform_components = $node->webform['components'];
+  foreach ($webform_components as $component) {
+    if ($component['type'] == $type) {
+      if (!empty($component['extra']['sermepa'][$field_name])) {
+        return $component['extra']['sermepa'][$field_name];
+      }
+    }
+  }
+  return NULL;
+}
+
+/**
+ * Search a key in a fields array.
+ */
+function _webform_sermepa_key_search($arr, $key) {
+  if (is_array($arr)) {
+    if (array_key_exists($key, $arr)) {
+      if (!is_array($arr[$key])) {
+        return $arr[$key];
+      }
+    }
+    else {
+      foreach ($arr as $subarr) {
+        if ($res = _webform_sermepa_key_search($subarr, $key)) {
+          return $res;
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Modifies format for some currency.
+ */
+function _webform_sermepa_format_amount($amount, $currency) {
+  if (strpos($amount, ',') !== FALSE || strpos($amount, '.') !== FALSE) {
+    $amount = floatval(str_replace(',', '.', $amount));
+    if ($currency == 978) {
+      return round($amount, 2) * 100;
+    }
+    else {
+      return round($amount);
+    }
+  }
+  elseif (empty($amount)) {
+    form_set_error('webform_sermepa', t('Enter a valid amount'));
+  }
+}
+
+/**
+ * Modifies Language options.
+ */
+function _webform_sermepa_get_language_options() {
+  return array(
+    1 => 'Spanish',
+    2 => 'English',
+    3 => 'Catalan',
+    4 => 'French',
+    5 => 'German',
+    6 => 'Dutch',
+    7 => 'Italian',
+    8 => 'Swedish',
+    9 => 'Portuguese',
+    10 => 'Valencian',
+    11 => 'Polish',
+    12 => 'Galician',
+    13 => 'Euskera',
+  );
+}
+
+/**
+ * Generates currency options.
+ */
+function _webform_sermepa_get_currency_options() {
+  return array(
+    978 => 'Euro (EUR)',
+    840 => 'US Dollar (USD)',
+    826 => 'British Pound (GBP)',
+    392 => 'Japanese Yen (JPY)',
+    32 => 'Argentine Peso (ARS)',
+    124 => 'Canadian Dollar (CAD)',
+    152 => 'Chilean Peso (CLP)',
+    170 => 'Colombian Peso (COP)',
+    356 => 'Indian Rupee (INR)',
+    484 => 'Mexican Peso (MXN)',
+    604 => 'Peruvian Nuevo Sol (PEN)',
+    756 => 'Swiss Franc (CHF)',
+    986 => 'Brazilian Real (BRL)',
+    937 => 'Venezuelan Bolivar (VEF)',
+    949 => 'Turkish Lira (TRK)',
+  );
+}
+
+/**
+ * Generates encryption options.
+ */
+function _webform_sermepa_get_encryption_options() {
+  return array(
+    'sha256' => t('SHA256'),
+    'sha1-enhanced' => t('Enhanced SHA'),
+    'sha1' => t('SHA'),
+  );
+}
+
+/**
+ * Handle the response of the payment transaction.
+ */
+function _webform_sermepa_get_message_response($code = NULL) {
+  switch ((int) $code) {
+    case 900:
+      $msg = t('Transaction authorized for returns and confirmations');
+      break;
+
+    case 101:
+      $msg = t('Expired card');
+      break;
+
+    case 102:
+      $msg = t('Temporary exception card or on suspicion of fraud');
+      break;
+
+    case 104:
+    case 9104:
+      $msg = t('Operation not allowed for the card or terminal');
+      break;
+
+    case 116:
+      $msg = t('Asset insufficient');
+      break;
+
+    case 118:
+      $msg = t('Card not registered');
+      break;
+
+    case 129:
+      $msg = t('Wrong security code (CVV2/CVC2)');
+      break;
+
+    case 180:
+      $msg = t('Card out of the service');
+      break;
+
+    case 184:
+      $msg = t('Error on owner authentication');
+      break;
+
+    case 190:
+      $msg = t('Denied without specific reasons');
+      break;
+
+    case 191:
+      $msg = t('Wrong expiration date');
+      break;
+
+    case 202:
+      $msg = t('Temporary or emergency card on suspicion of withdrawal card fraud');
+      break;
+
+    case 912:
+    case 9912:
+      $msg = t('Issuer not available');
+      break;
+
+    case 913:
+      $msg = t('Order duplicated');
+      break;
+
+    default:
+      $msg = t('Transaction refused');
+      break;
+  }
+  return $msg;
+}

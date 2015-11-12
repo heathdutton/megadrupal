@@ -1,0 +1,1448 @@
+<?php
+
+/**
+ * @file
+ * NetX integration main module.
+ */
+
+// Hooks and callbacks for integrating with File Entity module for display.
+require_once dirname(__FILE__) . '/includes/netx.formatters.inc';
+
+/**
+ * Implements hook_help().
+ */
+function netx_help($path, $arg) {
+  switch ($path) {
+    case 'admin/help#netx':
+      $output = '';
+      $output .= '<h3>' . t('About') . '</h3>';
+      $output .= '<p>' . t(
+          'The NetX module is an integration for <a href="@netx_url">netx.net</a>',
+          array('@netx_url' => 'http://netx.net')
+        ) . '</p>';
+
+      return $output;
+  }
+}
+
+/**
+ * Implements hook_menu().
+ */
+function netx_menu() {
+  $items['admin/config/media/netx'] = array(
+    'title' => 'NetX settings',
+    'description' => 'Configure the NetX authentication.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('netx_settings_form'),
+    'access arguments' => array('administer netx settings'),
+    'file' => 'netx.admin.inc',
+  );
+  $items['file/%file/netx_sync'] = array(
+    'title' => 'NetX sync',
+    'page callback' => 'netx_sync_get_asset',
+    'page arguments' => array(1),
+    'access callback' => 'netx_sync_page_access',
+    'access arguments' => array(1),
+    'type' => MENU_LOCAL_ACTION,
+    'file' => 'netx.admin.inc',
+  );
+  $items['netx-scan-tree'] = array(
+    'title' => 'NetX tree',
+    'page callback' => 'netx_scan_tree',
+    'delivery callback' => 'drupal_json_output',
+    'access arguments' => array('add media from remote sources'),
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_theme().
+ */
+function netx_theme() {
+  return array(
+    'netx_search_form' => array(
+      'template' => 'netx-search-form',
+      'render element' => 'form',
+      'path' => drupal_get_path('module', 'netx') . '/theme',
+    ),
+    'netx_attributes' => array(
+      'template' => 'netx-attributes',
+      'variables' => array('netx' => array(), 'settings' => array()),
+      'path' => drupal_get_path('module', 'netx') . '/theme'
+    ),
+  );
+}
+
+// @codingStandardsIgnoreStart
+/**
+ * Preprocess variables for netx-attributes.tpl.php
+ *
+ * Builds 'netx_attributes' array to be rendered in template.
+ *
+ * @see netx-attributes.tpl.php
+ */
+function template_preprocess_netx_attributes(&$vars) {
+  $attributes = array();
+  foreach ($vars['settings'] as $attribute_id) {
+    $index = array_search($attribute_id, $vars['netx']['attributeNames']);
+    if ($index !== FALSE) {
+      $attributes[check_plain($attribute_id)] = check_plain(
+        $vars['netx']['attributeValues'][$index]
+      );
+    }
+  }
+  $vars['netx_attributes'] = $attributes;
+}
+
+// @codingStandardsIgnoreEnd
+
+/**
+ * Implements hook_permission().
+ */
+function netx_permission() {
+  return array(
+    'administer netx settings' => array(
+      'title' => t('Administer NetX settings'),
+    ),
+    'add media from remote sources' => array(
+      'title' => t('Upload media from remote NetX source')
+    )
+  );
+}
+
+/**
+ * Returns NetX custom attributes.
+ *
+ * @param bool $reset
+ *   Reset the attributes static cache.
+ *
+ * @return array
+ *   An array of attributes as keyed arrays with label and type keys.
+ */
+function netx_get_attribues($reset = FALSE) {
+  $attributes = &drupal_static(__FUNCTION__);
+
+  if ($reset) {
+    $attributes = NULL;
+    cache_clear_all('netx_attributes', 'cache');
+  }
+
+  if (!isset($attributes)) {
+    if (!$reset && $cache = cache_get('netx_attributes')) {
+      $attributes = $cache->data;
+    }
+    else {
+      $repo = new NetXRepository();
+
+      // Get extended meta to build a select list options elements.
+      $pull_down_options = array();
+      foreach ($repo->getPulldowns() as $item) {
+        if (!$item['allowDelete']) {
+          // Index only items that are in-use.
+          $pull_down_options[$item['pulldownid']] = $item;
+        }
+      }
+
+      // Build a list of attributes.
+      $attributes = $repo->getAttributeTemplates();
+      foreach ($attributes as &$attribute) {
+        if (isset($pull_down_options[$attribute['spec1']])) {
+          $attribute['drupal_netx'] = $pull_down_options[$attribute['spec1']];
+        }
+      }
+
+      // Allow custom modules to change attributes.
+      drupal_alter('netx_attributes', $attributes);
+
+      // State expiration is controlled.
+      cache_set(
+        'netx_attributes',
+        $attributes,
+        'cache',
+        variable_get(
+          'netx_cron_threshold_attributes',
+          DRUPAL_CRON_DEFAULT_THRESHOLD
+        )
+      );
+    }
+  }
+
+  return $attributes;
+}
+
+/**
+ * Returns NetX categories tree starting from the root category.
+ *
+ * @param bool $reset
+ *   Reset the static cache.
+ *
+ * @return array
+ *   The root category object, whole tree is under subCategories key.
+ */
+function netx_get_categories($reset = FALSE) {
+  $categories = &drupal_static(__FUNCTION__);
+
+  if (!isset($categories) || $reset) {
+    if ($cache = cache_get('netx_categories')) {
+      $categories = $cache->data;
+    }
+    else {
+      $repo = new NetXRepository();
+      $categories = $repo->getCategoryTree();
+      drupal_alter('netx_categories', $categories);
+      // State expiration is controlled.
+      cache_set(
+        'netx_categories',
+        $categories,
+        'cache',
+        variable_get(
+          'netx_cron_threshold_categories',
+          DRUPAL_CRON_DEFAULT_THRESHOLD
+        )
+      );
+    }
+  }
+
+  return $categories;
+}
+
+/**
+ * Helper function for category search.
+ *
+ * @param string $name
+ *   The name of category to search.
+ * @param array $categories
+ *   An array of categories.
+ *
+ * @return int|NULL
+ *   The ID when category found, NULL otherwise.
+ */
+function _netx_find_category($name, $categories) {
+  // @todo Allow name to be a hierarchy.
+  foreach ($categories as $category) {
+    if ($category['label'] == $name) {
+      return $category['categoryId'];
+    }
+    if ($category['subCategories']) {
+      // Search in subcategories.
+      if ($category_id = _netx_find_category($name, $category['subCategories'])) {
+        return $category_id;
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_stream_wrappers().
+ */
+function netx_stream_wrappers() {
+  return array(
+    'netx' => array(
+      'name' => t('NetX assets'),
+      'class' => 'MediaNetXStreamWrapper',
+      'description' => t('Assets provided by NetX.'),
+      'type' => STREAM_WRAPPERS_WRITE_VISIBLE,
+    ),
+  );
+}
+
+/**
+ * Implements hook_media_parse().
+ */
+function netx_media_parse($url, $options = array()) {
+  $params = file_uri_target($url);
+
+  return array();
+}
+
+/**
+ * Implements hook_media_browser_plugin_info().
+ *
+ * Enables the NetX media browser tab.
+ */
+function netx_media_browser_plugin_info() {
+  return array(
+    'netx' => array(
+      'title' => t('NetX search'),
+      'class' => 'MediaNetXBrowser',
+    ),
+    'netx-tree' => array(
+      'title' => t('NetX tree'),
+      'class' => 'MediaNetXTreeBrowser',
+    )
+  );
+}
+
+/**
+ * Implements hook_ctools_plugin_api().
+ */
+function netx_ctools_plugin_api($owner, $api) {
+  if ($owner == 'file_entity') {
+    if ($api == 'file_default_displays') {
+      return array('version' => 1);
+    }
+    if ($api == 'file_type') {
+      return array('version' => 1);
+    }
+  }
+}
+
+/**
+ * Implements hook_views_api().
+ */
+function netx_views_api() {
+  return array(
+    'api' => 3,
+    'path' => drupal_get_path('module', 'netx') . '/views',
+  );
+}
+
+/**
+ * Implements hook_file_mimetype_mapping_alter().
+ */
+function netx_file_mimetype_mapping_alter(&$mapping) {
+  $mapping['mimetypes'][] = 'image/netx';
+  $mapping['mimetypes'][] = 'video/netx';
+  $mapping['mimetypes'][] = 'audio/netx';
+}
+
+/**
+ * Implements hook_file_default_types_alter().
+ */
+function netx_file_default_types_alter(&$types) {
+  $types['image']->mimetypes[] = 'image/netx';
+  $types['video']->mimetypes[] = 'video/netx';
+  $types['audio']->mimetypes[] = 'audio/netx';
+}
+
+/**
+ * Implements hook_file_metadata_info().
+ *
+ * Provides default attributes for assets.
+ */
+function netx_file_metadata_info() {
+  return array(
+    'assetId' => array('label' => t('Asset ID'), 'type' => 'integer'),
+    'file' => array('label' => t('File name'), 'type' => 'string'),
+    'description' => array('label' => t('Description'), 'type' => 'string'),
+    'filesize' => array('label' => t('File size'), 'type' => 'integer'),
+    'filetypelabel' => array('label' => t('File type'), 'type' => 'integer'),
+    'moddate' => array('label' => t('Changed'), 'type' => 'integer'),
+    'importDate' => array('label' => t('Import'), 'type' => 'integer'),
+    'creationdate' => array('label' => t('Created'), 'type' => 'integer'),
+    // @todo Do we need this attribute?
+    // 'sync date' => array('label' => t('Synced'), 'type' => 'integer'),
+  );
+}
+
+/**
+ * Provides a form for adding media items from NetX search.
+ */
+function netx_add_form($form, &$form_state, $types, $multiselect) {
+  // @todo Check allowed media types.
+  $form['multiselect'] = array(
+    '#type' => 'value',
+    '#value' => $multiselect,
+  );
+
+  $form['search'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Search'),
+    '#description' => t('Input a phrase or tags to search.'),
+    '#size' => 30,
+  );
+
+  $form['sort'] = array(
+    '#title' => t('Sort by'),
+    '#type' => 'select',
+    '#options' => array(
+      'fileSize' => t('File size'),
+    ),
+    '#empty_option' => t('- none -'),
+  );
+
+  $form['sort_type'] = array(
+    '#type' => 'select',
+    '#title' => t('Order'),
+    '#options' => array(
+      0 => t('Asc'),
+      1 => t('Desc'),
+    ),
+  );
+
+  $form['apply'] = array(
+    '#type' => 'submit',
+    '#value' => t('Search'),
+    '#submit' => array('_netx_search_images_submit'),
+    '#ajax' => array(
+      'callback' => '_netx_preview_callback',
+      'wrapper' => 'netx-preview',
+    ),
+  );
+
+  $path = drupal_get_path('module', 'netx');
+  $form['preview'] = array(
+    '#type' => 'container',
+    '#id' => 'netx-preview',
+    '#attributes' => array(
+      'class' => array('media-list-thumbnails'),
+    ),
+    '#attached' => array(
+      'js' => array(
+        $path . '/js/netx.forms.js',
+      ),
+      'css' => array(
+        $path . '/css/netx.forms.css',
+      ),
+    ),
+  );
+
+  if (empty($form_state['netx']['assets'])) {
+    $form['preview']['list'] = array(
+      '#markup' => '<div class="empty-message">' . t(
+          'No files found.'
+      ) . '</div>',
+    );
+  }
+  else {
+    // Build a list of assets.
+    $options = array();
+    foreach ($form_state['netx']['assets']['list'] as $asset_id => $asset) {
+      $file = file_uri_to_object(_netx_build_asset_uri($asset));
+      if (!isset($file->fid)) {
+        $file->fid = 0;
+        $file->type = file_get_type($file);
+        $file->metadata = $asset;
+      }
+      media_browser_build_media_item($file);
+      $options[$asset_id] = $file->preview;
+    }
+
+    $page = $form_state['netx']['page'];
+    $total = $form_state['netx']['assets']['total'];
+
+    $title = t(
+      'Page !page of !total',
+      array(
+        '!page' => $page,
+        '!total' => ceil($total / 10),
+      )
+    );
+    $form['preview']['list'] = array(
+      '#type' => $multiselect ? 'checkboxes' : 'radios',
+      '#options' => $options,
+      '#title' => $title,
+      '#attributes' => array(
+        'class' => array('netx-thumbnail'),
+      ),
+      '#suffix' => '<div class="clearfix"></div>',
+    );
+
+    // Add custom pager.
+    $form['preview']['pager'] = array(
+      '#type' => 'container',
+    );
+
+    if ($page > 1) {
+      $form['preview']['pager']['prev'] = array(
+        '#type' => 'submit',
+        '#value' => t('Previous'),
+        '#submit' => array('_netx_search_images_prev_submit'),
+        '#ajax' => array(
+          'callback' => '_netx_preview_callback',
+          'wrapper' => 'netx-preview',
+        ),
+      );
+    }
+    if ($total > $page * 10) {
+      $form['preview']['pager']['next'] = array(
+        '#type' => 'submit',
+        '#value' => t('Next'),
+        '#submit' => array('_netx_search_images_next_submit'),
+        '#ajax' => array(
+          'callback' => '_netx_preview_callback',
+          'wrapper' => 'netx-preview',
+        ),
+      );
+    }
+    $form['preview']['actions'] = array('#type' => 'actions');
+    $form['preview']['actions']['submit'] = array(
+      '#type' => 'submit',
+      '#value' => t('Submit'),
+      '#validate' => array('_netx_add_form_validate'),
+    );
+  }
+
+  $form['#theme'] = 'netx_search_form';
+
+  return $form;
+}
+
+/**
+ * AJAX callback to update preview.
+ */
+function _netx_preview_callback($form, $form_state) {
+  return $form['preview'];
+}
+
+/**
+ * Submit handler for the "Search" button.
+ */
+function _netx_search_images_submit($form, &$form_state) {
+  $form_state['netx'] = array(
+    'search' => trim($form_state['values']['search']),
+    // Start from first page because the search is new.
+    'page' => 1,
+    'sort' => $form_state['values']['sort'],
+    'sort_type' => $form_state['values']['sort_type'],
+  );
+  _netx_search_helper($form_state);
+}
+
+/**
+ * Submit handler for the "Previous" button.
+ */
+function _netx_search_images_prev_submit($form, &$form_state) {
+  $form_state['netx']['page']--;
+  _netx_search_helper($form_state);
+}
+
+/**
+ * Submit handler for the "Next" button.
+ */
+function _netx_search_images_next_submit($form, &$form_state) {
+  $form_state['netx']['page']++;
+  _netx_search_helper($form_state);
+}
+
+/**
+ * Helper for search and navigation.
+ */
+function _netx_search_helper(&$form_state) {
+  $form_state['netx']['assets'] = netx_search_images(
+    $form_state['netx']['page'],
+    $form_state['netx']['search'],
+    $form_state['netx']['sort'],
+    $form_state['netx']['sort_type']
+  );
+  $form_state['rebuild'] = TRUE;
+}
+
+/**
+ * Form validation handler for netx_add_form().
+ *
+ * Allow stream wrappers to have their chance at validation.
+ * Any module that implements hook_media_parse will have an
+ * opportunity to validate this.
+ *
+ * @see media_parse_to_uri()
+ */
+function _netx_add_form_validate($form, &$form_state) {
+  $values = $form_state['values'];
+  if ($values['multiselect']) {
+    $list = array_filter($values['list']);
+    if (!$list) {
+      form_set_error('preview][list', t('Please select an asset.'));
+
+      return FALSE;
+    }
+  }
+  elseif (empty($values['list'])) {
+    form_set_error('preview][list', t('Please select an asset.'));
+  }
+
+  // @todo Check access to asset.
+}
+
+/**
+ * Form submission handler for netx_add_form().
+ */
+function netx_add_form_submit($form, &$form_state) {
+  $values = $form_state['values'];
+  if ($values['multiselect']) {
+    $list = array_filter($values['list']);
+    foreach ($list as $asset_id) {
+      try {
+        // Save the remote file.
+        $file = _netx_save_file(
+          $form_state['netx']['assets']['list'][$asset_id]
+        );
+      }
+      catch (Exception $e) {
+        form_set_error('preview][list', $e->getMessage());
+
+        return;
+      }
+    }
+  }
+  else {
+    try {
+      // Save the remote file.
+      $file = _netx_save_file(
+        $form_state['netx']['assets']['list'][$values['list']]
+      );
+    }
+    catch (Exception $e) {
+      form_set_error('preview][list', $e->getMessage());
+
+      return;
+    }
+  }
+
+  if (!$file->fid) {
+    form_set_error(
+      'url',
+      t(
+        'The file %file could not be saved. An unknown error has occurred.',
+        array('%file' => $file->uri)
+      )
+    );
+
+    return;
+  }
+  else {
+    $form_state['file'] = $file;
+  }
+
+  // Redirect to the file edit page after submission.
+  // @todo Define a proper redirect.
+  if (file_entity_access('update', $file)) {
+    $destination = array('destination' => 'admin/content/file');
+    if (isset($_GET['destination'])) {
+      $destination = drupal_get_destination();
+      unset($_GET['destination']);
+    }
+    $form_state['redirect'] = array(
+      'file/' . $file->fid . '/edit',
+      array('query' => $destination)
+    );
+  }
+  else {
+    $form_state['redirect'] = 'admin/content/file';
+  }
+}
+
+/**
+ * Helper to build and save proper file object.
+ *
+ * @param array $asset
+ *   The serialized asset.
+ *
+ * @return \stdClass
+ *   Saved file object.
+ */
+function _netx_save_file($asset) {
+  $uri = _netx_build_asset_uri($asset);
+  $file = file_uri_to_object($uri, TRUE);
+  if (empty($file->fid)) {
+    // Set metadata from server-stored data.
+    // @todo Maybe store data serialized?
+    $file->metadata = $asset;
+    file_save($file);
+  }
+  else {
+    // @todo Configure sync metadata.
+  }
+
+  return $file;
+}
+
+/**
+ * Helper to convert asset to proper file URI.
+ *
+ * @param array $asset
+ *   The asset metadata to build URI.
+ *
+ * @return string
+ *   The file URI.
+ */
+function _netx_build_asset_uri($asset) {
+  // We have a problem that when we upload same file multiple times we get same asset id (NetX is smart enough to
+  // find out that new file being imported already exists). So we get same uri for drupal that is a problem
+  // as uri field should be unique. This is why we add random number in the uri. Do not add rand key to the end
+  // as functions to findout file name won't work properly. Random key being removed in MediaNetXStreamWrapper::_parse_url
+  return 'netx://' . rand(0, PHP_INT_MAX) . '/a/' . $asset['assetId'] . '/s/' . $asset['filesize'] . '/n/' . $asset['file'];
+}
+
+/**
+ * Implements hook_cron().
+ *
+ * Queues assets for updates once their refresh interval has elapsed.
+ */
+function netx_cron() {
+
+  // Trying to avoid possible race conditions, when there are more than one backend.
+  // The code below this one should run faster than 25 seconds.
+  // If it is not the lock will be automatically released.
+  if (!lock_acquire('netx_cron', 25)) {
+    return;
+  }
+
+  $result = db_query(
+    'SELECT fid FROM {file_managed} WHERE timestamp < :time AND uri LIKE :uri',
+    array(
+      ':time' => REQUEST_TIME - variable_get(
+          'netx_cron_threshold',
+          DRUPAL_CRON_DEFAULT_THRESHOLD
+      ),
+      ':uri' => 'netx://%',
+    )
+  );
+  $queue = DrupalQueue::get('netx_assets');
+  foreach ($result as $row) {
+    if ($queue->createItem($row->fid)) {
+      // Update timestamp to avoid queueing item more than once.
+      db_update('file_managed')
+        ->fields(array('timestamp' => REQUEST_TIME))
+        ->condition('fid', $row->fid)
+        ->execute();
+    }
+  }
+  $push_queue = DrupalQueue::get('netx_assets_for_push');
+  $count = $push_queue->numberOfItems();
+  if ($count > 0) {
+    $repo = new NetXRepository();
+    while ($count > 0) {
+      $item = $push_queue->claimItem();
+      if (!$item) {
+        // @todo decide how to deal with expired queue's items.
+        watchdog(
+          'netx',
+          'There are number of items: %count expired within queue',
+          array('%count' => $count),
+          WATCHDOG_ALERT
+        );
+        break;
+      }
+      $file = entity_load('file', array($item->data));
+      $file = array_shift($file);
+      $asset_id = $file->metadata['assetId'];
+      $asset = $repo->getAssetBean($asset_id);
+      // Let's update only changed data.
+      $equal1 = array_diff(
+        $file->metadata['attributeValues'],
+        $asset['attributeValues']
+      );
+      $equal2 = array_diff(
+        $asset['attributeValues'],
+        $file->metadata['attributeValues']
+      );
+      $changed = (!empty($equal1) || !empty($equal2)) ? TRUE : FALSE;
+      if (!$changed) {
+        $count--;
+        $push_queue->deleteItem($item);
+        continue;
+      }
+      $asset['attributeValues'] = $file->metadata['attributeValues'];
+      $status = $repo->setAsset($asset);
+      if ($status['status'] != 1) {
+        // Saving error. We are not removing item from queue.
+        watchdog(
+          'netx',
+          'Push status @status of file ID @fid',
+          array(
+            '@status' => $status,
+            '@fid' => $item->data,
+          ),
+          WATCHDOG_CRITICAL
+        );
+        $count--;
+        continue;
+      }
+      $count--;
+      $push_queue->deleteItem($item);
+    }
+  }
+
+  // Releasing the lock for ability to run this again at next crontab task.
+  lock_release('netx_cron');
+}
+
+/**
+ * Implements hook_cron_queue_info().
+ */
+function netx_cron_queue_info() {
+  $queues['netx_assets'] = array(
+    'worker callback' => 'netx_assets_refresh',
+    'time' => 60,
+  );
+  $queues['netx_upload'] = array(
+    'worker callback' => 'netx_assets_upload',
+    // @todo Allow configure, upload could take too much time.
+    'time' => 180,
+  );
+
+  return $queues;
+}
+
+/**
+ * Checks a new attributes for assets.
+ *
+ * @param int $fid
+ *   An ID the file to be refreshed.
+ */
+function netx_assets_refresh($fid) {
+  $file = file_load($fid);
+
+  if (empty($file->metadata['assetId'])) {
+    // When no metadata for file, try to get it from stream wrapper.
+    // @codingStandardsIgnoreStart
+    /** @var \MediaNetXStreamWrapper $wrapper */
+    // @codingStandardsIgnoreEnd
+    $wrapper = file_stream_wrapper_get_instance_by_uri($file->uri);
+    $asset_id = $wrapper->getAssetID();
+  }
+  else {
+    $asset_id = $file->metadata['assetId'];
+  }
+
+  if (empty($asset_id)) {
+    watchdog(
+      'netx',
+      'Asset ID for file %fid can not be found.',
+      array('%fid' => $fid),
+      WATCHDOG_ERROR,
+      l(t('view'), 'file/' . $fid)
+    );
+  }
+  else {
+    $repo = new NetXRepository();
+    if ($asset = $repo->getAssetBean($asset_id)) {
+      $file->metadata = $asset;
+      file_save($file);
+      watchdog(
+        'netx',
+        'Asset %asset_id attributes updated.',
+        array('%asset_id' => $asset_id),
+        WATCHDOG_INFO,
+        l(t('view'), 'file/' . $fid)
+      );
+    }
+    else {
+      // @todo Delete file if not cached?
+      watchdog(
+        'netx',
+        'Error pulling asset(%asset_id) attributes for file(%fid).',
+        array('%asset_id' => $asset_id, '%fid' => $fid),
+        WATCHDOG_ERROR,
+        l(t('view'), 'file/' . $fid)
+      );
+    }
+  }
+}
+
+/**
+ * Queue worker callback; uploads asset to DAM.
+ *
+ * @param int $fid
+ *   An ID the file to be uploaded.
+ */
+function netx_assets_upload($fid) {
+  $file = file_load($fid);
+
+  $repo = new NetXRepository();
+  $success = FALSE;
+  try {
+    if ($repo->uploadFile($file) === "<exogen>done</exogen>\n") {
+      // @todo Fix broken category selection.
+      $asset = $repo->importAsset($file->filename);
+      if (!empty($asset['assetId'])) {
+        $file->uri = _netx_build_asset_uri($asset);
+        $file->metadata = $asset;
+        file_save($file);
+        $success = TRUE;
+      }
+    }
+  }
+  catch (Exception $e) {
+  }
+
+  if ($success) {
+    watchdog(
+      'netx',
+      'File (%fid) uploaded as asset (%asset_id).',
+      array('%fid' => $fid, '%asset_id' => $asset['assetId']),
+      WATCHDOG_INFO,
+      l(t('view'), 'file/' . $fid)
+    );
+  }
+  else {
+    watchdog(
+      'netx',
+      'Error uploading file (%fid).',
+      array('%fid' => $fid),
+      WATCHDOG_ERROR,
+      l(t('view'), 'file/' . $fid)
+    );
+  }
+}
+
+/**
+ * Searches for media files.
+ *
+ * @param int $page
+ *   The page number starting from 1.
+ * @param string $keyword
+ *   The search substring.
+ * @param string $sort
+ *   Name of the field to sort by.
+ * @param string $sort_type
+ *   Type of search. Either 0 (ascending) or 1 (descending).
+ *
+ * @returns array
+ *   Keyed array:
+ *   - 'total': Amount of found items
+ *   - 'list': An array of found medias.
+ */
+function netx_search_images($page, $keyword, $sort = '', $sort_type = 0) {
+  $repo = new NetXRepository();
+
+  $total = $repo->doSearchAssetListLength($keyword);
+  if (!$total) {
+    // No assets found.
+    return array();
+  }
+
+  $data = $repo->doSearchAssets($keyword, --$page, $sort, $sort_type);
+
+  $assets = array();
+  foreach ($data as $asset) {
+    $assets[$asset['assetId']] = $asset;
+  }
+
+  $result = array(
+    'total' => $total,
+    'list' => $assets,
+  );
+
+  return $result;
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter() for file_entity_add_upload().
+ */
+function netx_form_file_entity_add_upload_alter(&$form, &$form_state, $form_id) {
+  if ($form['#step'] !== 4 || $form_state['storage']['scheme'] !== 'netx') {
+    // Only forth step allows edit attributes.
+    return;
+  }
+  $form += _netx_attributes_edit();
+  // Prepend own submit callback to update metadata/attributes.
+  array_unshift($form['#validate'], '_netx_form_file_entity_edit_validate');
+  array_unshift($form['#submit'], '_netx_form_file_entity_edit_submit');
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter() for file_entity_edit().
+ */
+function netx_form_file_entity_edit_alter(&$form, &$form_state, $form_id) {
+  // Limit only NetX files.
+  $file = $form_state['file'];
+  if (file_uri_scheme($file->uri) !== 'netx') {
+    return;
+  }
+
+  // Fetch fresh attributes from DAM to prevent edit old data.
+  // @todo Find a way to fetch only attributes for the asset.
+  $repo = new NetXRepository();
+  $asset = $repo->getAssetBean($file->metadata['assetId']);
+  if (empty($asset['assetId'])) {
+    drupal_set_message(t('Asset has been deleted from the DAM'), 'error');
+    return;
+  }
+
+  if ($asset['moddate'] !== $file->metadata['moddate']) {
+    drupal_set_message(t('Asset has been changed in the DAM. Form is displaying latest changes. Please save the form to apply these changes to Drupal.'), 'warning');
+  }
+  // Always use fresh data from DAM.
+  $form += _netx_attributes_edit($asset);
+
+  // Prepend own submit callback to update metadata/attributes.
+  array_unshift(
+    $form['actions']['submit']['#validate'],
+    '_netx_form_file_entity_edit_validate'
+  );
+  array_unshift(
+    $form['actions']['submit']['#submit'],
+    '_netx_form_file_entity_edit_submit'
+  );
+}
+
+/**
+ * Returns a form to edit NetX attributes.
+ *
+ * @param array $metadata
+ *   The array of file metadata.
+ *
+ * @return array
+ *   A form elements array.
+ */
+function _netx_attributes_edit(array $metadata = array()) {
+  // Display NetX attributes in own fieldset.
+  $form['netx'] = array(
+    '#type' => 'fieldset',
+    '#access' => user_access('administer files'),
+    '#title' => t('NetX attributes'),
+    '#collapsible' => TRUE,
+    '#collapsed' => TRUE,
+    '#group' => 'additional_settings',
+    '#attributes' => array(
+      'class' => array('file-form-netx'),
+    ),
+    '#weight' => 50,
+  );
+  // Process only custom attributes.
+  $attributes = array();
+  $attribute_inputs = array();
+  foreach (netx_get_attribues() as $attribute) {
+    $attribute_name = $attribute['name'];
+    // Use value as unique key.
+    $element_name = 'a_' . $attribute['attributeid'];
+    $attributes[$element_name] = $attribute_name;
+
+    $attribute_type = $attribute['type'];
+    // Provide mapping depending on attribute type. See AttributeBean details.
+    $type_map = array(
+      // Unknown.
+      0 => 'textfield',
+      // Text.
+      1 => 'textfield',
+      // Text Area.
+      2 => 'textarea',
+      // Pulldown.
+      3 => 'select',
+      // Date.
+      // @todo Check for date module support module_exists('date').
+      4 => 'date',
+      // Combo. Multiselect.
+      5 => 'select',
+      // Not used TYPE_AUTOCOMPLETE.
+      6 => 'textfield',
+      // Number.
+      7 => 'textfield',
+      // Not used TYPE_HIERARCHICAL.
+      8 => 'textfield',
+    );
+    $element = array(
+      '#type' => isset($type_map[$attribute_type]) ? $type_map[$attribute_type] : 'textfield',
+      '#title' => check_plain($attribute_name),
+      '#required' => (bool) $attribute['mandatory'],
+    );
+
+    if ($attribute_type == 5 || $attribute_type == 3) {
+      $element['#multiple'] = $attribute_type == 5;
+      $element['#empty_value'] = '';
+      // Add available options for select element.
+      $element['#options'] = drupal_map_assoc(explode("\n", $attribute['drupal_netx']['optionValues']));
+    }
+    elseif ($attribute_type == 7) {
+      // Add validation for number element.
+      $element['#element_validate'] = array('element_validate_number');
+    }
+
+    $default_value = $attribute['value'];
+    if (isset($metadata['attributeNames'])) {
+      // Try to get default value from asset metadata.
+      $key = array_search($attribute_name, $metadata['attributeNames']);
+      if ($key !== FALSE && isset($metadata['attributeValues'][$key])) {
+        $default_value = $metadata['attributeValues'][$key];
+      }
+    }
+    if ($attribute_type == 5) {
+      // Process multiple values.
+      $default_value = explode(',', $default_value);
+      foreach ($default_value as &$option) {
+        $option = trim($option, '"');
+      }
+    }
+    elseif ($attribute_type == 4) {
+      // Date is always passed in format MM/DD/YYYY.
+      $parts = explode('/', $default_value);
+
+      if (module_exists('date_popup')) {
+        // Prepare element for date module suite.
+        $element['#type'] = 'date_popup';
+        $element['#date_type'] = DATE_ISO;
+        $element['#date_format'] = 'Y-m-d';
+        $element['#date_label_position'] = 'none';
+        $default_value = $parts[2] . '-' . $parts[0] . '-' . $parts[1];
+      }
+      else {
+        // Fallback to core date element.
+        $default_value = array(
+          'day' => $parts[1],
+          'month' => $parts[0],
+          'year' => $parts[2],
+        );
+      }
+    }
+    $element['#default_value'] = $default_value;
+
+    $attribute_inputs[$element_name] = $element;
+  }
+
+  // Wrap attributes to get values from own form key.
+  $form['netx']['netx_attributes'] = $attribute_inputs + array(
+    '#type' => 'container',
+    '#tree' => TRUE,
+  );
+
+  $form['netx']['netx_ids'] = array(
+    '#type' => 'value',
+    '#value' => $attributes,
+  );
+
+  if (module_exists('date_popup')) {
+    // Remove useless padding.
+    $form['#attached']['css'][] = drupal_get_path('module', 'netx') . '/css/netx.forms.css';
+  }
+
+  return $form;
+}
+
+/**
+ * Form submission handler for file_entity_edit().
+ *
+ * @see netx_form_file_entity_edit_alter()
+ */
+function _netx_form_file_entity_edit_validate($form, &$form_state) {
+  // @todo Implement conflict resolution for concurrent edits.
+}
+
+/**
+ * Form submission handler for file_entity_edit().
+ *
+ * @see netx_form_file_entity_edit_alter()
+ */
+function _netx_form_file_entity_edit_submit($form, &$form_state) {
+  if ($form['#form_id'] == 'file_entity_edit') {
+    // Edit file entity form.
+    $file = $form_state['file'];
+  }
+  else {
+    // Upload file form.
+    $file = $form['#entity'];
+  }
+
+  $values = $form_state['values'];
+
+  $attributes_update = array();
+  foreach ($values['netx_ids'] as $id => $name) {
+    $value = $values['netx_attributes'][$id];
+
+    $update_attribute = TRUE;
+    if (isset($file->metadata['attributeNames'])) {
+      if (is_array($value)) {
+        // Process multi-select.
+        foreach ($value as &$item) {
+          // Wrap data in quotes for NetX. Double up double quotes.
+          $item = '"' . preg_replace('/"/', '\"', $item) . '"';
+        }
+        $value = implode(',', $value);
+      }
+      // Fix line endings if any.
+      $value = str_replace("\r", '', $value);
+
+      // File edit form.
+      $key = array_search($name, $file->metadata['attributeNames']);
+      if ($key !== FALSE && $file->metadata['attributeValues'][$key] == $value) {
+        $update_attribute = FALSE;
+      }
+      else {
+        // Append new attribute because form is build with latest metadata.
+        $file->metadata['attributeNames'][] = $key;
+        $file->metadata['attributeValues'][] = $value;
+      }
+    }
+    if ($update_attribute) {
+      $attributes_update[$name] = $value;
+    }
+  }
+
+  if ($attributes_update) {
+    // Store static to access later for attribute invalidation.
+    $uploads = &drupal_static('netx_file_presave');
+
+    if (file_uri_scheme($file->uri) !== 'netx') {
+      // File is not imported now, stored data in static will be used in
+      // stream wrapper to setup initial values for remote attributes.
+      $uploads['netx://'] = $attributes_update;
+      return;
+    }
+
+    // Update remote asset attributes.
+    // @todo Queue the task to hook_file_update() or to worker.
+    // $queue = DrupalQueue::get('netx_assets_for_push');
+    // $queued = $queue->createItem($fid);
+
+    // @codingStandardsIgnoreStart
+    /** @var \MediaNetXStreamWrapper $wrapper */
+    // @codingStandardsIgnoreEnd
+    $wrapper = file_stream_wrapper_get_instance_by_uri($file->uri);
+    $asset_id = $wrapper->getAssetID();
+    $repo = new NetXRepository();
+    $repo->updateAttributes(
+      $asset_id,
+      array_keys($attributes_update),
+      array_values($attributes_update)
+    );
+    // Invalidate asset metadata in netx_file_presave().
+    $uploads[$file->uri] = $asset_id;
+  }
+}
+
+/**
+ * Implements hook_file_presave().
+ */
+function netx_file_presave($file) {
+  // Populate asset metadata after uploading file to netx.
+  $uploads = &drupal_static(__FUNCTION__);
+  if (isset($uploads[$file->uri])) {
+    $asset_id = $uploads[$file->uri];
+    unset($uploads[$file->uri]);
+    // Force fetch asset metadata before saving the file. Files saved without
+    // using browser UI does not have metadata attributes.
+    $repo = new NetXRepository();
+    $asset = $repo->getAssetBean($asset_id);
+    // URI probably needs regeneration because of file name change.
+    $file->uri = _netx_build_asset_uri($asset);
+    $file->filename = $asset['file'];
+    $file->metadata = $asset;
+    $mime_parts = explode('/', $file->filemime);
+    if ($mime_parts[0] === 'image' || $mime_parts[0] === 'video') {
+      // Set width and height for images and video.
+      $file->metadata['width'] = $asset['filewidth'];
+      $file->metadata['height'] = $asset['fileheight'];
+    }
+  }
+}
+
+/**
+ * Menu item access callback - show this menu item for NetX files only.
+ *
+ * @param object $file
+ *   The file to check access.
+ *
+ * @return bool
+ *   True when current user is allowed to update NetX file.
+ */
+function netx_sync_page_access($file) {
+  return file_entity_access('update', $file) && file_uri_scheme(
+    $file->uri
+  ) === 'netx';
+}
+
+/**
+ * Form for custom cute file browser.
+ */
+function netx_cfb_form($form, &$form_state, $types, $multiselect) {
+
+  $form['multiselect'] = array(
+    '#type' => 'value',
+    '#default_value' => FALSE,
+  );
+  $form['cfb'] = array(
+    '#markup' => '<div class="cfbfilemanager"><div class="cfbbreadcrumbs"></div><ul class="cfbdata"></ul></div>'
+  );
+  $form['list'] = array(
+    '#prefix' => '<div id="cfbfile-id">',
+    '#type' => 'hidden',
+    '#default_value' => 0,
+    '#suffix' => '</div>',
+  );
+  $form['#attached']['js'] = array(
+    drupal_get_path('module', 'netx') . '/js/netx.cfb.js',
+  );
+  $form['#attached']['css'] = array(
+    drupal_get_path('module', 'netx') . '/css/netx.cfb.styles.css',
+  );
+  $form['actions'] = array(
+    '#type' => 'actions',
+  );
+  $form['actions']['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Submit'),
+  );
+
+  return $form;
+}
+
+/**
+ * Form submit callback.
+ */
+function netx_cfb_form_submit($form, &$form_state) {
+  if ($form_state['values']['list'] != 0) {
+    $n = new NetXRepository();
+    $asset = $n->getAssetBean($form_state['values']['list']);
+    $form_state['netx']['assets']['list'][$form_state['values']['list']] = $asset;
+    netx_add_form_submit($form, $form_state);
+  }
+  else {
+    form_set_error('assetId', t('Please select an asset.'));
+  }
+}
+
+
+/**
+ * JSON callback for NetX tree media browser.
+ *
+ * @return array
+ *   Array, that will be converted to JSON by callback.
+ */
+function netx_scan_tree() {
+
+  $q = $_GET['q'];
+  $path = '';
+  if ($q !== 'netx-scan-tree' && $q !== 'netx-scan-tree/top level') {
+    $path = explode('/', $q);
+    array_shift($path);
+    array_shift($path);
+    $path = implode('/', $path);
+  }
+
+  $n = new NetXRepository();
+  $c = $n->getCategoryTree();
+  if ($path !== '') {
+    $c = _netx_recursive_path_cleanup($path, $c);
+  }
+
+  $tree = new stdClass();
+  $tree->name = $c['label'];
+  $tree->type = 'folder';
+  $tree->path = $c['path'];
+  $tree->catId = $c['categoryId'];
+  $tree->items = empty($c['subCategories']) ? array() : _netx_populate_categories($tree->path, $c['subCategories']);
+
+  return $tree;
+}
+
+/**
+ * Helper function for obtaining list of category's assets.
+ *
+ * @param int $cid
+ *   Category ID getting assets for.
+ *
+ * @return array|null
+ *   Array of Assets from NetX. NULL if not found.
+ */
+function _netx_populate_assets_for_category($cid) {
+  $n = new NetXRepository();
+  $assets = $n->getAssetsForCategory($cid);
+  if (empty($assets)) {
+    return NULL;
+  }
+  $tree = array();
+  module_load_include('inc', 'media', '/includes/media.browser');
+  foreach ($assets as $id => $adata) {
+    // Creating preview for an asset for later usage in UI.
+    $file = file_uri_to_object(_netx_build_asset_uri($adata));
+    if (!isset($file->fid)) {
+      $file->fid = 0;
+      $file->type = file_get_type($file);
+      $file->metadata = $adata;
+    }
+    media_browser_build_media_item($file);
+    // Populating a tree with a data.
+    $tree[$id] = new stdClass();
+    $tree[$id]->name = $adata['file'];
+    $tree[$id]->type = 'file';
+    $tree[$id]->path = $adata['file'];
+    $tree[$id]->size = $adata['filesize'];
+    $tree[$id]->assetId = $adata['assetId'];
+    $tree[$id]->assetPreview = $file->preview;
+  }
+  return $tree;
+}
+
+/**
+ * Helper for clearing categories out from non needed data.
+ *
+ * @param string $path
+ *   Path of the file/category.
+ * @param array $categories
+ *   Categories array from NetX.
+ *
+ * @return bool|array
+ *   FALSE if not found, array otherwise.
+ */
+function _netx_recursive_path_cleanup($path, &$categories) {
+  if ($categories['path'] === $path) {
+    return $categories;
+  }
+  if ($categories['path'] != $path && !empty($categories['subCategories'])) {
+    foreach ($categories['subCategories'] as $key => &$value) {
+      if (_netx_recursive_path_cleanup(
+          $path,
+          $categories['subCategories'][$key]
+        ) === FALSE
+      ) {
+        unset($categories['subCategories'][$key]);
+        $categories['subCategories'] = array_values(
+          $categories['subCategories']
+        );
+        return FALSE;
+      }
+      if ($value['path'] !== $path && empty($value['subCategories'])) {
+        unset($categories['subCategories'][$key]);
+        $categories['subCategories'] = array_values(
+          $categories['subCategories']
+        );
+        continue;
+      }
+      if ($value['path'] === $path) {
+        if (!empty($categories['subCategories'][$key]['subCategories'])) {
+          foreach ($categories['subCategories'][$key]['subCategories'] as $pkey => $pvalue) {
+            $categories['subCategories'][$key]['subCategories'][$pkey]['stopPropagation'] = TRUE;
+          }
+        }
+        $categories['subCategories'][$key]['propagateAssets'] = TRUE;
+        continue;
+      }
+    }
+  }
+  return $categories;
+}
+
+/**
+ * Helper for preparing categories for cute file browser script.
+ *
+ * @param string $path
+ *   Path of the current view.
+ * @param array $categories
+ *   Array of categories, returned from NetX.
+ *
+ * @return array
+ *   Cleared array of categories for display.
+ */
+function _netx_populate_categories($path, $categories) {
+  $tree = array();
+  foreach ($categories as $cid => $cdata) {
+    $tree[$cid] = new stdClass();
+    $tree[$cid]->name = $cdata['label'];
+    $tree[$cid]->type = 'folder';
+    $tree[$cid]->path = $path . '/' . $cdata['path'];
+
+    // This is for count of sub items.
+    $tree[$cid]->items = array();
+    $tree[$cid]->items = !isset($cdata['stopPropagation']) ? _netx_populate_categories(
+      $path,
+      $cdata['subCategories']
+    ) : $cdata['subCategories'];
+    if (isset($cdata['propagateAssets']) && $cdata['hasAssets']) {
+      $assets = _netx_populate_assets_for_category($cdata['categoryId']);
+
+      if (empty($tree[$cid]->items) && !empty($assets)) {
+        $tree[$cid]->items = $assets;
+      }
+      if (!empty($tree[$cid]->items) && !empty($assets)) {
+        $tree[$cid]->items += $assets;
+      }
+
+    }
+    $tree[$cid]->catId = $cdata['categoryId'];
+    continue;
+  }
+
+  return $tree;
+}

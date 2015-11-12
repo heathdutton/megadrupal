@@ -1,0 +1,839 @@
+<?php
+
+/**
+ * @file
+ * Userpoints Payment Gateway for MS Core
+ *
+ * Original author: Leighton Whiting - Released under GENERAL PUBLIC LICENSE
+ * Current maintenance by multiple MoneySuite users.
+ * Re: new initiative: https://www.drupal.org/node/2315653 
+ */
+
+/**
+ * Implements hook_help().
+ */
+function ms_userpoints_help($path, $arg) {
+  $output = '';
+  switch ($path) {
+    case "admin/moneysuite/gateways/ms_userpoints":
+    case "admin/help#ms_userpoints":
+      $output = '<p>' . t("UserPoints Payment Gateway Module for MoneySuite. This allows your users to pay
+      for orders using their UserPoints balance. This gateway supports both Recurring and Non-Recurring Orders.
+      Users are also able to purchase UserPoints using a different payment method, such as PayPal.") . '</p>';
+      break;
+  }
+  return $output;
+}
+
+/**
+ * Implements  hook_perm().
+ */
+function ms_userpoints_permission() {
+  return array(
+    'purchase userpoints' => array(
+      'title' => t('Purchase Userpoints'),
+      'description' => t('Allows the user to purchase userpoints.'),
+    ),
+  );
+}
+
+/**
+ * Implements hook_menu().
+ */
+function ms_userpoints_menu() {
+  $items = array();
+  $items['ms/checkout/ms_userpoints'] = array(
+    'title' => 'Checkout',
+    'page callback' => 'ms_userpoints_checkout',
+    'access callback' => 'ms_userpoints_access_test',
+    'type' => MENU_VISIBLE_IN_BREADCRUMB,
+  );
+  $items['ms_userpoints/cancel/%'] = array(
+    'title' => 'Cancel Payments',
+    'page callback' => 'ms_userpoints_cancel_page',
+    'page arguments' => array(2),
+    'access callback' => 'ms_userpoints_cancel_test',
+    'access arguments' => array(2),
+    'type' => MENU_VISIBLE_IN_BREADCRUMB,
+  );
+  $items['ms_userpoints/purchase'] = array(
+    'title' => 'Buy Points',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('ms_userpoints_purchase_form'),
+    'access callback' => 'ms_userpoints_purchase_test',
+    'type' => MENU_NORMAL_ITEM,
+  );
+
+  return $items;
+}
+
+/**
+ * Access callback to see if the user can cancel an order
+ */
+function ms_userpoints_cancel_test($oid) {
+  global $user;
+  $order = ms_core_order_load($oid);
+  if ($user->uid == $order->uid OR user_access('administer moneysuite orders')) {
+    return TRUE;
+  }
+  return FALSE;
+}
+
+/**
+ * Access callback to see if the user can purchase points
+ */
+function ms_userpoints_purchase_test() {
+  return user_access('purchase userpoints');
+}
+
+/**
+ * Access callback that will always return true
+ */
+function ms_userpoints_access_test() {
+  return TRUE;
+}
+
+/**
+ * Implements hook_cron().
+ */
+function ms_userpoints_cron() {
+  // Process payments that need to be processed for UserPoints
+  $result = db_query("SELECT * FROM {ms_recurring_schedules} WHERE gateway = :gateway
+    AND status = :status AND next_payment <> :zero AND next_payment < :next_payment",
+    array(':gateway' => 'ms_userpoints', ':status' => 'active', ':zero' => 0, ':next_payment' => REQUEST_TIME));
+
+  foreach ($result as $recurring_schedule) {
+    // Load some variables
+    $order = ms_core_order_load($recurring_schedule->oid);
+
+    // Process the next payment
+    $response = ms_userpoints_charge_recurring($order, $order->recurring_schedule, FALSE);
+
+    if ($response['approved']) {
+      ms_core_log('ms_userpoints', 'Processed Recurring Charge for Order #!num. Here are the details: @message',
+        array('!num' => $order->oid, '@message' => ms_core_print_r($recurring_schedule)));
+
+      // Insert the rec_payment Payment to the database
+      $payment = ms_core_new_payment($order->oid, 'ms_userpoints', 'rec_payment');
+
+      $payment->transaction = $response['data']['transaction'];
+      $payment->amount = $response['data']['amount'];
+      $payment->currency = $order->currency;
+      $payment->data = $response['data'];
+
+      // Add the Payment to the Order
+      ms_core_enter_payment($payment);
+
+      // Check if the recurring_schedule is done, send rec_eot
+      if ($recurring_schedule->total_occurrences != 0 AND $recurring_schedule->total_occurrences <= ($recurring_schedule->current_payments + 1)) {
+        $payment->type = 'rec_eot';
+        $payment->amount = 0;
+        ms_core_enter_payment($payment);
+      }
+    } else {
+      // Log the error
+      ms_core_log_error('ms_userpoints', 'Error Processing Recurring Charge: @message',
+        array('@message' => $response['message']));
+
+      // Insert the rec_cancel Payment to the database
+      $payment = ms_core_new_payment($order->oid, 'ms_userpoints', 'rec_cancel');
+
+      $payment->transaction = drupal_get_token(serialize($order));
+      $payment->data = $response['data'];
+
+      // Add the Payment to the Order
+      ms_core_enter_payment($payment);
+    }
+  }
+}
+
+// ======================================
+// Functions:
+// ======================================
+
+/**
+ * Helper function to convert the amount to points
+ */
+function ms_userpoints_get_points_needed($amount) {
+  $rate = variable_get('ms_userpoints_point_value', 100);
+
+  // Round up for points
+  $points = ceil(($amount * $rate));
+
+  // Don't let it be negative
+  return ($points > 0) ? $points : 0;
+}
+
+/**
+ * Admin Settings Form
+ */
+function ms_userpoints_admin() {
+  $form['main'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Main Settings'),
+  );
+  $form['main']['ms_userpoints_point_value'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Userpoint Value'),
+    '#default_value' => variable_get('ms_userpoints_point_value', 100),
+    '#description' => t('How many userpoints are equal to 1 unit of currency? (Dollar, Euro, etc as defined in MS Core Currency setting). You can use decimals if you need to.'),
+  );
+
+  $cats = userpoints_get_categories();
+  $options = array();
+  $options['all'] = t('All');
+  foreach ($cats as $key => $value) {
+    $options[$key] = $value;
+  }
+  $form['main']['ms_userpoints_point_category'] = array(
+    '#type' => 'select',
+    '#title' => t('Userpoints Category'),
+    '#default_value' => variable_get('ms_userpoints_point_category', array('all')),
+    '#options' => $options,
+    '#required' => TRUE,
+  );
+  $form['sell'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Sell UserPoints Settings'),
+    '#description' => t("Users who have permission to will be able to purchase points from this page: !link.",
+      array('!link' => l(t('Purchase Points'), 'ms_userpoints/purchase'))),
+  );
+  $form['sell']['ms_userpoints_packages'] = array(
+    '#type' => 'textarea',
+    '#title' => t('Userpoint Packages'),
+    '#default_value' => variable_get('ms_userpoints_packages', "100|9.95"),
+    '#description' => t('Add as many packages as you want to offer, one per line, in the format [points]|[price]'),
+  );
+
+  $form['discount'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('UserPoints Discounts Settings'),
+  );
+  $form['discount']['ms_userpoints_show_discount'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Show UserPoints Discount Form on Checkout'),
+    '#default_value' => variable_get('ms_userpoints_show_discount', FALSE),
+    '#description' => t("Allow users to apply their userpoints towards a percentage of the order total.
+      This generally should be used instead of the full UserPoints Gateway option on the checkout form,
+      allowing for users to pay partially in UserPoints, and partially in another gateway."),
+  );
+  $form['discount']['ms_userpoints_max_percent'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Maximum UserPoints Discount Percent'),
+    '#default_value' => variable_get('ms_userpoints_max_percent', '100'),
+    '#description' => t('What percent of an order total can be paid for in UserPoints Discount? Enter the number without the % sign. Example: 100'),
+  );
+
+  return $form;
+}
+
+/**
+ * Implements hook_ms_core_payment_gateway().
+ */
+function ms_userpoints_ms_core_payment_gateway() {
+  $gateways['ms_userpoints'] = array(
+    'name' => 'UserPoints Payments',
+    'display_name' => variable_get(USERPOINTS_TRANS_UCPOINTS, 'Points'),
+    'description' => t('Pay with your !point balance.', array('!point' => variable_get(USERPOINTS_TRANS_LCPOINT, 'point'))),
+    'module' => 'ms_userpoints',
+    'checkout_path' => 'ms/checkout/ms_userpoints',
+    'cancel_url' => 'ms_userpoints_get_cancel_url',
+    'settings' => ms_userpoints_admin(),
+  );
+
+  return $gateways;
+}
+
+/**
+ * Get the Cancellation URL for a recurring order
+ */
+function ms_userpoints_get_cancel_url($order) {
+  return 'ms_userpoints/cancel/' . $order->oid;
+}
+
+/**
+ * Initiate a cancellation
+ */
+function ms_userpoints_cancel_page($oid) {
+  return drupal_get_form('ms_userpoints_cancel_page_confirm', $oid);
+}
+
+/**
+ * Initiate a cancellation
+ */
+function ms_userpoints_cancel_page_confirm($form, &$form_state, $oid) {
+  $order = ms_core_order_load($oid);
+  $form['#ms_core_oid'] = $order->oid;
+  return confirm_form($form, t('Are you sure you want to cancel your order?'), '', t('This action cannot be undone.'), t('Confirm'));
+}
+
+/**
+ * Comfirm the cancel page
+ */
+function ms_userpoints_cancel_page_confirm_submit($form, &$form_state) {
+  $order = ms_core_order_load($form['#ms_core_oid']);
+
+  // Get the subscription_id from the order
+  $subscription_id = ms_core_get_order_rec_id($order->oid);
+
+  // Enter the rec_cancel payment
+  $payment = ms_core_new_payment($order->oid, 'ms_userpoints', 'rec_cancel');
+  // Generate a Unique Transaction ID
+  $payment->transaction = drupal_get_token(serialize($order) . REQUEST_TIME);
+  $payment->currency = $order->currency;
+  $payment->recurring_id = $subscription_id;
+  $payment->billing_address = $order->billing_address;
+  $payment->shipping_address = $order->shipping_address;
+
+  ms_core_enter_payment($payment);
+}
+
+/********************************************************************
+ * Checkout Form
+ *******************************************************************/
+
+/**
+ * Make a form to show on the checkout page
+ */
+function ms_userpoints_checkout() {
+  global $user;
+
+  // Make sure the user is logged in, because only authenticated users can have User Points
+  if (!$account = user_load($user->uid)) {
+    return t('You are not logged in to an account. Please !login before you continue.',
+      array('!login', l(t('log in'), 'user', array('query' => drupal_get_destination()))));
+  }
+
+  // Get the Form
+  return drupal_get_form('ms_userpoints_checkout_form', $account);
+}
+
+/**
+ * Build the Checkout Form
+ */
+function ms_userpoints_checkout_form($form, $form_state, $account) {
+  $form = array();
+
+  // Get the $order from the session
+  if (!$order = ms_core_load_session_order()) {
+    // Error
+    return t('The order could not be loaded from the session.');
+  }
+
+  // Here we need to get the balance of the user's points and see if it is enough or not to make the purchase
+  $balance = userpoints_get_current_points($account->uid, variable_get('ms_userpoints_point_category', array('all')));
+
+  // We also need to show the user's balance
+  $form['balance'] = array(
+    '#type' => 'item',
+    '#title' => t('!points Balance', array('!points' => variable_get(USERPOINTS_TRANS_UCPOINTS, 'Points'))),
+    '#value' => $balance,
+  );
+
+  // We also need to show how many points would be needed to make the purchase
+  $points_needed = ms_userpoints_get_points_needed($order->amount);
+  $form['points_needed'] = array(
+    '#type' => 'item',
+    '#title' => t('!points Needed', array('!points' => variable_get(USERPOINTS_TRANS_UCPOINTS, 'Points'))),
+    '#value' => $points_needed,
+  );
+
+  // Store the order id for later
+  $form['ms_oid'] = array(
+    '#type' => 'value',
+    '#value' => $order->oid,
+  );
+
+  // Add the submit button
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Pay Now'),
+  );
+  return $form;
+}
+
+/**
+ * Validate the Checkout Form
+ */
+function ms_userpoints_checkout_form_validate($form, &$form_state) {
+  $form_values = $form_state['values'];
+
+  // Load the order and account
+  $order = ms_core_order_load($form_values['ms_oid']);
+  $account = user_load($order->uid);
+
+  // Do some checking to make sure the user has enough points
+  $balance = userpoints_get_current_points($account->uid, variable_get('ms_userpoints_point_category', array('all')));
+  $points_needed = ms_userpoints_get_points_needed($order->amount);
+
+  // If the user doesn't have enough points, show an error and return
+  if ($balance < $points_needed) {
+    form_set_error('balance', t('Error') . ': ' . t('Your balance is too low for this purchase'));
+    return;
+  }
+
+  // Otherwise let's charge the order
+  switch ($order->order_type) {
+    case 'recurring':
+      $response = ms_userpoints_charge_recurring($order, $order->recurring_schedule);
+
+      if ($response['approved'] == TRUE) {
+        // The credit card was approved, reset the order id and that the order was charged successfully
+        $form_state['values']['ms_oid'] = $order->oid;
+        $form_state['values']['ms_order_charged'] = TRUE;
+
+        // Insert the Payment to the database
+        $payment = ms_core_new_payment($order->oid, 'ms_userpoints', 'rec_signup');
+
+        $payment->transaction = $response['data']['transaction'];
+        $payment->recurring_id = $response['data']['recurring_id'];
+        $payment->amount = $response['data']['amount'];
+        $payment->currency = $response['data']['currency'];
+        $payment->data = $response['data'];
+
+        // Add the Payment to the Order
+        ms_core_enter_payment($payment);
+      } else { // The Charge was not approved, show an error
+        form_set_error('balance', t('Error') . ': ' . $response['message']);
+      }
+      break;
+
+    case 'cart':
+      $response = ms_userpoints_charge_single($order);
+
+      if ($response['approved'] == TRUE) {
+        // The charge was approved
+        $form_state['values']['ms_oid'] = $order->oid;
+        $form_state['values']['ms_order_charged'] = TRUE;
+
+        // Insert the Payment to the database
+        $payment = ms_core_new_payment($order->oid, 'ms_userpoints', 'cart');
+
+        $payment->transaction = $response['data']['transaction'];
+        $payment->recurring_id = $response['data']['recurring_id'];
+        $payment->amount = $response['data']['amount'];
+        $payment->currency = $order->currency;
+        $payment->data = $response['data'];
+
+        // Add the Payment to the Order
+        ms_core_enter_payment($payment);
+      } else { // The Credit Card was not approved, set an error on the form
+        form_set_error('balance', t('Error') . ': ' . $response['message']);
+      }
+      break;
+  }
+}
+
+/**
+ * The card has been charged, mark the order as completed
+ */
+function ms_userpoints_checkout_form_submit($form, &$form_state) {
+  $v = $form_state['values'];
+
+  // If the Order was charged, complete it
+  if ($v['ms_order_charged']) {
+    $order = ms_core_order_load($v['ms_oid']);
+    $order->status = 'Completed';
+    ms_core_order_save($order);
+    drupal_goto('ms/thankyou');
+  } else {
+    // There was an error...
+  }
+}
+
+/**
+ * Process a single charge with our gateway's class
+ */
+function ms_userpoints_charge_single($order) {
+  $return = array();
+
+  $account = user_load($order->uid);
+
+  // Deduct the correct amount from the user's points, and return
+  $points_needed = ms_userpoints_get_points_needed($order->amount);
+
+  $points_txn = userpoints_userpointsapi(array('uid' => $account->uid, 'points' => -$points_needed));
+
+  if ($points_txn['status']) {
+    $return['approved'] = TRUE;
+    // Get a unique transaction id using drupal_get_token
+    $return['data']['transaction'] = drupal_get_token(serialize($order) . REQUEST_TIME);
+    $return['data']['recurring_id'] = '';
+    $return['data']['amount'] = $order->amount;
+  } else {
+    // Fail the charge with the reason text in the decline message.
+    $return['approved'] = FALSE;
+    $return['message'] = t('There was a problem deducting !points: @error',
+      array('!points' => variable_get(USERPOINTS_TRANS_LCPOINTS, 'points'), '@error' => $points_txn['reason']));
+  }
+
+  return $return;
+}
+
+/**
+ * Process a recurring charge with our gateway's class
+ */
+function ms_userpoints_charge_recurring($order, $recurring_schedule, $first = TRUE) {
+  $return = array();
+
+  $account = user_load($order->uid);
+
+  $amount = round($recurring_schedule['main_amount'], 2);
+
+  if ($first) {
+    // If there is a trial set, use it instead
+    if ($recurring_schedule['has_trial']) {
+      $amount = round($recurring_schedule['trial_amount'], 2);
+    }
+  }
+
+  // Deduct the correct amount from the user's points, and return
+  $points_needed = ms_userpoints_get_points_needed($amount);
+  $points_txn = userpoints_userpointsapi(array('uid' => $account->uid, 'points' => -$points_needed));
+
+  if ($points_txn['status']) {
+    $return['approved'] = TRUE;
+    // Get a unique transaction id and recurring_id using drupal_get_token
+    $return['data']['transaction'] = drupal_get_token(serialize($order) . REQUEST_TIME);
+    $return['data']['recurring_id'] = drupal_get_token(serialize($order) . REQUEST_TIME . 'recurring_id');
+    $return['data']['amount'] = $amount;
+  } else {
+    // Fail the charge with the reason text in the decline message.
+    $return['approved'] = FALSE;
+    $return['message'] = t('There was a problem deducting !points: @error',
+      array('!points' => variable_get(USERPOINTS_TRANS_LCPOINTS, 'points'), '@error' => $points_txn['reason']));
+  }
+
+  return $return;
+}
+
+/**
+ * Get a list of packages for forms
+ */
+function ms_userpoints_get_packages_list() {
+  $packages = ms_userpoints_get_packages();
+  $list = array();
+
+  foreach ($packages as $package) {
+    $list[$package['points']] = t('@points !pointsname for @amount',
+      array(
+        '@points' => $package['points'],
+        '!pointsname' => variable_get(USERPOINTS_TRANS_LCPOINTS, 'points'),
+        '@amount' => ms_core_format_money($package['amount']),
+      ));
+  }
+
+  return $list;
+}
+
+/**
+ * Returns an array of packages keyed by points
+ */
+function ms_userpoints_get_packages() {
+  $packages = array();
+
+  $lines = preg_split('/[\n\r]+/', trim(variable_get('ms_userpoints_packages', "")));
+
+  foreach ($lines as $line) {
+    $package = explode('|', $line);
+    $packages[$package[0]] = array(
+      'points' => $package[0],
+      'amount' => $package[1],
+    );
+  }
+
+  return $packages;
+}
+
+/**
+ * Get a single package by id
+ */
+function ms_userpoints_get_package($id) {
+  $packages = ms_userpoints_get_packages();
+  return (isset($packages[$id])) ? $packages[$id] : FALSE;
+}
+
+/**
+ * Purchase Points form
+ */
+function ms_userpoints_purchase_form($form, &$form_state) {
+  $packages = ms_userpoints_get_packages_list();
+
+  if (!empty($packages)) {
+    $form['ms_userpoints'] = array(
+      '#type' => 'fieldset',
+      '#title' => t('Points Packages'),
+    );
+    $form['ms_userpoints']['package'] = array(
+      '#type' => 'radios',
+      '#title' => t('Choose your package'),
+      '#options' => $packages,
+      '#required' => TRUE,
+    );
+    $form['ms_userpoints']['submit'] = array(
+      '#type' => 'submit',
+      '#value' => t('Submit'),
+    );
+  }
+
+  return $form;
+}
+
+/**
+ * Submit function for purchase points form
+ */
+function ms_userpoints_purchase_form_submit($form, &$form_state) {
+  if ($package = ms_userpoints_get_package($form_state['values']['package'])) {
+    $product = ms_core_new_product(t('@points !pointsname',
+        array('@points' => $package['points'], '!pointsname' => variable_get(USERPOINTS_TRANS_LCPOINTS, 'points'))),
+      'ms_userpoints', 1, $package['amount'], 'cart');
+
+    // Store the custom data
+    $product->data['ms_userpoints_package_points'] = $package['points'];
+
+    // Empty the cart first
+    ms_core_empty_cart();
+
+    ms_core_add_cart_product($product, TRUE);
+
+    ms_core_checkout();
+    exit;
+  }
+}
+
+/**
+ * Implements  hook_ms_order_payment
+ */
+function ms_userpoints_ms_order_payment($type, $product, $order, $payment) {
+  if ($product->module == 'ms_userpoints') {
+    $account = user_load($order->uid);
+
+    //Get Points
+    $points = $product->data['ms_userpoints_package_points'];
+
+    // Handle Refunds
+    if ($type == 'refund' OR $type == 'reversal') {
+      // Remove the points from the user's account
+      userpoints_userpointsapi(array(
+        'uid' => $account->uid,
+        'points' => -$points,
+        'description' => t('Removed because of Refund'),
+        'display' => TRUE,
+      ));
+
+      ms_core_log_error('ms_userpoints', 'Removed @points points from @user because of refund.',
+        array('@points' => $points, '@user' => $account->name));
+    } else {
+      // Add the points to the user's account
+      // Remove the points from the user's account
+      userpoints_userpointsapi(array(
+        'uid' => $account->uid,
+        'points' => $points,
+        'description' => t('Package Purchased'),
+        'display' => TRUE,
+      ));
+
+      drupal_set_message(t('@points @pointsname have been added to your account.',
+        array('@points' => $points, '@pointsname' => variable_get(USERPOINTS_TRANS_LCPOINTS, 'points'))));
+    }
+  }
+}
+
+/********************************************************************
+ * UserPoints Discounts
+ *******************************************************************/
+
+/**
+ * Implements hook_ms_order_status_change()
+ */
+function ms_userpoints_ms_order_status_change($old_status, $new_status, $order) {
+  switch ($new_status) {
+    case 'completed':
+      foreach ($order->adjustments as $adjustment) {
+        if ($adjustment->id == 'ms_userpoints_discount') {
+          // We need to subtract the points used from the user's account
+          if ($order->uid AND $account = user_load($order->uid)) {
+            $points_txn = userpoints_userpointsapi(array(
+              'uid' => $account->uid,
+              'points' => -ceil($adjustment->data['points']),
+              'description' => t('Points applied to Order: @title', array('@title' => ms_core_get_order_title($order))),
+              'display' => TRUE,
+            ));
+
+            if ($points_txn['status']) {
+              drupal_set_message(t('@points @pointsname have been subtracted to your account.',
+                array('@points' => $adjustment->data['points'], '@pointsname' => variable_get(USERPOINTS_TRANS_LCPOINTS, 'points'))));
+            } else {
+              ms_core_log_error('ms_userpoints', 'Error subtracting userpoints for a UserPoints Discount for Order: !order',
+                array('!order' => ms_core_print_r($order)));
+            }
+          }
+        }
+      }
+      break;
+  }
+
+  return $order;
+}
+
+/**
+ * Validate that the user has enough points and it isn't over the set amount
+ */
+function ms_userpoints_validate_discount($account, $points) {
+  $result = new stdClass();
+  $result->valid = FALSE;
+
+  $cart = ms_core_get_cart();
+  $applicable_total = ms_core_get_order_products_total($cart);
+
+  if ($points <= 0) {
+    $result->message = t('!pointsname must be greater than 0.',
+      array('!pointsname' => variable_get(USERPOINTS_TRANS_UCPOINTS, 'Points')));
+    return $result;
+  }
+
+  if ($applicable_total == 0) {
+    $result->message = t('You cannot use !pointsname when the total for the products is 0.',
+      array('!pointsname' => variable_get(USERPOINTS_TRANS_UCPOINTS, 'Points')));
+    return $result;
+  }
+
+  // Ensure the user has enough points
+  $balance = userpoints_get_current_points($account->uid, variable_get('ms_userpoints_point_category', array('all')));
+  if ($balance < $points) {
+    $result->message = t('You do not have enough !pointsname for that.',
+      array('!pointsname' => variable_get(USERPOINTS_TRANS_UCPOINTS, 'Points')));
+    return $result;
+  }
+
+  // Get the maximum amount of points that can be used
+  $max_percent = (int)variable_get('ms_userpoints_max_percent', '100');
+  $rate = variable_get('ms_userpoints_point_value', 100);
+
+  $max_amount = $applicable_total * ($max_percent / 100);
+
+  $max_points = ceil($max_amount * $rate);
+
+  // Check that the points aren't over the max amount
+  if ($points > $max_points) {
+    $points = $max_points;
+  }
+
+  $result->valid = TRUE;
+  $result->points = $points;
+  $result->amount = $result->points / $rate;
+
+  return $result;
+}
+
+/**
+ * Show a form to enter a coupon
+ */
+function ms_userpoints_enter_points_discount_form($form, $form_state) {
+  global $user;
+  $balance = userpoints_get_current_points($user->uid, variable_get('ms_userpoints_point_category', array('all')));
+
+  $cart = ms_core_get_cart();
+  $applicable_total = ms_core_get_order_products_total($cart);
+
+  $max_percent = (int)variable_get('ms_userpoints_max_percent', '100');
+  $rate = variable_get('ms_userpoints_point_value', 100);
+
+  $max_amount = $applicable_total * ($max_percent / 100);
+
+  $max_points = ceil($max_amount * $rate);
+
+  $form['ms_userpoints']['points'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Use Points from Balance'),
+    '#description' => t('You may apply !pointsname from your balance towards this order.
+      You can use up to !max_points !pointsname for a total discount of !max_amount. !pointsname balance: !balance',
+      array(
+        '!pointsname' => variable_get(USERPOINTS_TRANS_UCPOINTS, 'Points'),
+        '!balance' => $balance,
+        '!max_points' => $max_points,
+        '!max_amount' => ms_core_format_money($max_amount),
+      )),
+    '#default_value' => '',
+    '#size' => 25,
+  );
+  $form['ms_userpoints']['apply_points'] = array(
+    '#type' => 'submit',
+    '#value' => t('Apply'),
+    '#validate' => array('ms_userpoints_enter_points_discount_form_validate'),
+  );
+
+  return $form;
+}
+
+/**
+ * Validation function for the enter coupon form
+ */
+function ms_userpoints_enter_points_discount_form_validate($form, $form_state) {
+  $points = $form_state['values']['points'];
+
+  drupal_get_messages('error'); //clears out messages thrown by built in validation
+
+  global $user;
+
+  $result = ms_userpoints_validate_discount($user, $points);
+  if (!$result->valid) {
+    form_set_error('points', $result->message);
+  } else {
+    $adjustment = new MsAdjustment();
+    $adjustment->id = 'ms_userpoints_discount';
+    $adjustment->display = t('!pointsname Used: !points',
+      array(
+        '!pointsname' => variable_get(USERPOINTS_TRANS_UCPOINTS, 'Points'),
+        '!points' => $result->points,
+      ));
+    $adjustment->type = 'fixed';
+    $adjustment->scope = 'initial';
+    $adjustment->value = -$result->amount;
+    $adjustment->data = array('points' => $result->points);
+
+    // First, remove userpoints from the cart if needed
+    ms_core_remove_cart_adjustment_match('ms_userpoints_discount');
+
+    // Add the coupon to the order
+    ms_core_add_cart_adjustment($adjustment, TRUE);
+
+    drupal_set_message(t('@points @pointsname have been applied towards this order, for a discount of @discount.',
+      array(
+        '@discount' => ms_core_format_money($result->amount),
+        '@points' => $result->points,
+        '@pointsname' => variable_get(USERPOINTS_TRANS_LCPOINTS, 'points'),
+      )));
+
+    // Redirec to ms/checkout
+    drupal_goto('ms/checkout');
+  }
+}
+
+/**
+ * Submit function for the enter pontints discou form
+ */
+function ms_userpoints_enter_points_discount_form_submit($form, $form_state) {
+
+}
+
+/**
+ * Implements  hook_ms_checkout_fields()
+ */
+function ms_userpoints_ms_checkout_fields($order) {
+  $fields = array();
+  global $user;
+  $applicable_total = ms_core_get_order_products_total($order);
+  if ($user->uid AND variable_get('ms_userpoints_show_discount', FALSE) AND ($applicable_total > 0)) {
+    // Show the Points Discount Form
+    $fields[] = array(
+      'id' => 'ms_userpoints_enter_points',
+      'title' => variable_get(USERPOINTS_TRANS_UCPOINTS, 'Points'),
+      'type' => 'form',
+      'html' => 'ms_userpoints_enter_points_discount_form',
+      'weight' => 11,
+    );
+  }
+
+  return $fields;
+}

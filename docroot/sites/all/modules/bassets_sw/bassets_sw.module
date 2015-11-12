@@ -1,0 +1,378 @@
+<?php
+
+/**
+ * @file
+ * Provides a file scheme which is used to deliver files from the server.
+ */
+
+// First part of the menu path to deliver the file.
+define('BASSETS_DELIVER_PATH', 'bassets');
+
+define('BASSETS_SCHEME', 'bassets');
+
+/**
+ * Implements hook_flush_caches().
+ */
+function bassets_sw_flush_caches() {
+  return array('cache_bassets');
+}
+
+/**
+ * Implements hook_permission().
+ */
+function bassets_sw_permission() {
+  $perms['bassets_private_files'] = array(
+    'title' => t('Access to private files'),
+    'desciption' => t('Allows a user to access files from a Bassets server which are stored in private file system.'),
+  );
+  return $perms;
+}
+
+/**
+ * Implements hook_menu().
+ */
+function bassets_sw_menu() {
+  $items[BASSETS_DELIVER_PATH . '/styles/%image_style'] = array(
+    'page callback' => 'bassets_sw_image_style_deliver',
+    'page arguments' => array(count(explode('/', BASSETS_DELIVER_PATH)) + 1),
+    'access callback' => TRUE,
+    'type' => MENU_CALLBACK,
+  );
+  $items[BASSETS_DELIVER_PATH] = array(
+    'page callback' => 'bassets_sw_image_deliver',
+    'access callback' => TRUE,
+    'type' => MENU_CALLBACK,
+  );
+  return $items;
+}
+
+/**
+ * Menu callback to deliver the origin image from the remote server.
+ */
+function bassets_sw_image_deliver() {
+  $args = func_get_args();
+  if (empty($args)) {
+    return MENU_NOT_FOUND;
+  }
+  $target = implode('/', $args);
+  $image_uri = BASSETS_SCHEME . '://' . $target;
+  static $file_contents = array();
+  $file_content = &$file_contents[$image_uri];
+  if (empty($file_content)) {
+    $file_content = _bassets_sw_get_cache($image_uri);
+  }
+  if (empty($file_content)) {
+    return MENU_NOT_FOUND;
+  }
+  drupal_add_http_header('content-type', file_get_mimetype($image_uri));
+  drupal_add_http_header('content-length', strlen($file_content));
+  drupal_send_headers();
+  print $file_content;
+  drupal_exit();
+}
+
+/**
+ * Custom image style deliver menu callback.
+ *
+ * The most code is from the origin callback image_style_deliver().
+ * We need a own callback to prepare the url for image_style_create_derivative().
+ *
+ * @see image_style_deliver()
+ */
+function bassets_sw_image_style_deliver($style, $scheme) {
+  $args = func_get_args();
+  array_shift($args);
+  array_shift($args);
+  $target = implode('/', $args);
+  $target = str_replace(BASSETS_SCHEME . '/', '', $target);
+  // Check that the style is defined, the scheme is valid, and the image
+  // derivative token is valid. (Sites which require image derivatives to be
+  // generated without a token can set the 'image_allow_insecure_derivatives'
+  // variable to TRUE to bypass the latter check, but this will increase the
+  // site's vulnerability to denial-of-service attacks. To prevent this
+  // variable from leaving the site vulnerable to the most serious attacks, a
+  // token is always required when a derivative of a derivative is requested.)
+  $valid = !empty($style) && file_stream_wrapper_valid_scheme($scheme);
+  if (!variable_get('image_allow_insecure_derivatives', FALSE) || strpos(ltrim($target, '\/'), 'styles/') === 0) {
+    $valid = $valid && isset($_GET[IMAGE_DERIVATIVE_TOKEN]) && $_GET[IMAGE_DERIVATIVE_TOKEN] === image_style_path_token($style['name'], $scheme . '://' . $target);
+  }
+  if (!$valid) {
+    return MENU_ACCESS_DENIED;
+  }
+
+  $image_uri = BASSETS_SCHEME . '://' . $target;
+  $settings = bassets_scc_get_settings($image_uri);
+  $derivative_uri = $settings->scheme . '://styles/' . $style['name'] . '/' . $settings->scheme . '/' . $target;
+  // If using the private scheme, let other modules provide headers and
+  // control access to the file.
+  if ($settings->scheme == 'private') {
+    if (file_exists($derivative_uri)) {
+      file_download($settings->scheme, file_uri_target($derivative_uri));
+    }
+    else {
+      // image_style_deliver() does this wrong
+      // See https://www.drupal.org/node/1891228, https://www.drupal.org/node/2151387
+      $headers = file_download_headers($image_uri);
+      if (count($headers)) {
+        foreach ($headers as $name => $value) {
+          drupal_add_http_header($name, $value);
+        }
+      }
+      else {
+        return MENU_ACCESS_DENIED;
+      }
+    }
+  }
+
+  // Don't start generating the image if the derivative already exists or if
+  // generation is in progress in another thread.
+  $lock_name = 'image_style_deliver:' . $style['name'] . ':' . drupal_hash_base64($image_uri);
+  if (!file_exists($derivative_uri)) {
+    $lock_acquired = lock_acquire($lock_name);
+    if (!$lock_acquired) {
+      // Tell client to retry again in 3 seconds. Currently no browsers are
+      // known to support Retry-After.
+      drupal_add_http_header('Status', '503 Service Unavailable');
+      drupal_add_http_header('Retry-After', 3);
+      print t('Image generation in progress. Try again shortly.');
+      drupal_exit();
+    }
+  }
+
+  // Try to generate the image, unless another thread just did it while we were
+  // acquiring the lock.
+  $success = file_exists($derivative_uri) || image_style_create_derivative($style, $image_uri, $derivative_uri);
+
+  if (!empty($lock_acquired)) {
+    lock_release($lock_name);
+  }
+
+  if ($success) {
+    $image = image_load($derivative_uri);
+    file_transfer($image->source, array('Content-Type' => $image->info['mime_type'], 'Content-Length' => $image->info['file_size']));
+  }
+  else {
+    watchdog('image', 'Unable to generate the derived image located at %path.', array('%path' => $derivative_uri));
+    drupal_add_http_header('Status', '500 Internal Server Error');
+    print t('Error generating image.');
+    drupal_exit();
+  }
+}
+
+/**
+ * Implements hook_stream_wrappers().
+ */
+function bassets_sw_stream_wrappers() {
+  $streams[BASSETS_SCHEME] = array(
+    'name' => t('Bassets'),
+    'class' => 'BassetsStreamWrapper',
+    'description' => t('The original files are served by the Bassets server and the image derivates are served by the local server.'),
+    'type' => STREAM_WRAPPERS_READ_VISIBLE,
+    'remote' => TRUE,
+  );
+  return $streams;
+}
+
+/**
+ * Implements hook_file_download().
+ */
+function bassets_sw_file_download($uri) {
+  $scheme = file_uri_scheme($uri);
+  $original_uri = $uri;
+  if ($scheme !== BASSETS_SCHEME) {
+    $original_uri = BASSETS_SCHEME . '://' . basename($uri);
+  }
+  $cache = _bassets_sw_get_cache($original_uri);
+  if (!empty($cache) && strlen($cache) > 0) {
+    $file = file_uri_to_object($uri, FALSE);
+    if ($file && user_access('bassets_private_files')) {
+      return file_get_content_headers($file);
+    }
+    return -1;
+  }
+  return NULL;
+}
+
+/**
+ * Caches the file to the temp file.
+ */
+function _bassets_sw_set_cache($fileuri, $data) {
+  if (!empty($data)) {
+    $temp_name = 'temporary://' . drupal_basename($fileuri);
+    $path = file_unmanaged_save_data($data, $temp_name, FILE_EXISTS_REPLACE);
+    if ($path) {
+      cache_set($fileuri, $path, 'cache_bassets', REQUEST_TIME + 60 * 60 * 24);
+      return TRUE;
+    }
+    else{
+      watchdog('bassets_sw', 'Could not create a cache for the file: @fileuri', array('@fileuri' => $fileuri), WATCHDOG_NOTICE);
+    }
+  }
+  return FALSE;
+}
+
+/**
+ * Returns the contents of the temp file.
+ */
+function _bassets_sw_get_cache($fileuri) {
+  static $data = array();
+  if (empty($data[$fileuri])) {
+    $cache = cache_get($fileuri, 'cache_bassets');
+    $data[$fileuri] = NULL;
+    if ($cache && REQUEST_TIME < $cache->expire && !empty($cache->data)) {
+      $temp_name = $cache->data;
+      if (file_exists($temp_name)) {
+        $data[$fileuri] = file_get_contents($temp_name);
+      }
+      else{
+        $data[$fileuri] = _bassets_sw_refresh_file($fileuri);
+      }
+    }
+    else{
+      $data[$fileuri] = _bassets_sw_refresh_file($fileuri);
+    }
+  }
+  return $data[$fileuri];
+}
+
+/**
+ * Helper function to request the file content and sets the cache for the file.
+ *
+ * @param string $fileuri
+ *   The file uri of the bassets file. Ex. bassets://1234.jpg.
+ *
+ * @return string
+ *  Raw file content.
+ */
+function _bassets_sw_refresh_file($fileuri) {
+  $function_name = variable_get('bassets_sw_base64_deliver', NULL);
+  if (!$function_name || !function_exists($function_name)) {
+    watchdog('bassets_sw', 'Missing function or module to deliver Bassets files', array(), WATCHDOG_ERROR);
+    return '';
+  }
+  $file_content = $function_name($fileuri);
+  _bassets_sw_set_cache($fileuri, $file_content);
+  return $file_content;
+}
+
+/**
+ * Loads the file entity for the file uri.
+ *
+ * We use a duplicate of file_uri_to_object(), because file_uri_to_object
+ * could be produce a recursion.
+ */
+function _bassets_sw_file_uri_to_object($file_uri) {
+  $file = NULL;
+  $files = file_load_multiple(array(), array('uri' => $file_uri));
+  if (count($files)) {
+    $file = reset($files);
+  }
+  return $file;
+}
+
+/**
+ * Implements hook_module_implements_alter().
+ *
+ * @see bassets_sw_file_delete()
+ */
+function bassets_sw_module_implements_alter(&$implementations, $hook) {
+  if ($hook == 'file_delete') {
+    unset($implementations['image']);
+    unset($implementations['bassets_sw']);
+    // Put us at the beginning.
+    $implementations = array_merge(array('bassets_sw' => FALSE), $implementations);
+  }
+  if ($hook == 'file_update') {
+    unset($implementations['file_entity']);
+  }
+}
+
+/**
+ * Implements hook_file_update().
+ *
+ * file_entity_file_update() calls image_path_flush() with a wrong uri therefore
+ * we need to duplicate the function.
+ */
+function bassets_sw_file_update($file) {
+  $scheme = file_uri_scheme($file->uri);
+  // Is is not our file scheme.
+  if ($scheme !== BASSETS_SCHEME) {
+    file_entity_file_update($file);
+    return;
+  }
+  // Ensure field data is saved since file_save() does not in Drupal 7.
+  field_attach_update('file', $file);
+
+  // Save file metadata.
+  if (!empty($file->metadata)) {
+    foreach ($file->metadata as $name => $value) {
+      db_merge('file_metadata')
+        ->fields(array(
+          'value' => serialize($value),
+        ))
+        ->key(array(
+          'fid' => $file->fid,
+          'name' => $name,
+        ))
+        ->execute();
+    }
+  }
+
+  // Save file metadata.
+  db_delete('file_metadata')->condition('fid', $file->fid);
+  if (!empty($file->metadata)) {
+    foreach ($file->metadata as $name => $value) {
+      db_merge('file_metadata')
+        ->fields(array(
+          'value' => serialize($value),
+        ))
+        ->key(array(
+          'fid' => $file->fid,
+          'name' => $name,
+        ))
+        ->execute();
+    }
+  }
+
+  if (file_entity_file_get_mimetype_type($file) == 'image' && module_exists('image')) {
+    // If the image dimensions have changed, update any image field references
+    // to this file and flush image style derivatives.
+    if ($file->metadata['width'] != $file->metadata['width'] || $file->metadata['height'] != $file->metadata['height']) {
+      _file_entity_update_image_field_dimensions($file);
+    }
+
+    // Flush image style derivatives whenever an image is updated.
+    _bassets_sw_image_path_flush($file);
+
+    // Clear any related field caches.
+    file_entity_invalidate_field_caches($file);
+  }
+}
+
+/**
+ * Implements hook_file_delete().
+ *
+ * image_file_delete() calls image_path_flush() with a wrong uri therefore
+ * we need to duplicate the function.
+ */
+function bassets_sw_file_delete($file) {
+  $scheme = file_uri_scheme($file->uri);
+
+  // Is not our file scheme.
+  if ($scheme !== BASSETS_SCHEME) {
+    return;
+  }
+  _bassets_sw_image_path_flush($file);
+}
+
+/**
+ * A wrapper function for image_path_flush() to prepare the wrong uri.
+ */
+function _bassets_sw_image_path_flush($file) {
+  if ($file->type == 'image') {
+    $conf = bassets_scc_get_settings($file->uri);
+    $uri = str_replace(BASSETS_SCHEME, $conf->scheme, $file->uri);
+    image_path_flush($uri);
+  }
+  cache_clear_all($file->uri, 'cache_bassets');
+}

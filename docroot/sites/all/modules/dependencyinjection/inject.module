@@ -1,0 +1,294 @@
+<?php
+
+/**
+ * @file
+ * Integrates Symfony's Dependency Injection Component.
+ */
+
+use Drupal\Component\PhpStorage\PhpStorageFactory;
+use Drupal\Core\DependencyInjection\YamlFileLoader;
+
+use Symfony\Component\DependencyInjection\ContainerBuilder;
+use Symfony\Component\DependencyInjection\ContainerInterface;
+use Symfony\Component\DependencyInjection\Dumper\PhpDumper;
+
+/**
+ * Gets the PHP code storage object to use for the compiled container.
+ *
+ * @return Drupal\Component\PhpStorage\PhpStorageInterface
+ */
+function inject_storage() {
+  static $storage;
+  if (!isset($storage)) {
+    $storage = PhpStorageFactory::get('service_container');
+  }
+  return $storage;
+}
+
+/**
+ * Returns the class name based on environment, debug and testing prefix.
+ *
+ * @return string
+ *   The class name.
+ */
+function inject_class() {
+  return variable_get('inject_class', 'ServiceContainer');
+}
+
+/**
+ * Gets the container's base class.
+ *
+ * All names except Container must be fully qualified.
+ *
+ * @return string
+ */
+function inject_base_class() {
+  return variable_get('inject_base_class', 'Container');
+}
+
+/**
+ * Implements hook_boot().
+ */
+function inject_boot() {
+  inject_register();
+
+  // Only load the dumped container if the option is set. When the variable is
+  // not yet set, if the bootstrap happens in a testing context, do not load the
+  // previously created container.
+  if (variable_get('inject_dump', ! (bool) drupal_valid_test_ua())) {
+    // This is the second module (weight=-500) to be booted, load the cached
+    // version of the container in order to allow hook_boot() to alleviate
+    // dependency injection.
+    $class = inject_class();
+    $cache_file = $class . '.php';
+
+    // First, try to load.
+    if (!class_exists($class, FALSE)) {
+      inject_storage()->load($cache_file);
+    }
+    // If the load succeeded or the class already existed, use it.
+    if (class_exists($class, FALSE)) {
+      drupal_container(new $class);
+      return;
+    }
+  }
+
+  // The cached version of the container does not exist, trigger a rebuild.
+  // Note: this operation is expensive and configuration should be dumped in
+  // production sites.
+  inject_build(module_list(TRUE, TRUE), new ContainerBuilder(), 'boot');
+}
+
+/**
+ * Implements hook_init().
+ */
+function inject_init() {
+  // Continue the process of registering services at hook_init level if we are
+  // in the building phase, e.g. if the container is a container builder object.
+  if (drupal_container() instanceof ContainerBuilder) {
+    // Fully re-build the container through the whole module list. This is super
+    // important because in a bootstrap context, some services needs to exists
+    // but may not be fully configured yet.
+    inject_build(module_list(), drupal_container());
+  }
+}
+
+/**
+ * Implements hook_modules_enabled().
+ */
+function inject_modules_enabled(array $modules) {
+  inject_flush_caches();
+}
+
+/**
+ * Implements hook_modules_installed().
+ */
+function inject_modules_installed(array $modules) {
+  inject_flush_caches();
+}
+
+/**
+ * Implements hook_form_system_performance_settings_alter().
+ */
+function inject_form_system_performance_settings_alter(&$form, $form_state) {
+  drupal_add_js(drupal_get_path('module', 'inject') . '/inject.js');
+  // Add JS to enable / disable the 'Compile configuration' checkbox.
+  drupal_add_js('jQuery(function () { Drupal.enableCompileConfigurationCheckbox(); });', 'inline');
+
+  $form['inject'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Dependency Injection Container'),
+    '#description' => t('Dumping the configuration can enhance performances, by compiling, dumping and caching the resulting file to disk.')
+  );
+
+  $writeable = inject_storage()->writeable();
+  $form['inject']['inject_dump'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Dump configuration to disk.'),
+    '#default_value' => variable_get('inject_dump', TRUE) && $writeable,
+    '#disabled' => !$writeable,
+  );
+
+  $dump_config = $form['inject']['inject_dump']['#default_value'];
+  $form['inject']['inject_compile'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Compile configuration.'),
+    '#default_value' => variable_get('inject_compile', FALSE) && $dump_config,
+    '#disabled' => !$dump_config
+  );
+}
+
+/**
+ * Implements hook_hook_info().
+ */
+function inject_hook_info() {
+  $hooks['inject_build'] = array(
+    'group' => 'inject',
+  );
+
+  return $hooks;
+}
+
+/**
+ * Build the dependency injection container.
+ *
+ * @param array $modules
+ *   The list of modules to register services in the container.
+ * @param Symfony\Component\DependencyInjection\ContainerBuilder $container
+ *   The container builder.
+ * @param string $phase
+ *   The phase in which the container is being build. Note: dump the container
+ *   when the phase 'init' is passed. This can be used in settings form where
+ *   admin can enter parameters which reconfigure the container without dumping.
+ */
+function inject_build($modules = NULL, ContainerBuilder $container = NULL, $phase = 'init') {
+
+  if (empty($modules)) {
+    $modules = module_list();
+  }
+
+  if (empty($container)) {
+    $container = new ContainerBuilder();
+  }
+
+  // In the bootstrap phase, either a cached container is loaded from dumped
+  // file, either a new container is created; In which case inject_build is
+  // called. In order to be able to dump a container the class has to be a
+  // ContainerBuilder.
+  $yaml_loader = new YamlFileLoader($container);
+
+  // Load each module services description file.
+  foreach ($modules as $module) {
+    $filename = drupal_get_filename('module', $module);
+    // Since this function can be called in a bootstrap context, the use of API
+    // functions easing this task is not possible.
+    $services = dirname($filename) . "/$module.services.yml";
+    if (file_exists($services)) {
+      // Build the container through YML files, expecting simple or complex
+      // static service definitions, but not dynamic.
+      $yaml_loader->load($services);
+    }
+
+    $filename = dirname($filename) . "/$module.inject.inc";
+    if (is_file($filename)) {
+      // In a bootstrap context, module_load_include can't be called too,
+      // requires the file before invoking hooks or the module_invoke will have
+      // no effects.
+      require_once $filename;
+    }
+    // Build the container through PHP code, operations such as redefining
+    // services or adding dynamic properties and services are expected.
+    module_invoke($module, 'inject_build', $container, $phase);
+  }
+
+  if (variable_get('inject_compile', FALSE)) {
+    // If Compile configuration is checked, compiles the container.
+    $container->compile();
+  }
+
+  // Set the container.
+  drupal_container($container);
+}
+
+/**
+ * Implements hook_exit().
+ */
+function inject_exit() {
+  // Dumps the container of registered services at hook_exit level if we are
+  // in the building phase, e.g. if the container is a container builder object.
+  if (drupal_container() instanceof ContainerBuilder) {
+    // If the exit happens in a testing context, do not dump the container to
+    // disk so the version of components and services is not altered.
+    if (variable_get('inject_dump', ! (bool) drupal_valid_test_ua())) {
+      // If the container needs to be dumped.
+      inject_dump(drupal_container());
+    }
+  }
+}
+
+/**
+ * Dumps the container.
+ *
+ * @param Symfony\Component\DependencyInjection\ContainerBuilder $container
+ *   The container builder.
+ */
+function inject_dump(ContainerBuilder $container) {
+  if (!inject_storage()->writeable()) {
+    watchdog('inject', 'Container cannot be written to disk', WATCHDOG_ERROR);
+    return;
+  }
+
+  // Cache the container.
+  $class = inject_class();
+  $dumper = new PhpDumper($container);
+  $content = $dumper->dump(array('class' => $class, 'base_class' => inject_base_class()));
+  inject_storage()->save($class . '.php', $content);
+}
+
+/**
+ * Implements hook_flush_caches().
+ */
+function inject_flush_caches() {
+  // In some context such as module activation, the boot method is not called so
+  // the component is never registered with the class loader. This cause
+  // troubles as we need the class definition when re-building the container.
+  inject_register();
+  // Re-build can now safely be called.
+  inject_build(module_list(), new ContainerBuilder());
+  return array();
+}
+
+/**
+ * Registers the Dependency Injection name-space with the class loader.
+ */
+function inject_register() {
+  // Activates the class loader.
+  $loader = drupal_classloader();
+  $loader->registerNamespace('Drupal\Component\PhpStorage', __DIR__ . '/lib');
+  $loader->registerNamespace('Drupal\Core\DependencyInjection', __DIR__ . '/lib');
+  $loader->registerNamespace('Symfony\Component\Config', __DIR__ . '/vendor/symfony/config');
+  $loader->registerNamespace('Symfony\Component\DependencyInjection', __DIR__ . '/vendor/symfony/dependency-injection');
+  $loader->registerNamespace('Symfony\Component\Filesystem', __DIR__ . '/vendor/symfony/filesystem');
+  $loader->registerNamespace('Symfony\Component\Yaml', __DIR__ . '/vendor/symfony/yaml');
+}
+
+/**
+ * Retrieves the Drupal Container to standardize object construction.
+ *
+ * @param Symfony\Component\DependencyInjection\ContainerInterface $new_container
+ *   (optional) A new container instance to replace the current.
+ *
+ * @return Symfony\Component\DependencyInjection\ContainerInterface|bool
+ *   The instance of the ContainerInterface used to set up and maintain
+ *   object instances or FALSE if none exist yet.
+ */
+function drupal_container(ContainerInterface $new_container = NULL) {
+  // We do not use drupal_static() here because we do not have a mechanism by
+  // which to reinitialize the stored objects, so a drupal_static_reset() call
+  // would leave Drupal in a nonfunctional state.
+  static $container = FALSE;
+  if (isset($new_container)) {
+    $container = $new_container;
+  }
+  return $container;
+}
