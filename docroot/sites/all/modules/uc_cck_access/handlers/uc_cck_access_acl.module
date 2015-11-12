@@ -1,0 +1,1234 @@
+<?php
+
+/**
+ * @file
+ * A handler for UC CCK Access module (possibly any other access control modules).
+ * Integrates with ACL and Content Access for granting access to nodes and CCK fields.
+ *
+ * Concepts
+ * $uaid - An id the UC CCK Access API keeps for us. We store acl_id in it.
+ */
+
+/**
+ * Implements hook_menu().
+ */
+function uc_cck_access_acl_menu() {
+  $items = array();
+
+  $items['ajax/uc_cck_access_acl/nid_autocomplete'] = array(
+    'title' => 'UC CCK Access ACL autocomplete',
+    'page callback' => 'uc_cck_access_acl_nid_autocomplete',
+    'access arguments' => array('administer product features'),
+    'type' => MENU_CALLBACK,
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_universal_access().
+ * hook_universal_access is defined only as an API manifest.
+ * Here we do both manifest and handler using optional argument $hook.
+ *
+ * @param $hook
+ * Empty or 'info' returns the API manifest, other verbs perform/dispatch handler operations:
+ * 'handler_form': ($form_state, $values, $access) - returns settings form for the handler instance
+ * 'handler_form_submit': ($arg) - object wrapper of array($form, &$form_state, $values, &$access) - invoke submit for the settings form for the handler instance
+ * 'revoke', 'delete', 'grant': ($nid, $uid, $data) - perform operation on access grant
+ * 'items_granted': ($conditions, $key_by) - return list of nodes granted to the user
+ * 'describe': ($access, $options) - describes the access item
+ * 'item_uaid': ($nid, $fields) - return an array of uaid's that a 'grant' operation would create
+ */
+function uc_cck_access_acl_universal_access($hook = '') {
+  $args = func_get_args();
+  array_shift($args); // remove first argument $hook
+  $function = 'uc_cck_access_acl_' . $hook . '_handler';
+  if ($hook == 'describe') {
+    $access = array_shift($args);
+    $options = count($args) ? array_shift($args) : array();
+    // Collect list of fields and their names
+    $items = array();
+    // Use node if given to break infinite nesting of node_load().
+    $node = isset($access['node']) ? $access['node'] : node_load($access['access_id']);
+    if ($node) {
+      $title = $node->title;
+      $fields = _uc_cck_access_get_fields_for_node_type($node->type);
+      if (is_array($access['data'])) {
+        foreach ($access['data'] as $field => $value) {
+          if ($value && isset($fields[$field])) {
+            $items[$field] = $fields[$field];
+          }
+        }
+      }
+    }
+    else {
+      $title = 'node ' . $access['access_id'];
+    }
+    $items = empty($items) ? t(' (no fields)') : t(' (fields @items)', array('@items' => implode(', ', $items)));
+    $verbs = array('@nid' => $access['access_id'], '@title' => $title, '!url' => url('node/' . $access['access_id']), '!items' => $items);
+    if (isset($options['short'])) {
+      return t('<a href="!url">@title</a>', $verbs);
+    }
+    if (isset($options['medium'])) {
+      return t('access to <a href="!url">@title</a>', $verbs);
+    }
+    return t('access to <a href="!url">@title</a>!items', $verbs);
+  }
+  elseif ($hook == 'describe_data') {
+    list($access) = $args;
+    return uc_cck_access_acl_describe_data($access);
+  }
+  elseif ($hook == 'lesser_data') {
+    list($data1, $data2) = $args;
+    // $data is empty for node-only access. Node-only access is considered
+    // less than node+fields access as node+fields superseed node only access.
+    if (empty($data1) || empty($data2)) {
+      return (empty($data1) && !empty($data2));
+    }
+    // From our perspective, 'lesser' is the one that gives less access,
+    // so we return TRUE only if all keys of $data1 are present in $data2
+    $res = array_diff(array_keys($data1), array_keys($data2));
+    return empty($res);
+  }
+  elseif ($hook == 'intersecting_data') {
+    list($data1, $data2) = $args;
+    // From our perspective, 'intersecting' is the one that interferes with other item access,
+    // so we return TRUE only if some keys of $data1 are present in $data2
+    $res = array_intersect(array_keys($data1), array_keys($data2));
+    return !empty($res);
+  }
+  elseif ($hook == 'revoke' || $hook == 'delete' || $hook == 'grant' || $hook == 'delay') {
+    list($uaid, $nid, $uid, $data) = $args;
+    return uc_cck_access_acl_ucca_node_handler($hook, $uaid, $nid, $uid, $data);
+  }
+  elseif ($hook == 'handler_form') {
+    list($form_state, $values, $access) = $args;
+    return uc_cck_access_acl_feature_form($form_state, $values, $access);
+  }
+  elseif ($hook == 'handler_form_submit') {
+    $args = (array) $args[0]; // Extra unwrap step for the object
+    $form = $args[0];
+    $form_state = &$args[1];
+    $values = $args[2];
+    $access = &$args[3];
+    return uc_cck_access_acl_feature_form_submit($form, $form_state, $values, $access);
+  }
+  elseif ($hook == 'items_granted') {
+    list($conditions, $key_by) = $args;
+    return uc_cck_access_acl_items_granted($conditions, $key_by);
+  }
+  elseif ($hook == 'item_uaid') {
+    list($nid, $fields) = $args;
+    return uc_cck_access_acl_item_uaid($nid, $fields);
+  }
+  elseif ($hook == 'item_uaid_data') {
+    list($uaid) = $args;
+    return uc_cck_access_acl_item_uaid_fields($uaid);
+  }
+  else {
+    return array(
+      // hook_universal_access manifest
+      'uc_cck_access_acl_universal_access' => array(
+        // title appears on the list of access options on the product feature configuration form
+        'title' => t('Node and fields'),
+        'description' => t('Node and fields access, integration with ACL, Content Access, CCK ACL Access'),
+//        'callback' => 'uc_cck_access_acl_ucca_node_handler',  // we may define a different handler function
+      ),
+    );
+  }
+}
+
+function _uc_cck_access_acl_name($module, $op, $nid, $fields = '') {
+  if ($module == 'uc_cck_access_acl') {
+    // Our scheme will break in the acl database if there are multiple
+    // field configurations with same name for the same node in two different
+    // uc_product_feature records.
+    // Resolve it by name tags that distinguish different field configurations:
+    $tags = array();
+    if (is_array($fields)) {
+      foreach ($fields as $field => $value) {
+        if ($value) {
+          $tags[] = (substr($field, 0, 6) == 'field_') ? substr($field, 6) : $field;
+        }
+      }
+    }
+    if (!empty($tags)) {
+      sort($tags, SORT_STRING);
+      $tag =  '#' . implode('#', $tags);
+    }
+    else {
+      $tag = '';
+    }
+    $acl_name = $op . '_' . $nid . $tag;
+  }
+  elseif ($module == 'content_access') {
+    $acl_name = $op . '_' . $nid;
+  }
+  return $acl_name;
+}
+
+function _uc_cck_access_acl_get_acl_id($module, $op, $nid, $fields = '') {
+  $acl_name = _uc_cck_access_acl_name($module, $op, $nid, $fields);
+  // Load the ID for the Access Control List
+  $acl_id = acl_get_id_by_name($module, $acl_name);
+
+  // Create a new one if it didn't already exist
+  if (!$acl_id) {
+    $acl_id = acl_create_new_acl($module, $acl_name);
+  }
+  return $acl_id;
+}
+
+function _uc_cck_access_acl_add_acl_nid($module, $op, $nid, $fields = '') {
+  $acl_id = _uc_cck_access_acl_get_acl_id($module, $op, $nid, $fields);
+
+  // Figure out the priority for this acl (use node's priority for field acl)
+  $priority = 0;
+  if (function_exists('content_access_get_settings')) {
+    $node = node_load($nid);
+    if ($node) {
+      $priority = content_access_get_settings('priority', $node->type);
+    }
+  }
+  // Add the target node to the list
+  acl_node_add_acl($nid, $acl_id, $op == 'view', $op == 'update', $op == 'delete', $priority);
+  db_update('acl_node')
+    ->fields(array(
+      'uc_cck_access_acl_data' => serialize($fields),
+    ))
+    ->condition('acl_id', $acl_id)
+    ->condition('nid', $nid)
+    ->execute();
+
+  return $acl_id;
+}
+
+function _uc_cck_access_acl_add_acl_uid($module, $op, $nid, $uid, $fields = '') {
+  $acl_id = _uc_cck_access_acl_add_acl_nid($module, $op, $nid, $fields);
+  // Add the user to the Access Control List for the target node.
+  acl_add_user($acl_id, $uid);
+  return $acl_id;
+}
+
+function _uc_cck_access_acl_get_nid($acl_id) {
+  return db_query("SELECT nid FROM {acl_node} WHERE acl_id = :acl_id", array(':acl_id' => $acl_id))->fetchField();
+}
+
+function _uc_cck_access_acl_remove_acl_uid($acl_id, $module, $op, $nid, $uid, $fields = '') {
+  if (!$acl_id) {
+    // Load the ID for the Access Control List
+    $acl_name = _uc_cck_access_acl_name($module, $op, $nid, $fields);
+    $acl_id = acl_get_id_by_name($module, $acl_name);
+  }
+  if ($acl_id) {
+    acl_remove_user($acl_id, $uid);
+  }
+  return $acl_id;
+}
+
+function _uc_cck_access_acl_delete_acl($acl_id, $module, $op, $nid, $fields = '') {
+  if (!$acl_id) {
+    // Load the ID for the Access Control List
+    $acl_name = _uc_cck_access_acl_name($module, $op, $nid, $fields);
+    $acl_id = acl_get_id_by_name($module, $acl_name);
+  }
+  if ($acl_id) {
+    acl_delete_acl($acl_id);
+  }
+  return $acl_id;
+}
+
+/**
+ * Find what uaid's an item would have if 'grant' is invoked.
+ */
+function uc_cck_access_acl_item_uaid($nid, $fields) {
+$op = 'view';
+  $node = node_load($nid);
+  if (empty($node)) {
+    return FALSE;
+  }
+  $uaids = array();
+  $uaids[] = _uc_cck_access_acl_add_acl_nid('content_access', $op, $nid);
+
+  // Now do the same for the fields
+  if ($fields) {
+    $uaids[] = _uc_cck_access_acl_add_acl_nid('uc_cck_access_acl', $op, $nid, $fields);
+  }
+  return $uaids;
+}
+
+/**
+ * Find what fields an uaid item has.
+ */
+function uc_cck_access_acl_item_uaid_fields($uaid) {
+  $fields = db_query("SELECT uc_cck_access_acl_data FROM {acl_node} WHERE acl_id = :acl_id", array(':acl_id' => $uaid))->fetchField();
+  if ($fields) {
+    $fields = unserialize($fields);
+  }
+  return $fields;
+}
+
+/**
+ * Controls the default node access system using ACL + Content Access.
+ * @param $cmd - one of 'delay', 'grant', 'revoke', 'delete'
+ * @param $uid - user id, has to be specified for 'grant', 'revoke'
+ * @param $uaid
+ * @param $nid
+ * @param $fields - either $uaid or $nid/$fields have to be specified for 'grant', 'revoke', 'delete'
+ */
+function uc_cck_access_acl_ucca_node_handler($cmd, $uaid, $nid, $uid, $fields) {
+$op = 'view';
+  switch ($cmd) {
+    case 'delay': // Grant will be delayed. We use this notification for creating acl_id records
+      // $uaid, $uid is unused
+      $node = node_load($nid);
+      if (empty($node)) {
+        return;
+      }
+      // Load the ID for the Access Control List or create a new one if it didn't already exist.
+      $node_acl_id = _uc_cck_access_acl_add_acl_nid('content_access', $op, $nid);
+      // Now do the same for the fields
+      if ($fields) {
+        $fields_acl_id = _uc_cck_access_acl_add_acl_nid('uc_cck_access_acl', $op, $nid, $fields);
+      }
+      break;
+
+    case 'grant':
+      // $uaid is unused
+      $node = node_load($nid);
+      if (empty($node) || $uid == 0) {
+        return;
+      }
+      // Load the ID for the Access Control List or create a new one if it didn't already exist.
+      $node_acl_id = _uc_cck_access_acl_add_acl_uid('content_access', $op, $nid, $uid);
+      // Now do the same for the fields
+      if ($fields) {
+        $fields_acl_id = _uc_cck_access_acl_add_acl_uid('uc_cck_access_acl', $op, $nid, $uid, $fields);
+      }
+      // Let Drupal know to adjust the access for the target node.
+      node_access_acquire_grants($node);
+      cache_clear_all();
+
+      $account = user_load($uid);
+      rules_invoke_event('uc_cck_access_acl_grant', $node, $account);
+      break;
+
+    case 'revoke':
+      // Either $uaid or $nid should be given
+      if ($uaid) {
+        $nid = _uc_cck_access_acl_get_nid($uaid);
+        $acl_id = _uc_cck_access_acl_remove_acl_uid($uaid, NULL, NULL, NULL, $uid);
+      }
+      else {
+        $node_acl_id = _uc_cck_access_acl_remove_acl_uid(NULL, 'content_access', $op, $nid, $uid);
+        $fields_acl_id = _uc_cck_access_acl_remove_acl_uid(NULL, 'uc_cck_access_acl', $op, $nid, $uid, $fields);
+      }
+      $node = node_load($nid);
+      // Let Drupal know to adjust the access for the target node.
+      node_access_acquire_grants($node);
+      cache_clear_all();
+      $account = user_load($uid);
+      rules_invoke_event('uc_cck_access_acl_revoke', $node, $account);
+      break;
+
+    case 'delete':
+      // Either $uaid or $nid should be given
+      if ($uaid) {
+        $nid = _uc_cck_access_acl_get_nid($uaid);
+        _uc_cck_access_acl_delete_acl($uaid, NULL, NULL, NULL);
+      }
+      else {
+        _uc_cck_access_acl_delete_acl(NULL, 'content_access', $op, $nid);
+        _uc_cck_access_acl_delete_acl(NULL, 'uc_cck_access_acl', $op, $nid, $fields);
+      }
+      $node = node_load($nid);
+      // Let Drupal know to adjust the access for the target node.
+      node_access_acquire_grants($node);
+      cache_clear_all();
+      break;
+  }
+}
+
+/**
+ * Implements hook_enabled().
+ * Used by the ACL module.
+ */
+function uc_cck_access_acl_enabled() {
+  return !_uc_cck_access_acl_disabling();
+}
+
+/**
+ * Implements hook_disable().
+ */
+function uc_cck_access_acl_disable() {
+  _uc_cck_access_acl_disabling(TRUE);
+}
+
+/**
+ * Remembers if we have disabled access.
+ */
+function _uc_cck_access_acl_disabling($set = NULL) {
+  static $disabling = FALSE;
+
+  if (isset($set)) {
+    $disabling = $set;
+  }
+  return $disabling;
+}
+
+/**
+ * Check if the given field access is controlled by us.
+ */
+function _uc_cck_access_acl_is_field_controlled($op, $field_name, $nid) {
+  static $cache;
+  if (!$cache) {
+    $cache = array();
+  }
+  $cache_key = $nid . '#' . $field_name;
+  // 1. Check if cache has the grant set
+  if (isset($cache[$cache_key])) {
+    return ($cache[$cache_key] == 1) ? TRUE : FALSE;
+  }
+
+  // 2. Check if the given node and field is controlled (is it in ACL database?)
+  $query = db_select('acl_node', 'n');
+  $query->innerJoin('acl', 'a', 'n.acl_id = a.acl_id');
+  $query
+    ->fields('n')
+    ->addField('a', 'module');
+  $query
+    ->condition(
+      db_or()
+        ->condition('a.module', 'content_access')
+        ->condition('a.module', 'uc_cck_access_acl')
+    )
+    ->condition('n.nid', $nid);
+  $result = $query->execute();
+
+  while ($access = $result->fetchAssoc()) {
+    if (empty($access['uc_cck_access_acl_data'])) {
+      continue; // Not a grant that involves fields, ignore.
+    }
+    $grant_fields = unserialize($access['uc_cck_access_acl_data']);
+    if (!is_array($grant_fields)) {
+      continue; // Not a grant that involves fields, ignore.
+    }
+    // Use this opportunity and set cache for all fields in this ACL
+    foreach ($grant_fields as $f => $v) {
+      $k = $nid . '#' . $f;
+      $cache[$k] = $v ? 1 : -1;
+    }
+    if (isset($grant_fields[$field_name]) && $grant_fields[$field_name]) {
+      $cache[$cache_key] = 1;
+      return TRUE;
+    }
+  }
+  $cache[$cache_key] = -1;
+  return FALSE;
+}
+
+/**
+ * Check if the given node access is controlled by us.
+ */
+function _uc_cck_access_acl_is_node_controlled($nid) {
+  static $cache;
+  if (!$cache) {
+    $cache = array();
+  }
+  $cache_key = $nid;
+  // 1. Check if cache has the grant set
+  if (isset($cache[$cache_key])) {
+    return ($cache[$cache_key] == 1) ? TRUE : FALSE;
+  }
+
+  // 2. Check if the given node is controlled (is it in ACL database?)
+// "PDOException, Invalid parameter number: no parameters were bound", really?
+//  $result = db_query('SELECT n.*, a.module FROM {acl_node} n INNER JOIN {acl} a ON n.acl_id = a.acl_id WHERE ((a.module = :module1) OR (a.module = :module2)) AND n.nid = :nid', array(':module1' => 'content_access', ':module2' => 'uc_cck_access_acl', ':nid' => $nid))->execute();
+  $query = db_select('acl_node', 'n');
+  $query->innerJoin('acl', 'a', 'n.acl_id = a.acl_id');
+  $query
+    ->fields('n')
+    ->addField('a', 'module');
+  $query
+    ->condition(
+      db_or()
+        ->condition('a.module', 'content_access')
+        ->condition('a.module', 'uc_cck_access_acl')
+    )
+    ->condition('n.nid', $nid);
+  $result = $query->execute();
+  while ($access = $result->fetchAssoc()) {
+    $cache[$cache_key] = 1;
+    return TRUE;
+  }
+  $cache[$cache_key] = -1;
+  return FALSE;
+}
+
+/**
+ * Implements hook_field_access().
+ *
+ * @see content_access().
+ */
+function uc_cck_access_acl_field_access($op, $field, $entity_type, $entity, $account) {
+  // To minimize database access we cache all grants
+  static $cache;
+  if (!$cache) {
+    $cache = array();
+  }
+  // @todo: eventually convert this module to entity_type/entity_id (needs acl.module conversion first!)
+  if ($entity_type != 'node' || empty($entity)) {
+    return TRUE; // not our entity_type, don't disallow.
+  }
+  $node = $entity;
+
+  // We can be called for a new node which has not been saved yet (no $node->nid).
+  $cache_key = $op . '#' . $field['field_name'] . '#' . $account->uid . (($node && isset($node->nid)) ? '#' . $node->nid : '');
+  // 1. Check if cache has the grant set
+  if (isset($cache[$cache_key])) {
+    return ($cache[$cache_key] == 1) ? TRUE : FALSE;
+  }
+
+  // We will engage only when there is no other module (like content_permissions) granting access
+  if (user_access($op . ' ' . $field['field_name'], $account) || user_access('bypass node access', $account)) {
+    $cache[$cache_key] = 1;
+    return TRUE;
+  }
+
+  if (isset($node->nid) && !_uc_cck_access_acl_is_field_controlled($op, $field['field_name'], $node->nid)) {
+    $cache[$cache_key] = 1;
+    return TRUE;
+  }
+
+  switch ($op) {
+    case 'edit':
+      $op = 'update'; // translate to cck_acl terms
+      // no break - continue to next clause
+    case 'view':
+      // 2. Check if the given node and field are controlled (is it in our database?)
+      if (!$node || !isset($node->nid)) {
+        $cache[$cache_key] = 1;
+        return TRUE; // We're only operating on node level
+      }
+
+      // 3. Check if a grant to the field is given
+      $grants = module_invoke_all('node_access_records', $node);
+      if (is_array($grants)) {
+        foreach ($grants as $grant) {
+          if (empty($grant['uc_cck_access_acl_data'])) {
+            continue; // Not a grant that involves fields, ignore.
+          }
+          $grant_fields = unserialize($grant['uc_cck_access_acl_data']);
+          if (!isset($grant_fields[$field['field_name']]) || !$grant_fields[$field['field_name']]) {
+            continue; // Not a grant for the right field
+          }
+          if ($grant['grant_' . $op]) {
+            // This is the grant, check if the user has it
+            if ($account->uid && acl_has_user($grant['acl_id'], $account->uid)) {
+              $cache[$cache_key] = 1;
+              return TRUE;
+            }
+          }
+        }
+      }
+      $cache[$cache_key] = -1;
+      return FALSE;
+  }
+  $cache[$cache_key] = 1;
+  return TRUE;
+}
+
+/**
+ * Collect list of fields and their names
+ */
+function uc_cck_access_acl_describe_data($access) {
+  $items = array();
+  if (isset($access['data']) && is_array($access['data'])) {
+    // Use node if given to break infinite nesting of node_load().
+    // @todo: shall we query from DB instead of node_load()?
+    // $node = db_query("SELECT title, type FROM {node} WHERE nid = :nid", array(':nid' => $access['access_id']))->fetch();
+    $node = isset($access['node']) ? $access['node'] : node_load($access['access_id']);
+    if ($node) {
+      $fields = _uc_cck_access_get_fields_for_node_type($node->type);
+      foreach ($access['data'] as $field => $value) {
+        if ($value && isset($fields[$field])) {
+          $items[$field] = $fields[$field];
+        }
+      }
+    }
+  }
+  return $items;
+}
+
+function _uc_cck_access_acl_items_query($conditions, $left_join = FALSE) {
+  $query = db_select('acl_node', 'n');
+  $query->fields('n');
+  $query->innerJoin('acl', 'a', 'n.acl_id = a.acl_id');
+  if ($left_join) {
+    $query->leftJoin('acl_user', 'au', 'au.acl_id = a.acl_id');
+    $query->leftJoin('users', 'u', 'au.uid = u.uid');
+  }
+  else {
+    $query->innerJoin('acl_user', 'au', 'au.acl_id = a.acl_id');
+    $query->innerJoin('users', 'u', 'au.uid = u.uid');
+  }
+  $query->fields('au', array('uid'));
+  $query->fields('u', array('name'));
+  $query->addField('a', 'name', 'acl_name');
+  $query->addField('a', 'module');
+  $query->addExpression("'acl'", 'realm');
+  $query->addExpression("'node'", 'type');
+  $query->addField('n', 'acl_id', 'gid');
+
+  if (!isset($conditions['module'])) {
+    $query->condition(
+      db_or()
+        ->condition('a.module', 'content_access')
+        ->condition('a.module', 'uc_cck_access_acl')
+    );
+  }
+  foreach ($conditions as $field => $condition) {
+    if ($field == 'handler') {
+      continue; // avoid a field that can leak from caller but has nothing to do with our data
+    }
+    if ($field == 'module') {
+      $query->condition('a.module', $condition);
+      continue;
+    }
+    if ($field == 'uid') {
+      $field = 'au.uid';
+    }
+    if ($field == 'op') {
+      $query->condition('a.name', $condition . '_%', 'LIKE');
+      $field = 'grant_' . $condition;
+      $condition = 1;
+    }
+    if ($field == 'access_id' || $field == 'nid') {
+      $field = 'n.nid';
+    }
+    $query->condition($field, $condition);
+  }
+  return $query;
+}
+
+/**
+ * Get a list of node grants (nodes that are granted to the user) filtered by given $condition
+ * @param $conditions - associative array ($field => $condition) of conditions (all will be 'AND'ed)
+ * @return - an array of grant records,
+ * each record according to the API is an array and contains:
+ * 'uaid'      - id that uniquely identifies the record and can be used for subsequent operations
+ * 'handler'   - our handler's name
+ * 'access_id' - accessed item id
+ * 'data'      - additional data (we use it for a list of CCK fields)
+ */
+function uc_cck_access_acl_items_granted($conditions, $key_by = NULL) {
+  $query = _uc_cck_access_acl_items_query($conditions);
+  $result = $query->execute();
+  $return = array();
+  while ($row = $result->fetchAssoc()) {
+    $row['uaid'] = $row['acl_id'];
+    $row['access_id'] = $row['nid'];
+    $row['data'] = $row['uc_cck_access_acl_data'] ? unserialize($row['uc_cck_access_acl_data']) : '';
+    unset($row['acl_id'], $row['nid'], $row['uc_cck_access_acl_data']);
+
+    $row['items'] = uc_cck_access_acl_describe_data($row);
+
+    // Format record according to the API definitions, rename fields appropriately
+    $row['handler'] = 'uc_cck_access_acl_universal_access';
+
+    if ($key_by) {
+      $return[$row[$key_by]] = $row;
+    }
+    else {
+      $return[] = $row;
+    }
+  }
+  return $return;
+}
+
+/**
+ * Get a list of node acl records filtered by given $condition
+ * @param $conditions - associative array ($field => $condition) of conditions (all will be 'AND'ed)
+ * @return - an array of grant records either keyed by $key, or by [$uaid]['users'][$uid],
+ * each record according to the API is an array and contains:
+ * 'uaid'      - id that uniquely identifies the record and can be used for subsequent operations
+ * 'handler'   - our handler's name
+ * 'access_id' - accessed item id
+ * 'data'      - additional data (we use it for a list of CCK fields)
+ */
+function uc_cck_access_acl_items($conditions, $key_by = NULL) {
+  // Load and process any expired CCK access rules.
+  $query = _uc_cck_access_acl_items_query($conditions, TRUE); // Use leftJoin()
+  $result = $query->execute();
+  $return = array();
+  while ($row = $result->fetchAssoc()) {
+    $row['uaid'] = $row['acl_id'];
+    $row['access_id'] = $row['nid'];
+    $row['data'] = $row['uc_cck_access_acl_data'] ? unserialize($row['uc_cck_access_acl_data']) : '';
+    unset($row['acl_id'], $row['nid'], $row['uc_cck_access_acl_data']);
+
+    $row['items'] = uc_cck_access_acl_describe_data($row);
+
+    // Format record according to the API definitions, rename fields appropriately
+    $row['handler'] = 'uc_cck_access_acl_universal_access';
+
+    if ($key_by) {
+      $return[$row[$key_by]] = $row;
+    }
+    else {
+      if ($row['uid']) {
+        $return[$row['uaid']]['users'][$row['uid']] = $row;
+      }
+      unset($row['uid'], $row['name']);
+      if (isset($return[$row['uaid']])) {
+        $return[$row['uaid']] += $row;
+      }
+      else {
+        $return[$row['uaid']] = $row;
+      }
+    }
+  }
+  return $return;
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function uc_cck_access_acl_form_alter(&$form, &$form_state, $form_id) {
+  if ($form_id == 'content_access_page') {
+    $node = $form_state['node'];
+    if (!is_object($node)) {
+      return; // something is wrong
+    }
+
+    $nid = $node->nid;
+
+    if (isset($form['acl'])) {
+      // More descriptive title for content_access user section (to distinguish from our section)
+      $form['acl']['#title'] = t('User access to the node');
+      $form['acl']['#description'] = t('These settings allow you to grant/revoke access to the node for specific users.') .
+        t('<br>For adjusting delays and expirations, use "Premium Content" tab on user\'s account page.');
+    }
+
+    // This is disabled when there is no node passed
+    $form['uc_cck_access_acl'] = array(
+      '#type' => 'fieldset',
+      '#title' => t('User access to the node\'s CCK Fields'),
+      '#description' => t('These settings allow you to grant/revoke access to the node\'s fields for specific users.') .
+        t('<br>Every field present in this section restricts access only to the listed users.') .
+        t('<br>To remove access control and make the field accessible to all, use "Remove ACL" checkbox in every group with that field.') .
+        t('<br>For adjusting delays and expirations, use "Premium Content" tab on user\'s account page.'),
+      '#collapsible' => TRUE,
+      '#tree' => TRUE,
+    );
+
+    foreach (array('view' /*, 'update', 'delete' */) as $op) {
+
+      $items = uc_cck_access_acl_items(array('op' => $op, 'nid' => $nid));
+
+      // Add grant schedule information using hook_universal_access_schedule()
+      // Our alternative to module_invoke_all so we can pass $items by reference
+      $hook = 'universal_access_schedule';
+      $args = array(&$items, $op, $nid, 'uc_cck_access_acl_universal_access');
+      foreach (module_implements($hook) as $module) {
+        $function = $module . '_' . $hook;
+        call_user_func_array($function, $args);
+      }
+
+      // Get the list of users for 'content_access' from the form
+      $users1 = unserialize($form['acl'][$op]['user_list']['#default_value']);
+      foreach ($items as $acl_id => $acl_grants) {
+        if ($acl_grants['module'] == 'uc_cck_access_acl') {
+          $form['uc_cck_access_acl'][$op][$acl_id] = acl_edit_form($form_state, $acl_id,
+            $acl_grants['items']
+              ? t('Grant !op access (fields !fields)', array('!op' => $op, '!fields' => implode(', ', $acl_grants['items'])))
+              : t('Grant !op access (no fields)', array('!op' => $op))
+          );
+          $form['uc_cck_access_acl'][$op][$acl_id]['delete_all'] = array(
+            '#type' => 'checkbox',
+            '#title' => 'Remove ACL',
+            '#description' => t('Checking this and clicking "Submit" will remove all users from this list and will make this field accessible by all.'),
+            '#weight' => -10,
+          );
+          // Get the list of users for 'uc_cck_access_acl' from the form
+          $users2 = unserialize($form['uc_cck_access_acl'][$op][$acl_id]['user_list']['#default_value']);
+        }
+
+        // Add our data to the names
+        if (isset($acl_grants['users'])) {
+          foreach ($acl_grants['users'] as $uid => $grant) {
+            $link = $grant['schedule_url']
+              ? t('<a href="!url">edit schedule</a>', array('!url' => $grant['schedule_url']))
+              : '';
+            $delay_str = !empty($grant['inception'])
+              ? t('Available on @date', array('@date' => format_date($grant['inception'], 'short')))
+              : '';
+            $expire_str = !empty($grant['expiration'])
+              ? t('Expires @date', array('@date' => format_date($grant['expiration'], 'short')))
+              : t('Unlimited time');
+            $schedule_str = t(' - !delay !expire !link', array('!delay' => $delay_str, '!expire' => $expire_str, '!link' => $link));
+
+            if ($acl_grants['module'] == 'content_access') {
+              if (!empty($users1[$uid])) { // Fixes http://drupal.org/node/1057330
+                $users1[$uid] = $users1[$uid] . $schedule_str;
+              }
+              // We are messing with content_access here - it will add grants to all users on the list,
+              // including the delayed ones, unless we fix it before acl_save_form
+              // We do a cleanup in uc_cck_access_acl_content_access_page_submit()
+              elseif ($grant['name']) {
+                $users1[$uid] = $grant['name'] . $schedule_str;
+              }
+            }
+
+            if ($acl_grants['module'] == 'uc_cck_access_acl') {
+              if (!empty($users2[$uid])) {
+                $users2[$uid] = $users2[$uid] . $schedule_str;
+              }
+              elseif ($grant['name']) {
+                $users2[$uid] = $grant['name'] . $schedule_str;
+              }
+            }
+          }  // foreach ($uid => $grant)
+        }
+
+        if ($acl_grants['module'] == 'uc_cck_access_acl') {
+          // Stuff the data for 'uc_cck_access_acl' back into the form
+          $form['uc_cck_access_acl'][$op][$acl_id]['user_list']['#default_value'] = serialize($users2);
+          $form['uc_cck_access_acl'][$op][$acl_id]['user_schedule'] = array('#type' => 'value', '#value' => serialize(isset($acl_grants['users']) ? $acl_grants['users'] : array()));
+          $form['uc_cck_access_acl'][$op][$acl_id]['#collapsed'] = !isset($_POST['acl_' . $acl_id]) && !$users2;
+        }
+        if ($acl_grants['module'] == 'content_access') {
+          $form['acl'][$op]['user_schedule'] = array('#type' => 'value', '#value' => serialize(isset($acl_grants['users']) ? $acl_grants['users'] : array()));
+        }
+      } // foreach ($items as $acl_id => $acl_grants)
+      // Stuff the data for 'content_access' back into the form
+      $form['acl'][$op]['user_list']['#default_value'] = serialize($users1);
+      $acl_id = $form['acl'][$op]['acl_id']['#value'];
+      $form['acl'][$op]['#collapsed'] = !isset($_POST['acl_' . $acl_id]) && !$users1;
+
+    } // foreach(... as $op)
+
+    // This button from content_access is very destructive... kills all content_access ACL records.
+    // No confirmation step either.
+    // Add more explanation:
+    $form['reset']['#value'] = t('Reset ALL to defaults (Also remove all user access to the node)');
+    $form['reset']['#weight'] = 20;
+
+    // Place our submit callback before content_acess_page_submit so we can cleanup the values before other submit handlers get the data
+    array_unshift($form['#submit'], 'uc_cck_access_acl_content_access_page_submit');
+
+    // Place our after_build callback first
+    $form += array('#after_build' => array());
+    array_unshift($form['#after_build'], 'uc_cck_access_acl_content_access_page_after_build');
+  }
+}
+
+function _uc_cck_access_acl_user($uid) {
+  $user = user_load($uid);
+  if (!$user) {
+    return t('@uid', array('@uid' => $uid));
+  }
+  return t('<a href="!url">%username</a>', array('!url' => url('user/' . $uid), '%username' => $user->name));
+}
+
+function _uc_cck_access_acl_node($node) {
+  if (!$node) {
+    return t('@nid', array('@nid' => $nid));
+  }
+  return t('<a href="!url">@title</a>', array('@nid' => $node->nid, '@title' => $node->title ? $node->title : 'node ' . $node->nid, '!url' => url('node/' . $node->nid)));
+}
+
+/**
+ * Helper function for uc_cck_access_acl_content_access_page_submit()
+ */
+function _uc_cck_access_acl_content_access_save(&$acl_data, $op, $node, $do_acl) {
+  $count_users_deleted = 0;
+  $count_users_added = 0;
+  $users_deleted = array();
+  $users_added = array();
+  $log = array();
+
+  $user_schedule = unserialize($acl_data['user_schedule']);
+  $users_return = $users = unserialize($acl_data['user_list']);
+  $acl_id = $acl_data['acl_id'];
+
+  if (!empty($acl_data['delete_all'])) {
+    $users_return = $users = array(); // This will force all users deletion
+    if ($do_acl) {
+      db_delete('acl_user')
+        ->condition('acl_id', $acl_id)
+        ->execute();
+      db_delete('acl_node')
+        ->condition('acl_id', $acl_id)
+        ->execute();
+      db_delete('acl')
+        ->condition('acl_id', $acl_id)
+        ->execute();
+      $log[] = array('All users and ACL record @acl_id for !node were removed.', array('@acl_id' => $acl_id, '!node' => _uc_cck_access_acl_node($node)));
+      return $log;
+    }
+  }
+
+  $result = db_query('SELECT uid FROM {acl_user} WHERE acl_id = :acl_id', array(':acl_id' => $acl_id));
+  while ($record = $result->fetchAssoc()) {
+    $uid = $record['uid'];
+    if (isset($users[$uid])) {
+      unset($users[$uid]);
+    }
+    else {
+      if ($do_acl) {
+        db_delete('acl_user')
+          ->condition('acl_id', $acl_id)
+          ->condition('uid', $uid)
+          ->execute();
+      }
+      // We do logging here for !$do_acl case to rectify content_access.module's lack of logging
+      $users_deleted[$acl_id][$uid] = 1;
+      $count_users_deleted += 1;
+      $log[] = array('User !user ACL record @acl_id for !node was removed.', array('!user' => _uc_cck_access_acl_user($uid), '@acl_id' => $acl_id, '!node' => _uc_cck_access_acl_node($node)));
+      $log = array_merge($log, module_invoke_all('universal_access_delete_notify', $op, $acl_id, $uid, $node->nid, 'uc_cck_access_acl_universal_access', t('ACL record for !node has been deleted', array('!node' => _uc_cck_access_acl_node($node)))));
+    }
+  }
+
+  // What remains in $users is a list of new users (can be 0 or 1 only) mixed in with delayed access users
+  foreach ($users as $uid => $str) {
+    if (!empty($user_schedule[$uid]['inception'])) {
+      // It's a delayed item, remove it from the list to avoid acl_save_form creating user acl record prematurely
+      unset($users[$uid], $users_return[$uid]);
+      // Also remove it from the schedule (we will use the remaining schedule items as deletes list)
+      unset($user_schedule[$uid]);
+    }
+    else {
+      if ($do_acl) {
+        $id = db_insert('acl_user')
+          ->fields(array(
+            'acl_id' => $acl_id,
+            'uid' => $uid,
+          ))
+          ->execute();
+      }
+      // We do logging here for !$do_acl case to rectify content_access.module's lack of logging
+      $users_added[$acl_id][$uid] = 1;
+      $count_users_added += 1;
+      $log[] = array('User !user was added to ACL record @acl_id for !node.', array('!user' => _uc_cck_access_acl_user($uid), '@acl_id' => $acl_id, '!node' => _uc_cck_access_acl_node($node)));
+    }
+  } // foreach ($uid)
+
+  foreach ($user_schedule as $uid => $item) {
+    $log = array_merge($log, module_invoke_all('universal_access_delete_notify', $op, $acl_id, $uid, $node->nid, 'uc_cck_access_acl_universal_access', t('ACL record for !node has been deleted', array('!node' => _uc_cck_access_acl_node($node)))));
+  }
+
+  // Put data back
+  $acl_data['user_list'] = serialize($users_return);
+  return $log;
+}
+
+/**
+ * Process a form that had acl_edit_form() buttons on it.
+ * It is copied from the way acl.module works... non-standard, but they try to
+ * avoid submitting the complete form which probably makes sense. the
+ * _after_build() handler gets called multiple times on the submit, but it works
+ * for them.
+ */
+function uc_cck_access_acl_content_access_page_after_build($form, &$form_state) {
+  if (isset($form_state['triggering_element']) && $form_state['triggering_element']['#value'] == t('Remove Checked')) {
+    // Deal with 'delete_all' as acl module is not aware of this control.
+    // It is essentially a submit.
+    uc_cck_access_acl_content_access_page_submit($form, $form_state);
+  }
+  return $form;
+}
+
+/**
+ * Submit handler for 'content_access_page' set in uc_cck_access_acl_form_alter().
+ */
+function uc_cck_access_acl_content_access_page_submit($form, &$form_state) {
+  $node = $form_state['node'];
+
+  $log = array();
+  foreach (array('view' /*, 'update', 'delete'*/) as $op) {
+
+    // Intercept data going to content_access's acl_save_form
+    $acl_data = $form_state['values']['acl'][$op];
+    // We can't use acl_save_form() here as it will create grants for users that are on delay
+    // Our version of acl_save_form($acl_data) with additional logic
+    $log = array_merge($log, _uc_cck_access_acl_content_access_save($acl_data, $op, $node, FALSE));
+    $form_state['values']['acl'][$op] = $acl_data;
+
+    if (isset($form_state['values']['uc_cck_access_acl'][$op])) {
+      foreach ($form_state['values']['uc_cck_access_acl'][$op] as $acl_id => $acl_data) {
+        // We can't use acl_save_form() here as it will create grants for users that are on delay
+        // Our version of acl_save_form($acl_data) with additional logic
+        $log = array_merge($log, _uc_cck_access_acl_content_access_save($acl_data, $op, $node, TRUE));
+
+        // Put data back
+        $form_state['values']['uc_cck_access_acl'][$op][$acl_id] = $acl_data;
+      } // foreach ($acl_id)
+    }
+  } // foreach ($op)
+
+  $text = '';
+  foreach ($log as $entry) {
+    if (is_array($entry)) {
+      drupal_set_message(t($entry[0], $entry[1]));
+      $text .= ($text ? '<br>' : '') . t($entry[0], $entry[1]);
+    }
+  }
+  if ($text) {
+    watchdog('uc_cck_access_acl', $text);
+  }
+}
+
+/**
+ * Implements hook_schema_alter().
+ */
+function uc_cck_access_acl_schema_alter(&$schema) {
+  // Add field to existing schema.
+  $schema['acl_node']['fields']['uc_cck_access_acl_data'] = array(
+    'type'        => 'varchar',
+    'length'      => 255,
+    'not null'    => FALSE,
+    'description' => 'Additional data for this grant.',
+  );
+}
+
+/**
+ * Helper - get fields for the given content type record.
+ */
+function _uc_cck_access_get_fields_for_node_type($node_type) {
+  $return = array();
+  if (!empty($node_type) && module_exists('field')) {
+    foreach (field_read_instances() as $id => $instance) {
+      if ($instance['entity_type'] != 'node' || $instance['bundle'] != $node_type) {
+        continue;
+      }
+      $key = $instance['field_name'];
+      $value =  $instance['label'];
+      if (in_array($value, $return)) {
+        $value .= ' ' . t('(@id)', array('@id' => $key));
+        // @todo: also modify the first item?? if there is a third item later, then it will remain unmodified?
+      }
+      $return[$key] = $value;
+    }
+  }
+  return $return;
+}
+
+/**
+ * Utility function for the ahah handler
+ * Adopted from ahah_helper module's code http://drupal.org/project/ahah_helper
+ * Disable #required and #element_validate validation.
+ *
+ * @param unknown_type $form
+ */
+function _uc_cck_access_acl_disable_validation(&$form) {
+  foreach (element_children($form) as $child) {
+    $form[$child]['#validated'] = TRUE;
+    _uc_cck_access_disable_validation($form[$child]);
+  }
+}
+
+/**
+ * Returns an autocomplete list for nodes on the feature handler form.
+ */
+function uc_cck_access_acl_nid_autocomplete($string = '') {
+  $matches = array();
+
+  if ($string) {
+    $query = db_select('node', 'n');
+    $query->innerJoin('node_type', 'nt', 'n.type = nt.type');
+    $query->fields('n', array('nid', 'title'));
+    $query->addField('nt', 'name', 'type_name');
+    $query->where('LOWER(title) LIKE LOWER(:title)', $args = array(':title' => '%' . $string . '%'));
+    $query->range(0, 10);
+    $query->addTag('node_access'); // See http://drupal.org/node/1204572
+    $result = $query->execute();
+    while ($node = $result->fetch()) {
+      $matches[$node->nid] = check_plain($node->title . ' (' . $node->type_name . ')');
+    }
+  }
+
+  print drupal_json_encode($matches);
+  exit();
+}
+
+/**
+ * Submit function for _uc_cck_access_handler_feature_form subform (does not conform to Form API as invoked from another submit handler).
+ * Processes input and fills $access record.
+ *
+ * Inputs:
+ *   $access['access_id']
+ *
+ * Outputs:
+ *   $access['data'] - access handler data
+ *   $access['handler_description'] - description from access handler
+ *
+ */
+function uc_cck_access_acl_feature_form_submit($form, &$form_state, $values, &$access) {
+
+  // @todo: should we overwrite 'access_nid' values (or it won't be needed)?
+  $access += array(
+    'access_id' => $values['access_nid'],
+    'data' => array(),
+  );
+
+  // Compress fields list
+  $fields_description = array();
+  if (!empty($values['fields']['fields_list'])) {
+    foreach ($values['fields']['fields_list'] as $key => $value) {
+      if ($value) {
+        $access['data'][$key] = 1;
+        $fields_description[] = $key;
+      }
+    }
+  }
+
+  $n = count($fields_description);
+  if (!$n) {
+    $fields_description = t('whole <a href="!url">node @nid</a>',
+      array('@nid' => $access['access_id'], '!url' => url('node/' . $access['access_id'])));
+  }
+  elseif ($n == 1) {
+    $fields_description = t('@fields of <a href="!url">node @nid</a>',
+      array('@nid' => $access['access_id'], '!url' => url('node/' . $access['access_id']), '@fields' => implode(', ', $fields_description)));
+  }
+  else {
+    $fields_description = t('fields @fields of <a href="!url">node @nid</a>',
+      array('@nid' => $access['access_id'], '!url' => url('node/' . $access['access_id']), '@fields' => implode(', ', $fields_description)));
+  }
+
+  $access['handler_description'] = $fields_description;
+}
+
+/**
+ * Submit form for no-js fallback of AHAH.
+ */
+function uc_cck_access_acl_form_nojs_submit($form, &$form_state) {
+  // Same as in AHAH submission, it's just the dependent field working.
+  $form_state['ahah_submission'] = TRUE;
+  $form_state['rebuild'] = TRUE;
+}
+
+/**
+ * Subform for _uc_cck_access_handler_feature_form.
+ */
+function uc_cck_access_acl_feature_form($form_state, $values, $access) {
+  $access_nid = isset($values['access_nid'])
+    ? $values['access_nid']
+    : (isset($access['access_id']) ? $access['access_id'] : NULL);
+  $form['access_nid'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Node id'),
+    '#description' => t('Specify which node this product should give access to.<br />') .
+      t('Start typing to view a list of available nodes with similar titles, then pick one from the list in order to get node id (javascript must be enabled).<br />') .
+      t('<em>Note: Access to the node should be turned off in Content Access (node > Access control tab) as well as per content node access shall be enabled in the node type settings in order for the node to be unviewable before purchase.</em>'),
+    '#default_value' => $access_nid,
+    '#autocomplete_path' => 'ajax/uc_cck_access_acl/nid_autocomplete',
+    '#required' => TRUE,
+    '#ajax' => array(
+      // Encode path to match elements of uc_product's path node/%node/edit/features/cck_access/%pfid
+      'callback' => 'uc_cck_access_acl_fieldslist_ahah',
+      'wrapper' => 'fieldslist-wrapper',
+      'effect' => 'fade',
+    ),
+  );
+  $form['access_nid_pick'] = array(
+    '#type' => 'submit',
+    '#value' => t('Use node id (update fields list)'),
+    // Submit the form so the handler options get updated.
+    // This is typically only used when JS is disabled.  Since the handler options
+    // won't be changed via AJAX, a button is provided in the form to submit
+    // the form and generate options in the handler form corresponding to the
+    // selected handler.
+    '#submit' => array('uc_cck_access_acl_form_nojs_submit'),
+    // We set the 'no-js' class, which means this submit button will be hidden
+    // automatically by Drupal if JS is enabled (opposite of no-js).
+    '#attributes' => array('class' => array('js-hide')),
+  );
+
+  $fields_list = isset($values['fields']['fields_list'])
+    ? $values['fields']['fields_list']
+    : (isset($access['data']) ? $access['data'] : array());
+  $node = $access_nid ? node_load($access_nid) : FALSE;
+  $type = $node ? node_type_get_type($node->type) : FALSE;
+  $fields = $node ? _uc_cck_access_get_fields_for_node_type($node->type) : array();
+  // checkboxes are particular in the format of #default_value, convert to it.
+  foreach ($fields as $key => $title) {
+    $fields_list[$key] = (isset($fields_list[$key]) && $fields_list[$key]) ? $key : 0;
+  }
+  $form['fields'] = array(
+    '#tree' => TRUE,
+    '#prefix' => "<div id='fieldslist-wrapper'>",
+    '#suffix' => "</div>",
+  );
+  $form['fields']['fields_list'] = ($fields
+    ? array(
+      '#type' => 'checkboxes',
+      '#title' => t('%title (@type) Fields', array('%title' => $node->title, '@type' => $type->name)),
+      '#options' => $fields,
+      '#default_value' => $fields_list,
+      '#description' => t('Select which CCK fields on the above node this product should give access to.<br />') .
+        t('<em>Note: Check on any of the fields will make them viewable only after purchase for ALL USERS.</em>'),
+    )
+    : ($node
+      ? array(
+        '#type' => 'item',
+        '#title' => t('%type Fields', array('%type' => $type->name)),
+        '#description' => t('(Node @nid has no fields)', array('@nid' => $access_nid)),
+      )
+      : array(
+        '#type' => 'item',
+        '#title' => t('Fields'),
+        '#description' => t('Please select a node first (Selected node "@nid" does not exist)', array('@nid' => $access_nid)),
+      )
+    )
+  );
+
+  return $form;
+}
+
+/**
+ * Returns an AHAH fields_list for nodes on the CCK access feature handler form.
+ */
+function uc_cck_access_acl_fieldslist_ahah($form, $form_state) {
+  // Enable the submit/validate handlers to determine whether AHAH-submittted.
+  $form_state['ahah_submission'] = TRUE;
+
+  // Disable validation since the form may be not yet filled in completely
+  if (!isset($_POST['op'])) {
+    _uc_cck_access_acl_disable_validation($form);
+  }
+
+  // Get the specific form item
+  // Depending on where in the main form we are (FIXME: DESIGN a better method than nested ifs? to determine what is the $subform in the $form tree
+  $subform =
+    isset($form['fields']) ? $form['fields']
+    : (isset($form['handler_form']['fields']) ? $form['handler_form']['fields']
+      : (isset($form['add_grant']['grant']['handler_form']['fields']) ? $form['add_grant']['grant']['handler_form']['fields']
+        : $form['add_grant']['grant']['fields']
+  ));
+  return $subform;
+}
+
+/**
+ * Implements hook_preprocess_node().
+ * Preprocesses template variables for the node template.
+ * It pre-populates variables that help custom themes to give some additional information about the node.
+ *  $uc_cck_access_acl - TRUE if node is controlled by UC CCK Access ACL
+ *
+ * @see uc_cck_access_preprocess_variables()
+ */
+function uc_cck_access_acl_preprocess_node(&$variables) {
+  $node = $variables['node'];
+  $user = $variables['user'];
+  // Performance optimization (so we don't run the full preprocess code on every node type)
+  if (!_uc_cck_access_acl_is_node_controlled($node->nid)) {
+    $variables['uc_cck_access_acl'] = FALSE;
+    return;
+  }
+  $variables['uc_cck_access_acl'] = TRUE;
+
+  $access_id = $node->nid;
+  uc_cck_access_preprocess_variables($user, $access_id, $variables);
+}
+

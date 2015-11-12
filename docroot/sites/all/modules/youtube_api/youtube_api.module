@@ -1,0 +1,259 @@
+<?php
+
+/**
+ * Implements hook_libraries_info().
+ */
+function youtube_api_libraries_info() {
+  $libraries['google-api-php-client'] = array(
+    'name' => 'Google APIs Client Library for PHP',
+    'vendor url' => 'http://google.com',
+    'download url' => 'https://github.com/google/google-api-php-client',
+    'version arguments' => array(
+      'file' => 'src/Google/Client.php',
+      'pattern' => '@LIBVER\s\=\s"([0-9a-zA-Z\.-]+)@',
+      'lines' => 28,
+    ),
+    'files' => array(
+      'php' => array(
+        'src/Google/autoload.php',
+      ),
+    ),
+  );
+
+  return $libraries;
+}
+
+/**
+ * Implements hook_menu().
+ */
+function youtube_api_menu() {
+  $items['admin/config/services/youtube-api'] = array(
+    'title' => 'Youtube API',
+    'description' => 'Configure Youtube API settings.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('youtube_api_settings_form'),
+    'access arguments' => array('administer site configuration'),
+    'file' => 'youtube_api.admin.inc',
+  );
+
+  $items['youtube-api/store-token'] = array(
+    'page callback' => 'youtube_api_store_token_page',
+    'access callback' => TRUE,
+    'file' => 'youtube_api.admin.inc',
+  );
+
+  return $items;
+}
+
+/**
+ * Get the captions being served for a video.
+ *
+ * @see youtube_api_download_captions
+ *
+ * @param string $video_id
+ *   The video id to get the captions from.
+ *
+ * @return array|NULL
+ *   The captions for the video or NULL if no captions was found.
+ */
+function youtube_api_get_serving_captions($video_id) {
+  $captions = youtube_api_list_captions($video_id);
+  $captions = $captions ?: array();
+  foreach ($captions as $caption) {
+    $snippet = $caption->getSnippet();
+    if ($snippet->status == 'serving') {
+      return youtube_api_download_captions($caption->id);
+    }
+  }
+  return NULL;
+}
+
+/**
+ * Get a list of captions associated to a video.
+ *
+ * @param string $video_id
+ *   The video id to get the captions from.
+ *
+ * @return Google_Service_YouTube_Caption[]
+ *   List of caption objects.
+ */
+function youtube_api_list_captions($video_id) {
+  $youtube = youtube_api_get_loaded_youtube();
+  $captions = $youtube->captions->listCaptions("snippet", $video_id);
+  $captions_list = array();
+  foreach ($captions as $caption) {
+    $captions_list[$caption->id] = $caption;
+  }
+  return $captions;
+}
+
+/**
+ * Download the captions from a youtube video.
+ *
+ * @return array|NULL
+ *   NULL on error getting captions or keyed array:
+ *   - value => The actual caption
+ *   - begin => The begin time of the caption in seconds
+ *   - end => The end time of the caption in seconds
+ */
+function youtube_api_download_captions($caption_id) {
+  if (!$caption_id) {
+    return NULL;
+  }
+  $youtube = youtube_api_get_loaded_youtube();
+  try {
+    $captionResouce = $youtube->captions->download($caption_id, array(
+        'tfmt' => "ttml",
+        'alt' => "media"
+    ));
+  } catch (Google_Service_Exception $e) {
+    watchdog('youtube_api', 'Unable to download caption with id: @id, error: @error', array(
+      '@id' => $caption_id,
+      '@error' => $e->getMessage(),
+    ));
+    return NULL;
+  }
+  if (!$captionResouce) {
+    return NULL;
+  }
+  $ttml = new DOMDocument();
+  if (!$ttml->loadXML($captionResouce)) {
+    watchdog('youtube_api', 'Unable to parse TTML caption with id: @id', array(
+      '@id' => $caption_id,
+    ));
+    return NULL;
+  }
+  $p_tags = $ttml->getElementsByTagName('p');
+  if (!$p_tags instanceof DOMNodeList) {
+    return NULL;
+  }
+  $captions = array();
+  foreach ($p_tags as $p_tag) {
+    $attributes = $p_tag->attributes;
+    $begin_attr = $attributes->getNamedItem('begin');
+    $end_attr = $attributes->getNamedItem('end');
+    $begin = NULL;
+    $end = NULL;
+    if ($begin_attr) {
+      sscanf($begin_attr->nodeValue, "%d:%d:%d", $hours, $minutes, $seconds);
+      $begin = $hours * 3600 + $minutes * 60 + $seconds;
+    }
+    if ($end_attr) {
+      sscanf($end_attr->nodeValue, "%d:%d:%d", $hours, $minutes, $seconds);
+      $end = $hours * 3600 + $minutes * 60 + $seconds;
+    }
+    $captions[] = array(
+      'value' => $p_tag->nodeValue,
+      'begin' => $begin,
+      'end' => $end,
+    );
+  }
+  return $captions;
+}
+
+/**
+ * Utility function to get a loaded youtube object.
+ *
+ * If authentication is missing, will redirect user to authenticated using OAuth.
+ *
+ * @param boolean $redirect
+ *   Indicates if the user should be redirecting if authentication if required.
+ *
+ * @return NULL|Redirect|Google_Service_YouTube
+ *  Fully loaded Google_Service_YouTube or NULL/Redirect if authentication is
+ *  missing, based on $redirect object. Will redirect if $redirect has a TRUE
+ *  value otherwise return NULL.
+ */
+function youtube_api_get_loaded_youtube($redirect = TRUE) {
+  static $youtube;
+  if (!empty($youtube)) {
+    return $youtube;
+  }
+  $token = variable_get('youtube_api_access_token', '');
+  $token_data = json_decode($token, TRUE);
+  if (empty($token_data)) {
+    if (!$redirect) {
+      return NULL;
+    }
+    return youtube_api_generate_web_oauth2_token();
+  }
+  // Give a little time for the request, so it doesn't expire during the time
+  // used to make the actual request.
+  if ($token_data['created'] + $token_data['expires_in'] < REQUEST_TIME - 15) {
+    if (!$redirect) {
+      return NULL;
+    }
+    return youtube_api_generate_web_oauth2_token();
+  }
+  $client = youtube_api_get_google_client();
+  $youtube = new Google_Service_YouTube($client);
+  $client->setAccessToken($token);
+  return $youtube;
+}
+
+/**
+ * Utility function to generate token via web.
+ */
+function youtube_api_generate_web_oauth2_token($redirect = NULL) {
+  $client = youtube_api_get_google_client();
+  if (!$client) {
+    return NULL;
+  }
+
+  if (!$redirect) {
+    $redirect = $_GET['q'];
+  }
+  variable_set('youtube_api_redirect_location', $redirect);
+
+  $client->setRedirectUri(url('youtube-api/store-token', array('absolute' => TRUE)));
+  // Regardlessly of the destination we want to redirect to google.
+  unset($_GET['destination']);
+  drupal_static_reset('drupal_get_destination');
+  drupal_get_destination();
+  return drupal_goto($client->createAuthUrl());
+}
+
+/**
+ * Get the google client.
+ *
+ * @param string|NULL $client_id
+ *  Optional client id to use instead of site default.
+ * @param string|NULL $secret
+ *  Optional secret to use instead of site default.
+ *
+ * @return NULL|Google_Client
+ *  NULL if can't load PHP library else the ready made Google_Client for youtube.
+ */
+function youtube_api_get_google_client($client_id = NULL, $secret = NULL) {
+  if (!youtube_api_load_library()) {
+    return NULL;
+  }
+
+  if (!$client_id) {
+    $client_id = variable_get('youtube_api_client_id', '');
+  }
+  if (!$secret) {
+    $secret = variable_get('youtube_api_secret', '');
+  }
+  $client = new Google_Client();
+  $client->setClientId($client_id);
+  $client->setClientSecret($secret);
+  $client->setScopes('https://www.googleapis.com/auth/youtube.force-ssl');
+  return $client;
+}
+
+/**
+ * Utility function to load the Google PHP library.
+ */
+function youtube_api_load_library() {
+  static $loaded = NULL;
+  if ($loaded !== NULL) {
+    return $loaded;
+  }
+  $info = libraries_load("google-api-php-client");
+  $loaded = $info['loaded'];
+  if (!$loaded) {
+    watchdog('youtube_api', 'Failed to load the Google PHP library.', array(), WATCHDOG_ERROR);
+  }
+  return $loaded;
+}

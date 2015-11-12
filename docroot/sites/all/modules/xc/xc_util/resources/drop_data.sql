@@ -1,0 +1,10 @@
+TRUNCATE TABLE xc_entity_properties;
+TRUNCATE TABLE xc_sql_metadata;
+TRUNCATE TABLE xc_entity_relationships;
+TRUNCATE TABLE xc_oaiharvester_bridge_header;
+TRUNCATE TABLE xc_oaiharvester_bridge_set;
+TRUNCATE TABLE node;
+TRUNCATE TABLE node_revision;
+TRUNCATE TABLE node_comment_statistics;
+# TRUNCATE TABLE print_node_conf;
+# TRUNCATE TABLE print_mail_node_conf;

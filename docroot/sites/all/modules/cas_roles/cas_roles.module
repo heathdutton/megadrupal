@@ -1,0 +1,268 @@
+<?php
+
+/**
+ * @file
+ * Allows user account and profile attributes to be automatically populated
+ * using tokens. Provides basic tokens for attributes returned by the CAS
+ * server.
+ */
+
+/**
+ * Only assign roles which are present in drupal and match,
+ * remove user roles not present in CAS.
+ */
+define('CAS_ROLES_DRUPAL_ROLES_ONLY', 0);
+
+/**
+ * Create roles which don't exits in Drupal,
+ * remove user roles not present in CAS.
+ */
+define('CAS_ROLES_CREATE_NEW_ROLES', 1);
+
+/**
+ * Match roles with regular expressions.
+ */
+define('CAS_ROLES_MATCH_REGEX', 2);
+
+
+/**
+ * Implements hook_menu().
+ */
+function cas_roles_menu() {
+  $items = array();
+
+  $items['admin/config/people/cas/roles'] = array(
+    'title' => 'Roles',
+    'description' => 'Settings for CAS roles.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('cas_roles_admin_settings'),
+    'access arguments' => array('administer cas'),
+    'file' => 'cas_roles.admin.inc',
+    'type' => MENU_LOCAL_TASK,
+    'weight' => -7,
+  );
+
+  return $items;
+}
+
+
+/**
+ * Implements hook_cas_user_presave().
+ */
+function cas_roles_cas_user_presave(&$edit, $account) {
+  $sync_every_login = variable_get('cas_roles_sync_every_login');
+  $behavior = variable_get('cas_roles_behavior');
+  $relations = variable_get('cas_roles_relations', array('2' => NULL));
+
+  // We synchronize on the first login (always) & on future logins (if chosen).
+  if ($account->login && !$sync_every_login) {
+    // The user has logged in before and we are not set to always synchronize.
+    return;
+  }
+
+  $role_candidates = cas_roles_candidates($edit['cas_user']);
+
+  if ($behavior == CAS_ROLES_CREATE_NEW_ROLES) {
+    $new_roles = array_diff($role_candidates, user_roles());
+    // Create new roles.
+    foreach ($new_roles as $new) {
+      $role = (object) array('name' => $new);
+      user_role_save($role);
+    }
+  }
+
+  if ($behavior == CAS_ROLES_MATCH_REGEX) {
+    // Do regexp matching!
+    $custom_roles = cas_roles_cutsom_user_roles();
+    $new_user_roles = $edit['roles'];
+    foreach ($custom_roles as $rid => $role) {
+      if (array_key_exists($role, $relations) && $relations[$role]) {
+        $matches = preg_grep($relations[$role], $role_candidates);
+        if (!empty($matches)) {
+          $new_user_roles[$rid] = $role;
+        }
+        else {
+          unset($new_user_roles[$rid]);
+        }
+      }
+    }
+  }
+  else {
+    // Just assign the roles!
+    // Add the authenticated user role.
+    $new_user_roles = array_intersect(cas_roles_cutsom_user_roles(), $role_candidates);
+
+  }
+  $new_user_roles[DRUPAL_AUTHENTICATED_RID] = 'authenticated user';
+
+  // Set the (new) roles.
+  $edit['roles'] = $new_user_roles;
+}
+
+/**
+ * Implements hook_cas_user_alter().
+ */
+function cas_roles_cas_user_alter(&$cas_user) {
+  $behavior = variable_get('cas_roles_behavior');
+  $require_a_role_create = variable_get('cas_roles_require_a_role_create', FALSE);
+  $require_a_role_login = variable_get('cas_roles_require_a_role_login', FALSE);
+  $relations = variable_get('cas_roles_relations', array('2' => NULL));
+
+  if ($behavior == CAS_ROLES_MATCH_REGEX) {
+    $role_candidates = cas_roles_candidates($cas_user);
+    $one_matches = FALSE;
+    // Check if one of the candidate roles matches a regular expression.
+    foreach (user_roles(TRUE) as $role) {
+      if (array_key_exists($role, $relations) && $relations[$role]) {
+        $matches = preg_grep($relations[$role], $role_candidates);
+        if (!empty($matches)) {
+          $one_matches = TRUE;
+          break;
+        }
+      }
+    }
+    if ($require_a_role_create && !$one_matches) {
+      $cas_user['register'] = FALSE;
+      // drupal_set_message(t('You can not log in on this site.'), 'error');
+    }
+    if ($require_a_role_login && !$one_matches) {
+      $cas_user['login'] = FALSE;
+      // drupal_set_message(t('You can not log in on this site.'), 'error');
+    }
+  }
+}
+
+/**
+ * Translate attributes to role candidates.
+ */
+function cas_roles_candidates($cas_user) {
+  $role_candidates = &drupal_static(__FUNCTION__);
+  if (!isset($role_candidates)) {
+    $roles = variable_get('cas_roles_roles');
+
+    // The users CAS attributes from the CAS module.
+    if (!isset($cas_user['attributes'])) {
+      return array();
+    }
+    $cas_attributes = $cas_user['attributes'];
+
+    // Get the name of the attributes.
+    $tokens = token_scan($roles);
+
+    // There is no cas token, hence no matching.
+    if (!is_array($tokens) || !array_key_exists('cas', $tokens)) {
+      return array();
+    }
+
+    $tokens = token_find_with_prefix($tokens['cas'], 'attribute');
+
+    // An Array with the relevant CAS attribute arrays.
+    $arr = array();
+    foreach ($tokens as $name => $original) {
+      // Custom token treatment to use the specified sub element or array
+      // ignore the case of the keys.
+      $chain = explode(':', strtolower($name));
+      $branch = array_change_key_case($cas_attributes);
+      $found = TRUE;
+      foreach ($chain as $link) {
+        if (isset($branch[$link])) {
+          if (is_array($branch[$link])) {
+            // Change the keys of the branch if it is an array.
+            $branch[$link] = array_change_key_case($branch[$link]);
+          }
+          $branch = $branch[$link];
+        }
+        else {
+          $found = FALSE;
+        }
+      }
+      if ($found) {
+        $arr[$original] = $branch;
+      }
+    }
+
+    // Assemble the patterns.
+    // at the end of this step $role_candidates will be the exploded attributes.
+    $role_candidates = array($roles);
+    foreach ($arr as $token => $elements) {
+      $new_candidates = array();
+      foreach ($role_candidates as $pattern) {
+        $new_pattern = array();
+        _cas_roles_recursive_str_replace($new_pattern, $token, $elements, $pattern);
+        $new_candidates = array_merge($new_candidates, $new_pattern);
+      }
+      $role_candidates = $new_candidates;
+    }
+
+    // Replace all the tokens including the cas tokens if cas_attributes exists.
+    if (module_exists('cas_attributes')) {
+      $data = array('cas' => $cas_user['name']);
+    }
+    else {
+      $data = array();
+    }
+    foreach ($role_candidates as $key => $pattern) {
+      $pattern = trim(token_replace($pattern, $data, array('clear' => TRUE)));
+      $role_candidates[$key] = html_entity_decode($pattern);
+    }
+    $role_candidates = array_unique($role_candidates);
+  }
+  return $role_candidates;
+}
+
+/**
+ * Implements hook_user_role_presave().
+ */
+function cas_roles_user_role_presave($role) {
+  // We have to use presave her because later the role ID is not known any more
+  // because we don't know the old name otherwise,
+  // this might potentially be a problem if another hook changes the name.
+  $relations = variable_get('cas_roles_relations', array());
+  $all_roles = user_roles(TRUE);
+
+  // Set the new key and delete the old one.
+  if (isset($role->rid)) {
+    if (isset($all_roles[$role->rid]) && isset($relations[$all_roles[$role->rid]])) {
+      // Only change if the name changed.
+      if ($role->name != $all_roles[$role->rid]) {
+        $relations[$role->name] = $relations[$all_roles[$role->rid]];
+        unset($relations[$all_roles[$role->rid]]);
+      }
+    }
+  }
+  variable_set('cas_roles_relations', $relations);
+}
+
+/**
+ * Validate the regular expression field.
+ */
+function _cas_roles_preg_validate($element, &$form_state, $form) {
+  if (!empty($element['#value']) && @preg_match($element['#value'], "CAS") === FALSE) {
+    form_error($element, t('This field is not a valid preg pattern.'));
+  }
+}
+
+/**
+ * Function to remove the authenticated user role.
+ */
+function cas_roles_cutsom_user_roles($permission = NULL) {
+  return array_diff_key(
+    user_roles(TRUE, $permission),
+    array(DRUPAL_AUTHENTICATED_RID => 'authenticated user')
+  );
+}
+
+
+/**
+ * Recursive function to cater for nested arrays.
+ */
+function _cas_roles_recursive_str_replace(&$pattern_array, $token, $elements, $pattern) {
+  if (!is_array($elements)) {
+    $pattern_array[] = str_replace($token, $elements, $pattern);
+  }
+  else {
+    foreach ($elements as $element) {
+      _cas_roles_recursive_str_replace($pattern_array, $token, $element, $pattern);
+    }
+  }
+}

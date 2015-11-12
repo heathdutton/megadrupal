@@ -1,0 +1,426 @@
+<?php
+/**
+ * @file
+ * Hook implementations and main functions for the uc_conditional_attributes module.
+ */
+
+/**
+ * Implements hook_menu().
+ */
+function uc_conditional_attributes_menu() {
+  $items['admin/store/settings/uc_conditional_attributes'] = array(
+    'title' => 'Conditional Attributes',
+    'page callback' => 'uc_conditional_attributes_definitions',
+    'access arguments' => array('administer uc_conditional_attributes'),
+    'type' => MENU_NORMAL_ITEM,
+  'description' => 'Configure dependency relationships between options and attributes.',
+    'file' => 'uc_conditional_attributes.admin.inc',
+  );
+  $items['admin/store/settings/uc_conditional_attributes/definitions'] = array(
+    'title' => 'Conditional Attribute Definitions',
+    'page callback' => 'uc_conditional_attributes_definitions',
+    'access arguments' => array('administer uc_conditional_attributes'),
+    'type' => MENU_DEFAULT_LOCAL_TASK,
+    'file' => 'uc_conditional_attributes.admin.inc',
+    'weight' => -11,
+  );
+  $items['admin/store/settings/uc_conditional_attributes/add/definitions'] = array(
+    'title' => 'Add Definitions',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('uc_conditional_attributes_admin_general_form'),
+    'access arguments' => array('administer uc_conditional_attributes'),
+    'type' => MENU_LOCAL_TASK,
+    'file' => 'uc_conditional_attributes.admin.inc',
+    'weight' => -10,
+  );
+  $items['admin/store/settings/uc_conditional_attributes/definitions/delete'] = array(
+    'title' => 'Delete Definition',
+    'page callback' => 'uc_conditional_attributes_delete_definition',
+    'access arguments' => array('administer uc_conditional_attributes'),
+    'type' => MENU_CALLBACK,
+    'file' => 'uc_conditional_attributes.admin.inc',
+  );
+  return $items;
+}
+
+/**
+ * Implements hook_permission().
+ */
+function uc_conditional_attributes_permission() {
+  return array(
+    'administer uc_conditional_attributes' => array(
+      'title' => t('Administer conditional attributes'),
+      'description' => t('Allows users to configure the conditional attribute dependency structure.'),
+    ),
+  );
+}
+
+/**
+ * Support for uc_node_checkout.
+ */
+function _uc_conditional_attributes_get_node_type(&$form) {
+  // Default to FALSE.
+  $nodetype = FALSE;
+
+  if (isset($form['node'])) {
+    // Regular product page
+    $nodetype = $form['node']['#value']->type;
+  }
+  elseif (module_exists('uc_node_checkout') && isset($form['type'])) {
+    // We are editing or adding a uc_node_checkout node
+    $map = uc_node_checkout_product_map($form['type']['#value']);
+    if (isset($map['nid'])) {
+      $node = node_load($map['nid']);
+      $nodetype = $node->type;
+    }
+  }
+  return $nodetype;
+}
+
+/**
+ * Generates an array describing the attribute dependencies given the node type
+ * and an array of attributes IDs. The array is in the form of
+ * $deps['parent_aid']['parent_oid']['dependent_aid']['type'], where 'type' is
+ * one of 'enabled' or 'disabled'.
+ *
+ * TODO: Implement caching so we don't hit the DB so much.
+ */
+function _uc_conditional_attributes_get_dependencies($nodetype) {
+  static $dependency_array = array();
+  if (isset($dependency_array[$nodetype])) {
+    return $dependency_array[$nodetype];
+  }
+  $dependency_array[$nodetype] = array();
+  $pcid = ($nodetype == "product") ? "0" : $nodetype;
+
+  $js_array = array();
+  $dependent_attr_sql = "SELECT aid, oid, dependent_aid, type FROM {uc_conditional_attributes} WHERE pcid = :pcid";
+  $dependent_attr_sql_res = db_query($dependent_attr_sql, array(':pcid' => $pcid))->fetchAll();
+  foreach ($dependent_attr_sql_res as $dependent_attr) {
+    $dependency_array[$nodetype][$dependent_attr->aid][$dependent_attr->oid][$dependent_attr->dependent_aid] = $dependent_attr->type;
+  }
+  return $dependency_array[$nodetype];
+}
+
+/**
+ * Implements hook_uc_form_alter().
+ */
+function uc_conditional_attributes_uc_form_alter(&$form, $form_state, $form_id) {
+  if (strpos($form_id, 'add_to_cart_form')) {
+    // Performs alterations even if not called directly from drupal_get_form()
+    _uc_conditional_attributes_alter_form($form, $form_state, $form_id);
+    // We must re-add the original callback, because this is an alter hook that
+    // triggers prior to drupal_get_form() - setting anything in #validate
+    // prevents the default from being added.
+    $form['#validate'][] = 'uc_product_add_to_cart_form_validate';
+    $form['#validate'][] = 'uc_conditional_attributes_add_to_cart_form_validate';
+  }
+}
+
+/**
+ * Implements hook_module_implements_alter().
+ */
+function uc_conditional_attributes_module_implements_alter(&$implementations, $hook) {
+  if ($hook == 'uc_form_alter') {
+    // Make sure we come after uc_attributes
+    $group = $implementations['uc_conditional_attributes'];
+    unset($implementations['uc_conditional_attributes']);
+    $implementations['uc_conditional_attributes'] = $group;
+  }
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function uc_conditional_attributes_form_alter(&$form, $form_state, $form_id) {
+  if (module_exists('uc_node_checkout') && drupal_substr($form_id, -10) === '_node_form') {
+    _uc_conditional_attributes_alter_form($form, $form_state, $form_id);
+    $form['#validate'][] = 'uc_conditional_attributes_add_to_cart_form_validate';
+  }
+  elseif ($form_id == 'uc_conditional_attributes_admin_general_form') {
+    /*
+     * this is to rebuild the parent attribute options when form is submitted.
+     */
+    $product_classes = uc_conditional_attributes_get_product_classes();
+    if (!empty($form_state['post'])) {
+      foreach ($product_classes as $pcid => $name) {
+        $form[$pcid]['parent_attr_options_' . $pcid]['#options'] = uc_conditional_attributes_get_attribute_options($form_state['post']['parent_attr_' . $pcid]);
+      }
+    }
+  }
+}
+
+function _uc_conditional_attributes_alter_form(&$form, $form_state, $form_id) {
+  static $types_added = array();
+
+  if ($form['attributes']) {
+    $nodetype = _uc_conditional_attributes_get_node_type($form);
+    $attributes = element_children($form['attributes']);
+    if (!isset($types_added[$nodetype])) {
+      // Only attach JS if we have not already sent it to page - see https://www.drupal.org/node/1911578
+      // #attached has a weird behavior were if multiple forms on the same page
+      // use it, then we get the duplicate array bug. If it's embedded from an
+      // AJAX form however, then it looks like it extends the existing array
+      // overwriting existing values or adding where there were none prior.
+      $types_added[$nodetype] = TRUE;
+      $to_add = array($nodetype => _uc_conditional_attributes_get_dependencies($nodetype, $attributes));
+      $form['#attached']['css'][] = drupal_get_path('module', 'uc_conditional_attributes') . '/uc_conditional_attributes.css';
+      $form['#attached']['js'][] = drupal_get_path('module', 'uc_conditional_attributes') . '/uc_conditional_attributes.js';
+      $form['#attached']['js'][] = array(
+        'data' => array('uc_conditional_attributes' => $to_add),
+        'type' => 'setting',
+      );
+    }
+    $form['uc_conditional_attributes_type'] = array(
+      '#type' => 'hidden',
+      '#value' => $nodetype,
+      '#attributes' => array('class' => 'uc_conditional_attributes_flag'),
+    );
+
+    foreach ($form['attributes'] as $aid => $attr) {
+      if (element_property($aid)) {
+        continue;
+      }
+
+      $form['attributes'][$aid]['#attributes']['class'][] = 'uc-conditional-attributes-aid-' . $aid;
+
+      if (uc_conditional_attributes_is_parent_attribute($aid, $nodetype, $attributes) && $attr['#type'] == 'select') {
+        // Removing disabled dependent attributes needs this.
+        $form['attributes'][$aid]['#attributes']['class'][] = 'uc-conditional-attributes-parent-attr';
+      }
+      if (uc_conditional_attributes_is_dependent_attribute($aid, $nodetype, $attributes)) {
+        if (isset($form['attributes'][$aid]['#attributes']) && is_array($form['attributes'][$aid]['#attributes'])) {
+          if (in_array('uc-conditional-attributes-parent-attr', $form['attributes'][$aid]['#attributes']['class'])) {
+            $form['attributes'][$aid]['#attributes']['class'][] = 'uc-conditional-attributes-parent-dependent-attr';
+            $form['attributes'][$aid]['#attributes']['class'][] = 'uc-conditional-attributes-dependent-attr';
+          }
+          else {
+            $form['attributes'][$aid]['#attributes']['class'][] = 'uc-conditional-attributes-dependent-attr';
+          }
+        }
+        else {
+          $form['attributes'][$aid]['#attributes']['class'][] = 'uc-conditional-attributes-dependent-attr';
+        }
+
+        //in order to handle required dependent attributes, we will need to assign them default values
+        if ($form['attributes'][$aid]['#required'] && !$form['attributes'][$aid]['#default_value']) {
+          $form['attributes'][$aid]['#required'] = FALSE;
+          $form['attributes'][$aid]['#title'] .= ' <span class="form-required">*</span>';
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Additional card validate callback for Ubercart to use when when uc_conditional_attributes is in
+ * use.
+ */
+function uc_conditional_attributes_add_to_cart_form_validate($form, &$form_state) {
+  if (count($form_state['values']['attributes'])) {
+    $pcid = ($form_state['values']['node']->type == 'product') ? '0' : $form_state['values']['node']->type;
+    $sql = "SELECT uc.aid, uc.oid, uc.dependent_aid, required
+            FROM {uc_conditional_attributes} uc
+            INNER JOIN {uc_attributes} ua ON ua.aid = uc.dependent_aid
+            WHERE uc.pcid = :pcid";
+    $result = db_query($sql, array(':pcid' => $pcid))->fetchAll();
+    $uc_ca_def = array();
+    foreach ($result as $rec) {
+      // check if the attributes is required globaly or set required only for the current product.
+      if ($rec->required || $form_state['values']['node']->attributes[$rec->dependent_aid]->required) {
+        $uc_ca_def[$rec->dependent_aid]['aid'] = $rec->aid;
+        $uc_ca_def[$rec->dependent_aid]['oid'][] = $rec->oid;
+      }
+    }
+    foreach ($uc_ca_def as $dependent_aid => $parent_attr) {
+      if (!$form_state['values']['attributes'][$dependent_aid]) {
+        $selected_option = $form_state['values']['attributes'][$parent_attr['aid']];
+        $dependent_attr = uc_conditional_attributes_get_attribute($dependent_aid);
+        if ($dependency_type = db_query("SELECT type FROM {uc_conditional_attributes} WHERE aid = :aid AND oid = :oid AND dependent_aid = :aid AND pcid = :pcid", array(':aid' => $parent_attr['aid'], ':oid' => $selected_option, ':dependent_aid' => $dependent_aid, ':pcid' => $pcid))->fetchField()) {
+          if ($dependency_type == 'enable') {
+            form_error($form['attributes'][$dependent_aid], $dependent_attr->label . t(' field is required.'));
+          }
+        }
+        else {
+          $extra_attr_sql = "SELECT oid, dependent_aid, type FROM {uc_conditional_attributes} WHERE aid = :aid AND oid <> :oid AND pcid = :pcid";
+          $extra_attr_sql_result = db_query($extra_attr_sql, array(':aid' => $parent_attr['aid'], ':oid' => $selected_option, ':pcid' => $pcid))->fetchAll();
+          $extra_attr_arr = array();
+          foreach ($extra_attr_sql_result as $rec) {
+            $extra_attr_arr[$rec->dependent_aid][] = $rec->type;
+          }
+          if (!count($extra_attr_arr)) {
+            //if no dependency defined
+            form_error($form['attributes'][$dependent_aid], $dependent_attr->label . t(' field is required.'));
+          }
+          else {
+            $enabled = FALSE;
+            $disabled = FALSE;
+            foreach ($extra_attr_arr[$dependent_aid] as $dependency_type) {
+              if ($dependency_type == 'enable') {
+                $enabled = TRUE;
+              }
+              if ($dependency_type == 'disable') {
+                $disabled = TRUE;
+              }
+            }
+            if (!$enabled && $disabled) {
+              form_error($form['attributes'][$dependent_aid], $dependent_attr->label . t(' field is required.'));
+            }
+          }
+        }
+      }
+    }
+    // Prevent hidden attributes from being shown in the cart item summary.
+    $nodetype = _uc_conditional_attributes_get_node_type($form);
+    uc_conditional_attributes_remove_hidden_attributes($nodetype, $form_state['values']['attributes']);
+  }
+}
+
+/**
+ * Remove hidden attributes from the array passed in $remove_from_me so that
+ * they do not appear in the cart and do not get priced. This prevents the case
+ * where a hidden attribute has a default option with a price adjustment, so a
+ * product would cost more without the option being selected. $attributes must
+ * be an *associative array* with format array(aid => selected_oid)!
+ */
+function uc_conditional_attributes_remove_hidden_attributes($nodetype, &$remove_from_me) {
+  // Get the list of dependencies we will use to determine which attributes to unset.
+  $dependency_array = _uc_conditional_attributes_get_dependencies($nodetype, element_children($remove_from_me));
+  // Make a copy so that we don't remove an index (attribute ID) that we need to
+  // verify the corresponding value (option ID) for below.
+  $attributes = $remove_from_me;
+  // Keep track of which attributes we think should be unset inside this array
+  $tracker = array();
+  foreach ($dependency_array as $aid => $required_oids) {
+    // Make the default assumptions based on relationship type
+    foreach ($required_oids as $required_oid => $dependent_aids) {
+      foreach ($dependent_aids as $dependent_aid => $dependency_type) {
+        if ($dependency_type == 'enable') {
+          $tracker[$dependent_aid] = FALSE;
+        }
+        else if ($dependency_type == 'disable') {
+          $tracker[$dependent_aid] = TRUE;
+        }
+      }
+    }
+    // Show ones we should be showing because of user selection
+    $selected_option = $attributes[$aid];
+    if (isset($required_oids[$selected_option])) {
+      foreach ($required_oids[$selected_option] as $dependent_aid => $dependency_type) {
+        if ($dependency_type == 'enable') {
+          $tracker[$dependent_aid] = TRUE;
+        }
+        elseif ($dependency_type == 'disable') {
+          $tracker[$dependent_aid] = FALSE;
+        }
+      }
+    }
+  }
+  // Take action, unsetting any ones we shouldn't explicitly be showing based on
+  // user selections.
+  foreach ($tracker as $aid => $status) {
+    if (!$status) {
+      unset($remove_from_me[$aid]);
+      uc_conditional_attributes_remove_hidden_child_attributes($nodetype, $remove_from_me, $aid);
+    }
+  }
+}
+
+/**
+ * Helper function to remove any child attributes of a previosuly hidden parent
+ * attribute
+ *
+ * @see uc_conditional_attributes_remove_hidden_attributes().
+ */
+function uc_conditional_attributes_remove_hidden_child_attributes($nodetype, &$remove_from_me, $parent_aid) {
+  $dependency_array = _uc_conditional_attributes_get_dependencies($nodetype, element_children($remove_from_me));
+  if (!isset($dependency_array[$parent_aid])) {
+    return;
+  }
+  foreach ($dependency_array[$parent_aid] as $required_oid => $dependent_aids) {
+    foreach ($dependent_aids as $dependent_aid => $dependency_type) {
+      unset($remove_from_me[$dependent_aid]);
+      uc_conditional_attributes_remove_hidden_child_attributes($nodetype, $remove_from_me, $dependent_aid);
+    }
+  }
+}
+
+/**
+ * Verifies if a given attribute is a dependent attribute for a product class.
+ */
+function uc_conditional_attributes_is_dependent_attribute($aid, $pcid, $attribute_aids) {
+  if (!$aid) {
+    return FALSE;
+  }
+  $pcid = ($pcid == "product") ? '0' : $pcid;
+  return db_query("SELECT def_id FROM {uc_conditional_attributes} WHERE dependent_aid = :dependent_aid AND pcid = :pcid AND aid IN (:aids)", array(':dependent_aid' => $aid, ':pcid' => $pcid, ':aids' => $attribute_aids))->fetchField();
+}
+
+/**
+ * Verifies if a given attribute is a parent attribute for a product class.
+ */
+function uc_conditional_attributes_is_parent_attribute($aid, $pcid, $attribute_aids) {
+  if (!$aid) {
+    return FALSE;
+  }
+  $pcid = ($pcid == "product") ? '0' : $pcid;
+  return db_query("SELECT def_id FROM {uc_conditional_attributes} WHERE aid = :aid AND pcid = :pcid AND dependent_aid IN (:dependent_aids)", array(':aid' => $aid, ':pcid' => $pcid, ':dependent_aids' => $attribute_aids))->fetchField();
+}
+
+/**
+ * Gets an array of all product class IDs mapped to their names.
+ */
+function uc_conditional_attributes_get_product_classes() {
+  $product_classes = array('product');
+  $result = db_query("SELECT pcid, name, description FROM {uc_product_classes}");
+  foreach ($result as $product_class) {
+    $product_classes[$product_class->pcid] = $product_class->name;
+  }
+  return $product_classes;
+}
+
+/**
+ * Returns an array of attributes defined through Ubercart attributes module
+ */
+function uc_conditional_attributes_get_parent_attributes() {
+  //fetch only select box control attributes
+  $result = db_query("SELECT aid, name FROM {uc_attributes} WHERE display = :display", array(':display' => 1))->fetchAll();
+  $attributes = array();
+  foreach ($result as $rec) {
+    $attributes[$rec->aid] = $rec->name;
+  }
+  return $attributes;
+}
+
+/**
+ * Returns an array of attribute IDs mapped to their labels.
+ */
+function uc_conditional_attributes_get_all_attributes() {
+  //fetch only select box control attributes
+  $result = db_query("SELECT aid, name FROM {uc_attributes}")->fetchAll();
+  $attributes = array();
+  foreach ($result as $rec) {
+    $attributes[$rec->aid] = $rec->name;
+  }
+  return $attributes;
+}
+
+/**
+ * Gets an array of option IDs mapped to their names for a given attribute.
+ * @see http://drupal.org/node/1354
+ */
+function uc_conditional_attributes_get_attribute_options($aid) {
+  $result = db_query("SELECT oid, name FROM {uc_attribute_options} WHERE aid = :aid", array(':aid' => $aid))->fetchAll();
+  $options = array();
+  foreach ($result as $rec) {
+    $options[$rec->oid] = $rec->name;
+  }
+  return $options;
+}
+
+/**
+ * Gets information about a particular attribute.
+ */
+function uc_conditional_attributes_get_attribute($aid) {
+  return db_query("SELECT * FROM {uc_attributes} WHERE aid = :aid", array(':aid' => $aid))->fetch();
+}

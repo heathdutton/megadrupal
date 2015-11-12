@@ -1,0 +1,501 @@
+<?php
+
+/**
+ * @file
+ * The previous next module indexes the previous and next nodes based upon
+ * user-selectable criteria and stores this index in the database for faster
+ * retrieval later.
+ */
+
+define('PREV_NEXT_BATCH_SIZE_DEFAULT', 200);
+define('PREV_NEXT_INDEXING_CRITERIA_DEFAULT', 'nid');
+define('PREV_NEXT_NODE_TYPE', 'prev_next_node_type_');
+define('PREV_NEXT_NUM_BLOCKS_DEFAULT', 1);
+define('PREV_NEXT_DISPLAY_DEFAULT', 1);
+define('PREV_NEXT_DISPLAY_TEXT_PREV_DEFAULT', '«[node:title]');
+define('PREV_NEXT_DISPLAY_TEXT_NEXT_DEFAULT', '[node:title]»');
+
+module_load_include('inc', 'prev_next', 'prev_next.block');
+
+/**
+ * Implements hook_menu().
+ */
+function prev_next_menu() {
+  $items['admin/config/system/prev_next'] = array(
+    'title' => 'Prev/Next',
+    'description' => 'Prev/Next API for nodes',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('prev_next_admin'),
+    'access arguments' => array('administer prev_next'),
+    'file' => 'prev_next.admin.inc',
+    'file path' => drupal_get_path('module', 'prev_next'),
+  );
+
+  $items['admin/config/system/prev_next/re-index'] = array(
+    //'type' => MENU_CALLBACK,
+    'title' => 'Prev/Next reset',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('prev_next_reindex_confirm'),
+    'access arguments' => array('administer prev_next'),
+    'file' => 'prev_next.admin.inc',
+    'file path' => drupal_get_path('module', 'prev_next'),
+  );
+
+  return $items;
+}
+
+/**
+ * Module function to initiate a reindexing of nodes.
+ */
+function prev_next_reindex() {
+  // Wipe the table clean
+  db_query('TRUNCATE {prev_next_node}');
+  // Get the highest nid
+  $max_nid = db_query('SELECT MAX(nid) FROM {node}')->fetchField();
+  // Set the variable to that
+  variable_set('prev_next_index_nid', $max_nid);
+  if ($max_nid) {
+    drupal_set_message(t('Prev/Next will index from node %nid downward.', array('%nid' => $max_nid)));
+  }
+}
+
+/**
+ * Implements hook_cron().
+ */
+function prev_next_cron() {
+  $max_nid = variable_get('prev_next_index_nid', 0);
+  if ($max_nid) {
+    $batch_size = variable_get('prev_next_batch_size', PREV_NEXT_BATCH_SIZE_DEFAULT);
+    $last_nid = FALSE;
+    $cond = _prev_next_node_types_sql();
+
+    timer_start('prev_next_cron');
+    $result = db_query_range("SELECT nid FROM {node} WHERE nid <= :nid AND status = 1 $cond ORDER BY nid DESC", 0, $batch_size, array(':nid' => $max_nid));
+    $count = 0;
+
+    foreach ($result as $row) {
+      // Remove existing data for this node.
+      db_delete('prev_next_node')
+        ->condition('nid', $row->nid)
+        ->execute();
+      //_prev_next_modify_pointing_nodes($row->nid);
+      _prev_next_add($row->nid);
+      // Update nodes that might point to this one.
+      
+      // Note that we have indexed at least one node.
+      $last_nid = $row->nid;
+      $count++;
+    }
+
+    $time = timer_read('prev_next_cron');
+
+    if ($last_nid !== FALSE) {
+      // Prepare a starting point for the next run.
+      variable_set('prev_next_index_nid', $last_nid - 1);
+    }
+    else {
+      // If all nodes have been indexed, set to zero to skip future cron runs.
+      variable_set('prev_next_index_nid', 0);
+    }
+    if ($count) watchdog('prev_next', 'Indexed %count nodes in %time milliseconds.', array('%count' => $count, '%time' => $time));
+
+    $total = db_query("SELECT COUNT(nid) FROM {node} WHERE status = 1 $cond")->fetchField();
+    $completed = db_query("SELECT COUNT(nid) FROM {prev_next_node}")->fetchField();
+    $remaining = max(0, $total - $completed);
+    drupal_set_message(t('Indexed %count nodes for the Prev/Next index. There are %remaining items left to index.', array(
+      '%count' => $count,
+      '%remaining' => $remaining,
+    )));
+
+  }
+}
+
+/**
+ * Create or update the prev_next records.
+ * @param string $nid
+ *   The current node id.
+ */
+function _prev_next_add($nid) {
+  $node_type = db_query_range("SELECT type
+                               FROM {node}
+                               WHERE nid = :nid", 0, 1,
+                               array(':nid' => $nid))->fetchField();
+  $search_criteria = variable_get(PREV_NEXT_NODE_TYPE . $node_type . '_indexing_criteria', PREV_NEXT_INDEXING_CRITERIA_DEFAULT);
+  $join = _prev_next_category_sql($node_type);
+  if (strlen($join) > 0) {
+    // search category for current node
+    $category = variable_get(PREV_NEXT_NODE_TYPE . $node_type . '_category_criteria', 'none');
+    $category_id = db_query("SELECT " . $category . "_tid FROM {field_data_" . $category . "} WHERE entity_id = :nid", array(
+      ':nid' => $nid
+    ))->fetchField();
+    if (empty($category_id)) {
+      $cond = '';
+    }
+    else {
+      $cond = " AND " . $category . "_tid = " . $category_id . " ";
+      $cond .= _prev_next_node_types_sql($node_type);
+    }
+  }
+  else {
+    $cond = _prev_next_node_types_sql($node_type);
+  }
+
+  if ($search_criteria != 'nid') {
+    $criteria_value = db_query_range("SELECT $search_criteria
+                                      FROM {node}
+                                      WHERE nid = :nid", 0, 1,
+                                      array(':nid' => $nid))->fetchField();
+    $next_nid = db_query_range("SELECT nid FROM {node}
+                                $join
+                                WHERE (($search_criteria = :value AND nid > :nid)
+                                OR $search_criteria > :value)
+                                AND status = 1
+                                $cond ORDER BY
+                                $search_criteria ASC,nid ASC", 0, 1,
+                                array(':value' => $criteria_value, ':nid' => $nid))->fetchField();
+    $prev_nid = db_query_range("SELECT nid FROM {node}
+                                $join
+                                WHERE (($search_criteria = :value
+                                AND nid < :nid)
+                                OR $search_criteria < :value)
+                                AND status = 1
+                                $cond
+                                ORDER BY $search_criteria DESC,nid DESC", 0, 1,
+                                array(':value' => $criteria_value, ':nid' => $nid))->fetchField();
+  }
+  else {
+    $next_nid = db_query_range("SELECT nid
+                                FROM {node}
+                                $join
+                                WHERE nid > :nid
+                                AND status = 1 $cond ORDER BY nid ASC", 0, 1,
+                                array(':nid' => $nid))->fetchField();
+    $prev_nid = db_query_range("SELECT nid
+                                FROM {node}
+                                $join
+                                WHERE nid < :nid
+                                AND status = 1
+                                $cond ORDER BY nid DESC", 0, 1,
+                                array(':nid' => $nid))->fetchField();
+  }
+  // Update the node-level data
+  $exists = (bool) db_query_range('SELECT 1
+                                   FROM {prev_next_node}
+                                   WHERE nid = :nid', 0, 1,
+                                   array(':nid' => $nid))->fetchField();
+  if (!empty($exists)) {
+    db_update('prev_next_node')
+      ->fields(array(
+        'prev_nid' => ($prev_nid) ? $prev_nid : 0,
+        'next_nid' => ($next_nid) ? $next_nid : 0,
+        'changed' => REQUEST_TIME,
+      ))
+      ->condition('nid', $nid)
+      ->execute();
+  }
+  else {
+    $id = db_insert('prev_next_node')
+      ->fields(array(
+        'prev_nid' => ($prev_nid) ? $prev_nid : 0,
+        'next_nid' => ($next_nid) ? $next_nid : 0,
+        'changed' => REQUEST_TIME,
+        'nid' => $nid,
+      ))
+      ->execute();
+  }
+
+  // Update the other nodes pointing to this node
+  foreach (node_type_get_types() as $type => $name) {
+    if (variable_get(PREV_NEXT_NODE_TYPE . $type, 0)) {
+      $search_criteria = variable_get(PREV_NEXT_NODE_TYPE . $type . '_indexing_criteria', PREV_NEXT_INDEXING_CRITERIA_DEFAULT);
+      $join = _prev_next_category_sql($node_type);
+      if (strlen($join) > 0) {
+        // search category for current node
+        $category = variable_get(PREV_NEXT_NODE_TYPE . $node_type . '_category_criteria', 'none');
+        $category_id = db_query("SELECT " . $category . "_tid FROM {field_data_" . $category . "} WHERE entity_id = :nid", array(
+          ':nid' => $nid
+        ))->fetchField();
+        if (empty($category_id)) {
+          $cond = '';
+          watchdog('prev_next', 'Node ' . $nid . ' missing taxonomy id for field_data_' . $category, WATCHDOG_ERROR);
+        }
+        else {
+          $cond = " AND " . $category . "_tid = " . $category_id . " ";
+          $cond .= _prev_next_node_types_sql($node_type);
+        }
+      }
+      else {
+        $cond = _prev_next_node_types_sql($node_type);
+      }
+
+      if ($search_criteria != 'nid') {
+
+        $criteria_value = db_query_range("SELECT $search_criteria
+                                          FROM {node}
+                                          WHERE nid = :nid", 0, 1,
+                                          array(':nid' => $nid))->fetchField();
+        $next_nid = db_query_range("SELECT nid
+                                    FROM {node}
+                                    $join
+                                    WHERE (($search_criteria = :value
+                                    AND nid > :nid)
+                                    OR $search_criteria > :value)
+                                    AND status = 1
+                                    $cond ORDER BY
+                                    $search_criteria ASC,nid ASC", 0, 1,
+                                    array(':value' => $criteria_value, ':nid' => $nid))->fetchField();
+        $prev_nid = db_query_range("SELECT nid
+                                    FROM {node}
+                                    $join
+                                    WHERE (($search_criteria = :value
+                                    AND nid < :nid)
+                                    OR $search_criteria < :value)
+                                    AND status = 1
+                                    $cond ORDER BY $search_criteria DESC,nid DESC", 0, 1,
+                                    array(':value' => $criteria_value, ':nid' => $nid))->fetchField();
+      }
+      else {
+        $prev_nid = db_query_range("SELECT nid
+                                    FROM {node}
+                                    $join
+                                    WHERE nid > :nid
+                                    AND status = 1
+                                    $cond
+                                    ORDER BY nid ASC", 0, 1,
+                                    array(':nid' => $nid))->fetchField();
+        $next_nid = db_query_range("SELECT nid
+                                    FROM {node}
+                                    $join
+                                    WHERE nid < :nid
+                                    AND status = 1
+                                    $cond
+                                    ORDER BY nid DESC", 0, 1,
+                                    array(':nid' => $nid))->fetchField();
+        }
+      }
+      if ($next_nid) {
+        db_update('prev_next_node')
+          ->fields(array(
+            'next_nid' => ($next_nid) ? $next_nid : 0,
+          ))
+          ->condition('nid', $nid)
+          ->execute();
+      }
+      if ($prev_nid) {
+        db_update('prev_next_node')
+          ->fields(array(
+            'next_nid' => ($nid) ? $nid : 0,
+          ))
+          ->condition('nid', $prev_nid)
+          ->execute();
+      }
+    }
+}
+
+/**
+ * Module function to update the prev_next records.
+ *
+ * @param string $nid
+ *   The node id of the current node.
+ */
+function _prev_next_modify($nid) {
+  // Find out if any other nodes point to this node and update them
+  _prev_next_modify_pointing_nodes($nid);
+  // Then update this one
+  _prev_next_add($nid);
+}
+
+/**
+ *  Module function to delete from the prev_next records.
+ *  @param string $nid
+ *    The node id of the current node.
+ */
+function _prev_next_remove($nid) {
+  // Delete the data for this node
+  db_delete('prev_next_node')
+    ->condition('nid', $nid)
+    ->execute();
+
+  // Find out if any other nodes point to this node and update them
+  _prev_next_modify_pointing_nodes($nid);
+}
+
+/**
+ * Updates other nodes pointing to a particular node.
+ *
+ * @param string $nid
+ *   The node id of the current node.
+ */
+function _prev_next_modify_pointing_nodes($nid) {
+  // First for previous
+  $prev = db_query("SELECT nid
+                    FROM {prev_next_node}
+                    WHERE prev_nid = :prev_nid",
+                    array(':prev_nid' => $nid))->fetchField();
+  if ($prev) _prev_next_add($prev);
+
+  // Then for next
+  $next = db_query("SELECT nid
+                    FROM {prev_next_node}
+                    WHERE next_nid = :next_nid",
+                    array(':next_nid' => $nid))->fetchField();
+  //if ($next) _prev_next_add($next);
+  if ($next) _prev_next_add($nid);
+}
+
+/**
+ * Implements hook_node_insert().
+ */
+function prev_next_node_insert($node) {
+  $types = _prev_next_node_types();
+  if (in_array($node->type, $types)) _prev_next_add($node->nid);
+}
+
+/**
+ * Implements hook_node_update().
+ */
+function prev_next_node_update($node) {
+  $types = _prev_next_node_types();
+  if (in_array($node->type, $types)) _prev_next_modify($node->nid);
+}
+
+/**
+ * Implements hook_node_delete().
+ */
+function prev_next_node_delete($node) {
+  //_prev_next_remove($node->nid);
+  $_SESSION['prev_next_remove_nids'][] = $node->nid;
+}
+
+/**
+ * Callable API function to get the next/prev nid of a given nid
+ * @param string $nid
+ *   The node id of the current node.
+ * @param string $op
+ *   The operation to perform. prev gets the previous node, next gets the next
+ *   node.
+ * @return string $nid
+ *   The node id of either the previous or next node of the current node.
+ */
+function prev_next_nid($nid, $op = 'next') {
+  foreach (module_implements('prev_next_nid') as $module) {
+    $function = $module . '_prev_next_nid';
+    $ret = $function($nid, $op);
+    if ($ret !== FALSE) {
+      // If the function returns FALSE, keep trying other methods
+      return $ret;
+    }
+  }
+  switch ($op) {
+    case 'prev':
+      return prev_next_nid_prev($nid);
+      break;
+    case 'next':
+      return prev_next_nid_next($nid);
+      break;
+    default:
+      return 0;
+  }
+}
+
+/**
+ * Module function to get the next node id of the current node.
+ * @param string $nid
+ *   The current node id.
+ * @return string
+ */
+function prev_next_nid_next($nid) {
+  return db_query("SELECT next_nid
+                   FROM {prev_next_node}
+                   WHERE nid = :nid",
+                   array(':nid' => $nid))->fetchField();
+}
+
+/**
+ * Module function to get the previous node id of the current node.
+ * @param string $nid
+ *   The current node id.
+ * @return string
+ */
+function prev_next_nid_prev($nid) {
+  return db_query("SELECT prev_nid
+                   FROM {prev_next_node}
+                   WHERE nid = :nid",
+                   array(':nid' => $nid))->fetchField();
+}
+
+/**
+ * Helper function to return an array of node types to index.
+ * @return array()
+ */
+function _prev_next_node_types() {
+  $types = array();
+  foreach (node_type_get_types() as $type => $name) {
+    if (variable_get(PREV_NEXT_NODE_TYPE . $type, 0)) {
+      $types[] = $type;
+    }
+  }
+  return $types;
+}
+
+/**
+ * Helper function to return a SQL clause for types to be indexed
+ * @param string $node_type
+ *   The indexing criteria for the type of node to query for.
+ * @return string
+ */
+function _prev_next_node_types_sql($node_type = '') {
+  $same_type = variable_get(PREV_NEXT_NODE_TYPE . $node_type . '_same_type', 0);
+  if (!$same_type) {
+    $types = _prev_next_node_types();
+    $quoted_types = array();
+    foreach (_prev_next_node_types() as $type) {
+      $quoted_types[] = "'" . $type . "'";
+    }
+    $cond = '';
+    if (count($types)) {
+      $cond  = ' AND type IN (' . implode(',', $quoted_types) . ')';
+    }
+  }
+  else {
+    $cond = " AND type = '" . $node_type . "'";
+  }
+  return $cond;
+}
+
+/**
+ * Helper function to return a SQL clause for categories to be indexed
+ * @param string $node_type
+ * @return string
+ */
+function _prev_next_category_sql($node_type = '') {
+  $cond = '';
+  $same_type = variable_get(PREV_NEXT_NODE_TYPE . $node_type . '_same_type', 0);
+  $category = variable_get(PREV_NEXT_NODE_TYPE . $node_type . '_category_criteria', 'none');
+  if (!$same_type || $category == 'none') {
+    return $cond;
+  }
+  $cond = " INNER JOIN {field_data_$category} ON nid = entity_id ";
+  return $cond;
+}
+
+/**
+ * Implements hook_init().
+ */
+function prev_next_init() {
+ if (!empty($_SESSION['prev_next_remove_nids'])) {
+   foreach ($_SESSION['prev_next_remove_nids'] as $nid) {
+     _prev_next_remove($nid);
+   }
+   unset($_SESSION['prev_next_remove_nids']);
+ }
+}
+
+function prev_next_permission() {
+  return array(
+    'administer prev_next' => array(
+      'title' => t('Administer the prev/next module for nodes, including re-indexing. This includes /admin/config/system/prev_next and admin/config/system/prev_next/re-index'),
+    ),
+  );
+
+}
