@@ -17,7 +17,7 @@ repoDir="$BASEDIR/docroot"
 tmpDir="$BASEDIR/tmp"
 
 datestamp() {
-  date +%Y-%m-%d
+  date "+%Y-%m-%d %H:%M"
 }
 
 make(){
@@ -28,42 +28,49 @@ make(){
   echo "Building make file"
   php build-make-files.php $version
 
-  echo "Running Drush Make process"
-  rm -rf "$tmpDir"
-  drush make "drupal-org-$version.make" "$tmpDir" --no-recursion --force-complete --concurrency 1 --prepare-install -y
+  if [[ -s "drupal-org-$version.make" ]]
+  then
+    echo "Running Drush Make process"
+    rm -rf "$tmpDir"
+    drush make "drupal-org-$version.make" "$tmpDir" --no-recursion --force-complete --concurrency 1 --prepare-install -y
 
-  # echo "Cloning if needed"
-  # rm -rf "$repoDir" >/dev/null 2>&1
-  # git clone $repo "$repoDir" >/dev/null 2>&1
+    # echo "Cloning if needed"
+    # rm -rf "$repoDir" >/dev/null 2>&1
+    # git clone $repo "$repoDir" >/dev/null 2>&1
 
-  # branch="$version.x"
-  # echo "Checking out branch: ${branch}"
-  # cd "$repoDir"
+    # branch="$version.x"
+    # echo "Checking out branch: ${branch}"
+    # cd "$repoDir"
 
-  # Use the following if this is a first time push
-  # git branch $branch >/dev/null 2>&1
-  # git checkout $branch
-  # git pull
+    # Use the following if this is a first time push
+    # git branch $branch >/dev/null 2>&1
+    # git checkout $branch
+    # git pull
 
-  echo "Cleaning out repo files to be replaced with those from make process"
-  rm -rf "$repoDir"
+    echo "Cleaning out repo files to be replaced with those from make process"
+    rm -rf "$repoDir"
 
-  echo "Moving make files into repo"
-  mv "$tmpDir" "$repoDir"
+    echo "Moving make files into repo"
+    mv "$tmpDir" "$repoDir"
 
-  echo "Copying make file into repo"
-  cp "$BASEDIR/drupal-org-$version.make" "$repoDir/drupal-org-$version.make"
+    echo "Copying make file into repo"
+    cp "$BASEDIR/drupal-org-$version.make" "$repoDir/drupal-org-$version.make"
 
-  echo "Committing all changes."
-  git add .
-  git commit --all --message="$(datestamp)"
+    if [[ -s "$repoDir/drupal-org-$version.make" ]]
+    then
+      date="$(datestamp)"
+      echo "Committing all changes: $date"
+      git add .
+      git commit --all --message="$date"
 
-  echo "Cleaning up Git."
-  git remote prune origin
-  git gc
+      echo "Cleaning up Git."
+      git remote prune origin
+      git gc
 
-  echo "Pushing changes."
-  git push origin master:master --force
+      echo "Pushing changes."
+      git push origin master:master --force
+    fi
+  fi
 }
 
 # make 6

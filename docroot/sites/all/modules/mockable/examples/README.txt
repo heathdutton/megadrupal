@@ -1,1 +1,0 @@
-The example folder contains simple modules for those of us who like to understand by example.

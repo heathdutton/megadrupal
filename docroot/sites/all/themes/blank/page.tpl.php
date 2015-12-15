@@ -1,1 +1,0 @@
-<div id="content-area"><?php print render($page['content']); ?></div>

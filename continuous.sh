@@ -3,6 +3,7 @@
 while :
 do
   bash make.sh
-	sleep 3h
+  echo "Waiting..."
+	sleep 21600
   echo "Looping..."
 done
