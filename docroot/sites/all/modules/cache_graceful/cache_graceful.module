@@ -1,0 +1,327 @@
+<?php
+/**
+ * @file
+ *
+ * Cache Graceful allows you to update cache in the background, without having to wait for it.
+ *
+ * To cache e.g. a node for 20 seconds, you would usually do something like this:
+ *
+ * @code
+ * $nid = 1;
+ * $key = 'cache_node:' . $nid;
+ * if ($cache = cache_get($key)) {
+ *   $node = $cache->data;
+ * }
+ * else {
+ *   $node = node_load($nid);
+ *   cache_set($key, $node, 'cache', time() + 20);
+ * }
+ * @endcode
+ *
+ * Cache Graceful allows you to update the cache in background, before it expires, in this example 10 seconds before.
+ *
+ * @code
+ * $nid = 1;
+ * $key = 'cache_node:' . $nid;
+ * $node = cache_graceful($key, array('node_load', $nid), 'cache', 20, 10);
+ * @endcode
+ *
+ * Cache Graceful can also handle thundering herds, and will wait for the cache
+ * to be updated if an update is currently in progress.
+ * The time to wait for the cache is configurable via settings.
+ *
+ * @todo Add service group support.
+ */
+
+include_once 'cache_graceful.defines.inc';
+
+/**
+ * Implements hook_menu().
+ */
+function cache_graceful_menu() {
+  $items = array();
+  $items['admin/config/system/cache_graceful'] = array(
+    'title' => 'Cache Graceful',
+    'description' => 'Cache Graceful settings.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('cache_graceful_settings_form'),
+    'access arguments' => array('administer site configuration'),
+    'file' => 'cache_graceful.admin.inc',
+  );
+  return $items;
+}
+
+/**
+ * Implements hook_views_plugins().
+ */
+function cache_graceful_views_plugins() {
+  $plugins = array(
+    'cache' => array(
+      'graceful' => array(
+        'title' => t('Graceful'),
+        'help' => t('Updates cache in background through prefetch if possible.'),
+        'handler' => 'cache_graceful_views_plugin_cache_graceful',
+        'uses options' => TRUE,
+        'help topic' => 'cache-graceful',
+      ),
+    ),
+  );
+  return $plugins;
+}
+
+/**
+ * Implementation of hook_ctools_plugin_directory().
+ */
+function cache_graceful_ctools_plugin_directory($module, $plugin) {
+  // Safety: go away if CTools is not at an appropriate version.
+  if (!module_invoke('ctools', 'api_version', '1.7.2')) {
+    return;
+  }
+
+  // We don't support the 'ctools' 'cache' plugin and pretending to causes
+  // errors when they're in use.
+  if ($module == 'ctools' && $plugin == 'cache') {
+    return;
+    // if we did we'd make a plugin/ctools_cache or something.
+  }
+
+  if ($module == 'page_manager' || $module == 'panels' || $module == 'ctools') {
+    return 'plugins/' . $plugin;
+  }
+}
+
+function cache_graceful_options($callback = NULL, $options = NULL) {
+  static $callback_options = array();
+  if (isset($options)) {
+    $callback_options[$callback] = $options;
+  }
+  return $callback ? $callback_options[$callback] : $callback_options;
+}
+
+/**
+ * Call a user function through the cache graceul system.
+ * Will always return the result from the user function, either cached or uncached.
+ *
+ * @param $cid
+ *   Cache ID.
+ * @param $args
+ *   Array of arguments, the first element being the function name.
+ * @param $table
+ *   The cache table to use.
+ * @param $expire
+ *   Expiration time in seconds.
+ * @param $prefetch
+ *   Time in seconds before begin prefetch should be performed.
+ * @param $options
+ *   wait_for_cache: Wait for cache, if we tried to get a lock, but couldn't. (time in seconds)
+ *   ensure_result: If cache or lock could not be obtained, run the function anyway. (default: true)
+ * @return mixed
+ *
+ * @see cache_get()
+ */
+function cache_graceful($key, $args, $table = 'cache', $expire = NULL, $prefetch = NULL, $options = array()) {
+  $options += array(
+    'wait_for_cache' => variable_get('cache_graceful_wait_for_cache', CACHE_GRACEFUL_WAIT_FOR_CACHE),
+    'ensure_result' => TRUE,
+  );
+
+  if (empty($expire) && (string)$expire !== '0') {
+    $expire = variable_get('cache_graceful_expire', CACHE_GRACEFUL_EXPIRE);
+  }
+  if (empty($prefetch) && (string)$prefetch !== '0') {
+    $prefetch = variable_get('cache_graceful_prefetch', CACHE_GRACEFUL_PREFETCH);
+  }
+
+  $callback = reset($args);
+  if (!is_callable($callback)) {
+    throw new Exception(print_r($callback, TRUE) . ' is not callable');
+  }
+
+  $update = FALSE;
+  $time = time();
+  // Get cache
+  if (($cache = cache_get($key, $table)) && $cache->expire >= $time) {
+    // watchdog('cache_graceful', 'Cache hit (' . $cache->data['expire'] . ') (' . $time . ')', array(), WATCHDOG_DEBUG);
+    if ($cache->data['expire'] < $time && lock_may_be_available($key)) {
+      // Soft expire, prefetch
+      // watchdog('cache_graceful', 'Prefetching', array(), WATCHDOG_DEBUG);
+      $update = TRUE;
+    }
+    // We got the cache, return it
+    $result = $cache->data['data'];
+  }
+  else {
+    // No cache, fetch results and store in cache
+    // watchdog('cache_graceful', 'Cache miss', array(), WATCHDOG_DEBUG);
+    if (!empty($options['ensure_result'])) {
+      $result = cache_graceful_execute($key, $args, $table, $expire, $prefetch, $options);
+    }
+    else {
+      $update = TRUE;
+      $result = NULL;
+    }
+  }
+
+  if ($update) {
+    // Always ensure result, and don't wait for cache when running in the background
+    $options = array(
+      'wait_for_cache' => -1,
+      'ensure_result' => TRUE,
+      'cache' => $cache,
+    );
+    // Create handle for background process and start
+    // @todo Is there a reason the handle is limited to 255 in the background process module?
+    $handle = "cache_graceful:$key";
+    $handle = strlen($handle) > 255 ? md5($handle) : $handle;
+    if (variable_get('cache_graceful_queue', CACHE_GRACEFUL_QUEUE)) {
+      background_process_queue_locked($handle, 'cache_graceful_execute_queue', $key, $args, $table, $expire, $prefetch, $options);
+    }
+    else {
+      background_process_start_locked($handle, 'cache_graceful_execute', $key, $args, $table, $expire, $prefetch, $options);
+    }
+  }
+  return $result;
+}
+
+/**
+ * Call a user function and store the results in the cache.
+ *
+ * @param $cid
+ *   Cache ID.
+ * @param $args
+ *   Array of arguments, the first element being the function name.
+ * @param $table
+ *   The cache table to use.
+ * @param $expire
+ *   Expiration time in seconds.
+ * @param $prefetch
+ *   Time in seconds before begin prefetch should be performed.
+ * @param $options
+ *   wait_for_cache: Wait for cache, if we tried to get a lock, but couldn't. (time in seconds)
+ *   ensure_result: If cache or lock could not be obtained, run the function anyway. (default: true)
+ * @return mixed
+ */
+function cache_graceful_execute($key, $args, $table = 'cache', $expire = NULL, $prefetch = NULL, $options = array()) {
+  $options += array(
+    'wait_for_cache' => variable_get('cache_graceful_wait_for_cache', CACHE_GRACEFUL_WAIT_FOR_CACHE),
+    'ensure_result' => TRUE,
+  );
+
+  $callback = array_shift($args);
+  if (!is_callable($callback)) {
+    throw new Exception(print_r($callback, TRUE) . ' is not callable');
+  }
+
+  // Lock, call function and store result in cache
+  if (lock_acquire($key, variable_get('cache_graceful_lock_timeout', CACHE_GRACEFUL_LOCK_TIMEOUT))) {
+    // watchdog('cache_graceful', 'Locked', array(), WATCHDOG_DEBUG);
+    cache_graceful_options(_background_process_callback_name($callback), $options);
+    $result = call_user_func_array($callback, $args);
+    $time = time();
+    cache_set($key, array('data' => $result, 'expire' => $time + $prefetch), $table, $time + $expire);
+    lock_release($key);
+    // watchdog('cache_graceful', 'Unlocked', array(), WATCHDOG_DEBUG);
+    return $result;
+  }
+  elseif ($options['wait_for_cache']) {
+    $cache = NULL;
+    // watchdog('cache_graceful', 'Could not obtain lock, waiting for cache', array(), WATCHDOG_DEBUG);
+    // Could not get lock, but we should wait for the cache to be updated.
+    $timeout = microtime(TRUE) + $options['wait_for_cache'];
+    while (microtime(TRUE) <= $timeout) {
+      if (lock_may_be_available($key)) {
+        if ($cache = cache_get($key, $table)) {
+          $result = $cache->data['data'];
+          break;
+        }
+      }
+
+      // Don't spam the cache backend with requests, wait a little bit
+      usleep(variable_get('cache_graceful_wait_for_cache_delay', CACHE_GRACEFUL_WAIT_FOR_CACHE_DELAY));
+    }
+
+    // Did cache arrive?
+    if ($cache) {
+      // watchdog('cache_graceful', 'Cache arrived', array(), WATCHDOG_DEBUG);
+      return $result;
+    }
+  }
+  else {
+    // watchdog('cache_graceful', 'Could not obtain lock ...', array(), WATCHDOG_DEBUG);
+  }
+
+  if ($options['ensure_result']) {
+    // watchdog('cache_graceful', 'Cache could not be obtained, rendering ...', array(), WATCHDOG_DEBUG);
+    cache_graceful_options(_background_process_callback_name($callback), $options);
+    $result = call_user_func_array($callback, $args);
+    // We might as well store it in the cache, now that we've got it
+    $time = time();
+    cache_set($key, array('data' => $result, 'expire' => $time + $prefetch), $table, $time + $expire);
+  }
+
+  return $result;
+}
+
+function cache_graceful_execute_queue($key, $args, $table = 'cache', $expire = NULL, $prefetch = NULL, $options = array()) {
+  // If cache exists and newer than request of refresh, then don't refresh.
+  if ($cache = cache_get($key, $table)) {
+    $handle = background_process_current_handle();
+    $process = background_process_get_process($handle);
+    if ($cache->created >= $process->start) {
+      return;
+    }
+  }
+  cache_graceful_execute($key, $args, $table, $expire, $prefetch, $options);
+}
+
+/**
+ * Execute view in background process.
+ *
+ * @param type $view
+ * @return type
+ */
+function _cache_graceful_views_execute($view) {
+  $view = unserialize($view);
+
+  $view->query->execute($view);
+  $view->_post_execute();
+
+  return array(
+    'result' => $view->result,
+    'total_rows' => isset($view->total_rows) ? $view->total_rows : 0,
+    'current_page' => $view->get_current_page(),
+  );
+}
+
+/**
+ * Render display or pane in background process.
+ *
+ * @param object $display
+ * @param object $pane
+ *
+ * @return
+ */
+function _cache_graceful_panels_recache($display, $pane = NULL) {
+  ctools_include('plugins', 'panels');
+  if ($pane) {
+    ctools_include('content');
+    $content = ctools_content_render($pane->type, $pane->subtype, $pane->configuration, array(), $display->args, $display->context);
+
+    if ($content) {
+      foreach (module_implements('panels_pane_content_alter') as $module) {
+        $function = $module . '_panels_pane_content_alter';
+        $function($content, $pane, $display->args, $display->context, $display->renderer_handler, $display);
+      }
+    }
+  }
+  else {
+    $content = $display->renderer_handler->render_layout();
+  }
+  $cache = new panels_cache_object();
+  $cache->set_content($content);
+  panels_set_cached_content($cache, $display, $display->args, $display->context, $pane);
+  $result = new stdClass();
+  $result->data = $cache;
+  return $result;
+}
+

@@ -1,0 +1,1802 @@
+<?php
+
+/**
+ * @file
+ * MoneySuite CRE Secure Gateway Module
+ *
+ * Original author: Leighton Whiting - Released under GENERAL PUBLIC LICENSE
+ * Current maintenance by multiple MoneySuite users.
+ * Re: new initiative: https://www.drupal.org/node/2315653 
+ */
+
+/**
+ * Implements hook_help().
+ */
+function ms_cres_help($path, $arg) {
+  $output = '';
+  switch ($path) {
+    case "admin/moneysuite/gateways/ms_cres":
+    case "admin/help#ms_cres":
+      $output .= '<p>' . t("CRE Secure Payment Gateway Module for MoneySuite. This allows you to
+      receive payments using your CRE Secure Account. This gateway supports both Recurring and Non-Recurring
+      Orders. To use Recurring Orders, you will need to use a gateway that supports the Tokenization feature
+      of CRE Secure, such as Authorize.net CIM.") . '</p>';
+      $output .= '<p>' . t("The Tokenization method is recommended because it stores a profile id in the database which allows you to
+      securely process future payments without storing any confidential information on your site, making you
+      PCI Compliant in that regard. This allows users to easily make future purchases from your site without
+      needing to enter their payment details over and over again. It is also used to charge recurring payments
+      during Cron.") . '</p>';
+      $output .= '<p>' . t("You will need SSL enabled on your server to use CRE Secure.") . '</p>';
+      break;
+  }
+  return $output;
+}
+
+/**
+ * Check if the user should have access to remove or make default the payment profiles
+ */
+function ms_cres_card_admin_access_test($id) {
+  global $user;
+  $payment_profile = ms_cres_get_payment_profile($id);
+
+  return (($user->uid == $payment_profile->uid) OR (user_access('administer moneysuite settings')));
+}
+
+/**
+ * Checks to see if a user can add a card for the specified account
+ */
+function ms_cres_add_card_access_test($account) {
+  global $user;
+
+  return (($user->uid AND ($user->uid == $account->uid)) OR (user_access('administer moneysuite settings')));
+}
+
+/**
+ * Implements hook_menu().
+ */
+function ms_cres_menu() {
+  $items = array();
+
+  $items['ms_cres/thank-you'] = array(
+    'title' => 'Thank You',
+    'page callback' => 'ms_cres_thankyou_page',
+    'access callback' => 'ms_core_view_page_access_test',
+    'type' => MENU_VISIBLE_IN_BREADCRUMB,
+  );
+  $items['ms_cres/card_added'] = array(
+    'title' => 'Card Added',
+    'page callback' => 'ms_cres_card_added_page',
+    'access callback' => 'ms_core_view_page_access_test',
+    'type' => MENU_VISIBLE_IN_BREADCRUMB,
+  );
+  $items['ms_cres/template'] = array(
+    'title' => 'Checkout',
+    'page callback' => 'ms_cres_template_page',
+    'access callback' => 'ms_core_view_page_access_test',
+    'type' => MENU_VISIBLE_IN_BREADCRUMB,
+  );
+  $items['ms/checkout/ms_cres'] = array(
+    'title' => 'Checkout',
+    'page callback' => 'ms_cres_checkout',
+    'access callback' => 'ms_core_view_page_access_test',
+    'type' => MENU_VISIBLE_IN_BREADCRUMB,
+  );
+  $items['ms/checkout/ms_cres/jump/%ms_core_order_key'] = array(
+    'title' => 'Checkout',
+    'page callback' => 'ms_cres_jump_page',
+    'page arguments' => array(4),
+    'access callback' => 'ms_core_view_page_access_test',
+    'type' => MENU_CALLBACK,
+  );
+  $items['ms_cres/add_card/%user'] = array(
+    'title' => 'Add Card',
+    'page callback' => 'ms_cres_add_card_jump_page',
+    'page arguments' => array(2),
+    'access callback' => 'ms_cres_add_card_access_test',
+    'access arguments' => array(2),
+    'type' => MENU_VISIBLE_IN_BREADCRUMB,
+  );
+  $items['ms_cres/remove_card/%'] = array(
+    'title' => 'Remove Card',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('ms_cres_remove_card_confirm', 2),
+    'access callback' => 'ms_cres_card_admin_access_test',
+    'access arguments' => array(2),
+    'type' => MENU_VISIBLE_IN_BREADCRUMB,
+  );
+  $items['ms_cres/set_default_card/%'] = array(
+    'title' => 'Set Default Card',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('ms_cres_set_default_card_confirm', 2),
+    'access callback' => 'ms_cres_card_admin_access_test',
+    'access arguments' => array(2),
+    'type' => MENU_VISIBLE_IN_BREADCRUMB,
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_cron().
+ */
+function ms_cres_cron() {
+  // Process payments that need to be processed
+  $result = db_query("SELECT * FROM {ms_recurring_schedules} WHERE gateway = :gateway AND status = :status AND next_payment <> :zero AND next_payment < :next_payment", array(':gateway' => 'ms_cres', ':status' => 'active', ':zero' => 0, ':next_payment' => REQUEST_TIME));
+
+  // Add a counter so that only a certain number of payments are processed each cron run
+  $count = 0;
+
+  foreach ($result as $recurring_schedule) {
+    $count += 1;
+    if ($count > variable_get('ms_cres_cron_number', 3)) {
+      break;
+    }
+
+    // Load some variables
+    $order = ms_core_order_load($recurring_schedule->oid);
+    $account = user_load($order->uid);
+    $payment_profile = ms_cres_get_default_payment_profile($order->uid);
+
+    if ($payment_profile) {
+      // Process the next payment
+      $response = ms_cres_charge($order, $recurring_schedule->main_amount, $payment_profile);
+
+      if ($response['approved']) {
+        ms_core_log('ms_cres', 'Processing Recurring Charge for Order #!num. Here are the details: @message',
+          array('!num' => $order->oid, '@message' => ms_core_print_r($recurring_schedule)));
+        // Insert the rec_payment Payment to the database
+        $payment = ms_core_new_payment($order->oid, 'ms_cres', 'rec_payment');
+        $payment->transaction = $response['data']['TxnGUID'];
+        $payment->amount = $recurring_schedule->main_amount;
+        $payment->currency = $order->currency;
+        $payment->data = $response['data'];
+
+        // Update the address
+        $payment->billing_address = array(
+          'street' => $payment_profile->street,
+          'city' => $payment_profile->city,
+          'state' => $payment_profile->state,
+          'zip' => $payment_profile->zip,
+          'country' => $payment_profile->country,
+          'phone' => $payment_profile->phone,
+        );
+
+        // Update the contact details
+        $payment->first_name = $payment_profile->first_name;
+        $payment->last_name = $payment_profile->last_name;
+
+        // Add the Payment to the Order
+        ms_core_enter_payment($payment);
+
+        // Check if the recurring_schedule is done, send rec_eot
+        if ($recurring_schedule->total_occurrences != 0 AND $recurring_schedule->total_occurrences <= ($recurring_schedule->current_payments + 1)) {
+          $payment->type = 'rec_eot';
+          $payment->amount = 0;
+          ms_core_enter_payment($payment);
+        }
+      } else {
+        // Log the error
+        ms_core_log_error('ms_cres', 'Error Processing Charge: @message',
+          array('@message' => $response['message']));
+
+        // If the failed payments counter is greater than or equal to the allowed amount, cancel the order, send rec_cancel
+        if ($recurring_schedule->failed_payments >= variable_get('ms_cres_retry_attempts', 3)) {
+          // Insert the rec_cancel Payment to the database
+          $payment = ms_core_new_payment($order->oid, 'ms_cres', 'rec_cancel');
+          $payment->transaction = drupal_get_token(serialize($order));
+          $payment->currency = $order->currency;
+          $payment->data = $response;
+
+          // Update the address
+          $payment->billing_address = array(
+            'street' => $payment_profile->street,
+            'city' => $payment_profile->city,
+            'state' => $payment_profile->state,
+            'zip' => $payment_profile->zip,
+            'country' => $payment_profile->country,
+            'phone' => $payment_profile->phone,
+          );
+
+          // Update the contact details
+          $payment->first_name = $payment_profile->first_name;
+          $payment->last_name = $payment_profile->last_name;
+
+          // Add the Payment to the Order
+          ms_core_enter_payment($payment);
+        } else {
+          // Email the User with the error details and instruct them to update their card
+          if (variable_get('ms_cres_billing_error_body', '')) {
+            $vars = array(
+              'payment_profile' => $payment_profile,
+            );
+            drupal_mail('ms_cres', 'billing_error', $account->mail, language_default(), $vars);
+          }
+
+          // Mark the recurring_schedule next_payment date in 3 days
+          db_update('ms_recurring_schedules')
+            ->fields(array(
+              'next_payment' => strtotime('+3 days', $recurring_schedule->next_payment),
+            ))
+            ->condition('id', $recurring_schedule->id)
+            ->execute();
+
+          // Increment the Failed Payments counter
+          db_update('ms_recurring_schedules')
+            ->fields(array(
+              'failed_payments' => $recurring_schedule->failed_payments + 1,
+            ))
+            ->condition('id', $recurring_schedule->id)
+            ->execute();
+        }
+      }
+    } else {
+      // Log the error
+      ms_core_log_error('ms_cres', 'Error Loading Payment Profile for Recurring Payment: @message',
+        array('@message' => ms_core_print_r($recurring_schedule)));
+
+      // Email the User with the error details and instruct them to update their card
+      if (variable_get('ms_cres_billing_error_body', '')) {
+        $vars = array(
+          'payment_profile' => $payment_profile,
+        );
+        drupal_mail('ms_cres', 'billing_error', $account->mail, language_default(), $vars);
+      }
+
+      // Mark the recurring_schedule next_payment date in 3 days
+      db_update('ms_recurring_schedules')
+        ->fields(array(
+          'next_payment' => strtotime('+3 days', $recurring_schedule->next_payment),
+        ))
+        ->condition('id', $recurring_schedule->id)
+        ->execute();
+
+      // Increment the Failed Payments counter
+      db_update('ms_recurring_schedules')
+        ->fields(array(
+          'failed_payments' => $recurring_schedule->failed_payments + 1,
+        ))
+        ->condition('id', $recurring_schedule->id)
+        ->execute();
+    }
+  }
+
+  // Check for cards that are expiring soon, and send a notice to the user to change them
+  $frequency = (int)variable_get('ms_cres_expiration_reminder_frequency', 3);
+  if (variable_get('ms_cres_last_expiration_reminder', 0) < (REQUEST_TIME - (86400 * $frequency)) AND variable_get('ms_cres_expiration_reminder_body', '')) {
+    variable_set('ms_cres_last_expiration_reminder', REQUEST_TIME);
+
+    $month = (int)date('n');
+    $year = (int)date('y');
+    $threshold = (int)variable_get('ms_cres_expiration_reminder_months', 1);
+
+    // Set the month and year variables
+    if ($month <= $threshold) {
+      $month = (12 - $threshold) + $month;
+      $year -= 1;
+    } else {
+      $month -= $threshold;
+    }
+
+    $result = db_query("SELECT * FROM {ms_cres_payment_profiles} as p
+      LEFT JOIN {ms_orders} as o ON o.uid = p.uid
+      LEFT JOIN {ms_recurring_schedules} as r ON r.oid = o.oid
+      WHERE p.year <= :p_year AND p.month <= :p_month AND r.gateway = :r_gateway AND r.status = :r_status AND r.next_payment <> :r_next_payment",
+      array(':p_year' => $year, ':p_month' => $month, ':r_gateway' => 'ms_cres', ':r_status' => 'active', ':r_next_payment' => 0));
+
+    foreach ($result as $row) {
+      $vars = array(
+        'payment_profile' => $row,
+      );
+      $email_temp = db_query("SELECT mail FROM {users} WHERE uid = :uid", array(':uid' => $row->uid))->fetchField();
+
+      ms_core_log('ms_cres', 'Expiring credit card reminder sent to @userid at @email. Expiration date (MM/YY): @expMonth/@expYear.',
+        array('@userid' => $row->uid, '@email' => $email_temp, '@expYear' => $row->year, '@expMonth' => $row->month));
+
+      // Send the card expiring soon email
+      drupal_mail('ms_cres', 'expirationReminder', $email_temp, language_default(), $vars);
+    }
+  }
+}
+
+/**
+ * Admin Settings Form
+ */
+function ms_cres_admin() {
+  $form['api'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('API Credentials'),
+    '#description' => t('This information is required to interact with your payment gateway account.'),
+  );
+  $form['api']['ms_cres_api_id'] = array(
+    '#type' => 'textfield',
+    '#title' => t('CRE Secure Account ID'),
+    '#default_value' => variable_get('ms_cres_api_id', ''),
+  );
+  $form['api']['ms_cres_api_token'] = array(
+    '#type' => 'textfield',
+    '#title' => t('CRE Secure API Token'),
+    '#default_value' => variable_get('ms_cres_api_token', ''),
+  );
+  $form['api']['ms_cres_txn_mode'] = array(
+    '#type' => 'radios',
+    '#title' => t('Transaction mode'),
+    '#description' => t('Use SandBox mode for testing the gateway.'),
+    '#options' => array(
+      'live' => t('Live transactions in a live account'),
+      'sandbox' => t('Developer test account transactions'),
+    ),
+    '#default_value' => variable_get('ms_cres_txn_mode', 'live'),
+  );
+  $form['api']['ms_cres_use_tokens'] = array(
+    '#type' => 'checkbox',
+    '#title' => t("Use CRE Secure's Tokenization Feature?"),
+    '#description' => t('This is required in order to use CRE Secure as a Payment Gateway for Recurring Payment orders.
+      Only certain gateways support the use of the Tokenization feature. See !link for more details.
+      Note - only Authorize.net with CIM, Chase, and Payflow Pro are supported as of April 20, 2011.',
+      array('!link' => l(t('CRE Secure'), 'http://www.cresecure.com'))),
+    '#default_value' => variable_get('ms_cres_use_tokens', FALSE),
+  );
+
+  $form['general'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('General Settings'),
+  );
+  $form['general']['ms_cres_default_language'] = array(
+    '#type' => 'select',
+    '#title' => t('Language'),
+    '#options' => array(
+      'english' => t('English'),
+    ),
+    '#default_value' => variable_get('ms_cres_default_language', 'english'),
+  );
+  $form['general']['ms_cres_template_page_text'] = array(
+    '#type' => 'textarea',
+    '#title' => t('Template Page Text'),
+    '#description' => t('Enter the HTML you want to show at the top of the Credit Card Form.'),
+    '#default_value' => variable_get('ms_cres_template_page_text', t('Please complete your payment below. This is a secure payment page.')),
+  );
+
+  $form['email'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Email Settings'),
+    '#collapsible' => FALSE,
+    '#collapsed' => FALSE,
+  );
+  $form['email']['ms_cres_expiration_reminder_months'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Card Expiring Soon Threshold'),
+    '#required' => FALSE,
+    '#description' => t("How many months before the card expires should the expiring soon email be sent?."),
+    '#default_value' => variable_get('ms_cres_expiration_reminder_months', 1),
+  );
+  $form['email']['ms_cres_expiration_reminder_frequency'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Card Expiring Soon Reminder Frequency'),
+    '#required' => FALSE,
+    '#description' => t("Send the Expiring Soon email every X days."),
+    '#default_value' => variable_get('ms_cres_expiration_reminder_frequency', 3),
+  );
+  $form['email']['ms_cres_expiration_reminder_subject'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Card Expiring Soon Email Subject'),
+    '#required' => FALSE,
+    '#default_value' => variable_get('ms_cres_expiration_reminder_subject', t("Please update your Billing Info")),
+  );
+  $form['email']['ms_cres_expiration_reminder_body'] = array(
+    '#type' => 'textarea',
+    '#title' => t('Card Expiring Soon Email Body'),
+    '#description' => t("Leave blank to not send an email."),
+    '#required' => FALSE,
+    '#default_value' => variable_get('ms_cres_expiration_reminder_body', t("Your credit card [ms_cres_payment_profile:cardNumber] is expiring soon. To avoid interruption of service, please update your billing information here: [ms_cres_payment_profile:updateUrl]
+
+Sincerely,
+Site Admin")),
+  );
+  $form['email']['ms_cres_expiration_reminder_token_help']['tokens'] = array(
+    '#theme' => 'token_tree',
+    '#token_types' => array('ms_cres_payment_profile', 'user'),
+    '#dialog' => TRUE,
+  );
+
+  $form['email']['ms_cres_card_update_confirm_subject'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Card Updated Confirmation Email Subject'),
+    '#required' => FALSE,
+    '#default_value' => variable_get('ms_cres_card_update_confirm_subject', t("Billing Information Changed")),
+  );
+  $form['email']['ms_cres_card_update_confirm_body'] = array(
+    '#type' => 'textarea',
+    '#title' => t('Card Updated Confirmation Email Body'),
+    '#description' => t("Leave blank to not send an email."),
+    '#required' => FALSE,
+    '#default_value' => variable_get('ms_cres_card_update_confirm_body', t("Your billing information has been successfully updated.
+
+Sincerely,
+Site Admin")),
+  );
+  $form['email']['ms_cres_card_update_confirm_token_help']['tokens'] = array(
+    '#theme' => 'token_tree',
+    '#token_types' => array('ms_cres_payment_profile', 'user'),
+    '#dialog' => TRUE,
+  );
+
+  return $form;
+}
+
+// ======================================
+// User Hooks
+// ======================================
+
+
+/**
+ * Implements hook_user_cancel().
+ */
+function ms_cres_user_cancel($edit, $account, $method) {
+  //Remove the Records
+  db_delete('ms_cres_payment_profiles')
+    ->condition('uid', $account->uid)
+    ->execute();
+
+  return;
+}
+
+/********************************************************************
+ * FUNCTIONS
+ *******************************************************************/
+
+/**
+ * Get the allowed card types in a format that CRE Secure likes
+ */
+function ms_cres_get_allowed_types() {
+  $cards = array_filter(variable_get('ms_cres_allowed_cards', array(
+    'visa' => 'Visa',
+    'mc' => 'MasterCard',
+    'amex' => 'American Express',
+    'discover' => 'Discover',
+  )));
+
+  $allowed_types = array();
+
+  foreach ($cards as $card) {
+    switch ($card) {
+      case 'visa':
+        $allowed_types[] = 'Visa';
+        break;
+      case 'mc':
+        $allowed_types[] = 'MasterCard';
+        break;
+      case 'amex':
+        $allowed_types[] = 'American Express';
+        break;
+      case 'discover':
+        $allowed_types[] = 'Discover';
+        break;
+    }
+  }
+
+  return implode('|', $allowed_types);
+}
+
+/**
+ * Load a payment profile by id
+ */
+function ms_cres_get_payment_profile($id) {
+  $result = db_query("SELECT * FROM {ms_cres_payment_profiles} WHERE id = :id", array(':id' => $id));
+
+  foreach ($result as $payment_profile) {
+    return $payment_profile;
+  }
+
+  return FALSE;
+}
+
+/**
+ * Get the payment profiles for a user
+ */
+function ms_cres_get_payment_profiles($uid) {
+  $payment_profiles = array();
+  $result = db_query("SELECT * FROM {ms_cres_payment_profiles} WHERE uid = :uid ORDER BY is_default DESC", array(':uid' => $uid));
+
+  foreach ($result as $payment_profile) {
+    $payment_profiles[$payment_profile->id] = t('Credit Card: @number', array('@number' => $payment_profile->card_type . ' - ' . $payment_profile->card_number));
+  }
+
+  return $payment_profiles;
+}
+
+/**
+ * Create a Payment Profile
+ */
+function ms_cres_create_payment_profile($uid, $address, $card_num, $card_type, $month, $year, $token) {
+  $payment_profile = new stdClass();
+
+  $payment_profile->uid = $uid;
+  $payment_profile->default = 0;
+  $payment_profile->first_name = $address['first_name'];
+  $payment_profile->last_name = $address['last_name'];
+  $payment_profile->street = $address['address'];
+  $payment_profile->city = $address['city'];
+  $payment_profile->state = $address['state'];
+  $payment_profile->zip = $address['zip'];
+  $payment_profile->country = $address['country'];
+  $payment_profile->phone = $address['phone'];
+  $payment_profile->fax = $address['fax'];
+  $payment_profile->card_number = $card_num;
+  $payment_profile->card_type = $card_type;
+  $payment_profile->token = $token;
+  $payment_profile->month = $month;
+  $payment_profile->year = $year;
+
+  ms_core_log('ms_cres', 'Creating a new Payment Profile');
+
+  $payment_profile->token = $token;
+  drupal_write_record('ms_cres_payment_profiles', $payment_profile);
+
+  // Set this as the new default
+  ms_cres_set_default_payment_profile($payment_profile);
+
+  return array('success' => TRUE, 'payment_profile' => $payment_profile);
+}
+
+/**
+ * Set a default payment profile
+ */
+function ms_cres_set_default_payment_profile($payment_profile) {
+  // First, set all profiles as 0
+  db_update('ms_cres_payment_profiles')
+    ->fields(array(
+      'is_default' => 0,
+    ))
+    ->condition('uid', $payment_profile->uid)
+    ->execute();
+
+  // Next, set the profile with $id to 1
+  db_update('ms_cres_payment_profiles')
+    ->fields(array(
+      'is_default' => 1,
+    ))
+    ->condition('id', $payment_profile->id)
+    ->execute();
+
+  return;
+}
+
+/**
+ * Delete a payment profile
+ */
+function ms_cres_delete_payment_profile($id) {
+  return db_delete('ms_cres_payment_profiles')
+    ->condition('id', $id)
+    ->execute();
+}
+
+/**
+ * Get the default payment profile for a user
+ */
+function ms_cres_get_default_payment_profile($uid) {
+  $result = db_query("SELECT * FROM {ms_cres_payment_profiles} WHERE uid = :uid AND is_default = :default", array(':uid' => $uid, ':default' => 1));
+
+  foreach ($result as $payment_profile) {
+    return $payment_profile;
+  }
+
+  return FALSE;
+}
+
+/**
+ * Implements hook_ms_core_payment_gateway().
+ */
+function ms_cres_ms_core_payment_gateway() {
+  $gateways['ms_cres'] = array(
+    'name' => 'CRE Secure',
+    'display_name' => t('Credit Card'),
+    'description' => t('Pay by Credit Card'),
+    'cards' => array('visa', 'mc', 'amex', 'discover', 'paypal'),
+    'module' => 'ms_cres',
+    'checkout_path' => 'ms/checkout/ms_cres',
+    'cancel_url' => 'ms_core_get_cancel_helper_url',
+    'modify_url' => 'ms_core_get_modify_helper_url',
+    'billing_url' => 'ms_core_get_billing_helper_url',
+    'recurring_schedule_support' => TRUE,
+    'saved_cards_support' => TRUE,
+    'recurring' => variable_get('ms_cres_use_tokens', FALSE),
+    'settings' => ms_cres_admin(),
+  );
+
+  return $gateways;
+}
+
+/**
+ * Implements hook_ms_core_modification_charge().
+ *
+ * Charges the amount and approves or denies the modification
+ *
+ * @param $amount
+ *   The amount that should be charged before approval
+ * @param $order
+ *   The $order object
+ *
+ * @return
+ *   TRUE if the amount was charged successfully, FALSE otherwise
+ */
+function ms_cres_ms_core_modification_charge($amount, $order) {
+  // Load the payment profile
+  $payment_profile = ms_cres_get_default_payment_profile($order->uid);
+
+  $response = ms_cres_charge($order, $amount, $payment_profile);
+
+  if ($response['approved']) {
+    return TRUE;
+  } else {
+    // Log the error
+    ms_core_log_error('ms_cres', 'Error Processing Charge: @message',
+      array('@message' => $response['message']));
+    drupal_set_message(t('Error Processing Charge: @message',
+      array('@message' => $response['message'])));
+    return FALSE;
+  }
+}
+
+/**
+ * Implements hook_ms_core_billing_info_alter().
+ *
+ * This will show the user's payment profiles in the user account
+ */
+function ms_cres_ms_core_billing_info_alter(&$html, $account) {
+  if (variable_get('ms_cres_use_tokens', FALSE)) {
+    $html['ms_cres'] = array(
+      '#type' => 'fieldset',
+      '#title' => t('Accounts'),
+      '#description' => t('View your saved accounts. !add_card_link',
+        array('!add_card_link' => l(t('Add a card'), 'ms_cres/add_card/' . $account->uid))),
+    );
+
+    // Show a table of the saved profiles, with actions such as 'Set as Default' and 'Delete'
+    $header[] = array('data' => t('Account'));
+    $header[] = array('data' => t('Expiration'));
+    $header[] = array('data' => t('Status'));
+    $header[] = array('data' => t('Actions'));
+
+    $result = db_query('SELECT * FROM {ms_cres_payment_profiles} WHERE uid = :uid ORDER BY is_default DESC', array(':uid' => $account->uid));
+    $rows = array();
+    foreach ($result as $row) {
+      $actions = array();
+      if (!$row->is_default) {
+        $actions[] = l(t('Make Default'), "ms_cres/set_default_card/" . $row->id, array('query' => drupal_get_destination()));
+        $actions[] = ' ' . l(t('Delete'), "ms_cres/remove_card/" . $row->id, array('query' => drupal_get_destination()));
+        $status = t('Backup');
+      } else {
+        $status = t('Default');
+      }
+
+      $rows[] = array($row->card_type . ' - ' . $row->card_number, $row->month . '/' . $row->year, $status, implode(' | ', $actions));
+    }
+
+    if (count($rows)) {
+      $html['ms_cres']['ms_cres_payment_profiles'] = array(
+        '#type' => 'item',
+        '#markup' => theme('table', array('header' => $header, 'rows' => $rows, 'empty' => t('No payment profiles.'))),
+      );
+    }
+  }
+}
+
+/**
+ * Redirect to the add card jump page
+ */
+function ms_cres_add_card_form_submit($form, &$form_state) {
+  global $user;
+  drupal_goto('ms_cres/add_card/' . $user->uid);
+}
+
+/**
+ * Confirm if the user wants to delete payment profile
+ */
+function ms_cres_remove_card_confirm($form, &$form_state, $id) {
+  $payment_profile = ms_cres_get_payment_profile($id);
+  $form['#ms_cres_payment_id'] = $payment_profile->id;
+  return confirm_form($form, t('Are you sure you want to delete the saved payment method: @card?',
+      array('@card' => $payment_profile->card_type . ' - ' . $payment_profile->card_number)),
+    '', t('This action cannot be undone.'), t('Confirm'));
+}
+
+/**
+ * Delete a payment profile
+ */
+function ms_cres_remove_card_confirm_submit($form, &$form_state) {
+  $payment_profile = ms_cres_get_payment_profile($form['#ms_cres_payment_id']);
+
+  ms_cres_delete_payment_profile($payment_profile->id);
+
+  $form_state['redirect'] = '';
+}
+
+/**
+ * Confirm if the user wants to set a default card
+ */
+function ms_cres_set_default_card_confirm($form, &$form_state, $id) {
+  $payment_profile = ms_cres_get_payment_profile($id);
+  $form['#ms_cres_payment_id'] = $payment_profile->id;
+  return confirm_form($form, t('Are you sure you want to set @card as the default payment method?',
+      array('@card' => $payment_profile->card_type . ' - ' . $payment_profile->card_number)),
+    '', t('Future payments will be charged to this account.'), t('Confirm'));
+}
+
+/**
+ * Set the default payment profile
+ */
+function ms_cres_set_default_card_confirm_submit($form, &$form_state) {
+  $payment_profile = ms_cres_get_payment_profile($form['#ms_cres_payment_id']);
+
+  ms_cres_set_default_payment_profile($payment_profile);
+}
+
+/********************************************************************
+ * Checkout Form
+ *******************************************************************/
+
+/**
+ * Decide whether the user should use a pre-saved Payment Profile or be redirected to CRE Secure
+ */
+function ms_cres_checkout() {
+  $build = array();
+  // Stop the caching
+  $GLOBALS['conf']['cache'] = FALSE;
+
+  if (variable_get('ms_cres_txn_mode', 'live') == 'sandbox') {
+    drupal_set_message(t('Using Test Mode. Cards will not be charged.'));
+  }
+
+  global $user;
+
+  if (!$order = ms_core_load_session_order()) {
+    // Error
+    return t('There was an error with the checkout');
+  }
+
+  $use_new = FALSE;
+  if (arg(3) == 'new') {
+    $use_new = TRUE;
+  } elseif ($order->status != 'checkout') {
+    // The order is not in checkout and shouldn't be here
+    return t('This order has already been through Checkout.');
+  }
+
+  // Check if the user has a saved payment profile
+  if (!$use_new AND $user->uid AND $payment_profile = ms_cres_get_default_payment_profile($user->uid)) {
+    // Show the form to use the saved profile
+    $build['content'] = drupal_get_form('ms_cres_token_checkout_form', $user, $order);
+  } else {
+    // Get the Payment Form
+    $build['content'] = drupal_get_form('ms_cres_checkout_form', $order);
+  }
+
+  return $build;
+}
+
+/**
+ * Build form to collect the order information
+ *
+ * @param $order
+ */
+function ms_cres_checkout_form($form, &$form_state, $order) {
+  $form = array();
+
+  ms_core_get_cc_form($form, $order, array(), FALSE);
+
+  ms_core_get_billing_form($form, $order);
+
+  $form['#validate'][] = 'ms_core_cc_form_validate';
+
+  $form['ms_oid'] = array(
+    '#type' => 'value',
+    '#value' => $order->oid,
+  );
+
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Continue'),
+  );
+
+  return $form;
+}
+
+/**
+ * Submit handler for the checkout form
+ *
+ * Saves the order, then redirects to the jump page
+ */
+function ms_cres_checkout_form_submit($form, &$form_state) {
+  $v = $form_state['values'];
+  $order = ms_core_order_load($v['ms_oid']);
+
+  // Set the values from the form into the order
+  $order->first_name = $v['cc_first_name'];
+  $order->last_name = $v['cc_last_name'];
+  $order->email_address = $v['billing_email'];
+  $order->billing_address['street'] = $v['billing_address1'];
+  $order->billing_address['city'] = $v['billing_city'];
+  $order->billing_address['state'] = $v['billing_state'];
+  $order->billing_address['zip'] = $v['billing_zip'];
+  $order->billing_address['country'] = $v['billing_country'];
+  $order->billing_address['phone'] = $v['billing_phone'];
+
+  // Save the order
+  ms_core_order_save($order);
+
+  // Redirect to the jump page
+  $form_state['redirect'] = 'ms/checkout/ms_cres/jump/' . $order->order_key;
+}
+
+/**
+ * Form builder for jump form
+ */
+function ms_cres_jump_form($form, &$form_state, $order) {
+  $form = array();
+
+  $data = array();
+
+  // Add the variables
+  $data['customer_firstname'] = $order->first_name;
+  $data['customer_lastname'] = $order->last_name;
+  $data['customer_address'] = $order->billing_address['street'];
+  $data['customer_address2'] = '';
+  $data['customer_city'] = $order->billing_address['city'];
+  $data['customer_state'] = $order->billing_address['state'];
+  $data['customer_postal_code'] = $order->billing_address['zip'];
+  $data['customer_country'] = $order->billing_address['country'];
+  $data['customer_phone'] = $order->billing_address['phone'];
+  $data['customer_email'] = $order->email_address;
+
+  $data['CRESecureID'] = variable_get('ms_cres_api_id', '');
+  $data['CRESecureAPIToken'] = variable_get('ms_cres_api_token', '');
+  $data['return_url'] = url('ms_cres/thank-you/' . $order->unique_key, array('absolute' => TRUE, 'https' => TRUE));
+  $data['content_template_url'] = url('ms_cres/template', array('absolute' => TRUE, 'https' => TRUE));
+  $data['currency_code'] = $order->currency;
+  $data['total_amt'] = $order->amount;
+
+  // Add the Token settings if set
+  if (variable_get('ms_cres_use_tokens', FALSE)) {
+    // CRE_Tokenize should always be set to store_only, and the payment, if any, should be captured on the Thank-You page
+    $data['total_amt'] = 0.00;
+    $data['CRE_Tokenize'] = 'store_only';
+  }
+  $data['ip_address'] = ip_address();
+  $data['order_id'] = $order->oid;
+  $data['order_desc'] = ms_core_get_order_title($order, 128);
+  $data['allowed_types'] = ms_cres_get_allowed_types();
+  $data['lang'] = variable_get('ms_cres_default_language', 'english');
+
+  // Set the user id to be passed to the template page
+  if ($order->uid) {
+    // Set a cache marker so that users can't use this to spoof accounts
+    $cid = drupal_get_token(serialize($data));
+    cache_set($cid, $order->uid);
+    $data['sess_id'] = $cid;
+    $data['sess_name'] = 'ms_cres_sess';
+  }
+
+  $url = (variable_get('ms_cres_txn_mode', 'live') == 'live') ? 'https://safe.cresecure.net/securepayments/a1/cc_collection.php' : 'https://sandbox-cresecure.net/securepayments/a1/cc_collection.php';
+  $form['#action'] = $url;
+  $form['#id'] = 'cre-secure-jump';
+
+  // Add the hidden form elements
+  foreach ($data as $key => $value) {
+    $form[$key] = array(
+      '#type' => 'hidden',
+      '#value' => $value,
+    );
+  }
+
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Continue'),
+  );
+
+  return $form;
+}
+
+/**
+ * Prepare the form items to jump to CRE Secure
+ *
+ * This is preferred instead of simply setting the form #action to go to CRE Secure
+ * because it allows the form to pass through validation first.
+ */
+function ms_cres_jump_page($order) {
+  $build = array();
+
+  $build['ms_cres_message'] = array(
+    '#markup' => variable_get('ms_cres_jump_page_text', t("Please wait for a few seconds, your order is being processed and you will be redirected to a secure payment page.
+<br/><br/>
+If you are not automatically redirected to the secure payment page within 5 seconds, click below:
+<br/><br/>")),
+  );
+
+  $build['ms_cres_jump_form'] = drupal_get_form('ms_cres_jump_form', $order);
+
+  // Add in the JS
+  $timeout = variable_get('ms_cres_jump_page_timeout', 0) * 1000;
+  $js = "
+    (function ($) {
+    window.setTimeout(function() {
+      $('#cre-secure-jump').submit();
+    }, $timeout);
+    })(jQuery);
+  ";
+  drupal_add_js($js, array('type' => 'inline', 'scope' => 'footer'));
+
+  return $build;
+}
+
+/**
+ * Helper to swap the name of a form field
+ */
+function ms_cres_change_form_field_name(&$form, $f0, $f1, $f2) {
+  if (isset($form[$f0][$f1])) {
+    $form[$f0][$f2] = $form[$f0][$f1];
+    unset($form[$f0][$f1]);
+  }
+}
+
+/**
+ * Redirect to CRE Secure to let the user add a card
+ */
+function ms_cres_add_card_jump_page($account) {
+  $build = array();
+  $build['content']['ms_cres_add_card_header']['#markup'] = t('Please fill out the form below to add a new payment method.');
+  $build['content']['ms_cres_add_card_form'] = drupal_get_form('ms_cres_add_card_jump_page_form', $account);
+
+  return $build;
+}
+
+/**
+ * Redirect to CRE Secure to let the user add a card
+ */
+function ms_cres_add_card_jump_page_form($form, &$form_state, $account) {
+  $form = array();
+
+  $url = (variable_get('ms_cres_txn_mode', 'live') == 'live') ? 'https://safe.cresecure.net/securepayments/a1/cc_collection.php' : 'https://sandbox-cresecure.net/securepayments/a1/cc_collection.php';
+
+  $form['#action'] = $url;
+  $form['#id'] = 'cre-secure-jump';
+
+  $order = ms_core_order_new();
+  $order->uid = $account->uid;
+  $order->email_address = $account->mail;
+
+  ms_core_get_cc_form($form, $order, array(), FALSE);
+
+  ms_core_get_billing_form($form, $order);
+
+  // Set the names of the fields to the proper value
+  ms_cres_change_form_field_name($form, 'cc', 'cc_first_name', 'customer_firstname');
+  ms_cres_change_form_field_name($form, 'cc', 'cc_last_name', 'customer_lastname');
+  ms_cres_change_form_field_name($form, 'billing', 'billing_address1', 'customer_address');
+  ms_cres_change_form_field_name($form, 'billing', 'billing_address2', 'customer_address2');
+  ms_cres_change_form_field_name($form, 'billing', 'billing_city', 'customer_city');
+  ms_cres_change_form_field_name($form, 'billing', 'billing_state', 'customer_state');
+  ms_cres_change_form_field_name($form, 'billing', 'billing_zip', 'customer_postal_code');
+  ms_cres_change_form_field_name($form, 'billing', 'billing_country', 'customer_country');
+  ms_cres_change_form_field_name($form, 'billing', 'billing_phone', 'customer_phone');
+  ms_cres_change_form_field_name($form, 'billing', 'billing_email', 'customer_email');
+
+  $data = array();
+
+  // Add the variables
+  $data['CRESecureID'] = variable_get('ms_cres_api_id', '');
+  $data['CRESecureAPIToken'] = variable_get('ms_cres_api_token', '');
+  $data['return_url'] = url('ms_cres/card_added', array('absolute' => TRUE, 'https' => TRUE));
+  $data['content_template_url'] = url('ms_cres/template', array('absolute' => TRUE, 'https' => TRUE));
+  $data['total_amt'] = 0.00;
+  if (variable_get('ms_cres_use_tokens', FALSE)) {
+    $data['CRE_Tokenize'] = 'store_only';
+  }
+  $data['ip_address'] = ip_address();
+  $data['order_id'] = 0;
+  $data['customer_id'] = $account->uid;
+  $data['allowed_types'] = ms_cres_get_allowed_types();
+  $data['lang'] = variable_get('ms_cres_default_language', 'english');
+
+  // Set the user id to be passed to the template page
+  if ($account->uid) {
+    // Set a cache marker so that users can't use this to spoof accounts
+    $cid = drupal_get_token(serialize($data));
+    cache_set($cid, $account->uid);
+    $data['sess_id'] = $cid;
+    $data['sess_name'] = 'ms_cres_sess';
+  }
+
+  // Add the hidden form elements
+  foreach ($data as $key => $value) {
+    $form[$key] = array(
+      '#type' => 'hidden',
+      '#value' => $value,
+    );
+  }
+
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Continue'),
+  );
+
+  $form['#validate'][] = 'ms_core_cc_form_validate';
+
+  $_SESSION['ms_cres_adding_card'] = $account->uid;
+
+  return $form;
+}
+
+/**
+ * Build the Token Checkout Form
+ */
+function ms_cres_token_checkout_form($form, &$form_state, $account, $order) {
+  $payment_profiles = ms_cres_get_payment_profiles($account->uid);
+
+  $form['ms_order_contents'] = array(
+    '#type' => 'markup',
+    '#markup' => ms_core_get_order_details_table($order),
+  );
+
+  $form['payment_id'] = array(
+    '#type' => 'radios',
+    '#title' => 'Payment Method',
+    '#options' => $payment_profiles,
+    '#description' => t("Select which method you'd like to use to pay for this purchase."),
+    '#default_value' => key($payment_profiles),
+    '#required' => TRUE,
+  );
+
+  $form['ms_oid'] = array(
+    '#type' => 'value',
+    '#value' => $order->oid,
+  );
+
+  $form['submit_token'] = array(
+    '#type' => 'submit',
+    '#value' => t('Pay Now'),
+    '#validate' => array('ms_cres_token_checkout_form_validate'),
+    '#submit' => array('ms_cres_token_checkout_form_submit'),
+  );
+  $form['submit_cre'] = array(
+    '#type' => 'submit',
+    '#value' => t('Use a new card'),
+    '#submit' => array('ms_cres_checkout_cre_form_submit'),
+    '#validate' => array('ms_cres_checkout_cre_form_validate'),
+  );
+
+  return $form;
+}
+
+/**
+ * Validate callback if the 'Add new Card' button is clicked
+ */
+function ms_cres_checkout_cre_form_validate($form, &$form_state) {
+  // Do nothing
+}
+
+/**
+ * The user has opted to use a new card, reload the page and pass the skip parameter
+ */
+function ms_cres_checkout_cre_form_submit($form, &$form_state) {
+  drupal_goto('ms/checkout/ms_cres/new');
+}
+
+/**
+ * Validate the Checkout Form, and Try to Charge the Card from the Payment Profile
+ */
+function ms_cres_token_checkout_form_validate($form, &$form_state) {
+  $form_values = $form_state['values'];
+
+  $order = ms_core_order_load($form_values['ms_oid']);
+  $payment_profile = ms_cres_get_payment_profile($form_values['payment_id']);
+
+  switch ($order->order_type) {
+    case 'recurring':
+      // Check if there is a free trial
+      if ($order->recurring_schedule['trial_length'] AND !$order->recurring_schedule['trial_amount']) {
+        // Just insert a rec_signup payment without charging
+        // Insert the Payment to the database for the Free Trial
+        $payment = ms_core_new_payment($order->oid, 'ms_cres', 'rec_signup');
+
+        // Generate a Unique Transaction ID
+        $payment->transaction = drupal_get_token(serialize($order));
+        $payment->currency = $order->currency;
+        $payment->data = $payment_profile;
+
+        // Update the address
+        $payment->billing_address = array(
+          'street' => $payment_profile->street,
+          'city' => $payment_profile->city,
+          'state' => $payment_profile->state,
+          'zip' => $payment_profile->zip,
+          'country' => $payment_profile->country,
+          'phone' => $payment_profile->phone,
+        );
+
+        // Update the contact details
+        $payment->first_name = $payment_profile->first_name;
+        $payment->last_name = $payment_profile->last_name;
+        $payment->recurring_id = "ms_cres-" . $order->oid;
+
+        // Add the Payment to the Order
+        ms_core_enter_payment($payment);
+
+        // Add the payment to the order
+        $form_state['values']['ms_oid'] = $order->oid;
+        $form_state['values']['ms_order_charged'] = TRUE;
+      } else {
+        // Check if there is a trial
+        $amount = ($order->recurring_schedule['trial_length']) ? $order->recurring_schedule['trial_amount'] : $order->recurring_schedule['main_amount'];
+
+        // Charge the first payment, and enter rec_signup and rec_payment
+        $response = ms_cres_charge($order, $amount, $payment_profile);
+
+        if ($response['approved']) {
+          // Add the payment to the order
+          $form_state['values']['ms_oid'] = $order->oid;
+          $form_state['values']['ms_order_charged'] = TRUE;
+
+          // Insert the rec_signup Payment to the database
+          $payment = ms_core_new_payment($order->oid, 'ms_cres', 'rec_signup');
+          $payment->transaction = $response['data']['TxnGUID'];
+          $payment->currency = $order->currency;
+          $payment->data = $response['data'];
+
+          // Update the address
+          $payment->billing_address = array(
+            'street' => $payment_profile->street,
+            'city' => $payment_profile->city,
+            'state' => $payment_profile->state,
+            'zip' => $payment_profile->zip,
+            'country' => $payment_profile->country,
+            'phone' => $payment_profile->phone,
+          );
+
+          // Update the contact details
+          $payment->first_name = $payment_profile->first_name;
+          $payment->last_name = $payment_profile->last_name;
+          $payment->recurring_id = "ms_cres-" . $order->oid;
+
+          // Add the Payment to the Order
+          $payment->amount = $amount;
+          ms_core_enter_payment($payment);
+        } else {
+          // Log the error
+          $form_state['values']['ms_order_charged'] = FALSE;
+          ms_core_log_error('ms_cres', 'Error Processing Charge: @message', array('@message' => $response['message']));
+        }
+      }
+      break;
+
+    case 'cart':
+      $response = ms_cres_charge($order, $order->amount, $payment_profile);
+
+      if ($response['approved']) {
+        // Add the payment to the order
+        $form_state['values']['ms_oid'] = $order->oid;
+        $form_state['values']['ms_order_charged'] = TRUE;
+
+        // Insert the Payment to the database
+        $payment = ms_core_new_payment($order->oid, 'ms_cres', 'cart');
+        $payment->transaction = $response['data']['TxnGUID'];
+        $payment->amount = $order->amount;
+        $payment->currency = $order->currency;
+        $payment->data = $response['data'];
+
+        // Update the address
+        $payment->billing_address = array(
+          'street' => $payment_profile->street,
+          'city' => $payment_profile->city,
+          'state' => $payment_profile->state,
+          'zip' => $payment_profile->zip,
+          'country' => $payment_profile->country,
+          'phone' => $payment_profile->phone,
+        );
+
+        // Update the contact details
+        $payment->first_name = $payment_profile->first_name;
+        $payment->last_name = $payment_profile->last_name;
+
+        // Add the Payment to the Order
+        ms_core_enter_payment($payment);
+      } else {
+        $form_state['values']['ms_order_charged'] = FALSE;
+        form_set_error('payment_id', t('Error: @message', array('@message' => $response['message'])));
+      }
+      break;
+  }
+}
+
+/**
+ * The card has been charged, mark the order as completed
+ */
+function ms_cres_token_checkout_form_submit($form, &$form_state) {
+  $v = $form_state['values'];
+
+  // If the Order was charged, complete it
+  if (!empty($v['ms_order_charged'])) {
+    drupal_goto('ms/thankyou');
+  } else {
+    // There was an error...
+  }
+}
+
+// ======================================
+// MAIL
+// ======================================
+
+
+/**
+ * Handle Mail functions
+ */
+function ms_cres_mail($key, &$message, $seed_vars) {
+  $subject = "";
+  $body = "";
+  $tokens = array();
+  switch ($key) {
+    case 'expirationReminder':
+      $tokens['payment_profile'] = $seed_vars['payment_profile'];
+      $tokens['account'] = user_load($tokens['payment_profile']->uid);
+
+      $subject = variable_get('ms_cres_expiration_reminder_subject', '');
+      $body = variable_get('ms_cres_expiration_reminder_body', '');
+      break;
+
+    case 'card_update_confirm':
+      $tokens['payment_profile'] = $seed_vars['payment_profile'];
+      $tokens['account'] = user_load($tokens['payment_profile']->uid);
+
+      $subject = variable_get('ms_cres_card_update_confirm_subject', '');
+      $body = variable_get('ms_cres_card_update_confirm_body', '');
+      break;
+
+    case 'billing_error':
+      $tokens['payment_profile'] = $seed_vars['payment_profile'];
+      $tokens['account'] = user_load($tokens['payment_profile']->uid);
+
+      $subject = variable_get('ms_cres_billing_error_subject', '');
+      $body = variable_get('ms_cres_billing_error_body', '');
+      break;
+  }
+
+  // Replace the Tokens
+  $message['subject'] = token_replace($subject, $tokens);
+  $message['body'][] = token_replace($body, $tokens);
+}
+
+// ======================================
+// TOKEN
+// ======================================
+
+/**
+ * Implements hook_token_info().
+ */
+function ms_cres_token_info() {
+  $types = array(
+    'ms_cres_payment_profile' => array(
+      'name' => t('Payment Profile'),
+      'description' => t('Payment Profile Variables'),
+      'needs-data' => 'ms_cres_payment_profile',
+    ),
+  );
+
+  $tokens = array(
+    'ms_cres_payment_profile' => array(
+      'updateUrl' => array(
+        'name' => t('Update URL'),
+        'description' => t("The URL for the update payment profile page."),
+      ),
+      'expirationMonth' => array(
+        'name' => t('Expiration Month'),
+        'description' => t("Expiration Month of the Card"),
+      ),
+      'expirationYear' => array(
+        'name' => t('Expiration Year'),
+        'description' => t("Expiration Year of the Card"),
+      ),
+      'cardNumber' => array(
+        'name' => t('Card Number'),
+        'description' => t("Last 4 Digits of Card Number with XXXXs for the rest"),
+      ),
+      'firstName' => array(
+        'name' => t('Billing First Name'),
+        'description' => t("Billing First Name"),
+      ),
+      'lastName' => array(
+        'name' => t('Billing Last Name'),
+        'description' => t("Billing Last Name"),
+      ),
+      'street' => array(
+        'name' => t('Billing Address'),
+        'description' => t("Billing Address"),
+      ),
+      'city' => array(
+        'name' => t('Billing City'),
+        'description' => t("Billing City"),
+      ),
+      'state' => array(
+        'name' => t('Billing State'),
+        'description' => t("Billing State"),
+      ),
+      'zip' => array(
+        'name' => t('Billing Zip'),
+        'description' => t("Billing Zip"),
+      ),
+      'country' => array(
+        'name' => t('Billing Country'),
+        'description' => t("Billing Country"),
+      ),
+      'phone' => array(
+        'name' => t('Billing Phone Number'),
+        'description' => t("Billing Phone Number"),
+      ),
+      'fax' => array(
+        'name' => t('Billing Fax Number'),
+        'description' => t("Billing Fax Number"),
+      ),
+    ),
+  );
+
+  return array('types' => $types, 'tokens' => $tokens);
+}
+
+/**
+ * Implements hook_tokens().
+ */
+function ms_cres_tokens($type, $tokens, $data = array(), $options = array()) {
+  $replacements = array();
+
+  if ($type == 'ms_cres_payment_profile' && !empty($data['ms_cres_payment_profile'])) {
+    $object = $data['ms_cres_payment_profile'];
+    foreach ($tokens as $name => $original) {
+      switch ($name) {
+        case 'updateUrl':
+          $replacements[$original] = url('user/' . $object->uid . '/billing-info', array('absolute' => TRUE));
+          break;
+        case 'expirationMonth':
+          $replacements[$original] = str_pad($object->month, 2, 0, STR_PAD_LEFT);
+          break;
+        case 'expirationYear':
+          $replacements[$original] = $object->year;
+          break;
+        case 'cardNumber':
+          $replacements[$original] = $object->card_number;
+          break;
+        case 'firstName':
+          $replacements[$original] = $object->first_name;
+          break;
+        case 'lastName':
+          $replacements[$original] = $object->last_name;
+          break;
+        case 'street':
+          $replacements[$original] = $object->street;
+          break;
+        case 'city':
+          $replacements[$original] = $object->city;
+          break;
+        case 'state':
+          $replacements[$original] = $object->state;
+          break;
+        case 'zip':
+          $replacements[$original] = $object->zip;
+          break;
+        case 'country':
+          $replacements[$original] = $object->country;
+          break;
+        case 'phone':
+          $replacements[$original] = $object->phone;
+          break;
+        case 'fax':
+          $replacements[$original] = $object->fax;
+          break;
+      }
+    }
+  }
+
+  return $replacements;
+}
+
+/**
+ * Landing page which will add a card profile
+ */
+function ms_cres_card_added_page() {
+  // Check to make sure this is a valid request
+  if (!isset($_SESSION['ms_cres_adding_card'])) {
+    drupal_set_title(t('Error'));
+    ms_core_log_error('ms_cres', t('Error, account mismatch.'));
+    return t('Error, account mismatch.');
+  }
+
+  $account = user_load($_SESSION['ms_cres_adding_card']);
+
+  unset($_SESSION['ms_cres_adding_card']);
+
+  $valid_payment = ms_cres_validate_added_card($_GET);
+
+  // Validate the payment
+  if ($valid_payment['approved']) {
+    $data = $valid_payment['params'];
+    $cc_num = $data['mPAN'];
+    $cc_type = $data['type'];
+    $month = substr($data['exp'], 0, 2);
+    $year = substr($data['exp'], 2, 2);
+    $token = $data['CRE_Card_Token'];
+
+    $address = array(
+      'first_name' => $data['customer_firstname'],
+      'last_name' => $data['customer_lastname'],
+      'address' => $data['customer_address'],
+      'city' => $data['customer_city'],
+      'state' => $data['customer_state'],
+      'zip' => $data['customer_postal_code'],
+      'country' => $data['customer_country'],
+      'phone' => $data['customer_phone'],
+      'fax' => '',
+    );
+
+    // Create a new Payment Profile
+    ms_cres_create_payment_profile($account->uid, $address, $cc_num, $cc_type, $month, $year, $token);
+
+    // Set a message
+    drupal_set_message(t('Your payment information has been updated.'));
+
+    // Go to the user account page
+    drupal_goto('user');
+  } else {
+    // The payment didn't pass validation, so we show an error message
+    drupal_set_message(t('The payment did not pass validation. The message returned was: @message. The error has been logged. Please contact us for more help.',
+      array('@message' => $valid_payment['message'])));
+
+    // Go to the user account page
+    drupal_goto('user');
+  }
+}
+
+/**
+ * Landing page which will validate the order, then enter the payment and create a payment profile
+ */
+function ms_cres_thankyou_page() {
+  $unique_key = arg(2);
+
+  // Attempt to load the order
+  if (!$order = ms_core_order_load_unique($unique_key)) {
+    // Should never get this far
+    ms_core_log_error('ms_cres', 'The order was unable to be loaded by key: !key. Details: !values',
+      array('!key' => $unique_key, '!values' => ms_core_print_r($_GET)));
+    return t("There was an error processing the payment. This error has been logged.");
+  }
+
+  // Validate the payment
+  if (isset($_GET['CRE_Tokenize'])) {
+    $valid_payment = ms_cres_validate_added_card($_GET);
+  } else {
+    $valid_payment = ms_cres_validate_payment($order, $_GET);
+  }
+
+  if ($valid_payment['approved']) {
+    $data = $valid_payment['params'];
+    $cc_num = $data['mPAN'];
+    $cc_type = $data['type'];
+    $month = substr($data['exp'], 0, 2);
+    $year = substr($data['exp'], 2, 2);
+
+    // Insert the Payment to the order
+    $payment = ms_core_new_payment($order->oid, 'ms_cres', 'cart');
+    $payment->transaction = $data['TxnGUID'];
+    $payment->amount = $order->amount;
+    $payment->currency = $order->currency;
+    $payment->recurring_id = "ms_cres-" . $order->oid;
+    $payment->data = $data;
+
+    // Update the address
+    $payment->billing_address = array(
+      'street' => $data['customer_address'],
+      'city' => $data['customer_city'],
+      'state' => $data['customer_state'],
+      'zip' => $data['customer_postal_code'],
+      'country' => $data['customer_country'],
+      'phone' => $data['customer_phone'],
+    );
+
+    $payment->first_name = $data['customer_firstname'];
+    $payment->last_name = $data['customer_lastname'];
+
+    switch ($order->order_type) {
+      case 'recurring':
+        $payment->type = 'rec_signup';
+        $payment->amount = 0;
+
+        // Add the Signup Payment
+        ms_core_enter_payment($payment);
+        break;
+
+      case 'cart':
+        // Add the Payment to the Order
+        ms_core_enter_payment($payment);
+        break;
+    }
+
+    // Create a new Payment Profile
+    if (isset($data['CRE_Card_Token'])) {
+      // Create the Payment Profile
+      // Reload the $order to get the user id
+      $order = ms_core_order_load($order->oid);
+      $account = user_load($order->uid);
+
+      $address = array(
+        'first_name' => $order->first_name,
+        'last_name' => $order->last_name,
+        'address' => $order->billing_address['street'],
+        'city' => $order->billing_address['city'],
+        'state' => $order->billing_address['state'],
+        'zip' => $order->billing_address['zip'],
+        'country' => $order->billing_address['country'],
+        'phone' => $order->billing_address['phone'],
+        'fax' => '',
+      );
+
+      $token = $data['CRE_Card_Token'];
+      ms_cres_create_payment_profile($account->uid, $address, $cc_num, $cc_type, $month, $year, $token);
+
+      // Also need to charge the payment here, since the payment won't be charged if using Tokenization
+      if ($payment_profile = ms_cres_get_default_payment_profile($order->uid)) {
+        watchdog('ms_cres', 'Charging the first payment for a tokenized order.');
+
+        // Handle Trial Periods
+        $amount = $order->amount;
+        if ($order->order_type == 'recurring') {
+          if ($order->recurring_schedule['trial_length'] AND !$order->recurring_schedule['trial_amount']) {
+            // If there is a free trial, then go straight to the thank-you page
+            drupal_goto('ms/thankyou');
+          } else {
+            // Otherwise, set the amount to the trial amount if applicable
+            $amount = ($order->recurring_schedule['trial_length']) ? $order->recurring_schedule['trial_amount'] : $order->recurring_schedule['main_amount'];
+          }
+        }
+
+        /**
+         * @fixme - This is failing when the user entered an incorrect billing address.
+         * We should try and charge the order before entering the payments above for signup,
+         * so that the user isn't granted a free month for products, and so that they won't
+         * be shown a success message.
+         */
+
+        // Process the next payment
+        $response = ms_cres_charge($order, $amount, $payment_profile);
+
+        if (!$response['approved']) {
+          // Log the failed payment
+          $payment->type = 'failed';
+
+          ms_core_log_error('ms_cres', 'A payment has failed. Details: !details',
+            array('!details' => ms_core_print_r($response)));
+
+          ms_core_enter_payment($payment);
+        } elseif ($order->order_type == 'recurring') {
+          $payment->type = 'rec_payment';
+          $payment->amount = $amount;
+
+          // Add the Payment
+          ms_core_enter_payment($payment);
+        }
+      }
+    }
+
+    // Go to the thank you page
+    drupal_goto('ms/thankyou');
+  } else {
+    // The payment didn't pass validation, so we show an error message
+    drupal_set_title(t('Error'));
+
+    ms_core_log_error('ms_cres', 'The payment did not pass validation. The message returned was: @message. Details: !details',
+      array('@message' => $valid_payment['message'], '!details' => ms_core_print_r($_GET)));
+
+    return t('The payment did not pass validation. The message returned was: @message. The error has been logged. Please contact us for more help.',
+      array('@message' => $valid_payment['message']));
+  }
+}
+
+/**
+ * Template page callback
+ *
+ * Notes:
+ * Must use the [[FORM INSERT]] token
+ * Must be useable via HTTPS
+ * Must have the BASE tag with the URL of your HTTPS domain or use absolute urls for CSS and image SRC values
+ * Must allow for the user session to be set via the URL
+ * <script> and <iframe> tags are stripped
+ */
+function ms_cres_template_page() {
+  global $user;
+  // Set the correct user if specified
+  if (isset($_GET['ms_cres_sess'])) {
+    if ($data = cache_get($_GET['ms_cres_sess'])) {
+      $uid = $data->data;
+      // Load the user
+      $user = user_load($uid);
+
+      // Remove the cached user id so it can't be used as a security loophole
+      cache_clear_all($_GET['ms_cres_sess'], 'cache');
+    }
+  } else {
+    // Make sure there is no user logged in
+    $user = user_load(0);
+  }
+
+  // Add the base tag
+  $element = array(
+    '#tag' => 'base',
+    '#attributes' => array(
+      'href' => url('', array('absolute' => TRUE)),
+    ),
+  );
+  drupal_add_html_head($element, 'ms_cres_template');
+
+  $html = variable_get('ms_cres_template_page_text', t('Please complete your payment below. This is a secure payment page.'));
+  $html .= "<div class='cre_secure_form_wrapper'>[[FORM INSERT]]</div>";
+
+  return $html;
+}
+
+// ======================================
+// CRE Direct Service API Calls
+// ======================================
+
+
+/**
+ * Charge a Payment Profile
+ */
+function ms_cres_charge($order, $amount, $payment_profile) {
+  $url = (variable_get('ms_cres_txn_mode', 'live') == 'live') ? 'https://direct.cresecure.net/direct/services/authorize/' : 'https://direct.sandbox-cresecure.net/direct/services/authorize/';
+
+  // Build the request params
+  $request = array();
+  $request['total_amt'] = $amount;
+  $request['CRE_Card_Token'] = $payment_profile->token;
+  $request['customer_id'] = $payment_profile->uid;
+  $request['customer_zip_code'] = $payment_profile->zip;
+  $request['order_desc'] = ms_core_get_order_title($order, 128);
+  $request['order_id'] = $order->oid;
+  $request['currency_code'] = $order->currency;
+
+  $response = ms_cres_curl_process($url, $request);
+
+  if (empty($response)) {
+    ms_core_log_error('ms_cres', "Transaction timed out or no response received.");
+    $return['approved'] = FALSE;
+    $return['message'] = t('Transaction timed out or no response received.');
+  } else {
+    // Determine if the transaction was a success
+    if (isset($response['code'])) {
+      if ($response['code'] == '000') {
+        $return['approved'] = TRUE;
+        $return['data'] = $response;
+      } else {
+        ms_core_log_error('ms_cres', "Error %reasoncode: %reasondesc",
+          array('%reasoncode' => $response['code'], '%reasondesc' => $response['message']));
+        $return['approved'] = FALSE;
+        $return['message'] = t("%reasoncode - %reasondesc",
+          array('%reasoncode' => $response['code'], '%reasondesc' => $response['message']));
+      }
+    } else {
+      ms_core_log_error('ms_cres', "Unknown Error: %response",
+        array('%response' => ms_core_print_r($response)));
+      $return['approved'] = FALSE;
+      $return['message'] = t("Unknown Error, see log for details.");
+    }
+  }
+
+  return $return;
+}
+
+/**
+ * Make sure that a payment is valid
+ */
+function ms_cres_validate_payment($order, $params) {
+  $url = (variable_get('ms_cres_txn_mode', 'live') == 'live') ? 'https://direct.cresecure.net/direct/services/validation/' : 'https://direct.sandbox-cresecure.net/direct/services/validation/';
+
+  // Build the request params
+  $request = array();
+  $request['total_amt'] = $order->amount;
+  $request['order_id'] = $params['order_id'];
+
+  $response = ms_cres_curl_process($url, $request);
+
+  if (empty($response)) {
+    ms_core_log_error('ms_cres', "Transaction timed out or no response received.");
+    $return['approved'] = FALSE;
+    $return['message'] = t('Transaction timed out or no response received.');
+  } else {
+    if ($response['status'] == 'success') {
+      $params_clean = array();
+      foreach ($_GET as $key => $value) {
+        $params_clean[$key] = $value;
+      }
+
+      // The payment is valid
+      $return['approved'] = TRUE;
+      $return['data'] = $response;
+      $return['params'] = $params_clean;
+    } // Check if the payment is valid
+    elseif (isset($response['error']) AND $response['error']) {
+      $return['approved'] = FALSE;
+      $return['message'] = t('Error validating the payment: @message',
+        array('@message' => $response['error_message']));
+
+      ms_core_log_error('ms_cres', "Error validating the payment: @message. Details: !details",
+        array('!details' => ms_core_print_r($response), '@message' => $response['error_message']));
+    } elseif ($response['order_id_match'] == 'NO' OR $response['total_amt_match'] == 'NO') {
+      $return['approved'] = FALSE;
+      $return['message'] = t('Error validating the payment: @message',
+        array('@message' => t('Order ID or Total Amount did not match.')));
+
+      ms_core_log_error('ms_cres', "Error validating the payment: @message. Details: !details",
+        array('!details' => ms_core_print_r($response), '@message' => t('Order ID or Total Amount did not match.')));
+    } else {
+      $params_clean = array();
+      foreach ($_GET as $key => $value) {
+        $params_clean[$key] = $value;
+      }
+
+      // The payment is valid
+      $return['approved'] = TRUE;
+      $return['data'] = $response;
+      $return['params'] = $params_clean;
+    }
+  }
+
+  return $return;
+}
+
+/**
+ * Make sure that an added card is valid
+ */
+function ms_cres_validate_added_card($params) {
+  // Check if the payment is valid
+  if (isset($params['code']) AND $params['code'] == '000') {
+    $params_clean = array();
+    $params['TxnGUID'] = 't_' . drupal_get_token(serialize($params));
+    foreach ($params as $key => $value) {
+      $params_clean[$key] = $value;
+    }
+
+    // The payment is valid
+    $return['approved'] = TRUE;
+    $return['data'] = $params;
+    $return['params'] = $params_clean;
+  } else {
+    if (!isset($params['msg'])) {
+      $params['msg'] = t('Unknown Error');
+    }
+    $return['approved'] = FALSE;
+    $return['message'] = t('Error validating the payment: @message',
+      array('@message' => $params['msg']));
+
+    ms_core_log_error('ms_cres', "Error validating the payment: @message. Details: !details",
+      array('!details' => ms_core_print_r($params), '@message' => $params['msg']));
+  }
+
+  return $return;
+}
+
+/**
+ * Send the Server Request using cURL
+ */
+function ms_cres_curl_process($url, $params) {
+  // Set the API Credentials
+  $params['CRESecureID'] = variable_get('ms_cres_api_id', '');
+  $params['CRESecureAPIToken'] = variable_get('ms_cres_api_token', '');
+
+  // Use cURL to send the server request
+  $ch = curl_init($url . '?' . http_build_query($params));
+  curl_setopt($ch, CURLOPT_HEADER, 0);
+  curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
+  curl_setopt($ch, CURLOPT_TIMEOUT, 300);
+  $raw_response = curl_exec($ch);
+  curl_close($ch);
+
+  $response = array();
+  parse_str(htmlspecialchars_decode($raw_response), $response);
+
+  return $response;
+}

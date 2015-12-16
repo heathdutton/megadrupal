@@ -1,0 +1,571 @@
+<?php
+/**
+ * @file
+ * Main module file.
+ */
+
+/**
+ * Implements hook_init().
+ */
+function mail_tracking_init() {
+  if (module_exists('mailsystem')) {
+    // Remove the our class from the Mail System classes list.
+    $classes = &mailsystem_get_classes();
+    unset($classes['MailTrackingMailSystem']);
+  }
+}
+
+/**
+ * Implements hook_menu().
+ */
+function mail_tracking_menu() {
+  $items = array();
+
+  $items['mtg/%/%/%/%/%'] = array(
+    'title' => 'Mail Tracking Gateway',
+    'access callback' => TRUE,
+    'page callback' => 'mail_tracking_gateway',
+    'page arguments' => array(1, 2, 3, 4, 5),
+    'type' => MENU_CALLBACK,
+  );
+
+  $items['admin/config/system/mail-tracking'] = array(
+    'title' => 'Mail Tracking',
+    'description' => 'Manage the Mail Tracking settings.',
+    'access callback' => 'user_access',
+    'access arguments' => array('administer mail tracking'),
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('mail_tracking_admin_settings'),
+    'type' => MENU_NORMAL_ITEM,
+    'file' => 'includes/mail_tracking.admin.inc',
+  );
+
+  $items['admin/reports/mail-tracking'] = array(
+    'title' => 'Mail Tracking',
+    'description' => 'Overview of send count, reads, clicks and unsubscriptions per mail.',
+    'access callback' => 'user_access',
+    'access arguments' => array('access mail tracking statistics'),
+    'page callback' => 'mail_tracking_admin_statistics',
+    'type' => MENU_NORMAL_ITEM,
+    'file' => 'includes/mail_tracking.admin.inc',
+  );
+
+  $items['admin/reports/mail-tracking/statistics'] = array(
+    'title' => 'Statistics',
+    'type' => MENU_DEFAULT_LOCAL_TASK,
+  );
+
+  $items['admin/reports/mail-tracking/tokens'] = array(
+    'title' => 'Tokens',
+    'access arguments' => array('access mail tracking tokens'),
+    'page callback' => 'mail_tracking_admin_tokens',
+    'type' => MENU_LOCAL_TASK,
+    'file' => 'includes/mail_tracking.admin.inc',
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_permission().
+ */
+function mail_tracking_permission() {
+  return array(
+    'administer mail tracking' => array(
+      'title' => t('Administer Mail Tracking settings'),
+      'description' => t('Change the Mail Tracking settings.'),
+    ),
+    'access mail tracking statistics' => array(
+      'title' => t('Access Mail Tracking statistics'),
+      'description' => t('Acces the Mail Tracking e-mail statistics.'),
+    ),
+    'access mail tracking tokens' => array(
+      'title' => t('Access Mail Tracking tokens'),
+      'description' => t('Acces the list of Mail Tracking tokens and their statistics.'),
+    ),
+  );
+}
+
+/**
+ * Implements hook_module_implements_alter().
+ */
+function mail_tracking_module_implements_alter(&$implementations, $hook) {
+  if ($hook == 'mail_alter') {
+    // Move our hook_mail_alter() implementation to the end.
+    $group = $implementations['mail_tracking'];
+    unset($implementations['mail_tracking']);
+    $implementations['mail_tracking'] = $group;
+  }
+}
+
+/**
+ * Implements hook_mail_alter().
+ */
+function mail_tracking_mail_alter(&$message) {
+  // Override the mail system, this will be reverted in the format() method
+  // of our custom MailSystemInterface implementation.
+  _mail_tracking_alter_mail_system();
+}
+
+/**
+ * Implements hook_cron().
+ */
+function mail_tracking_cron() {
+  // Clean-up expired tokens.
+  db_delete('mail_tracking_token')
+    ->condition('timestamp', _mail_tracking_token_expire_timestamp(), '<')
+    ->execute();
+}
+
+/**
+ * Implements hook_views_api().
+ */
+function mail_tracking_views_api() {
+  return array(
+    'api' => 3,
+    'path' => drupal_get_path('module', 'mail_tracking') . '/includes/views',
+  );
+}
+
+/**
+ * Implements hook_form_BASE_FORM_ID_alter().
+ */
+function mail_tracking_form_node_form_alter(&$form, &$form_state, $form_id) {
+  // Only alter Simplenews newsletter nodes.
+  if (_mail_tracking_has_simplenews_ga_tracking($form['type']['#value'])) {
+    $node = $form['#node'];
+
+    $form['title']['#weight']--;
+
+    $form['mail_tracking_source'] = array(
+      '#type' => 'machine_name',
+      '#title' => t('Tracking source'),
+      '#description' => t('Value for the Google Analytics source parameter.'),
+      '#default_value' => (isset($node->mail_tracking_source) ? $node->mail_tracking_source : ''),
+      '#maxlength' => 100,
+      '#disabled' => (isset($node->simplenews) && $node->simplenews->status != SIMPLENEWS_STATUS_SEND_NOT),
+      '#required' => TRUE,
+      '#weight' => ($form['title']['#weight'] + 1),
+      '#machine_name' => array(
+        'label' => t('Tracking source'),
+        'source' => array('title'),
+        'exists' => 'mail_tracking_check_source_exists',
+        'replace_pattern' => '[^a-z0-9-]+',
+        'replace' => '-',
+      ),
+    );
+  }
+}
+
+/**
+ * Implements hook_node_load().
+ */
+function mail_tracking_node_load($nodes, $types) {
+  if (_mail_tracking_has_simplenews_ga_tracking($types)) {
+    // Load the source records.
+    $query = db_select('mail_tracking_source', 's')
+      ->fields('s', array('nid'))
+      ->condition('nid', array_keys($nodes));
+    $query->addField('s', 'source', 'mail_tracking_source');
+    $sources = $query->execute()->fetchAllKeyed();
+
+    // Add them to the nodes.
+    foreach ($sources as $nid => $source) {
+      $nodes[$nid]->mail_tracking_source = $source;
+    }
+  }
+}
+
+/**
+ * Implements hook_node_presave().
+ */
+function mail_tracking_node_presave($node) {
+  if (empty($node->mail_tracking_source) && _mail_tracking_has_simplenews_ga_tracking($node->type)) {
+    // Create a valid source property.
+    $source = preg_replace('/[^a-z0-9-]+/', '-', drupal_strtolower($node->title));
+    $source = trim(substr($source, 0, 90), '-');
+
+    // Use the title MD5 hash as fallback.
+    if (!$source) {
+      $source = md5($node->title);
+    }
+
+    // Make sure it's unique.
+    $i = 1;
+    $original = $source;
+    while (mail_tracking_check_source_exists($source)) {
+      $source = $original . '-' . $i;
+      $i++;
+    }
+
+    $node->mail_tracking_source = $source;
+  }
+}
+
+/**
+ * Implements hook_node_insert().
+ */
+function mail_tracking_node_insert($node) {
+  if (_mail_tracking_has_simplenews_ga_tracking($node->type)) {
+    // Save the tracking source.
+    db_insert('mail_tracking_source')
+      ->fields(array(
+        'nid' => $node->nid,
+        'source' => $node->mail_tracking_source,
+      ))
+      ->execute();
+  }
+}
+
+/**
+ * Implements hook_node_update().
+ */
+function mail_tracking_node_update($node) {
+  if (_mail_tracking_has_simplenews_ga_tracking($node->type)) {
+    if (!isset($node->original->mail_tracking_source)) {
+      // Insert a new record.
+      mail_tracking_node_insert($node);
+    }
+    elseif ($node->original->mail_tracking_source != $node->mail_tracking_source) {
+      // Update the existing record.
+      db_update('mail_tracking_source')
+        ->fields(array('source' => $node->mail_tracking_source))
+        ->condition('nid', $node->nid)
+        ->execute();
+    }
+  }
+}
+
+/**
+ * Implements hook_node_delete().
+ */
+function mail_tracking_node_delete($node) {
+  if (_mail_tracking_is_simplenews_type($node->type)) {
+    if (_mail_tracking_has_simplenews_ga_tracking($node->type)) {
+      // Delete the tracking source.
+      db_delete('mail_tracking_source')
+        ->condition('nid', $node->nid)
+        ->execute();
+    }
+
+    // Delete the statistics.
+    db_delete('mail_tracking_statistics')
+      ->condition('nid', $node->nid)
+      ->execute();
+  }
+}
+
+/**
+ * Page callback; Acts as a tracking gateway to handle the e-mail action
+ * and forward to the destination.
+ *
+ * @param $token
+ *   Unique user token.
+ * @param $action
+ *   E-mail action linked to this incoming request, this can be one of the
+ *   following values:
+ *     - "r": Read, the e-mail is being read;
+ *     - "c": Click, the recipient clicks on a link in the e-mail;
+ *     - "u": Unsubscribe, the recipient unsubscribes from the newsletter.
+ * @param $timestamp
+ *   Unix timestamp the token was generated on.
+ * @param $desination
+ *   Encoded destination URL.
+ * @param $hash
+ *   Hash to verify the request integrity.
+ */
+function mail_tracking_gateway($token, $timestamp, $action, $destination_enc, $hash) {
+  // Validate the timestamp and action.
+  if (is_numeric($timestamp) && in_array($action, array('r', 'c', 'u'))) {
+    // Verify the URL integrity.
+    if ($hash == _mail_tracking_hash($token, $timestamp, $action, $destination_enc)) {
+      // Skip token handling for older timestamps.
+      if ($timestamp >= _mail_tracking_token_expire_timestamp()) {
+        // Get the token information.
+        $query = db_select('mail_tracking_token', 't');
+        $query->addJoin('INNER', 'mail_tracking_statistics', 's', 't.sid = s.sid');
+        $info = $query
+          ->fields('t', array('is_read', 'is_clicked', 'is_unsubscribed'))
+          ->fields('s', array('sid', 'nid'))
+          ->condition('t.token', $token)
+          ->execute()
+          ->fetch();
+
+        if ($info) {
+          switch ($action) {
+            // E-mail is being read.
+            case 'r':
+              if (!$info->is_read) {
+                db_update('mail_tracking_token')
+                  ->fields(array('is_read' => 1))
+                  ->condition('token', $token)
+                  ->execute();
+
+                db_update('mail_tracking_statistics')
+                  ->expression('read_count', 'read_count + 1')
+                  ->condition('sid', $info->sid)
+                  ->execute();
+              }
+              break;
+
+            // The user clicked a link.
+            case 'c':
+              if (!$info->is_clicked) {
+                db_update('mail_tracking_token')
+                  ->fields(array('is_read' => 1, 'is_clicked' => 1))
+                  ->condition('token', $token)
+                  ->execute();
+
+                db_update('mail_tracking_statistics')
+                  ->expression('read_count', 'read_count + :add_read_count', array(':add_read_count' => ($info->is_read ? 0 : 1)))
+                  ->expression('clicked_count', 'clicked_count + 1')
+                  ->condition('sid', $info->sid)
+                  ->execute();
+              }
+              break;
+
+            // The user unsubscribed from the mailing list.
+            case 'u':
+              if (!$info->is_unsubscribed && $info->nid) {
+                db_update('mail_tracking_token')
+                  ->fields(array('is_read' => 1, 'is_unsubscribed' => 1))
+                  ->condition('token', $token)
+                  ->execute();
+
+                db_update('mail_tracking_statistics')
+                  ->expression('read_count', 'read_count + :add_read_count', array(':add_read_count' => ($info->is_read ? 0 : 1)))
+                  ->expression('unsubscribed_count', 'unsubscribed_count + 1')
+                  ->condition('sid', $info->sid)
+                  ->execute();
+              }
+              break;
+          }
+        }
+      }
+
+      // Forward to the destination.
+      $desination = _mail_tracking_url_decode($destination_enc);
+      drupal_goto($desination, array(), 301);
+    }
+  }
+
+  drupal_not_found();
+}
+
+/**
+ * Check wether a Simplenews newsletter source for Google Analytics already exists.
+ *
+ * @param $source
+ *   Source to check.
+ *
+ * @return
+ *   TRUE if the source already exists.
+ */
+function mail_tracking_check_source_exists($source) {
+  return (bool) db_select('mail_tracking_source', 's')
+    ->fields('s', array('nid'))
+    ->condition('source', $source)
+    ->execute()
+    ->fetchField();
+}
+
+/**
+ * Checks if a node of $type a Simplenews newsletter is.
+ *
+ * @param $type
+ *   Node type or an array of types.
+ *
+ * @return
+ *   TRUE if at lease one of the types a Simplenews newsletter is.
+ */
+function _mail_tracking_is_simplenews_type($type) {
+  $type = (array) $type;
+  return (module_exists('simplenews') && count(array_intersect($type, simplenews_get_content_types())));
+}
+
+/**
+ * Checks if a node has Simplenews Google Analytics tracking.
+ *
+ * @param $type
+ *   Node type or an array of types.
+ *
+ * @return
+ *   TRUE if the node type is a Simplenews node with Google Analytics tracking.
+ */
+function _mail_tracking_has_simplenews_ga_tracking($type) {
+  return (module_exists('googleanalytics') && _mail_tracking_is_simplenews_type($type));
+}
+
+/**
+ * Overrides and reverts the "mail_system" variable so we can force the usage
+ * of our own MailSystemInterface implementation. This function should always
+ * be called twice, once to override and once to revert.
+ */
+function _mail_tracking_alter_mail_system() {
+  global $conf;
+  static $original;
+
+  if (isset($original)) {
+    // Revert back to the original settings.
+    if ($original['set']) {
+      $conf['mail_system'] = $original['value'];
+    }
+    else {
+      unset($conf['mail_system']);
+    }
+
+    // Reset $original to override again on the next invocation.
+    $original = NULL;
+  }
+  else {
+    // Load and statically cache the original mail system settings.
+    $original = array(
+      'value' => variable_get('mail_system', array('default-system' => 'DefaultMailSystem')),
+      'set' => isset($conf['mail_system']),
+    );
+
+    // Override the configuration to use our own MailSystemInterface implementation.
+    // We do not use variable_set() because the changes are temporary and shouldn't
+    // be written to the database.
+    $conf['mail_system'] = array('default-system' => 'MailTrackingMailSystem');
+  }
+}
+
+/**
+ * Get the current token expire timestamp, all tokens older than this timestamp
+ * will be ignored by the gateway and deleted on next cron.
+ *
+ * @return int
+ *   Expire timestamp.
+ */
+function _mail_tracking_token_expire_timestamp() {
+  $timestamp = &drupal_static(__FUNCTION__);
+
+  if (!$timestamp) {
+    $timestamp = '-' . variable_get('mail_tracking_token_retention', '1 month');
+    $timestamp = strtotime($timestamp, REQUEST_TIME);
+  }
+
+  return $timestamp;
+}
+
+/**
+ * Encode an URL so it can be used as part of a path.
+ *
+ * @param $url
+ *   URL (including "http://" or "https://" protocol) to encode.
+ *
+ * @return
+ *   Encoded URL.
+ */
+function _mail_tracking_url_encode($url) {
+  // Replace the protocol.
+  if (strpos($url, 'https://') === 0) {
+    $out = 's:' . drupal_substr($url, 8);
+  }
+  else {
+    $out = 'p:' . drupal_substr($url, 7);
+  }
+
+  // Compress and encode.
+  $out = base64_encode(gzcompress($out, 9));
+
+  // Cleanup.
+  $out = rtrim($out, '=');
+  $out = str_replace(array('+', '/'), array('-', '_'), $out);
+
+  return $out;
+}
+
+/**
+ * Decode an URL.
+ *
+ * @param $url_encoded
+ *   Encoded URL.
+ *
+ * @return
+ *   Original URL.
+ */
+function _mail_tracking_url_decode($url_encoded) {
+  // Undo the cleanup.
+  $out = str_replace(array('-', '_'), array('+', '/'), $url_encoded);
+
+  // Decode and uncompress.
+  if ($out = @base64_decode($out)) {
+    $out = @gzuncompress($out);
+  }
+
+  if ($out && $out[1] == ':') {
+    // Add the protocol.
+    $out = 'http' . (strpos($out, 's:') === 0 ? 's' : '') . '://' . drupal_substr($out, 2);
+  }
+  else {
+    // Faulty output, fall back to the old decoding system.
+    $out = base64_decode(rawurldecode(str_replace('-', '%', $url_encoded)));
+  }
+
+  return $out;
+}
+
+/**
+ * Generate the URL integrity validation hash.
+ *
+ * @param $token
+ *   Unique user token.
+ * @param $timestamp
+ *   Unix timestamp the token was generated on.
+ * @param $action
+ *   Gateway action.
+ * @param $destination_enc
+ *   Encoded destination URL.
+ *
+ * @return
+ *   Validation hash.
+ *
+ * @see mail_tracking_gateway().
+ */
+function _mail_tracking_hash($token, $timestamp, $action, $destination_enc) {
+  return md5($token . '|' . $timestamp . '|' . $action . '|' . $destination_enc . '|' . drupal_get_hash_salt());
+}
+
+/**
+ * Format a period to a more sensible string.
+ *
+ * @param $period
+ *   Period as set in the database, e.a. "2013-week-12" or "2013-day-315".
+ *
+ * @return
+ *   Formatted period.
+ */
+function _mail_tracking_format_period($period) {
+  $short = &drupal_static(__FUNCTION__);
+
+  if (!isset($short)) {
+    $short = rtrim(variable_get('date_format_short', 'm/d/Y - H:i'), 'Hgias:- ');
+  }
+
+  $period = explode('-', $period);
+
+  switch ($period[1]) {
+    case 'day':
+      $date = strtotime($period[0] . '-01-01 + ' . $period[2] . ' ' . $period[1], REQUEST_TIME);
+      return format_date($date, 'custom', $short);
+
+    case 'week':
+      $fromdate = strtotime($period[0] . 'W' . str_pad($period[2], 2, '0', STR_PAD_LEFT), REQUEST_TIME);
+      $todate = strtotime('+ 6 days', $fromdate);
+
+      return t('Week @week <em>(!fromdate - !todate)</em>', array(
+        '@week' => $period[2],
+        '!fromdate' => format_date($fromdate, 'custom', $short),
+        '!todate' => format_date($todate, 'custom', $short),
+      ));
+
+    case 'month':
+      $date = strtotime($period[0] . '-01-01 + ' . ($period[2] - 1) . ' ' . $period[1], REQUEST_TIME);
+      return format_date($date, 'custom', 'F Y');
+
+    case 'year':
+      return $period[0];
+  }
+}

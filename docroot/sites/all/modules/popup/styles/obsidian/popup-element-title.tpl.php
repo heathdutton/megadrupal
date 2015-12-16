@@ -1,1 +1,0 @@
-<a <?php print $href;?> class="<?php print $class;?>"><span><?php print $title; ?></span></a>

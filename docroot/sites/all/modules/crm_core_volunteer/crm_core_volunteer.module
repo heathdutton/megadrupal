@@ -1,0 +1,679 @@
+<?php
+/**
+ * @file
+ * Code for the CRM Core Volunteer feature.
+ */
+
+include_once 'crm_core_volunteer.features.inc';
+
+define('CMCV_SIGN_EMAIL_TAG', variable_get('crm_core_volunteer_sign_email_tag', 'CRM Core Volunteer Message'));
+define('CMCV_WAIT_EMAIL_TAG', variable_get('crm_core_volunteer_wait_email_tag', 'CRM Core Volunteer Wait Email'));
+define('CMCV_CHART_HEIGHT', '200');
+define('CMCV_XAXIS_TICKS', '7');
+define('CMCV_COLUMN_WIDTH', '0.8');
+
+/**
+ * Implements hook_form_BASE_FORM_ID_alter().
+ */
+function crm_core_volunteer_form_node_form_alter(&$form, $form_state) {
+
+  $node = $form['#node'];
+
+  if ($node->type == 'cmcv_volunteer') {
+    $form['crm_core_volunteer'] = array(
+      '#title' => t('CRM Core Volunteer'),
+      '#type' => 'fieldset',
+      '#group' => 'additional_settings',
+    );
+
+    $node_config = isset($node->nid) ? crm_core_volunteer_load_node_config($node->nid) : FALSE;
+
+    $form['crm_core_volunteer']['wait_list'] = array(
+      '#type' => 'checkbox',
+      '#title' => t('Enable wait list?'),
+      '#default_value' => empty($node_config) ? 1 : $node_config->wait_list,
+    );
+
+    $rule_set_tag = CMCV_SIGN_EMAIL_TAG;
+    $rules_components = _crm_core_volunteer_load_rules_components_by_tag($rule_set_tag);
+    $form['crm_core_volunteer']['sign_email'] = array(
+      '#type' => 'select',
+      '#title' => t('Volunteer sign up message'),
+      '#default_value' => empty($node_config) ? variable_get('crm_core_volunteer_default_sign_email', '') : $node_config->sign_email,
+      '#empty_option' => t('--Please Select--'),
+      '#empty_value' => '',
+      '#options' => $rules_components,
+    );
+
+    $rule_set_tag = CMCV_WAIT_EMAIL_TAG;
+    $rules_components = _crm_core_volunteer_load_rules_components_by_tag($rule_set_tag);
+    $form['crm_core_volunteer']['wait_email'] = array(
+      '#type' => 'select',
+      '#title' => t('Volunteer wait list message'),
+      '#default_value' => empty($node_config) ? variable_get('crm_core_volunteer_default_wait_email', '') : $node_config->wait_email,
+      '#empty_option' => t('--Please Select--'),
+      '#empty_value' => '',
+      '#options' => $rules_components,
+    );
+  }
+}
+
+/**
+ * Loads rules components with specified tag name.
+ *
+ * @param string $rule_set_tag
+ *   Tag name.
+ *
+ * @return array
+ *   Array of rules components keyed by machine name.
+ */
+function _crm_core_volunteer_load_rules_components_by_tag($rule_set_tag) {
+
+  $rules_config_ids = db_select('rules_tags', 'rt')
+    ->fields('rt', array('id'))
+    ->condition('tag', $rule_set_tag)
+    ->execute()
+    ->fetchCol();
+
+  return empty($rules_config_ids) ? array() : rules_get_components(TRUE, NULL, array('id' => $rules_config_ids));
+}
+
+/**
+ * Implements hook_node_insert().
+ */
+function crm_core_volunteer_node_insert($node) {
+  if ($node->type == 'cmcv_volunteer') {
+    if (isset($node->sign_email)) {
+      $config = new stdClass();
+      $config->nid = $node->nid;
+      $config->sign_email = $node->sign_email;
+      $config->wait_email = $node->wait_email;
+      $config->wait_list = $node->wait_list;
+      crm_core_volunteer_node_config_save($config);
+    }
+    elseif (isset($node->crm_core_volunteer_node_config)) {
+      $config = $node->crm_core_volunteer_node_config;
+      $uuid = $config['nid'];
+      $nids = entity_get_id_by_uuid('node', array($uuid));
+      if (isset($nids[$uuid])) {
+        $config['nid'] = $nids[$uuid];
+        crm_core_volunteer_node_config_save($config);
+      }
+    }
+  }
+}
+
+
+/**
+ * Saves nodes configuration.
+ *
+ * @param object $config
+ *   Nodes configuration.
+ */
+function crm_core_volunteer_node_config_save($config) {
+  $config = (array) $config;
+  db_merge('crm_core_volunteer_nodes')
+    ->condition('nid', $config['nid'])
+    ->fields($config)
+    ->execute();
+}
+
+/**
+ * Implements hook_node_update().
+ */
+function crm_core_volunteer_node_update($node) {
+  crm_core_volunteer_node_insert($node);
+}
+
+/**
+ * Implements hook_node_delete().
+ */
+function crm_core_volunteer_node_delete($node) {
+  if ($node->type == 'cmcv_volunteer') {
+    db_delete('crm_core_volunteer_nodes')
+      ->condition('nid', $node->nid)
+      ->execute();
+  }
+}
+
+/**
+ * Load node config.
+ *
+ * @param int $nid
+ *   Node ID.
+ *
+ * @return object
+ *   Returns nodes configuration, if saved, FALSE otherwise.
+ */
+function crm_core_volunteer_load_node_config($nid) {
+  $cache =& drupal_static(__FUNCTION__, array());
+  if (empty($cache[$nid])) {
+    $cache[$nid] = db_select('crm_core_volunteer_nodes', 'c')
+      ->condition('nid', $nid)
+      ->fields('c')
+      ->execute()->fetchObject();
+  }
+
+  return empty($cache[$nid]) ? FALSE : $cache[$nid];
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function crm_core_volunteer_form_crm_core_profile_entry_form_alter(&$form, &$form_state, $form_id) {
+  $form['#submit'][100] = 'crm_core_volunteer_submit_handler';
+}
+
+/**
+ * Volunteer opportunity submit handler.
+ *
+ * This handler triggers several things:
+ *
+ * - It triggers emails to be sent to petition targets.
+ * - It triggers thank you emails to be sent to signatories.
+ * - It saves personal messages automatically added to CRM Core Profiles.
+ */
+function crm_core_volunteer_submit_handler($form, &$form_state) {
+
+  // Load the volunteer opportunity, make sure it is a node.
+  $opportunity = menu_get_object();
+  if (is_object($opportunity) && $opportunity->type == 'cmcv_volunteer') {
+
+    // Get the configuration for the node.
+    $opportunity_config = crm_core_volunteer_load_node_config($opportunity->nid);
+
+    // Find the right person to send a thank you note to.
+    $volunteer = isset($form_state['crm_core_contact']) ? $form_state['crm_core_contact'] : NULL;
+
+    // Get volunteer primary email.
+    // It could be empty if primary field not configure or it was not
+    // filed on form.
+    $email_to = crm_core_contact_get_primary_field_value($volunteer, 'email');
+
+    $signature = isset($form_state['crm_core_activity']) ? $form_state['crm_core_activity'] : NULL;
+
+    // There's some logic going on here around volunteer needs:
+    // - if someone is signing up for an opportunity and we have already
+    // reached the maximum number of slots, that person is treated as being
+    // on the wait list.
+    // - if the maximum number of slots has not been reached, that person
+    //   is being treated as committed.
+    //
+    // Based on whether or not someone is going on the wait list,
+    // we handle things differently:
+    // - we send a different email based on the slot status.
+    // - we mark contacts differently based on the slot status.
+    // Total opportunity slots.
+    $opportunity_wrapper = entity_metadata_wrapper('node', $opportunity);
+    $total_slots = $opportunity_wrapper->field_cmcv_slots->value();
+
+    $query = new EntityFieldQuery();
+    $used_slots = $query->entityCondition('entity_type', 'crm_core_activity')
+      ->entityCondition('bundle', 'cmcv_volunteer_commitment')
+      ->fieldCondition('field_cmcv_vo_reference', 'target_id', $opportunity->nid)
+      ->count()
+      ->execute();
+
+    // Total slots set to zero means it's unlimited.
+    if ($total_slots == 0 || $total_slots >= $used_slots) {
+      if (!empty($email_to) && !empty($opportunity_config->sign_email)) {
+        rules_invoke_component($opportunity_config->sign_email, $email_to, $volunteer, $signature, $opportunity);
+      }
+    }
+    else {
+      $signature_wrapper = entity_metadata_wrapper('crm_core_activity', $signature);
+      $signature_wrapper->field_cmcv_signup_status->set('wait list');
+      $signature_wrapper->save();
+      if (!empty($email_to) && !empty($opportunity_config->sign_email)) {
+        rules_invoke_component($opportunity_config->wait_email, $email_to, $volunteer, $signature, $opportunity);
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_permission().
+ */
+function crm_core_volunteer_permission() {
+  return array(
+    'administer crm core volunteer' => array(
+      'title' => t('Administer CRM Core Volunteer'),
+      'description' => t('Provides access to tools for administering CRM Core Volunteer.'),
+    ),
+    'sign up for volunteer opportunity' => array(
+      'title' => t('Sign up for volunteer opportunity'),
+    ),
+    'view volunteer reports' => array(
+      'title' => t('View volunteer reports'),
+      'description' => t('Provides access volunteer reports.'),
+    ),
+    'view volunteer overview report' => array(
+      'title' => t('View volunteer overview report'),
+      'description' => t('Provides access to the volunteer overview report.'),
+    ),
+    'view volunteer details report' => array(
+      'title' => t('View volunteer details report'),
+      'description' => t('Provides access to the volunteer sign up details report.'),
+    ),
+    'view volunteer sources report' => array(
+      'title' => t('View volunteer sources report'),
+      'description' => t('Provides access to the volunteer sign up source  report.'),
+    ),
+    'access registration list for own opportunities' => array(
+      'title' => t('Access registration list for own opportunities'),
+      'description' => t('Provides access to the registration list for users who are viewing opportunities they have created.'),
+    ),
+    'access registration list for any opportunity' => array(
+      'title' => t('Access registration list for any opportunity'),
+      'description' => t('Provides access to the registration list for opportunities in the system.'),
+    ),
+    'access volunteer overview report' => array(
+      'title' => t('Access volunteer overview report'),
+      'description' => t('Provides access to the volunteer overview report.'),
+    ),
+    'access volunteer report' => array(
+      'title' => t('Access volunteer report'),
+      'description' => t('Provides access to the volunteer details report.'),
+    ),
+    'access opportunities report' => array(
+      'title' => t('Access opportunities report'),
+      'description' => t('Provides access to the volunteer opportunities report, the attendance report, and the opportunity summary report.'),
+    ),
+    'access sources report' => array(
+      'title' => t('Access sources report'),
+      'description' => t('Provides access to the volunteer sources report and the source summary report.'),
+    ),
+  );
+}
+
+/**
+ * Access callback used in panel 'Opportunities Signups'.
+ *
+ * @param array $contexts
+ *   Panels contexts.
+ *
+ * @return bool
+ *   Does user has access.
+ */
+function crm_core_volunteer_access_my_opportunity($contexts) {
+  global $user;
+  $node = $contexts['argument_entity_id:node_1']->data;
+
+  // Check that user is current node author and have 'Access registration list
+  // for own opportunities' permission.
+  if ($node->uid == $user->uid
+    && user_access('access registration list for own opportunities', $user)
+  ) {
+    return TRUE;
+  }
+  // Check that user have 'Access registration list for any opportunity'
+  // permission.
+  elseif (user_access('access registration list for any opportunity', $user)) {
+    return TRUE;
+  }
+
+  return FALSE;
+}
+
+/**
+ * Implements hook_menu_local_tasks_alter().
+ */
+function crm_core_volunteer_menu_local_tasks_alter(&$data, $router_item, $root_path) {
+  switch ($root_path) {
+    case 'admin/structure/crm-core/cmcv':
+      $item = menu_get_item('node/add/cmcv-volunteer');
+      if ($item['access']) {
+        $item['title'] = 'Add Volunteer Opportunity';
+        $data['actions']['output'][] = array(
+          '#theme' => 'menu_local_action',
+          '#link' => $item,
+        );
+      }
+      break;
+  }
+}
+
+/**
+ * Implements hook_node_view().
+ */
+function crm_core_volunteer_node_view($node, $view_mode) {
+  // Hide CRM Core Profile on Volunteer Opportunities nodes if user has
+  // no 'sign up for volunteer opportunity' permission.
+  if ($node->type == 'cmcv_volunteer'
+    && isset($node->content['crm_core_profile'])
+    && !user_access('sign up for volunteer opportunity')
+  ) {
+    $node->content['crm_core_profile']['#access'] = FALSE;
+  }
+}
+
+/**
+ * Implements hook_crm_core_report_register().
+ */
+function crm_core_volunteer_crm_core_report_register() {
+
+  $reports = array(
+    'cmcv' => array(
+      'title' => t('Volunteers'),
+      'reports' => array(),
+      'widgets' => array(),
+    ),
+  );
+
+  // Volunteers overview page.
+  $reports['cmcv']['reports']['cmcv_overview'] = array(
+    'title' => t('Volunteers Overview'),
+    'path' => 'crm-core/reports/cmcv',
+    'description' => t('Volunteers quick overview.'),
+  );
+
+  // Volunteers report.
+  $reports['cmcv']['reports']['cmcv_volunteer'] = array(
+    'title' => t('Volunteers Report'),
+    'path' => 'crm-core/reports/cmcv/volunteer',
+    'description' => t('Provides information about volunteers.'),
+  );
+
+  // Volunteers commitment details page.
+// @todo: Check if we need this report. Also cmcv_details_report view relate
+// this report.
+//  $reports['cmcv']['reports']['cmcv_detail'] = array(
+//    'title' => t('Commitment details'),
+//    'path' => 'crm-core/reports/cmcv/details',
+//    'description' => t('Details on volunteers commitments, including filters and sorting.'),
+//  );
+
+  // Volunteers commitment sources page.
+  $reports['cmcv']['reports']['cmcv_source'] = array(
+    'title' => t('Commitment sources'),
+    'path' => 'crm-core/reports/cmcv/source',
+    'description' => t('Provides information about sources of volunteers signatures.'),
+  );
+
+  // Volunteers opportunities report.
+  $reports['cmcv']['reports']['cmcv_opportunities'] = array(
+    'title' => t('Opportunities Report'),
+    'path' => 'crm-core/reports/cmcv/opportunities',
+    'description' => t('Provides information about volunteer opportunities.'),
+  );
+
+  return $reports;
+}
+
+/**
+ * Implements hook_ctools_plugin_directory().
+ */
+function crm_core_volunteer_ctools_plugin_directory($owner, $plugin_type) {
+  if ($owner == 'ctools' && $plugin_type == 'content_types') {
+    return 'plugins/' . $plugin_type;
+  }
+
+  return NULL;
+}
+
+/**
+ * Implements hook_menu().
+ */
+function crm_core_volunteer_menu() {
+
+  $items['admin/structure/crm-core/cmcv'] = array(
+    'title' => 'Volunteer opportunities',
+    'description' => 'Manage CRM Core Volunteer opportunities',
+    'position' => 'left',
+    'page callback' => 'views_embed_view',
+    'page arguments' => array('cmcv_manage_volunteer_opportunities', 'default'),
+    'access arguments' => array('administer site configuration'),
+    'type' => MENU_LOCAL_TASK,
+  );
+
+  $items['admin/structure/crm-core/cmcv/manage-volunteer-opportunities'] = array(
+    'title' => 'Manage volunteer opportunities',
+    'description' => 'Manage CRM Core Volunteer opportunities',
+    'access arguments' => array('administer site configuration'),
+    'file path' => drupal_get_path('module', 'views'),
+    'file' => 'views.module',
+  );
+
+  // Configuration settings for CRM Core Volunteer.
+  $items['admin/config/crm-core/cmcv'] = array(
+    'title' => 'CRM Core Volunteer settings',
+    'type' => MENU_NORMAL_ITEM,
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('cmcv_admin_general_settings_form'),
+    'file' => 'crm_core_volunteer.admin.inc',
+    'access arguments' => array('administer crm core volunteer'),
+    'description' => 'Provides controls for general behaviors of volunteer registration, the appearance of reports, etc.',
+  );
+
+  // General settings page for CRM Core Volunteer.
+  $items['admin/config/crm-core/cmcv/settings'] = array(
+    'title' => 'General settings',
+    'description' => 'Configure settings for CRM Core Volunteer.',
+    'position' => 'left',
+    'type' => MENU_DEFAULT_LOCAL_TASK,
+  );
+
+  // Settings page for reports in CRM Core Volunteer.
+  $items['admin/config/crm-core/cmcv/reports'] = array(
+    'title' => 'Reports settings',
+    'description' => 'Configure settings for reports in CRM Core Volunteer.',
+    'position' => 'left',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('cmcv_admin_report_settings_form'),
+    'file' => 'crm_core_volunteer.admin.inc',
+    'access arguments' => array('administer crm core volunteer'),
+    'type' => MENU_LOCAL_TASK,
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_action_info().
+ */
+function crm_core_volunteer_action_info() {
+  return array(
+    'crm_core_volunteer_change_status_action' => array(
+      'type' => 'crm_core_activity',
+      'label' => t('Change Status'),
+      'configurable' => TRUE,
+      'behavior' => array('changes_property'),
+    ),
+  );
+}
+
+/**
+ * Change status action.
+ */
+function crm_core_volunteer_change_status_action(&$activity, $context) {
+  $aw = entity_metadata_wrapper('crm_core_activity', $activity);
+  if ($aw->getBundle() == 'cmcv_volunteer_commitment') {
+    $aw->field_cmcv_signup_status->set($context['status']);
+    watchdog('action', 'Changed status to !status for activity !activity.', array(
+      '!status' => $context['status'],
+      '!activity' => $aw->activity_id->value(),
+    ));
+  }
+}
+
+/**
+ * Change status action form.
+ */
+function crm_core_volunteer_change_status_action_form($context) {
+  $info = field_info_field('field_cmcv_signup_status');
+
+  $form['status'] = array(
+    '#type' => 'select',
+    '#title' => t('Status:'),
+    '#options' => $info['settings']['allowed_values'],
+    '#description' => t('Set new status for selected volunteer(s).'),
+  );
+
+  return $form;
+}
+
+/**
+ * Change status action form submit callback.
+ */
+function crm_core_volunteer_change_status_action_submit($form, $form_state) {
+  return array('status' => $form_state['values']['status']);
+}
+
+/**
+ * Implements hook_node_view_alter().
+ */
+function crm_core_volunteer_node_view_alter(&$build) {
+  // If the following things are true:
+  // - we are viewing a volunteer opportunity page
+  // - there is a profile form attached
+  // - the profile includes a volunteer commitment activity
+  // - the profile has a field for volunteer opportunity page
+  //
+  // Then please kindly prepopulate the value of the form field.
+  $node =& $build['#node'];
+  $profile =& $build['crm_core_profile'];
+  if (arg(1) === $node->nid && isset($profile) && $node->type == 'cmcv_volunteer' && isset($profile['field_cmcv_vo_reference'])) {
+    $profile['field_cmcv_vo_reference'][LANGUAGE_NONE][0]['target_id']['#default_value'] = $node->title . ' (' . $node->nid . ')';
+    $profile['field_cmcv_vo_reference'][LANGUAGE_NONE][0]['target_id']['#value'] = $node->title . ' (' . $node->nid . ')';
+    $profile['field_cmcv_vo_reference'][LANGUAGE_NONE][0]['value']['#default_value'][0] = $node->nid;
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function crm_core_volunteer_form_alter(&$form, &$form_state) {
+  if ($node = menu_get_object()) {
+    if (isset($form['field_cmcv_vo_reference'])) {
+      $form['field_cmcv_vo_reference'][LANGUAGE_NONE][0]['target_id']['#default_value'] = $node->title . ' (' . $node->nid . ')';
+      $form['field_cmcv_vo_reference'][LANGUAGE_NONE][0]['target_id']['#value'] = $node->title . ' (' . $node->nid . ')';
+      $form['field_cmcv_vo_reference'][LANGUAGE_NONE][0]['value']['#default_value'][0] = $node->nid;
+    }
+  }
+}
+
+/**
+ * Implements hook_preprocess_page().
+ */
+function crm_core_volunteer_preprocess_page(&$vars) {
+
+  // Set breadcrumbs for all volunteer reports.
+  if (arg(0) == 'crm-core' && arg(1) == 'reports' && arg(2) == 'cmcv') {
+    $breadcrumb = array(
+      l(t('Home'), '<front>'),
+      l(t('CRM Core'), 'crm-core'),
+      l(t('Reports'), 'crm-core/reports'),
+    );
+    if (arg(3) != '' && (arg(4) == '' || arg(4) == 'summary' || arg(4) == 'attendance')) {
+      $breadcrumb[] = l(t('Volunteer reports'), 'crm-core/reports/cmcv');
+    }
+    if (arg(3) == 'opportunities' && (arg(4) == 'summary' || arg(4) == 'attendance')) {
+      $breadcrumb[] = l(t('Volunteer opportunities'), 'crm-core/reports/cmcv/opportunities');
+    }
+    elseif (arg(3) == 'source' && arg(4) == 'summary') {
+      $breadcrumb[] = l(t('Volunteer commitment sources'), 'crm-core/reports/cmcv/source');
+    }
+    drupal_set_breadcrumb($breadcrumb);
+  }
+}
+
+
+/**
+ * Implements hook_node_load().
+ *
+ * Checking volunteer opportunity configuration here.
+ */
+function crm_core_volunteer_node_load($nodes, $types) {
+
+  foreach ($nodes as $node) {
+    if ($node->type == 'cmcv_volunteer') {
+      $node_config = crm_core_profile_load_node_config($node->nid);
+      if (!empty($node_config->use_profile)) {
+        $profile = crm_core_profile_load($node_config->profile_name);
+        $opp_config = crm_core_volunteer_load_node_config($node->nid);
+        // Init profile data, if not set.
+        if (!isset($node->crm_core_profile_data)) {
+          $node->crm_core_profile_data = array();
+        }
+        // Lets check if opportunity has passed.
+        $nw = entity_metadata_wrapper('node', $node);
+        $start_date = $nw->field_cmcv_date->value->value();
+        $current_date = time();
+        $late_registration = variable_get('cmcv_late_registration', 1);
+        if (($current_date > $start_date) && empty($late_registration)) {
+          $node->crm_core_profile_data['access_override']['access'] = FALSE;
+          $node->crm_core_profile_data['access_override']['message'] = variable_get('cmcv_cutoff_message', 'Registration closed!');
+          continue;
+        }
+        // Lets check available slots.
+        $slots = (int) $nw->field_cmcv_slots->value();
+        if (!empty($slots)) {
+          $query = db_select('crm_core_activity', 'cca');
+          $query->join('field_data_field_cmcv_vo_reference', 'vo', 'cca.activity_id = vo.entity_id');
+          $query->condition('type', 'cmcv_volunteer_commitment');
+          $query->where('vo.field_cmcv_vo_reference_target_id = :vo_id', array(':vo_id' => $node->nid));
+          $count = $query->fields('cca', array('activity_id'))->countQuery();
+          $registrations = (int) $count->execute()->fetchField();
+          $wait_list_global = variable_get('cmcv_wait_list', 1);
+          if ($registrations >= $slots && empty($wait_list_global)) {
+            $node->crm_core_profile_data['access_override']['access'] = FALSE;
+            $node->crm_core_profile_data['access_override']['message'] = variable_get('cmcv_cutoff_message', 'Registration closed!');
+            continue;
+          }
+          elseif (!empty($node_config->display_profile) && !empty($opp_config->wait_list)) {
+            $node->crm_core_profile_data['access_override']['access'] = FALSE;
+            $node->crm_core_profile_data['access_override']['message'] = variable_get('cmcv_cutoff_message', 'Registration closed!');
+            continue;
+          }
+        }
+      }
+    }
+  }
+}
+
+
+/**
+ * Implements hook_uuid_node_features_export_render_alter().
+ *
+ * Adding node configuration to export.
+ */
+function crm_core_volunteer_uuid_node_features_export_render_alter(&$export, $node, $module) {
+  if ($export->type == 'cmcv_volunteer') {
+    $nids = entity_get_id_by_uuid('node', array($node->uuid));
+    $config = crm_core_volunteer_load_node_config($nids[$node->uuid]);
+    if ($config !== FALSE) {
+      $config->nid = $node->uuid;
+      $export->crm_core_volunteer_node_config = $config;
+    }
+  }
+}
+
+/**
+ * Implements hook_entity_uuid_load().
+ */
+function crm_core_volunteer_entity_uuid_load(&$entities, $entity_type) {
+  if ($entity_type == 'node') {
+    foreach ($entities as $nid => $node) {
+      $config = crm_core_volunteer_load_node_config($nid);
+      if ($config !== FALSE) {
+        $config->nid = $node->uuid;
+        $entities[$nid]->crm_core_volunteer_node_config = $config;
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_entity_uuid_save().
+ */
+function crm_core_volunteer_entity_uuid_save(&$entity, $entity_type) {
+  if ($entity_type == 'node') {
+    if (isset($entity->crm_core_volunteer_node_config)) {
+      $config = (array) $entity->crm_core_volunteer_node_config;
+      $uuid = $config['nid'];
+      $nids = entity_get_id_by_uuid('node', array($uuid));
+      $config['nid'] = $nids[$uuid];
+      crm_core_volunteer_node_config_save($config);
+    }
+  }
+}
