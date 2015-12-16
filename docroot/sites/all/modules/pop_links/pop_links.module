@@ -1,0 +1,429 @@
+<?php
+
+/**
+ * @file
+ *
+ * Uses the Voting API to rate external links by click traffic
+ *
+ * @ingroup pop_links
+ */
+
+/**
+ * Implementation of hook_enable().
+ */
+function pop_links_enable() {
+  // direct the user to the module's settings page
+  $settings = l(t('settings'), 'admin/settings/pop_links');
+  drupal_set_message(t("External Link Popularity has been enabled.  Visit the !settings page to configure the module.",
+    array('!settings' => $settings)));
+}
+
+/**
+ * Implementation of hook_disable().
+ */
+function pop_links_disable() {
+  // set variables to their default values
+  // for development purposes only *** remove before releasing ***
+  variable_set('pop_links_vote_life', 0);
+  variable_set('pop_links_block_size', 10);
+}
+
+/**
+ * Implementation of hook_help().
+ */
+function pop_links_help($path) {
+  switch ($path) {
+    case 'admin/help#pop_links':
+      return '<p>' . t('External Link Popularity uses the Voting API module to
+        rank nodes that contain external links.  Nodes are awarded points when
+        users follow the external link.  These points can be given a lifetime
+        to limit the scope of the rankings: e.g. most popular today, weekly,
+        etc.  Each user click is counted only once per voting period per node.
+        The module also provides a block showing the most popular nodes.') . '</p>';
+      break;
+  }
+}
+
+/**
+ * Implementation of hook_permission().
+ */
+function pop_links_permission() {
+  return array(
+    'record external click' => array(
+      'title' => t('Record external clicks'),
+      'description' => t('causes users to have their clicks traced and tallied.'),
+    ), 
+    'access click counter' => array(
+      'title' => t('Access click counter'),
+      'description' => t('allows users to view a tally of clicks on external links.'),
+    ),
+    'access link popularity stats' => array(
+      'title' => t('Access link popularity stats'),
+      'description' => t('allows users to view statistics about the popularity of links on the site.'),
+    ),
+  );
+}
+
+/**
+ * Implementation of hook_node_view().
+ *
+ * Adds necessary Javascript and settings when viewing nodes whose links are to be tracked.
+ */
+function pop_links_node_view($node) {
+  $node_types = variable_get('pop_links_node_types', array('page'));
+  global $user;
+  if (in_array($node->type, $node_types) && arg(0) != 'admin' && _pop_links_track($user)) {
+    $setting = array(
+      'pop_links' => array(
+        '#node-' . $node->nid => array(
+          'nid' => $node->nid,
+        ),
+      ),
+    );
+    drupal_add_js($setting, array('type' => 'setting'));
+    drupal_add_js(drupal_get_path('module', 'pop_links') . '/pop_links.js');
+  }
+}
+
+/**
+ * Implementation of hook_node_view_alter().
+ *
+ * Adds the click counter to the node body, if the current user has permission to view it.
+ */
+function pop_links_node_view_alter(&$build) {
+ if (user_access('access click counter')) {
+    $criteria = array(
+      'entity_type' => 'node',
+      'entity_id' => $build['#node']->nid,
+      'value_type' => 'points',
+      'tag' => 'pop_links',
+      'function' => 'sum',
+    );
+    $result = votingapi_select_results($criteria);
+    if (isset($result[0]['value']) && !empty($result[0]['value'])) {
+      $build['pop_links_click_counter'] = array(
+        '#type' => 'markup',
+        '#markup' => theme('pop_links_node_click_counter', array('count' => $result[0]['value'])),
+        '#weight' => 500,
+      );
+    }
+  }
+}
+
+/**
+ * Implementation of hook_node_delete().
+ *
+ * Wipes out log data for links when their parent node is deleted.
+ */
+function pop_links_node_delete($node) {
+  db_delete('pop_links_stats')
+    ->condition('nid', $node->nid)
+    ->execute();
+  // Delete Voting API data.
+  $votes = votingapi_select_votes(array('entity_type' => 'node', 'entity_id' => $node->nid, 'tag' => 'pop_links'));
+  votingapi_delete_votes($votes);
+  $results = votingapi_select_results(array('entity_type' => 'node', 'entity_id' => $node->nid, 'tag' => 'pop_links'));
+  votingapi_delete_results($results);
+}
+
+/**
+ * Implementation of hook_field_extra_fields().
+ *
+ * Makes the node click counter appear in the Field UI, where administrators can move it in relation
+ * to other fields and fieldable elements.
+ */
+function pop_links_field_extra_fields() {
+  $node_types = variable_get('pop_links_node_types', array('page'));
+  $extra = array();
+  foreach ($node_types as $node_type) {
+    $extra['node'][$node_type]['display'] = array(
+        'pop_links_click_counter' => array(
+        'label' => t('Link click counter'),
+        'description' => t('Tally of clicks on external links within the node; provided by the
+          External Link Popularity module.'),
+        'weight' => 500,
+      ),
+    );
+  }
+  return $extra;
+}
+
+/**
+ * Implementation of hook_menu().
+ */
+function pop_links_menu() {
+  $items = array();
+
+  $items['admin/config/services/pop_links'] = array(
+    'title' => 'External Link Popularity',
+    'description' => 'Configure the External Link Popularity module.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('pop_links_admin_settings'),
+    'access callback' => 'user_access',
+    'access arguments' => array('administer site configuration'),
+    'type' => MENU_NORMAL_ITEM,
+  );
+
+  $items['pop_links/handle'] = array(
+    'title' => 'NOOP',
+    'page callback' => 'pop_links_handle',
+    'access callback' => 'user_access',
+    'access arguments' => array('record external click'),
+    'type' => MENU_CALLBACK,
+  );
+
+  if (module_exists('chart')) {
+    $items['admin/reports/pop_links/charts'] = array(
+      'title' => 'Charts',
+      'description' => 'External Link Popularity Charts',
+      'page callback' => 'pop_links_charts',
+      'access callback' => 'user_access',
+      'access arguments' => array('access link popularity stats'),
+      'weight' => 1,
+      'type' => MENU_LOCAL_TASK,
+    );
+  }
+  return $items;
+}
+
+/**
+ * Define the settings form.
+ *
+ * @ingroup forms
+ */
+function pop_links_admin_settings() {
+  $period = array(0 => t('Indefinite')) + drupal_map_assoc(array(300, 900, 1800, 3600, 10800, 21600, 32400, 43200, 86400, 172800, 345600, 604800, 1209600, 2419200), 'format_interval');
+
+  $form['pop_links_vote_life'] = array(
+    '#type' => 'select',
+    '#title' => t('Click Points Lifetime'),
+    '#description' => t('Enter the time before a click point is deleted.'),
+    '#default_value' => variable_get('pop_links_vote_life', 0),
+    '#options' => $period
+  );
+
+  $form['pop_links_stats_life'] = array(
+    '#type' => 'select',
+    '#title' => t('Statistics Lifetime'),
+    '#description' => t('Enter the time before the statistical data is deleted.'),
+    '#default_value' => variable_get('pop_links_stats_life', 0),
+    '#options' => $period
+  );
+  
+  $node_types = node_type_get_types();
+  $node_types = array_keys($node_types);
+  $node_types = array_combine($node_types, $node_types);
+  
+  $form['pop_links_node_types'] = array(
+    '#type' => 'checkboxes',
+    '#title' => t('Node types'),
+    '#description' => t('What node types should be monitored for external click traffic?'),
+    '#default_value' => variable_get('pop_links_node_types', array('page')),
+    '#options' => $node_types,
+  );
+
+  $form['pop_links_track_roles'] = array(
+    '#type' => 'checkboxes',
+    '#title' => t('Tracking by role'),
+    '#description' => t('Only track the following roles. Leave empty for all roles. Admin pages are never tracked.'),
+    '#default_value' => variable_get('pop_links_track_roles', array(0, 0)),
+    '#options' => user_roles(),
+  );
+
+  return system_settings_form($form);
+}
+
+/**
+ * AJAX handler function
+ */
+function pop_links_handle() {
+  if ($_REQUEST['operation']) {
+    $op = $_REQUEST['operation'];
+
+    if ($op == 'track_click') {
+      $nid = $_REQUEST['nid']; // node id where the external click took place
+      $url = $_REQUEST['url']; // the user is going to this URL (href)
+      $uid = $GLOBALS['user']->uid;
+      $hostname = $_SERVER['REMOTE_ADDR']; // user's ip address
+
+      // cast the vote using the Votingapi module
+      $vote = array();
+      $vote[] = array(
+        'entity_type' => 'node',
+        'entity_id' => $nid,
+        'value_type' => 'points',
+        'value' => 1,
+        'tag' => 'pop_links',
+        'uid' => $uid,
+        'vote_source' => $hostname,
+        'timestamp' => REQUEST_TIME,
+      );
+      votingapi_set_votes($vote);
+
+      // save click data to the statistics table
+      db_insert('pop_links_stats')
+        ->fields(array(
+          'nid' => $nid,
+          'url' => $url,
+          'uid' => $uid,
+          'hostname' => $hostname,
+          'timestamp' => REQUEST_TIME,
+        ))->execute();
+
+      // send acknowledge receipt
+      print 'ACK';
+      exit;
+    }
+  }
+
+  // send negative acknowledgement
+  print 'NAK';
+  exit;
+}
+
+/**
+ * Implementation of hook_views_api().
+ */
+function pop_links_views_api() {
+  return array(
+    'api' => 2.0,
+  );
+}
+
+/**
+ * Page callback to create a chart of the 15 most popular nodes, according to clicks on their
+ * external links. This page will only function if the Google Chart API (chart) module is installed;
+ * its menu link will not be built unless that module is available.
+ */
+function pop_links_charts() {
+  // create the pie chart
+  $chart = array(
+    '#chart_id' => 'click_chart',
+    '#title' => chart_title(t('Top 15 Nodes by Clicks'), '555555', 15),
+    '#type' => CHART_TYPE_PIE,
+    '#size' => chart_size(600, 200),
+  );
+  
+  $other = db_query("SELECT COUNT(*) FROM {pop_links_stats}")->fetchField();
+  
+  $query = db_select('pop_links_stats', 'p');
+  $query->leftJoin('node', 'n', 'n.nid = p.nid');
+  $query->groupBy('n.nid');
+//  $query->groupBy('p.url');
+  $query->fields('n', array('title'));
+  $query->addExpression('COUNT(*)', 'cnt');
+  $query->orderBy('cnt', 'DESC');
+  $query->range(0, 15);
+  $query->addTag('node_access');
+  
+  $result = $query->execute();
+
+  foreach ($result as $click_data) {
+    $chart['#data'][$click_data->title] = $click_data->cnt;
+    $chart['#labels'][] = t($click_data->title);
+
+    $other -= $click_data->cnt;
+  }
+
+  if ($other) {
+    $chart['#data']['other'] = $other;
+    $chart['#labels'][] = 'All Others';
+  }
+
+  $output = theme('chart', array('chart' => $chart));
+
+  return $output;
+}
+
+/**
+ * Implementation of hook_cron().
+ *
+ * Deletes data from Pop Links and Voting API tables that has reached its expiration time.
+ */
+function pop_links_cron() {
+  $vote_life = variable_get('pop_links_vote_life', 0);
+  $cutoff = REQUEST_TIME - $vote_life;
+
+  // keep votes indefinitely if vote_life = 0
+  if ($vote_life) {
+    // fetch this module's overaged votes
+    $result = db_select('votingapi_vote', 'v')
+      ->fields('v', array('vote_id', 'entity_id'))
+      ->condition('tag', 'pop_links')
+      ->condition('timestamp', $cutoff, '<')
+      ->execute();
+    
+    $votes = array();
+    $nids = array();
+    foreach ($result as $vote) {
+      $vote = (array) $vote;
+      $votes[] = $vote;
+      $nids[] = $vote['content_id'];
+    }
+    votingapi_delete_votes($votes); // delete the votes
+    $nids = array_unique($nids);
+    foreach ($nids as $nid) {
+      votingapi_recalculate_results('node', $nid, TRUE); // refresh the vote cache
+    }
+  }
+
+  $stats_life = variable_get('pop_links_stats_life', 0);
+  $cutoff = time() - $stats_life;
+
+  // keep votes indefinitely if stats_life = 0
+  if ($stats_life) {
+    // delete overaged stats
+    db_delete('pop_links_stats')
+      ->condition('timestamp', $cutoff, '<')
+      ->execute();
+  }
+}
+
+/**
+ * Determine if the user's external link clicks should be tracked
+ * @param $user
+ *   The user object
+ * @return boolean
+ *   TRUE if the user's clicks should be tracked
+ */
+function _pop_links_track($user) {
+  $roles_to_track = variable_get("pop_links_track_roles", array(1 => 0, 2 => 0));
+
+  if ($user->uid == 1) {
+    // don't track the admin/webmaster
+    return FALSE;
+  }
+
+  if (!array_sum($roles_to_track)) {
+    return TRUE;
+  }
+
+  foreach ($user->roles as $rid => $role) {
+    if (in_array($rid, $roles_to_track)) {
+      return TRUE;
+    }
+  }
+
+  return FALSE;
+}
+
+/**
+ * Implementation of hook_theme().
+ */
+function pop_links_theme() {
+  return array(
+    'pop_links_node_click_counter' => array(
+      'variables' => array('count' => 0),
+    ),
+  );
+}
+
+/**
+ * Theme function; displays the number of clicks on external links within a node. This is only
+ * visible to users who have been given the "access click counter" permission.
+ * @param $variables
+ */
+function theme_pop_links_node_click_counter($variables) {
+  $count = $variables['count'];
+  return format_plural($count, '1 click', '@count clicks');
+}

@@ -1,0 +1,244 @@
+<?php
+
+/**
+ * @file
+ * Provides payment method for Drupal Commerce for MoIP Brazilian payment
+ * gateway.
+ *
+ * @see http://www.moip.com.br/
+ * @see http://labs.moip.com.br/
+ */
+
+define('COMMERCE_MOIP_STATUS_AUTHORIZED', 1);
+define('COMMERCE_MOIP_STATUS_INITIALIZED', 2);
+define('COMMERCE_MOIP_STATUS_PRINTED', 3);
+define('COMMERCE_MOIP_STATUS_COMPLETED', 4);
+define('COMMERCE_MOIP_STATUS_CANCELED', 5);
+define('COMMERCE_MOIP_STATUS_PENDING', 6);
+
+/**
+ * Implements hook_menu().
+ */
+function commerce_moip_menu() {
+  $items = array();
+
+  // Define an always accessible path to receive NASP - Notificação de Alteração
+  // de Status de Pagamento (Notification of Payment Status Change).
+  $items['commerce-moip/nasp/%/%commerce_payment_method_instance'] = array(
+    'page callback' => 'commerce_moip_process_nasp',
+    'page arguments' => array(2, 3),
+    // TODO: implement a proper access callback for checking generated key.
+    'access callback' => TRUE,
+    'type' => MENU_CALLBACK,
+  );
+
+  return $items;
+}
+
+/**
+ * Generate an URL to be used for NASP - Notificação de Alteração de Status de
+ * Pagamento (Notification of Payment Status Change).
+ *
+ * @param $method_id
+ *   Optionally specify a payment method ID to include in the URL.
+ *
+ * @see http://labs.moip.com.br/api/nasp/
+ */
+function commerce_moip_nasp_url($method_id = NULL) {
+  $parts = array(
+    'commerce-moip',
+    'nasp',
+    commerce_moip_nasp_key(),
+  );
+
+  if (!empty($method_id)) {
+    $parts[] = $method_id;
+  }
+
+  return url(implode('/', $parts), array('absolute' => TRUE));
+}
+
+/**
+ * Processes an incoming NASP - Notificação de Alteração de Status de Pagamento
+ * (Notification of Payment Status Change).
+ *
+ * This function has some code borrowed from Commmerce PayPal module. In the
+ * long run, some of this code should be moved to Commerce core as an AIP, so
+ * other payment modules can use it.
+ *
+ * @param $key
+ *   The key generated for this site to increase security.
+ * @param $payment_method
+ *   The payment method instance array that originally made the payment.
+ * @param $debug_nasp
+ *   Optionally specify a NASP array for debug purposes; if left empty, the NASP
+ *   data will be pulled from the $_POST.
+ *
+ * @return
+ *   TRUE or FALSE indicating whether the NASP was successfully processed or not.
+ *
+ * @see http://labs.moip.com.br/api/nasp/
+ */
+function commerce_moip_process_nasp($key, $payment_method, $debug_nasp = array()) {
+  // Validate NASP key.
+  if ($key != commerce_moip_nasp_key()) {
+    // Invalid key, log attempt and return.
+    watchdog('commerce_moip', 'Invalid NASP received and ignored.', array(), WATCHDOG_ALERT);
+    return FALSE;
+  }
+
+  // Retrieve the NASP from $_POST if the caller did not supply an NASP array.
+  $nasp = !empty($debug_nasp) ? $debug_nasp : $_POST;
+
+  // Exit if the NASP has already been processed.
+  if (!empty($nasp['cod_moip']) && $prior_nasp = commerce_moip_nasp_load($nasp['cod_moip'])) {
+    if ($prior_nasp['id_transacao'] != $nasp['id_transacao']) {
+      watchdog('commerce_moip', "NASP Transaction id (@id_transacao) doesn't match the one saved locally (@id_transacao_local).", array('@id_transacao' => $nasp['id_transacao'], '@id_transacao_local' => $prior_nasp['id_transacao']), WATCHDOG_NOTICE);
+      return FALSE;
+    }
+
+    if ($prior_nasp['status_pagamento'] == $nasp['status_pagamento']) {
+      watchdog('commerce_moip', 'Attempted to process an NASP that has already been processed with transaction ID @id_transacao.', array('@id_transacao' => $nasp['id_transacao']), WATCHDOG_NOTICE);
+      return FALSE;
+    }
+  }
+
+  if ($nasp['id_transacao']) {
+    $nasp['order_id'] = $nasp['id_transacao'];
+    $order = commerce_order_load($nasp['order_id']);
+  }
+  else{
+    $order = FALSE;
+  }
+
+  // Give the payment method module an opportunity to validate the data
+  // received. If a validate function exists, it is responsible for setting its
+  // own watchdog message.
+  if (!empty($payment_method)) {
+    $callback = $payment_method['base'] . '_moip_nasp_validate';
+
+    // If a validator function existed...
+    if (function_exists($callback)) {
+      // Only exit if the function explicitly returns FALSE.
+      if ($callback($order, $payment_method, $nasp) === FALSE) {
+        return FALSE;
+      }
+    }
+  }
+
+  // Give the payment method module an opportunity to process the NASP.
+  if (!empty($payment_method)) {
+    $callback = $payment_method['base'] . '_moip_nasp_process';
+
+    // If a processing function existed...
+    if (function_exists($callback)) {
+      // Skip saving if the function explicitly returns FALSE, meaning the NASP
+      // wasn't actually processed.
+      if ($callback($order, $payment_method, $nasp) !== FALSE) {
+        // Save the processed NASP details.
+        commerce_moip_nasp_save($nasp);
+      }
+    }
+  }
+
+  // Invoke the hook here so implementations have access to the order and
+  // payment method if available and a saved NASP array that includes the payment
+  // transaction ID if created in the payment method's default process callback.
+  module_invoke_all('commerce_moip_nasp_process', $order, $payment_method, $nasp);
+}
+
+/**
+ * Loads a stored NASP by transaction ID.
+ *
+ * @param $id
+ *   The transaction ID of the NASP to load.
+ * @param $type
+ *   The type of ID you've specified, either the serial numeric masp_id or the
+ *   actual MoIP code cod_moip or id_transacao. Defaults to cod_moip.
+ *
+ * @return
+ *   The original NASP with some related meta data.
+ */
+function commerce_moip_nasp_load($id, $type = 'cod_moip') {
+  return db_select('commerce_moip_nasp', 'cmn')
+    ->fields('cmn')
+    ->condition('cmn.' . $type, $id)
+    ->execute()
+    ->fetchAssoc();
+}
+
+/**
+ * Saves an NASP with some processing meta data.
+ *
+ * @param $nasp
+ *   An NASP array with additional parameters for the order_id and Commerce
+ *   Payment transaction_id associated with the NASP.
+ *
+ * @return
+ *   The operation performed by drupal_write_record() on save; since the NASP is
+ *   received by reference, it will also contain the serial numeric nasp_id used
+ *   locally.
+ */
+function commerce_moip_nasp_save(&$nasp) {
+  if (!empty($nasp['id_transacao']) && commerce_moip_nasp_load($nasp['id_transacao'])) {
+    $nasp['changed'] = REQUEST_TIME;
+
+    return drupal_write_record('commerce_moip_nasp', $nasp, 'id_transacao');
+  }
+  else {
+    $nasp['created'] = REQUEST_TIME;
+    $nasp['changed'] = REQUEST_TIME;
+
+    return drupal_write_record('commerce_moip_nasp', $nasp);
+  }
+
+  return $nasp;
+}
+
+/**
+ * Deletes a stored NASP by transaction ID.
+ *
+ * @param $id
+ *   The transaction ID of the NASP to delete.
+ */
+function commerce_moip_nasp_delete($id) {
+  db_delete('commerce_moip_nasp')
+    ->condition('id_transacao', $id)
+    ->execute();
+}
+
+/**
+ * Return a random key to be used to validate NASP URL. If no one exists yet,
+ * creates a new key for this intallation.
+ */
+function commerce_moip_nasp_key() {
+  $key = variable_get('commerce_moip_nasp_key', NULL);
+
+  if (empty($key)) {
+    // Generate a random key.
+    $key = user_password(32);
+    // Store variable for later use.
+    variable_set('commerce_moip_nasp_key', $key);
+  }
+
+  return $key;
+}
+
+/**
+ * Return a list of payment statuses, or an specific payment status message.
+ *
+ * @param $status
+ *   The status identification in which to return the message.
+ */
+function commerce_moip_statuses($status = NULL) {
+  $statuses = array(
+    'COMMERCE_MOIP_STATUS_AUTHORIZED' => t('The payment authorized but not completed yet due to the normal flow of chosen payment method.'),
+    'COMMERCE_MOIP_STATUS_INITIALIZED' => t('The payment is being made or user has abandoned the payment process.'),
+    'COMMERCE_MOIP_STATUS_PRINTED' => t('The payment receipt "Boleto" was printed, awaiting offline payment.'),
+    'COMMERCE_MOIP_STATUS_COMPLETED' => t('The payment completed, the money was credited in the recipient account.'),
+    'COMMERCE_MOIP_STATUS_CANCELED' => t('The payment was canceled by the payer, payment institution, MoIP or recipent account.'),
+    'COMMERCE_MOIP_STATUS_PENDING' => t('The customer has paid with a credit card, the payment is waiting manual review from MoIP team.'),
+  );
+
+  return empty($status) ? $statuses : $statuses[$status];
+}

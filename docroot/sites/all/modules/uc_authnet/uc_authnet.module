@@ -1,0 +1,800 @@
+<?php
+
+/**
+ * @file
+ * Ubercart Authorize.net Payment Gateway
+ *
+ * Replacement for Ubercart's core Authorize.net gateway.
+ * Integrates with the Authorize.net API module to provide CIM profile management,
+ * with a fallback on AIM.
+ */
+
+/* ******************************************************************************
+ * Drupal hooks
+ * *****************************************************************************/
+
+/**
+ * Implements hook_form_alter().
+ */
+function uc_authnet_form_alter(&$form, &$form_state, $form_id) {
+
+  // Alter the credit card terminal form in the order admin interface (/admin/store/orders/%order-id/credit)
+  if ($form_id == 'uc_credit_terminal_form') {
+
+    // Load the order.
+    // Bail if no order or if order doesn't have a user
+    $order = uc_order_load($form['order_id']['#value']);
+    if (empty($order) || empty($order->uid)) {
+      return;
+    }
+
+    // Load the customer profile id.
+    $customer_profile_id = authnet_cim_entity_profile_id_load('user', $order->uid);
+
+    // Load the customer's payment profiles.
+    $payment_profiles = authnet_cim_entity_customer_payment_profiles_load($customer_profile_id);
+
+    // Set the weight of the 'amount' field so that it is at the top.
+    $form['amount']['#weight'] = -2;
+
+    // Create a new fieldset for the existing payment profiles.
+    $form['authnet_payment_profiles'] = array(
+      '#type' => 'fieldset',
+      '#title' => t('Customer payment profiles'),
+      '#description' => t('Select from the customer\'s existing payment profiles below. To edit them, go to the ' . l(t('customer\'s billing list'), 'user/' . $order->uid . '/billing') . '.'),
+      '#weight' => -1,
+    );
+
+    // If the customer doesn't have any payment profiles...
+    if (empty($payment_profiles)) {
+
+      // Change the fieldset description.
+      $form['authnet_payment_profiles']['#description'] = t('The customer assigned to this order doesn\'t have any payment profiles. Use the form below to add one.');
+    }
+
+    // If the customer does have payment profiles, display them.
+    else {
+
+      // Load the list of payment profiles for this customer.
+      $payment_profile_options = authnet_ui_payment_profile_options($customer_profile_id);
+
+      // If a payment profile id is set in the order's payment details, it means that it was selected as the preferred profile for this order.
+      if (!empty($order->payment_details['payment_profile_id'])) {
+
+        // Look up the payment profile's record in the database to get more information.
+        $payment_profile = authnet_cim_entity_payment_profile_load($order->payment_details['payment_profile_id']);
+
+        // Set the default pid to this profile's pid.
+        $default_pid = $payment_profile['pid'];
+
+        // Add some text to the payment profile option to indicate that it was selected.
+        if (!empty($payment_profile_options[$default_pid])) {
+          $payment_profile_options[$default_pid] .= ' - <strong>(preferred for this order)</strong>';
+        }
+      }
+
+      // Otherwise, select the customer's default payment profile, if available.
+      else {
+        $default_pid = authnet_cim_entity_customer_payment_profile_default($customer_profile_id);
+      }
+
+      // Radio select list of payment profiles
+      $form['authnet_payment_profiles']['payment_profile'] = array(
+        '#type' => 'radios',
+        '#options' => $payment_profile_options,
+        '#default_value' => $default_pid,
+      );
+
+      // Buttons
+      $form['authnet_payment_profiles']['charge'] = array(
+        '#type' => 'submit',
+        '#value' => t('Charge amount to this profile'),
+        '#validate' => array('uc_authnet_payment_profile_form_validate'),
+        '#submit' => array('uc_authnet_payment_profile_charge_submit'),
+      );
+      $form['authnet_payment_profiles']['authorize'] = array(
+        '#type' => 'submit',
+        '#value' => t('Authorize amount only on this profile'),
+        '#validate' => array('uc_authnet_payment_profile_form_validate'),
+        '#submit' => array('uc_authnet_payment_profile_authorize_submit'),
+      );
+    }
+
+    // Make the 'specify_card' fieldset collapsed by default, if the customer has payment profiles.
+    if (!empty($payment_profiles)) {
+      $form['specify_card']['#collapsible'] = TRUE;
+      $form['specify_card']['#collapsed'] = TRUE;
+    }
+
+    // Set the weight of the 'cc_data' fieldset so that it is at the top.
+    $form['specify_card']['cc_data']['#weight'] = -2;
+
+    // Add a checkbox for saving a credit card to the customer profile.
+    $form['specify_card']['save_card'] = array(
+      '#type' => 'checkbox',
+      '#title' => t('Add this credit card to the customer\'s payment profiles.'),
+      '#description' => t('When this is checked, the buttons below it will work normally, but they will also save the credit card to the customer\'s list of payment profiles above. The only exception is the "Set reference" button, which will only add the new customer payment profile. If you want to "Set a reference" on this order alone, leave this unchecked.'),
+      '#default_value' => TRUE,
+      '#weight' => -1,
+    );
+
+    // If the 'references' fieldset is available, change the language to be more accurate.
+    if (isset($form['references'])) {
+      $form['references']['#title'] = t('Order references');
+      $form['references']['#description'] = t('Use the available buttons in this fieldset to select and act on a reference that has been associated with this order.');
+    }
+
+    // Add a validation function.
+    $form['#validate'][] = 'uc_authnet_payment_profile_add_validate';
+  }
+}
+
+/* ******************************************************************************
+ * Ubercart hooks
+ * *****************************************************************************/
+
+/**
+ * Implements hook_uc_payment_gateway().
+ */
+function uc_authnet_uc_payment_gateway() {
+  $gateways[] = array(
+    'id' => 'authnet',
+    'title' => t('Authorize.net API (uc_authnet)'),
+    'description' => t('Process credit card payments through Authorize.net API using uc_authnet module.'),
+    'settings' => 'uc_authnet_settings_form',
+    'credit' => 'uc_authnet_charge',
+    'credit_txn_types' => array(
+      UC_CREDIT_AUTH_CAPTURE,
+      UC_CREDIT_PRIOR_AUTH_CAPTURE,
+      UC_CREDIT_AUTH_ONLY,
+      // UC_CREDIT_CREDIT,
+      // UC_CREDIT_VOID,
+      UC_CREDIT_REFERENCE_SET,
+      UC_CREDIT_REFERENCE_TXN,
+      // UC_CREDIT_REFERENCE_REMOVE,
+      // UC_CREDIT_REFERENCE_CREDIT,
+    ),
+  );
+
+  return $gateways;
+}
+
+/**
+ * Implements hook_uc_payment_method_alter().
+ */
+function uc_authnet_uc_payment_method_alter(&$methods) {
+
+  /**
+   * Replace the callback function of the 'credit' payment method with our own.
+   * We do this so that we can offer users the ability to choose an existing card.
+   * See uc_authnet_payment_method_credit() below.
+   */
+  if (!empty($methods)) {
+    foreach ($methods as &$method) {
+      if ($method['id'] == 'credit') {
+
+        // Replace the callback function with our own.
+        $method['callback'] = 'uc_authnet_payment_method_credit';
+
+        // Stop the foreach loop.
+        break;
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_uc_checkout_complete().
+ */
+function uc_authnet_uc_checkout_complete($order, $account) {
+
+  /**
+   * During checkout, it's possible that a CIM profile was created for the user, but was
+   * assigned to the order instead (if the user was anonymous and the default checkout
+   * transaction type is set to 'Set a reference only').
+   *
+   * If that's the case, we want to move the CIM profile from the order to the customer.
+   *
+   * We can tell by looking at the customer profile that was saved for the order, and checking
+   * to see if is present in the order's list of references. If it isn't, then it should be assigned
+   * to the order's user instead.
+   */
+
+  // If the order's payment method is 'credit'...
+  if ($order->payment_method == 'credit') {
+
+    // Load the customer profile id for this order from the database.
+    $customer_profile_id = authnet_cim_entity_profile_id_load('order', $order->order_id);
+
+    // If a customer profile id is available, and:
+    //   a) there are no references on the order, or
+    //   b) the customer profile id is not one of the reference keys...
+    if ($customer_profile_id && (empty($order->data['cc_txns']['references']) || !array_key_exists($customer_profile_id, $order->data['cc_txns']['references']))) {
+
+      // Load the customer profile from Authorize.net.
+      $customer_profile = authnet_cim_profile_load($customer_profile_id);
+
+      // Pass it through the authnet_user module's helper function to change the merchant customer id, description, and email to match that of the user.
+      $customer_profile = authnet_user_customer_profile_new($account->uid, FALSE, $customer_profile);
+
+      // Save the updated profile to Authorize.net.
+      authnet_cim_profile_save($customer_profile);
+
+      /**
+       * @todo
+       * We should check to see if this fails, and if so, add an order admin comment.
+       * If it succeeds, we don't need an order comment, because this whole piece is supposed to be invisible.
+       */
+
+      // Update the database record for the customer profile.
+      $query = db_update('authnet_cim_entity');
+      $query->fields(array(
+        'type' => 'user',
+        'id' => $account->uid,
+      ));
+      $query->condition('customer_profile_id', $customer_profile_id);
+      $query->execute();
+    }
+  }
+}
+
+/**
+ * Implements hook_uc_order().
+ */
+function uc_authnet_uc_order($op, &$order, $arg2) {
+
+  // If an order is being deleted, delete any customer profiles and payment profiles associated with it.
+  if ($op == 'delete') {
+
+    // Load the customer profile id, if available.
+    if ($customer_profile_id = authnet_cim_entity_profile_id_load('order', $order->order_id)) {
+
+      // Delete the customer profile from Authorize.net.
+      authnet_cim_profile_delete($customer_profile_id);
+    }
+  }
+}
+
+/* ******************************************************************************
+ * Form functions
+ * *****************************************************************************/
+
+/**
+ * Payment gateway settings form.
+ */
+function uc_authnet_settings_form() {
+
+  // Link to general settings.
+  $form['authnet'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('General Authorize.net settings'),
+    '#description' => t('General Authorize.net settings can be configured in the ' . l(t('Authorize.net API settings'), 'admin/config/services/authnet') . '.'),
+  );
+
+  // Ubercart-specific CIM settings
+  $form['uc_cim'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Ubercart-specific CIM settings'),
+    '#description' => t('The following settings apply to Authorize.net CIM transactions conducted by Ubercart.'),
+  );
+
+  // Allow customers to use CIM in checkout.
+  $form['uc_cim']['uc_authnet_cim_checkout'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Allow customers to use CIM features (save new credit cards, and choose from existing ones) in checkout.'),
+    '#default_value' => variable_get('uc_authnet_cim_checkout', TRUE),
+  );
+
+  // Ubercart-specific AIM settings
+  $form['uc_aim'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Ubercart-specific AIM settings'),
+    '#description' => t('The following settings apply to Authorize.net AIM transactions conducted by Ubercart.'),
+  );
+
+  // AIM email receipt
+  $form['uc_aim']['uc_authnet_aim_email_receipt'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Send the customer an email receipt via Authorize.net when the Advanced Integration Method (AIM) is used.'),
+    '#default_value' => variable_get('uc_authnet_aim_email_customer', FALSE),
+  );
+
+  // Allow admin to set duplicate window
+  $form['uc_aim']['uc_authnet_aim_duplicate_window'] = array(
+    '#type' => 'select',
+    '#title' => t('Duplicate window'),
+    '#description' => t('Blocks submission of duplicate transactions within the specified window.  Defaults to 120 seconds.'),
+    '#default_value' => variable_get('uc_authnet_aim_duplicate_window', 120),
+    '#options' => drupal_map_assoc(array(0, 15, 30, 45, 60, 75, 90, 105, 120)),
+  );
+
+  return $form;
+}
+
+/**
+ * Credit payment method checkout form.
+ */
+function uc_authnet_payment_method_credit_checkout_form($form, &$form_state, $order, $customer_profile_id) {
+
+  // Add our custom css for the checkout form. We weight so it comes after uc_payment.css.
+  $options = array(
+    'group' => CSS_THEME,
+    'weight' => '9999',
+  );
+  drupal_add_css(drupal_get_path('module', 'uc_authnet') . '/uc_authnet.css', $options);
+
+  // Start with an empty form.
+  $form = array();
+
+  // If CIM checkout features are enabled and a customer profile id is provided...
+  if (variable_get('uc_authnet_cim_checkout', TRUE) && $customer_profile_id) {
+
+    // Get the list of payment profile options for this customer.
+    $options = authnet_ui_payment_profile_options($customer_profile_id);
+
+    // If the user has payment profiles, display them in a radio select list.
+    if (!empty($options)) {
+
+      // Add an option for setting up a new card.
+      $options['new'] = t('Use a new card...');
+
+      // Display the list of radio buttons.
+      $form['cc_select'] = array(
+        '#type' => 'radios',
+        '#title' => t('Choose an existing credit card or use a new one'),
+        '#options' => $options,
+        '#required' => TRUE,
+      );
+
+      // If a payment profile id was already selected, use it as the default selection.
+      if (!empty($order->payment_details['payment_profile_id'])) {
+
+        // Load the payment profile.
+        $payment_profile = authnet_cim_entity_payment_profile_load($order->payment_details['payment_profile_id']);
+
+        // Set the default pid.
+        $default_pid = $payment_profile['pid'];
+      }
+
+      // Otherwise, try to load the customer's default payment profile.
+      else {
+        $default_pid = authnet_cim_entity_customer_payment_profile_default($customer_profile_id);
+      }
+
+      // If a default payment profile id is set, select it as the default value.
+      if ($default_pid) {
+        $form['cc_select']['#default_value'] = $default_pid;
+      }
+
+      // Otherwise, select 'Add a new card'.
+      else {
+        $form['cc_select']['#default_value'] = 'new';
+      }
+    }
+  }
+
+  // Append the old uc_payment_method_credit_form().
+  $form += uc_payment_method_credit_form($form, $form_state, $order);
+
+  // If CIM checkout features are enabled, add a checkbox to give the customer
+  // the choice of saving the card or not.
+  if (variable_get('uc_authnet_cim_checkout', TRUE)) {
+    $form['cc_save'] = array(
+      '#type' => 'checkbox',
+      '#title' => t('Save this credit card for later use.'),
+      '#default_value' => 1,
+    );
+  }
+
+  // Return the form.
+  return $form;
+}
+
+/**
+ * Validate function for the order admin payment profile form buttons.
+ */
+function uc_authnet_payment_profile_form_validate($form, &$form_state) {
+
+  // Make sure the user entered an amount.
+  if (empty($form_state['values']['amount'])) {
+    form_set_error('amount', 'You must enter a positive number for the amount.');
+  }
+}
+
+/**
+ * Submit function for the order admin payment profile charge button.
+ */
+function uc_authnet_payment_profile_charge_submit($form, &$form_state) {
+
+  // Get the pid of the payment profile that was selected.
+  $pid = $form_state['values']['payment_profile'];
+
+  // If no payment profile was selected, don't do anything.
+  if (!$pid) {
+    return;
+  }
+
+  // Load the payment profile id.
+  $payment_profile_id = authnet_cim_entity_payment_profile_id_load($pid);
+
+  // Build the data array passed on to the payment gateway.
+  $data = array();
+
+  // Set a flag to indicate that we're charging via the admin terminal.
+  $data['admin_terminal'] = TRUE;
+
+  // Set the transaction type to "Authorize and Capture"
+  $data['txn_type'] = UC_CREDIT_AUTH_CAPTURE;
+
+  // Set the Authorize.net payment profile id to charge to.
+  $data['payment_profile_id'] = $payment_profile_id;
+
+  // Process the payment.
+  $result = uc_payment_process_payment('credit', $form_state['values']['order_id'], $form_state['values']['amount'], $data, TRUE, NULL, FALSE);
+
+  // If the payment was processed successfully...
+  if ($result) {
+
+    // Set a message.
+    drupal_set_message(t('The credit card was processed successfully. See the admin comments for more details.'));
+
+    // Redirect to the order view.
+    $form_state['redirect'] = 'admin/store/orders/' . $form_state['values']['order_id'];
+  }
+
+  // If an error occurred during processing...
+  else {
+    drupal_set_message(t('There was an error processing the credit card. See the admin comments for details.'), 'error');
+  }
+}
+
+/**
+ * Submit function for the order admin payment profile authorize-only button.
+ */
+function uc_authnet_payment_profile_authorize_submit($form, &$form_state) {
+
+  // Get the pid of the payment profile that was selected.
+  $pid = $form_state['values']['payment_profile'];
+
+  // If no payment profile was selected, don't do anything.
+  if (!$pid) {
+    return;
+  }
+
+  // Load the payment profile id.
+  $payment_profile_id = authnet_cim_entity_payment_profile_id_load($pid);
+
+  // Build the data array passed on to the payment gateway.
+  $data = array();
+
+  // Set a flag to indicate that we're authorizing via the admin terminal.
+  $data['admin_terminal'] = TRUE;
+
+  // Set the transaction type to "Authorize only"
+  $data['txn_type'] = UC_CREDIT_AUTH_ONLY;
+
+  // Set the Authorize.net payment profile id to charge to.
+  $data['payment_profile_id'] = $payment_profile_id;
+
+  // Process the payment.
+  $result = uc_payment_process_payment('credit', $form_state['values']['order_id'], $form_state['values']['amount'], $data, TRUE, NULL, FALSE);
+
+  // If the payment was processed successfully...
+  if ($result) {
+
+    // Set a message.
+    drupal_set_message(t('The credit card was authorized successfully. See the admin comments for more details.'));
+
+    // Redirect to the order view.
+    $form_state['redirect'] = 'admin/store/orders/' . $form_state['values']['order_id'];
+  }
+
+  // If an error occurred during processing...
+  else {
+    drupal_set_message(t('There was an error authorizing the credit card. See the admin comments for details.'), 'error');
+  }
+}
+
+/**
+ * Validation function for adding a new credit card to a customer from the order admin credit card terminal.
+ */
+function uc_authnet_payment_profile_add_validate($form, &$form_state) {
+
+  // We are going to stash the 'save_card' value in a static variable function so that we can access it in the charge function.
+  $data = array(
+    'save_card' => FALSE,
+  );
+
+  // We only need validation if one of the three credit card fieldset buttons were clicked and the 'save_card' checkbox was checked.
+  $cc_buttons = array(
+    t('Charge amount'),
+    t('Authorize amount only'),
+    t('Set a reference only'),
+  );
+  if (in_array($form_state['values']['op'], $cc_buttons) && !empty($form_state['values']['save_card'])) {
+
+    // Set the data value to TRUE.
+    $data['save_card'] = TRUE;
+
+    // Load the order information.
+    $order = uc_order_load($form_state['values']['order_id']);
+
+    // Bail if no order was found.
+    if (!$order) {
+      return;
+    }
+
+    // Make sure that all the necessary billing fields are available on the order.
+    $required_billing_fields = array(
+      'first name' => $order->billing_first_name,
+      'last name' => $order->billing_last_name,
+      'address' => trim($order->billing_street1 . ' ' . $order->billing_street2),
+      'city' => $order->billing_city,
+      'state/province' => uc_zone_get_by_id($order->billing_zone),
+      'zip/postal code' => $order->billing_postal_code,
+      'country' => uc_country_get_by_id($order->billing_country),
+    );
+    $missing = array();
+    foreach ($required_billing_fields as $name => $field) {
+      if (empty($field)) {
+        $missing[] = $name;
+      }
+    }
+    if (!empty($missing)) {
+      form_set_error('', t('The order must have a valid billing address in order to add a new credit card. Please add missing fields to the order\'s billing address and try again. The following fields are missing: ' . implode(', ', $missing)));
+    }
+
+    // Make sure that all the necessary credit card fields are available.
+    $required_cc_fields = array(
+      'card number' => $form_state['values']['cc_data']['cc_number'],
+      'expiration month' => $form_state['values']['cc_data']['cc_exp_month'],
+      'expiration year' => $form_state['values']['cc_data']['cc_exp_year'],
+    );
+    if (variable_get('uc_credit_type_enabled', FALSE)) {
+
+      // Ubercart doesn't require a credit card type by default, so we check that first.
+      $required_cc_fields['card type'] = $form_state['values']['cc_data']['cc_type'];
+    }
+    $missing = array();
+    foreach ($required_cc_fields as $name => $field) {
+      if (empty($field)) {
+        $missing[] = $name;
+      }
+    }
+    if (!empty($missing)) {
+      form_set_error('', t('Please fill in all of the credit card fields. The following fields are missing: ' . implode(', ', $missing)));
+    }
+  }
+
+  // Stash the data in a static variable function for retrieval in the charge function.
+  uc_authnet_charge_data_set($data);
+}
+
+/* ******************************************************************************
+ * Ubercart callbacks
+ * *****************************************************************************/
+
+/**
+ * Callback for payment gateway charge function.
+ */
+function uc_authnet_charge($order_id, $amount, $data) {
+  module_load_include('inc', 'uc_authnet', 'uc_authnet.charge');
+  return _uc_authnet_charge($order_id, $amount, $data);
+}
+
+/**
+ * Replacement callback for the credit payment method.
+ * The goal of this function is to act as a simple wrapper around the uc_credit's normal payment method callback: uc_payment_method_credit().
+ * This function is called first, does the stuff it needs to do, and in most cases passes the call of to uc_payment_method_credit().
+ *
+ * See uc_authnet_uc_payment_method_alter() above.
+ */
+function uc_authnet_payment_method_credit($op, &$order, $form = NULL, &$form_state = NULL) {
+
+  // Get information about the current user.
+  global $user;
+
+  // Switch through the operations.
+  switch ($op) {
+
+    // If the $op is 'cart-details' it means we're rendering the checkout form.
+    case 'cart-details':
+
+      // Attempt to load the user's customer profile id (it will be FALSE if they are not logged in, or don't have one).
+      $customer_profile_id = authnet_cim_entity_profile_id_load('user', $user->uid);
+
+      // Return our custom credit card form.
+      $details = uc_authnet_payment_method_credit_checkout_form(array(), $form_state, $order, $customer_profile_id);
+      return $details;
+
+    // If the $op is 'cart-process', then perform some extra processing if our custom form was used in $op == 'cart-details' above.
+    case 'cart-process':
+
+      // If cc_select is not 'new', proceed.
+      if (!empty($form_state['values']['panes']['payment']['details']['cc_select']) && $form_state['values']['panes']['payment']['details']['cc_select'] != 'new') {
+
+        // Load the payment profile id, based on the pid (stored in cc_select).
+        $payment_profile_id = authnet_cim_entity_payment_profile_id_load(check_plain($form_state['values']['panes']['payment']['details']['cc_select']));
+
+        // Check to be sure the user has access to this payment profile.
+        if ($payment_profile_id && !authnet_user_access($user, $payment_profile_id)) {
+          drupal_set_message(t('You do not have permission to use this payment profile. Please select one that belongs to you.'), 'error');
+          return FALSE;
+        }
+
+        // Save the payment profile id to the order's payment details.
+        $order->payment_details = array(
+          'payment_profile_id' => $payment_profile_id,
+        );
+
+        // Put the last four digits into the order array so that it is saved to the order.
+        $payment_profile = authnet_cim_entity_payment_profile_load($order->payment_details['payment_profile_id']);
+        $order->payment_details['cc_number'] = $payment_profile['cc_last_four'];
+      }
+
+      // Otherwise, check to see if the user wants to save a new card.
+      else {
+
+        // First, execute the normal function.
+        $result = uc_payment_method_credit($op, $order, $form, $form_state);
+
+        // If the normal function failed, we should too.
+        if (!$result) {
+          return $result;
+        }
+
+        // Add the 'checkout_save_card' variable to the payment details on the order.
+        if (!empty($form_state['values']['panes']['payment']['details']['cc_save'])) {
+          $order->payment_details['checkout_save_card'] = TRUE;
+        }
+      }
+
+      /**
+       * Store the payment details in the 'sescrd' global session variable so they can be
+       * accessed across page loads. This is Ubercart's default expected behavior, so we're
+       * following it.
+       */
+
+      // Initialize the encryption key and class.
+      $key = uc_credit_encryption_key();
+      $crypt = new UbercartEncryption();
+
+      // Encrypt and save it.
+      $_SESSION['sescrd'] = $crypt->encrypt($key, base64_encode(serialize($order->payment_details)));
+
+      // Return TRUE.
+      return TRUE;
+
+    // If the $op is 'cart-review', display information about the payment profile, if one was selected.
+    case 'cart-review':
+
+      // If the user selected a payment profile...
+      if (!empty($order->payment_details['payment_profile_id'])) {
+
+        // Assemble an array of review items.
+        $review = array();
+
+        // Load the payment profile record for theming.
+        $payment_profile = authnet_cim_entity_payment_profile_load($order->payment_details['payment_profile_id']);
+
+        // Add the saved card information.
+        $review[] = array('title' => t('Saved card'), 'data' => theme('authnet_payment_profile', array('payment_profile' => $payment_profile)));
+
+        // Return the review array.
+        return $review;
+      }
+  }
+
+  // If the above code hasn't returned something already, pass-through to to original uc_payment_method_credit() function.
+  return uc_payment_method_credit($op, $order, $form, $form_state);
+}
+
+/* ******************************************************************************
+ * Helper functions
+ * *****************************************************************************/
+
+/**
+ * Get statically cached charge data.
+ *
+ * @see uc_authnet_charge()
+ */
+function uc_authnet_charge_data_get() {
+  return uc_authnet_charge_data_set();
+}
+
+/**
+ * Save a payment profile to a static variable for use later on in session.
+ */
+function uc_authnet_charge_data_set($new_data = NULL) {
+  static $data = array();
+
+  // If new data is passed in, cache it
+  if ($new_data) {
+    $data = $new_data;
+  }
+
+  return $data;
+}
+
+/**
+ * Translate Ubercart's transaction types to those expected by Authorize.net.
+ *
+ * @param $uc_type
+ *   The Ubercart transaction type to translate.
+ *
+ * @return
+ *   Returns the Authorize.net equivalent transaction type, FALSE otherwise.
+ */
+function uc_authnet_translate_txn_type($type) {
+
+  // Define the available Ubercart transaction types and their Authorize.net equivalents.
+  $types = array(
+    UC_CREDIT_AUTH_CAPTURE => AUTHNET_METHOD_AUTH_CAPTURE,
+    UC_CREDIT_PRIOR_AUTH_CAPTURE => AUTHNET_METHOD_PRIOR_AUTH_CAPTURE,
+    UC_CREDIT_AUTH_ONLY => AUTHNET_METHOD_AUTH_ONLY,
+    UC_CREDIT_CREDIT => AUTHNET_METHOD_CREDIT,
+    UC_CREDIT_VOID => AUTHNET_METHOD_VOID,
+
+    // 'Setting a reference' technically involves authorizing,
+    // and we need it to set 'log_payment' = FALSE in _uc_authnet_transaction_result().
+    UC_CREDIT_REFERENCE_SET => AUTHNET_METHOD_AUTH_ONLY,
+
+    // Reference transaction are 'Authorize and capture'.
+    UC_CREDIT_REFERENCE_TXN => AUTHNET_METHOD_AUTH_CAPTURE,
+
+    /**
+     * There is no equivalent for Ubercart's other reference transactions, at the moment.
+     */
+    // UC_CREDIT_REFERENCE_REMOVE => 0,
+    // UC_CREDIT_REFERENCE_CREDIT => 0,
+  );
+
+  // If the requested type is in the above array, return it's equivalent.
+  if (array_key_exists($type, $types)) {
+    return $types[$type];
+  }
+
+  // If all else fails, return FALSE.
+  return FALSE;
+}
+
+/**
+ * Stores a CIM authorization to an order's data array.
+ * Copied and modified from uc_credit_log_authorization().
+ *
+ * @param $order_id
+ *   The order associated with the credit card capture.
+ * @param $payment_profile_id
+ *   The ID of the payment profile that the authorization was made under.
+ * @param $auth_id
+ *   The payment service's ID for the authorization.
+ * @param $amount
+ *   The amount that was authorized on the card.
+ *
+ * @return
+ *   The entire updated data array for the order.
+ */
+function uc_authnet_log_cim_authorization($order_id, $payment_profile_id, $auth_id, $amount) {
+
+  // Load the existing order data array.
+  $query = db_select('uc_orders', 'uo');
+  $query->addField('uo', 'data');
+  $query->condition('order_id', $order_id);
+  $result = $query->execute();
+  $data = unserialize($result->fetchField());
+
+  // Add the authorization to the cc_txns.
+  $data['cc_txns']['authorizations'][$auth_id] = array(
+    'payment_profile_id' => $payment_profile_id,
+    'amount' => $amount,
+    'authorized' => REQUEST_TIME,
+  );
+
+  // Save the updated data array to the database.
+  $query = db_update('uc_orders');
+  $query->fields(array('data' => serialize($data)));
+  $query->condition('order_id', $order_id);
+  $query->execute();
+
+  return $data;
+}
