@@ -1,0 +1,522 @@
+<?php
+
+/**
+ * @file
+ * A robust HTTP REST request client library.
+ *
+ * This module is for module developers use. Only
+ * install it if another module requires it.
+ * @see drupal_http_request
+ * This is basically a replacement for drupal_http_request(). It adds features
+ * such as:
+ *     large file streaming
+ *     uses Expect 100 on PUT
+ *     md5,  sha1,  and hmac header encryption
+ *     and more
+ *
+ * To use it just call rest_client_request($request, $headers, $data, $retry)
+ * It will return a response with headers and data seperated. You have to
+ * handle the business logic of what to do with the response in your module.
+ * Including any parsing of the data body of the response.
+ */
+
+
+/**
+ * rest_client controller,  call this function to make a request
+ * @public
+ * @param $request array see README
+ * @param $headers array see README
+ * @param $data    array see README
+ * @param $retry   int number of retries if redirected
+ * @return object std class see README
+ */
+function rest_client_request($request = array(), $headers = array(), $data = NULL, $retry = 3) {
+
+  // ensure array keys are lowercase
+  $request = array_change_key_case($request, CASE_LOWER);
+  $headers = array_change_key_case($headers, CASE_LOWER);
+  $header  = rest_client_build_header($request, $headers, $data);
+  return     rest_client_send_request($request, $header, $data, $retry);
+}
+
+/**
+ * Builds the request header
+ * @private
+ * @param $request array by reference from rest_request
+ * @param $headers array by reference from rest_request
+ * @param $data    array by reference from rest_request
+ * @return string  array containing the header parts
+ */
+function rest_client_build_header(&$request, &$headers, &$data) {
+  // TODO: run check for all required headers and provide error feedback
+
+  // set request defaults
+  $request['host'       ] = $headers['host'       ];
+  $request['method'     ] = $request['method'     ] ? $request['method'     ] : 'GET';
+  $request['resource'   ] = $request['resource'   ] ? $request['resource'   ] : '/'  ;
+  $request['port'       ] = $request['port'       ] ? $request['port'       ] : '80' ;
+  $request['httpversion'] = $request['httpversion'] ? $request['httpversion'] : '1.0';
+
+  // set scheme if secure,  only availiable PHP > 4.3.0 with openSSL loaded
+  // TODO: test if openssl is loaded
+  switch ($request['scheme']) {
+    case 'ssl':
+    case 'https':
+      $request['scheme'] = 'ssl://';
+      break;
+
+    case 'http':
+    default:
+      $request['scheme'] = NULL;
+  }
+
+  // not using DATE_RFC822 constant to be PHP4 compat,  DATE_RFC822 > PHP 5.1.1
+  $headers['date'] = gmdate('D, d M Y H:i:s T');
+
+  // set Content-MD5 and Content-Length headers
+  if (isset($data) && is_array($data)) {
+
+    switch ($data['type']) {
+      case 'string':
+        $headers['content-type'  ] = $headers['content-type'] ? $headers['content-type'] : 'text/plain';
+        $headers['content-md5'   ] = base64_encode(rest_client_binary_md5($data));
+        $headers['content-length'] = strlen($data['value']);
+        break;
+
+      case 'file':
+        if (is_readable($data['value'])) {
+          // TODO: possibly set content type by file extension
+          $headers['content-type'  ] = $headers['content-type'] ? $headers['content-type'] : 'binary/octet-stream';
+          $headers['content-md5'   ] = base64_encode(rest_client_binary_md5($data));
+          $headers['content-length'] = $data['length'] = filesize($data['value']);
+
+        }
+        else {
+          // Error: File not readable
+        }
+        break;
+    }
+  }
+  else {
+
+    // no data to send
+    //$headers['content-md5']    = '';
+    unset($headers['content-md5' ]);
+    unset($headers['content-type']);
+          $headers['content-length'] = 0;
+  }
+
+  // default user agent to drupal
+  $headers['user-agent'] = $headers['user-agent'] ? $headers['user-agent'] : 'Drupal (+http://drupal.org/)';
+
+  // set Expect header to avoid sending the body if redirected
+  if ($request['method'] === 'PUT') {
+
+    $headers['expect'] = '100-continue';
+  }
+
+  // building header in sections to allow for easy redirect without rebuilding
+  // the entire header again by seperating the Host and request lines
+  $header    = array();
+  $header[0] = strtoupper($request['method']) . ' '
+                       .  $request['resource']
+                       . ' HTTP/' . $request['httpversion']
+                       . "\n";
+  $header[1] = 'Host: ' . $headers['host'] . "\n";
+  unset($headers['host']);
+
+  foreach ($headers as $key => $value) {
+
+    $header[2] .= $key . ': ' . $value . "\n";
+  }
+
+  return $header;
+}
+
+/**
+ * Sends the HTTP request
+ * @private
+ * @param $request array
+ * @param $header  array
+ * @param $data    array
+ * @param $retry   int
+ * @return object std class
+ */
+function rest_client_send_request($request, $header, $data, $retry) {
+
+  $response = new stdClass();
+  $fp = rest_client_get_socket($request);
+
+  if (isset($fp->errorCode)) {
+    // error opening socket return error
+    // $fp in this case is not the stream pointer but a response object
+    return $fp;
+  }
+
+  // if PUT wait for 100 response before sending data
+  if ($request['method'] === 'PUT' && $data) {
+
+    rest_client_put_header($fp, $request, $header, $retry);
+    if ( ! isset($fp->errorCode)) {
+
+      rest_client_put_data($fp, $data);
+    }
+    else {
+
+      return $fp;
+    }
+  }
+  else {
+
+    // all methods except PUT have just headers and possibly string data to send
+    // so no streaming is needed here we just need to send the request
+    $req =  implode('', $header);
+    if ($data) {
+      $req .= "\n\n" . $data['value'];
+    }
+    $req .= "\n";
+
+    // send the request
+    fwrite($fp, $req);
+  }
+
+  // get final response
+  $response = rest_client_get_response($fp);
+
+  // close socket
+  fclose($fp);
+
+  return $response;
+}
+
+/**
+ * Creates a HTTP request socket
+ * @private
+ * @param $request array
+ * @return object request socket
+ */
+function rest_client_get_socket($request) {
+
+  $response = new stdClass();
+  // open a socket
+  $fp = @fsockopen($request['scheme'] . $request['host'], $request['port'], $response->errorCode, $response->errorText, 20);
+  // if no connection return error
+  if ( ! $fp) {
+    // TODO: set watchdog error
+    return $response;
+  }
+
+  return $fp;
+}
+
+/**
+ * Sends the HTTP request header,  if redirected creates the new socket
+ * @private
+ * @param $fp      object request socket
+ * @param $request array
+ * @param $header  array
+ * @param $retry   int
+ */
+function rest_client_put_header(&$fp, &$request, &$header, &$retry) {
+
+  // write the header
+  fwrite($fp, implode('', $header));
+  $response = rest_client_get_response($fp);
+
+  // if response is a redirect close socket and send headers to new endpoint
+  while ($response->redirect) {
+
+    fclose($fp);
+    // only redirect up to the number of retries
+    --$retry;
+    if ($retry === 0) {
+
+      $fp = new stdClass();
+      $fp->errorCode = 1;
+      $fp->errorText = 'Redirected more than retry limit.';
+      break;
+    }
+    // rebuild header[0] and header[1] with redirected info
+    $url = parse_url($response->headers['location']);
+    $url['path'] = '/' . $url['path'];
+    $url['path'] = $url['query']
+                 ? $url['path'] . '?' . $url['query']
+                 : $url['path'];
+    $header[0] = strtoupper($request['method']) . ' '
+                          . $url['path']
+                          . ' HTTP/' . $request['httpversion']
+                          . "\n";
+    $header[1] = 'Host: ' . $url['host'] . "\n";
+
+    // open a socket to the new location
+    $fp = rest_client_get_socket($request);
+
+    // if the socket did not return an error on opening send header
+    // else a error code was sent and we do nothing
+    if ( ! isset($fp->errorCode)) {
+      // rinse and repeat
+      rest_client_put_header($fp, $header);
+    }
+    break;
+  }
+  // nothing to return $fp is taken by reference
+}
+
+/**
+ * Sends the request body
+ * @private
+ * @param $fp   object HTTP request socket
+ * @param $data array
+ * @return bool TRUE on success and FALSE on error
+ */
+function rest_client_put_data(&$fp, $data) {
+
+  if ($data !== NULL) {
+
+    switch ($data['type']) {
+
+      case 'string':
+        fwrite($fp, $data['value']);
+        break;
+
+      case 'file':
+        if (is_readable($data['value'])) {
+          // if file larger than 1MB then stream file else get contents
+          if ($data['length'] > 1024) {
+            if ( ! $file = fopen($data['value'], 'r')) {
+              // TODO: better error handling
+              return FALSE;
+            }
+            if (! rest_client_stream_file($fp, $file, 8192)) {
+              // TODO: better error handling
+              return FALSE;
+            }
+            // close file socket
+            fclose($file);
+          }
+          else {
+            if ( ! fwrite($fp, file_get_contents($data['value']))) {
+              return FALSE;
+            }
+          }
+        }
+        break;
+    }
+  }
+  return TRUE;
+}
+
+/**
+ * Streams large files through the socket
+ * @private
+ * @param $fp object HTTP request socket
+ * @param $file string path to the file
+ * @param $chunkSize int size of chunks to stream in bytes
+ * @return bool TRUE on success,  FALSE on error
+ */
+function rest_client_stream_file(&$fp, &$file, $chunkSize) {
+
+  while ( ! feof($file)) {
+
+    if ( ! fwrite($fp, fread($file, $chunkSize))) {
+
+      return FALSE;
+    }
+  }
+
+  return TRUE;
+}
+
+/**
+ * Retrieves the response from the HTTP request
+ * @private
+ * @param $fp object HTTP request socket
+ * @return object std class object with parsed response headers and raw body
+ */
+function rest_client_get_response(&$fp) {
+
+  if (version_compare(phpversion(), '5.0.0', '>=')) {
+
+    $str = stream_get_contents($fp);
+  }
+  else {
+
+    $str = '';
+    while ( ! feof($fp) && $chunk = fread($fp, 1024)) {
+
+      $str .= $chunk;
+    }
+  }
+  return rest_client_parse_response($str);
+}
+
+/**
+ * Parses Response by splitting header from body and parsing headers
+ * @private
+ * @param $str string HTTP response
+ * @return object std class object with parsed response headers and raw body
+ */
+function rest_client_parse_response($str) {
+
+  $response = new stdClass();
+  // Parse response.
+  list($header, $response->data) = explode("\r\n\r\n", $str, 2);
+  $headers = preg_split("/\r\n|\n|\r/", $header);
+
+  // parse first line of header response
+  list($protocol, $response->code, $response->text) = explode(' ', trim(array_shift($headers)), 3);
+
+  $responseCodes = array(
+
+    100 => 'Continue'                       ,
+    101 => 'Switching Protocols'            ,
+
+    200 => 'OK'                             ,
+    201 => 'Created'                        ,
+    202 => 'Accepted'                       ,
+    203 => 'Non-Authoritative Information'  ,
+    204 => 'No Content'                     ,
+    205 => 'Reset Content'                  ,
+    206 => 'Partial Content'                ,
+
+    300 => 'Multiple Choices'               ,
+    301 => 'Moved Permanently'              ,
+    302 => 'Found'                          ,
+    303 => 'See Other'                      ,
+    304 => 'Not Modified'                   ,
+    305 => 'Use Proxy'                      ,
+    307 => 'Temporary Redirect'             ,
+
+    400 => 'Bad Request'                    ,
+    401 => 'Unauthorized'                   ,
+    402 => 'Payment Required'               ,
+    403 => 'Forbidden'                      ,
+    404 => 'Not Found'                      ,
+    405 => 'Method Not Allowed'             ,
+    406 => 'Not Acceptable'                 ,
+    407 => 'Proxy Authentication Required'  ,
+    408 => 'Request Time-out'               ,
+    409 => 'Conflict'                       ,
+    410 => 'Gone'                           ,
+    411 => 'Length Required'                ,
+    412 => 'Precondition Failed'            ,
+    413 => 'Request Entity Too Large'       ,
+    414 => 'Request-URI Too Large'          ,
+    415 => 'Unsupported Media Type'         ,
+    416 => 'Requested range not satisfiable',
+    417 => 'Expectation Failed'             ,
+
+    500 => 'Internal Server Error'          ,
+    501 => 'Not Implemented'                ,
+    502 => 'Bad Gateway'                    ,
+    503 => 'Service Unavailable'            ,
+    504 => 'Gateway Time-out'               ,
+    505 => 'HTTP Version not supported'     ,
+  );
+
+  $response->codeText = $responseCodes[$response->code];
+  // check for a redirect
+  switch ($response->code) {
+
+    case 301: // Moved permanently
+    case 302: // Moved temporarily
+    case 307: // Moved temporarily
+      $response->redirect = TRUE;
+      break;
+  }
+
+  // Parse the rest of the headers lines
+  $response->headers = array();
+  while ($line = trim(array_shift($headers))) {
+
+    list($key, $value) = explode(':', $line, 2);
+    $key = drupal_strtolower($key);
+    if (isset($response->headers[$key]) && $key == 'set-cookie') {
+      // RFC 2109: the Set-Cookie response header comprises the token Set-
+      // Cookie:,  followed by a comma-separated list of one or more cookies.
+      $response->headers[$key] .= ', ' . trim($value);
+    }
+    else {
+
+      $response->headers[$key] = trim($value);
+    }
+  }
+
+  return $response;
+}
+
+
+/* ***********************    Utility functions   *****************************/
+
+/**
+ * Creates a HMAC code
+ * @public
+ * @param $data string data to be encoded
+ * @param $key sting key to use for encryption
+ * @return string binary version of a sha1 hash
+ */
+function rest_client_hmac($data, $key) {
+
+  if (strlen($key) < 64) {
+
+    $key = str_pad($key, 64, chr(0));
+  }
+
+  $ipad = (substr($key, 0, 64) ^ str_repeat(chr(0x36), 64));
+  $opad = (substr($key, 0, 64) ^ str_repeat(chr(0x5c), 64));
+
+  $hmac = rest_client_binary_sha1($opad . rest_client_binary_sha1($ipad . $data));
+
+  //echo '<pre>'; echo "\n\n" . $data; echo "\n\n" . bin2hex($data);echo '</pre>';
+  return base64_encode($hmac);
+}
+
+/**
+ * Creates a binary sha1 hash
+ * @public
+ * @param $data string
+ * @return string binary version of a sha1 hash
+ */
+function rest_client_binary_sha1($data) {
+
+  if (version_compare(phpversion(), '5.0.0', '>=')) {
+
+    return sha1($data, TRUE);
+  }
+  else {
+    return pack('H40', sha1($data));
+  }
+}
+
+/**
+ * Creates a binary md5 hash
+ * @public
+ * @param $data array containing 'type' and 'value' keys - see README
+ * @return string binary version of a md5 hash
+ */
+function rest_client_binary_md5($data) {
+
+  if (version_compare(phpversion(), '5.0.0', '>=')) {
+
+    switch ($data['type']) {
+      case 'string':
+        return md5($data, TRUE);
+        break;
+
+      case 'file':
+        return md5_file($data, TRUE);
+        break;
+    }
+  }
+  else { // addded for PHP4 compat
+    switch ($data['type']) {
+      case 'string':
+        return pack('H*', md5($data));
+        break;
+
+      case 'file':
+        return pack('H*', md5_file($data));
+        break;
+    }
+  }
+}

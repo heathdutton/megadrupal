@@ -1,0 +1,1 @@
+<div class="messages messages-inline error"><?php print  $message ?></div>

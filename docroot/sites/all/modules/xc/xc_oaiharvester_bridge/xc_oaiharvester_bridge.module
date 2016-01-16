@@ -1,0 +1,2207 @@
+<?php
+/**
+ * @file
+ * XC-OAI Harvester Bridge functions
+ *
+ * This module in large parts contains implementations of OAI Harvester module's hooks.
+ * These hooks are documented at ../oaiharvester/oaiharvester.api.php file and at drupal.org
+ * http://drupal.org/node/499802.
+ *
+ * The implemented hooks:
+ *  - hook_oaiharvester_harvest_starting  (xc_oaiharvester_bridge_oaiharvester_harvest_starting)
+ *  - hook_oaiharvester_batch_started     (xc_oaiharvester_bridge_oaiharvester_batch_started)
+ *  - hook_oaiharvester_request_started   (xc_oaiharvester_bridge_oaiharvester_request_started)
+ *  - hook_oaiharvester_process_record    (xc_oaiharvester_bridge_oaiharvester_process_record)
+ *  - hook_oaiharvester_request_processed (xc_oaiharvester_bridge_oaiharvester_request_processed)
+ *  - hook_oaiharvester_schedule_view     (xc_oaiharvester_bridge_oaiharvester_schedule_view)
+ *  - hook_oaiharvester_additional_harvest_steps (xc_oaiharvester_bridge_oaiharvester_additional_harvest_steps)
+ *  - hook_oaiharvester_harvest_finished  (xc_oaiharvester_bridge_oaiharvester_harvest_finished)
+ *
+ * @copyright (c) 2010-2011 eXtensible Catalog Organization
+ */
+
+/**
+ * @addtogroup global variables
+ * @{
+ */
+
+/**
+ * Information regarding to the CSV files during the harvesting process.
+ *
+ * It is an associative array. There is a 'dir' key, which contains the top level directory
+ * under which the CSV files located. Each table has its own file(s), so each of them
+ * has a key in the array (xc_entity_properties, xc_sql_metadata, xc_entity_relationships,
+ * xc_oaiharvester_bridge_header, and xc_oaiharvester_bridge_set) (Note: currently
+ * XC doesn't create CSV files for the later two). The value belongs to the table names
+ * is an array, whith two keys: 'counter' is the counter of files created so far (the first
+ * file's counter is 0, and 'files' which contains the array of file names.
+ *
+ * It is persisted in 'xc_oaiharvester_bridge_files' Drupal variable. It always
+ * created from scratch when the OAI harvest begins.
+ *
+ * @var array
+ */
+global $_xc_oaiharvester_bridge_files;
+
+/**
+ * The current CSV file resource for xc_entity_properties table records.
+ * @var resource
+ */
+global $_xc_entity_properties_csv;
+
+/**
+ * The current CSV file resource for xc_sql_metadata table records.
+ * @var resource
+ */
+global $_xc_sql_metadata_csv;
+
+/**
+ * The current CSV file resource for xc_oaiharvester_bridge_header table records.
+ * @var resource
+ */
+global $_xc_oaiharvester_bridge_header_csv;
+
+/**
+ * The current CSV file resource for xc_oaiharvester_bridge_set table records.
+ * @var resource
+ */
+global $_xc_oaiharvester_bridge_set_csv;
+
+/**
+ * The current CSV file resource for xc_entity_relationships table records.
+ * @var resource
+ */
+global $_xc_entity_relationships_csv;
+
+/**
+ * A temporary variable contains information about current changes - the results
+ * of harvest. It keep tracks of what type of records (work, expression...) were changed,
+ * and how (new, deleted, updated). It is a hierarhial structure. The first hierarchy
+ * is the nature of change, the second one means the types of records, and the on
+ * the final level are the array of metadata IDs of the records belonging to that category.
+ *
+ * Here is a more understandable pseudo code:
+ * <code>
+ *  $_xc_oaiharvester_bridge_changes = array(
+ *    XC_DELETED => array(
+ *       XC_WORK => array(...),
+ *       XC_EXPRESSION => array(...),
+ *       XC_MANIFESTATION => array(...),
+ *       XC_HOLDINGS => array(...),
+ *     ),
+ *     XC_UPDATED => array(
+ *       XC_WORK => array(...),
+ *       XC_EXPRESSION => array(...),
+ *       XC_MANIFESTATION => array(...),
+ *       XC_HOLDINGS => array(...),
+ *     ),
+ *     XC_NEW => array(
+ *       XC_WORK => array(...),
+ *       XC_EXPRESSION => array(...),
+ *       XC_MANIFESTATION => array(...),
+ *       XC_HOLDINGS => array(...),
+ *     ),
+ *   );
+ * </code>
+ *
+ * The content of the variable is persisted into the xc_oaiharvester_bridge_changes
+ * table after each OAI request.
+ *
+ * XC keep track of this information in order we should not iterate over all records
+ * when we would like to reflect the changes in Apache Solr index. From this table
+ * XC will know what records should be deleted, added or updated in order everything
+ * should be in syncronized in a relatively short time.
+ * @var array
+ */
+global $_xc_oaiharvester_bridge_changes;
+
+/**
+ * A statistical variable, which collects information about the number of changes.
+ * It persisted in the 'xc_metadata_stat_harvested' Drupal variable.
+ * @var array
+ */
+global $_xc_metadata_statistics;
+
+/**
+ * This variable is responsible to keep track of the metadata_id of an incoming entity.
+ * At the first record XC selects the maximal metadata_id among the already stored
+ * records (in xc_entity_properties table) and increment it by one. Every subsequental
+ * records get the next incre,emted values. Between OAI requests it is persisted in
+ * xc_oaiharvester_bridge_max_metadata_id Drupal variable. The Drupal variable is
+ * deleted before the first OAI request, so it should be set from scratch with a
+ * SQL query, which guarantees the consistency.
+ * @var int
+ */
+global $_xc_oaiharvester_bridge_max;
+/**
+ * @} End of "addtogroup global variables".
+ */
+
+define('XC_ESCAPE', '\'');
+
+/**
+ * The delimiter between CSV fields
+ * @var (String)
+ */
+define('XC_CSV_TAB', "\000\t");
+
+/**
+ * The delimiter between CSV records
+ * @var (String)
+ */
+define('XC_CSV_CR', "\000\n");
+
+/**
+ * Size of write file buffering (0). Since it is 0, it means no file buffer.
+ *
+ * @var int
+ */
+define('XC_WRITE_BUFFER_SIZE', 0);
+
+/**
+ * Code of the deleted records (1)
+ * @var int
+ */
+define('XC_DELETED', 1);
+
+/**
+ * Code of the updated records (2)
+ * @var int
+ */
+define('XC_UPDATED', 2);
+
+/**
+ * Code of the new records (3)
+ * @var int
+ */
+define('XC_NEW', 3);
+
+/**
+ * Code for work records
+ * @var int
+ */
+define('XC_WORK', 1);
+
+/**
+ * Code for expression records
+ * @var int
+ */
+define('XC_EXPRESSION', 2);
+
+/**
+ * Code for manifestation records
+ * @var int
+ */
+define('XC_MANIFESTATION', 3);
+
+/**
+ * Code for holdings records
+ * @var int
+ */
+define('XC_HOLDINGS', 4);
+
+/**
+ * The maximal file size of the CSV files (1 GiB)
+ * @var (int)
+ */
+define('XC_FILE_SIZE_LIMIT', 1024 * 1024 * 1024);
+
+define('XC_SQL_CMD_LOAD_LOCAL', 0);
+define('XC_SQL_CMD_INSERT', 1);
+define('XC_SQL_CMD_LOAD', 2);
+
+global $XC_METADATA_TYPES;
+
+global $XC_CHANGE_TYPES;
+
+/**
+ * Implements hook_theme().
+ */
+function xc_oaiharvester_bridge_theme() {
+  $themes = array(
+    'xc_oaiharvester_bridge_locations' => array(
+      'render element' => 'form',
+//      'function' => 'theme_xc_oaiharvester_bridge_locations',
+    ),
+    'xc_oaiharvester_bridge_harvest_report_table' => array(
+      'arguments' => array('data', 'caption'),
+    ),
+  );
+  return $themes;
+}
+
+/**
+ * Implements hook_menu().
+ */
+function xc_oaiharvester_bridge_menu() {
+  $items['admin/xc/harvester/bridge_load'] = array(
+    'title' => 'Load CSV files',
+     // $schedule_id, $saved_batch_id = -1, $operation_id = -1
+    'page callback' => 'xc_oaiharvester_bridge_load_csv_and_optimize',
+    'page arguments' => array(),
+    'access arguments' => array(ADMINISTER_HARVESTER),
+    'type' => MENU_NORMAL_ITEM,
+    'weight' => 100,
+  );
+  $items['admin/xc/harvester/bridge_load/%'] = array(
+    'title' => 'Load CSV files',
+     // $schedule_id, $saved_batch_id = -1, $operation_id = -1
+    'page callback' => 'xc_oaiharvester_bridge_load_csv_and_optimize',
+    'page arguments' => array(4),
+    'access arguments' => array(ADMINISTER_HARVESTER),
+    'type' => MENU_NORMAL_ITEM,
+    'weight' => 100,
+  );
+
+  $schedules = _oaiharvester_schedule_get_all();
+  foreach ($schedules as $schedule) {
+    $id = $schedule->harvest_schedule_id;
+    $items['admin/xc/harvester/schedule/' . $id . '/list_csv_cache'] = array(
+      'title' => 'List CSV cache',
+      'description' => 'List CSV cache',
+      'page callback' => 'xc_oaiharvester_bridge_list_csv_cache',
+      'page arguments' => array(4, TRUE),
+      'load arguments' => array(4, TRUE),
+      'access arguments' => array(ADMINISTER_HARVESTER),
+      'type' => MENU_LOCAL_TASK,
+      'weight' => 11,
+    );
+  }
+
+  $items['oaiidentifier/%'] = array(
+    'title' => 'Node by OAI identifier',
+    'page callback' => 'xc_oaiharvester_oai_redirector',
+    'page arguments' => array(1, 'identifier'),
+    'access callback' => TRUE,
+    'type' => MENU_CALLBACK,
+    'weight' => 100,
+  );
+  // Request by Kyushu
+  $items['oaiid_f/%'] = array(
+    'title' => 'Node by OAI identifier',
+    'page callback' => 'xc_oaiharvester_oai_redirector',
+    'page arguments' => array(1, 'identifier'),
+    'access callback' => TRUE,
+    'type' => MENU_CALLBACK,
+    'weight' => 100,
+  );
+  $items['oaiidentifier_int/%'] = array(
+    'title' => 'Node by OAI identifier',
+    'page callback' => 'xc_oaiharvester_oai_redirector',
+    'page arguments' => array(1, 'identifier_int'),
+    'access callback' => TRUE,
+    'type' => MENU_CALLBACK,
+    'weight' => 100,
+  );
+  // Request by Kyushu
+  $items['oaiid_s/%'] = array(
+    'title' => 'Node by OAI identifier',
+    'page callback' => 'xc_oaiharvester_oai_redirector',
+    'page arguments' => array(1, 'identifier_int'),
+    'access callback' => TRUE,
+    'type' => MENU_CALLBACK,
+    'weight' => 100,
+  );
+
+  return $items;
+}
+
+/**
+ * TODO: finish it later
+ function xc_oaiharvester_bridge_menu_alter(&$menu) {
+ $menu['admin/xc/harvester/schedule/%oaiharvester_schedule/node'] = array(
+ 'title' => 'Create nodes',
+ 'description' => 'Create nodes',
+ 'page callback' => 'oaiharvester_schedule_start',
+ 'page arguments' => array(4, TRUE),
+ 'load arguments' => array(4, TRUE),
+ 'access arguments' => array(ADMINISTER_HARVESTER),
+ 'type' => MENU_LOCAL_TASK,
+ 'weight' => 11,
+ );
+ $menu['admin/xc/harvester/schedule/%oaiharvester_schedule/index'] = array(
+ 'title' => 'Index',
+ 'description' => 'Index',
+ 'page callback' => 'oaiharvester_schedule_start',
+ 'page arguments' => array(4, TRUE),
+ 'load arguments' => array(4, TRUE),
+ 'access arguments' => array(ADMINISTER_HARVESTER),
+ 'type' => MENU_LOCAL_TASK,
+ 'weight' => 12,
+ );
+ }
+ */
+
+/**
+ * Implements hook_block_info().
+ */
+function xc_oaiharvester_bridge_block_info() {
+  $blocks['xc_harvest'] = array(
+    'info' => t('XC harvest admin'),
+    'region' => 'sidebar_first',
+    'status' => 1,
+    'visibility' => 1,
+    'pages' => "admin/*"
+  );
+  return $blocks;
+}
+
+/**
+ * Implements hook_block_view().
+ */
+function xc_oaiharvester_bridge_block_view($delta) {
+  if ($delta == 'xc_harvest') {
+    return array(
+      'title' => t('XC harvest admin'),
+      'content' => theme('item_list', array('items' => array(
+        l(t('Repositories'), 'admin/xc/harvester/repository'),
+        l(t('Schedules'), 'admin/xc/harvester/schedule'),
+        l(t('Delete metadata'), 'admin/xc/metadata/delete'),
+        l(t('Delete Solr index'), 'admin/xc/solr/delete_content'),
+        l(t('Metadata statistics'), 'admin/xc/metadata/statistics'),
+        l(t('Solr information'), 'admin/xc/solr/info'),
+    ))));
+  }
+}
+
+/**
+ * Implements hook_block().
+ *
+ * Display a list of important links for harvesting.
+ *
+ * @param $op (String)
+ *   Operation to run
+ * @param $delta (int)
+ *   Which block are we talking about
+ * @param $edit
+ */
+function xc_oaiharvester_bridge_block_OLD($op = 'list', $delta = 0, $edit = array()) {}
+
+/**
+ * Redirects to node according to the OAI identifier.
+ *
+ * @param $identifier (mixed)
+ *   The OAI identifier (string) or identifier_int (int) which is the last numerical
+ *   part of the OAI identifier
+ * @param $type (String)
+ *   The type of the identifier. Possible values:
+ *   - 'identifier' The OAI identifier
+ *   - 'identifier_int' The numeric part of identifier
+ */
+function xc_oaiharvester_oai_redirector($identifier, $type = 'identifier') {
+  // OAI Identifiers may contain / characters. Drupal arguments use the same character to
+  // separate arguments. We have to join arguments again to get the original OAI identifier.
+  $all_arguments = arg();
+  array_shift($all_arguments);
+
+  if ($type == 'identifier') {
+    $sql = "SELECT node_id FROM {xc_entity_properties} WHERE identifier = ':id'";
+    if (count($all_arguments) > 1) {
+      $identifier = join('/', $all_arguments);
+    }
+  }
+  elseif ($type == 'identifier_int') {
+    $sql = 'SELECT node_id FROM {xc_entity_properties} WHERE identifier_int = :id';
+    $identifier = (int) $identifier;
+  }
+
+  if ($sql) {
+    $node_id = db_query($sql, array(':id' => $identifier))->fetchField();
+    if ($node_id) {
+      drupal_goto('node/' . $node_id);
+    }
+  }
+  return t('No appropriate node for OAI identifier %id', array('%id' => $identifier));
+}
+
+/**
+ * Implements hook_oaiharvester_harvest_starting().
+ *
+ * The even is called just before the batch starts to run. The implementation runs
+ * some initialization tasks, clearing caches and others before the harvest would
+ * start.
+ */
+function xc_oaiharvester_bridge_oaiharvester_harvest_starting() {
+  // reset fields2index
+  variable_del('xc_solr_fields2index_list');
+  // reset max_metadata_id
+  variable_del('xc_oaiharvester_bridge_max_metadata_id');
+  // delete file registry
+  variable_del('xc_oaiharvester_bridge_files');
+  // CSV is not loaded
+  variable_set('xc_oaiharvester_bridge_csv_loaded', 0);
+
+  // empty xc_oaiharvester_bridge_changes table
+  db_delete('xc_oaiharvester_bridge_changes')->execute();
+
+  // variable_del('xc_solr_iteration_strategies');
+
+  if (!function_exists('xc_metadata_statistics')) {
+    require_once drupal_get_path('module', 'xc_metadata') . '/includes/xc_metadata.statistics.inc';
+  }
+  variable_set('xc_metadata_stat_previous', xc_metadata_statistics('current'));
+  variable_del('xc_metadata_stat_harvested');
+  variable_set('xc_metadata_stat_harvested', xc_metadata_statistics_empty());
+}
+
+/**
+ * Implements hook_oaiharvester_batch_started().
+ *
+ * Responds to the event that a batch has been started
+ *
+ * @param $parameters (array)
+ *   The batch parameters
+ */
+function xc_oaiharvester_bridge_oaiharvester_batch_started($parameters) {
+  global $_xc_oaiharvester_bridge_files;
+  $file_dir = drupal_realpath(file_default_scheme() . '://');
+  $cache_dir = $file_dir . '/oaiharvester_sql_cache/';
+
+  $sql_cache_dir = $cache_dir . $parameters['schedule']->harvest_schedule_id;
+  if (!file_prepare_directory($cache_dir, FILE_CREATE_DIRECTORY)) {
+    xc_log_error('harvester', t('The Drupal default \'file\' directory is not writable. Check out your Drupal settings, or turn off the caching of harvested responses. Your current file directory is %file.',
+      array('%file' => $file_dir)));
+  }
+  else {
+    $file_check_success = file_prepare_directory($sql_cache_dir, FILE_CREATE_DIRECTORY);
+    if (!$file_check_success) {
+      xc_log_error('harvester', t('The OAI harvester\'s cache directory (%file) is not writable. Check out your Drupal settings, or turn off the caching of harvested responses.',
+      array('%file' => $cache_dir)));
+    }
+    else {
+
+    }
+  }
+  $_xc_oaiharvester_bridge_files = array('dir' => $sql_cache_dir);
+
+  // delete old files if they exists
+  $older_files = scandir($sql_cache_dir);
+  foreach ($older_files as $file) {
+    if (preg_match('/\.\d*\.csv$/', $file)) {
+      unlink($sql_cache_dir . '/' . $file);
+    }
+  }
+
+  // Register a counter for files. Each file is limited in size, so if there are more
+  // data, we continue with a new file, like xc_sql_metadata.0.csv, xc_sql_metadata.1.csv, etc.
+  $sql_tables = array(
+    'xc_entity_properties',
+    'xc_sql_metadata',
+    'xc_entity_relationships',
+    'xc_oaiharvester_bridge_header',
+    'xc_oaiharvester_bridge_set',
+  );
+
+  foreach ($sql_tables as $table) {
+    $_xc_oaiharvester_bridge_files[$table] = array(
+      'files' => array($sql_cache_dir . '/' . $table . '.0.csv'),
+      'counter' => 0
+    );
+  }
+  variable_set('xc_oaiharvester_bridge_files', $_xc_oaiharvester_bridge_files);
+}
+
+/**
+ * Implements hook_oaiharvester_request_started().
+ *
+ * @param $parameters (array)
+ *   The initial parameters of the schedule
+ */
+function xc_oaiharvester_bridge_oaiharvester_request_started($parameters) {
+  global $_xc_oaiharvester_bridge_files, $_xc_entity_properties_csv, $_xc_sql_metadata_csv,
+    $_xc_oaiharvester_bridge_header_csv, $_xc_oaiharvester_bridge_set_csv,
+    $_xc_entity_relationships_csv, $_xc_oaiharvester_bridge_changes,
+    $_xc_metadata_statistics;
+
+  if (!isset($_xc_oaiharvester_bridge_files)) {
+    $_xc_oaiharvester_bridge_files = variable_get('xc_oaiharvester_bridge_files', array());
+  }
+
+  // clear file size stat
+  clearstatcache();
+  $change = FALSE;
+  if (isset($_xc_oaiharvester_bridge_files['xc_entity_properties'])) {
+    $table = 'xc_entity_properties';
+    $counter = $_xc_oaiharvester_bridge_files[$table]['counter'];
+    $file = xc_oaiharvester_bridge_check_file($table);
+    if ($counter != $_xc_oaiharvester_bridge_files[$table]['counter']) {
+      $change = TRUE;
+    }
+    if ($_xc_entity_properties_csv = fopen($file, 'ab')) {
+      stream_set_write_buffer($_xc_entity_properties_csv, XC_WRITE_BUFFER_SIZE);
+    }
+    else {
+      xc_log_error('bridge', 'Cannot write to file ' . $file);
+    }
+  }
+
+  if ($_xc_oaiharvester_bridge_files['xc_sql_metadata']) {
+    $table = 'xc_sql_metadata';
+    $counter = $_xc_oaiharvester_bridge_files[$table]['counter'];
+    $file = xc_oaiharvester_bridge_check_file($table);
+    if ($counter != $_xc_oaiharvester_bridge_files[$table]['counter']) {
+      $change = TRUE;
+    }
+    if ($_xc_sql_metadata_csv = fopen($file, 'ab')) {
+      stream_set_write_buffer($_xc_sql_metadata_csv, XC_WRITE_BUFFER_SIZE);
+    }
+    else {
+      xc_log_error('bridge', 'Cannot write to file ' . $file);
+    }
+  }
+  else {
+    xc_log_error('bridge', 'No xc_sql_metadata file! Files: ' . var_export($_xc_oaiharvester_bridge_files, TRUE));
+  }
+
+  if ($_xc_oaiharvester_bridge_files['xc_oaiharvester_bridge_header']) {
+    $table = 'xc_oaiharvester_bridge_header';
+    $counter = $_xc_oaiharvester_bridge_files[$table]['counter'];
+    $file = xc_oaiharvester_bridge_check_file($table);
+    if ($counter != $_xc_oaiharvester_bridge_files[$table]['counter']) {
+      $change = TRUE;
+    }
+    if ($_xc_oaiharvester_bridge_header_csv = fopen($file, 'ab')) {
+      stream_set_write_buffer($_xc_oaiharvester_bridge_header_csv, XC_WRITE_BUFFER_SIZE);
+    }
+    else {
+      xc_log_error('bridge', 'Cannot write to file ' . $file);
+    }
+  }
+
+  if ($_xc_oaiharvester_bridge_files['xc_oaiharvester_bridge_set']) {
+    $table = 'xc_oaiharvester_bridge_set';
+    $counter = $_xc_oaiharvester_bridge_files[$table]['counter'];
+    $file = xc_oaiharvester_bridge_check_file($table);
+    if ($counter != $_xc_oaiharvester_bridge_files[$table]['counter']) {
+      $change = TRUE;
+    }
+    if ($_xc_oaiharvester_bridge_set_csv = fopen($file, 'ab')) {
+      stream_set_write_buffer($_xc_oaiharvester_bridge_set_csv, XC_WRITE_BUFFER_SIZE);
+    }
+    else {
+      xc_log_error('bridge', 'Cannot write to file ' . $file);
+    }
+  }
+
+  if ($_xc_oaiharvester_bridge_files['xc_entity_relationships']) {
+    $table = 'xc_entity_relationships';
+    $counter = $_xc_oaiharvester_bridge_files[$table]['counter'];
+    $file = xc_oaiharvester_bridge_check_file($table);
+    if ($counter != $_xc_oaiharvester_bridge_files[$table]['counter']) {
+      $change = TRUE;
+    }
+    if ($_xc_entity_relationships_csv = fopen($file, 'ab')) {
+      stream_set_write_buffer($_xc_entity_relationships_csv, XC_WRITE_BUFFER_SIZE);
+    }
+    else {
+      xc_log_error('bridge', 'Cannot write to file ' . $file);
+    }
+  }
+
+  // save changes in file list
+  if ($change == TRUE) {
+    variable_set('xc_oaiharvester_bridge_files', $_xc_oaiharvester_bridge_files);
+  }
+
+  if (!isset($_xc_oaiharvester_bridge_changes)) {
+    $_xc_oaiharvester_bridge_changes = array(
+      XC_DELETED => array(),
+      XC_UPDATED => array(),
+      XC_NEW     => array(),
+    );
+  }
+
+  if (!function_exists('xc_metadata_statistics_empty')) {
+    require_once drupal_get_path('module', 'xc_metadata') . '/includes/xc_metadata.statistics.inc';
+  }
+  $_xc_metadata_statistics = variable_get('xc_metadata_stat_harvested', xc_metadata_statistics_empty());
+}
+
+/**
+ * Implements hook_oaiharvester_process_record().
+ *
+ * @param $record (Array)
+ *   The OAI-PMH record
+ * @param $schedule_id (int)
+ *   The identifier of a schedule
+ *
+ * @return unknown_type
+ */
+function xc_oaiharvester_bridge_oaiharvester_process_record($record, $schedule_id) {
+  global $_xc_oai_harvester_bridge_active, $_oaiharvester_statistics, $_xc_oaiharvester_bridge_max,
+    $_xc_entity_properties_csv, $_oaiharvester_is_initial_harvest, $_oaiharvester_need_debug,
+    $_xc_metadata_statistics;
+  static $formats, $entity_params, $build_hooks, $build_params, $store_hooks, $caller, $empty_array;
+
+  $start_time = microtime(TRUE);
+  $_xc_oai_harvester_bridge_active = TRUE;
+
+  if (!isset($formats)) {
+    $formats = array();
+  }
+
+  $identifier   = $record['header']['identifier'];
+  $datestamp    = $record['header']['datestamp'];
+  $setSpec      = $record['header']['setSpec'];
+  $about        = $record['about'];
+  if (isset($record['metadata'])) {
+    $namespaceURI = isset($record['metadata']['namespaceURI']) ? $record['metadata']['namespaceURI'] : null;
+    $raw = isset($record['metadata']['childNode']) ? $record['metadata']['childNode'] : null;
+  }
+  else {
+    $namespaceURI = $raw = null;
+  }
+
+  $_xc_metadata_statistics->entities++;
+
+  // handling deleted records <header status="deleted">
+  $status     = $record['header']['@status'];
+
+  $initialization_time = microtime(TRUE);
+  if (!isset($caller)) {
+    $caller = '01 step1/02 bridge';
+  }
+  xc_oaiharvester_statistics_set($caller . '/01 initialization', $initialization_time - $start_time);
+
+  $schedule = oaiharvester_schedule_load($schedule_id, TRUE);
+  $identifier_int = xc_util_get_identifier_int($identifier, $schedule->oai_identifier['identifierPrefix']);
+
+  if (!is_null($status) && $status == 'deleted') {
+    xc_log_error('bridge-delete', 'deleted record found for record: ' . $identifier);
+    if (!isset($_xc_metadata_statistics->deleted['total'])) {
+      $_xc_metadata_statistics->deleted['total'] = 0;
+    }
+    $_xc_metadata_statistics->deleted['total']++;
+    $entity = xc_metadata_ids_by_identifier_int($identifier_int);
+    xc_log_error('bridge-delete', 'deleted record entity: ' . print_r($entity, TRUE));
+
+    if ($entity === FALSE || is_null($entity)) {
+      xc_log_error('bridge', 'No existing entity in Drupal for the OAI deleted record: ' . $identifier);
+      if (isset($_xc_metadata_statistics->deleted['unknown'])) {
+        $_xc_metadata_statistics->deleted['unknown'] = 0;
+      }
+      $_xc_metadata_statistics->deleted['unknown']++;
+      return 1;
+    }
+
+    if (!isset($entity->identifier_int)) {
+      $entity->identifier_int = $identifier_int;
+    }
+    xc_oaiharvester_bridge_set_changes($entity, TRUE);
+
+    if (!isset($_xc_metadata_statistics->deleted[$entity->metadata_type])) {
+      $_xc_metadata_statistics->deleted[$entity->metadata_type] = 0;
+    }
+    $_xc_metadata_statistics->deleted[$entity->metadata_type]++;
+
+    if (!isset($_xc_metadata_statistics->types[$entity->metadata_type])) {
+      $_xc_metadata_statistics->types[$entity->metadata_type] = 0;
+    }
+    $_xc_metadata_statistics->types[$entity->metadata_type]++;
+
+    if ($entity->node_id) {
+      xc_log_error('bridge-delete', 'calling node delete for entity: ' . $entity->metadata_id . ' with node ID: ' . $entity->node_id);
+
+      $node = node_load($entity->node_id);
+
+      // delete node
+      db_delete('node')->condition('nid', $node->nid)->execute();
+      db_delete('node_revision')->condition('nid', $node->nid)->execute();
+
+      // Call the node-specific callback (if any):
+      node_invoke($node, 'delete');
+      module_invoke_all('node_delete', $node);
+
+      // Clear the page and block caches.
+      cache_clear_all();
+
+      // Remove this node from the search index if needed.
+      if (function_exists('search_wipe')) {
+        search_wipe($node->nid, 'node');
+      }
+    }
+    else {
+      xc_log_error('bridge-delete', 'manually deleting entity: ' . $entity->metadata_id . ' because no node ID was found');
+      // xc_metadata_delete_metadata($entity->metadata_id, $identifier_int);
+    }
+
+    return 1;
+  }
+
+  if (empty($namespaceURI)) {
+    return 1;
+  }
+
+  if (!isset($formats[$namespaceURI])) {
+    $formats[$namespaceURI] = FALSE;
+    require_once drupal_get_path('module', 'xc_metadata') . '/includes/xc_metadata.format.inc';
+    foreach (xc_format_get() as $format_name => $format_array) {
+      if ($format_array['namespaceURI'] == $namespaceURI) {
+        $formats[$namespaceURI] = $format_name;
+        break;
+      }
+    }
+  }
+
+  if ($formats[$namespaceURI] === FALSE) {
+    return 1;
+  }
+
+  $format = $formats[$namespaceURI];
+
+  // $params['oai_header'] = _xc_oaiharvester_bridge_store_oaiheader($identifier, $datestamp, $setSpec);
+  // $params['identifier'] = $identifier;
+
+  $use_insert = (!$_oaiharvester_is_initial_harvest) ? 1 : xc_oaiharvester_bridge_get_use_insert_value($schedule_id);
+
+  // prepare default data for entity
+  $time = time();
+  if (!isset($empty_array)) {
+    $empty_array = serialize(array());
+  }
+
+  $entity = (object) array(
+    'identifier' => $identifier,
+    'identifier_int' => $identifier_int,
+    'source_id' => _schedule_id_to_source_id($schedule_id),
+    'format' => $format,
+    'raw' => $raw,
+    'node_id' => 0,
+    'locks' => $empty_array,
+    'locations' => $empty_array,
+    'properties' => $empty_array,
+    'created' => $time,
+    'updated' => $time,
+    'stored' => 0,
+    'deleted' => 0,
+    'built' => FALSE,
+  );
+
+  // getting the metadata_id
+  if (!$_oaiharvester_is_initial_harvest) {
+    $saved_entity = xc_metadata_ids_by_identifier_int($identifier_int);
+    // $saved_metadata_id = xc_metadata_metadata_id_from_identifier_int($identifier_int);
+    if ($saved_entity) {
+      $entity->stored = 1;
+      $entity->metadata_id = $saved_entity->metadata_id;
+      // TODO: what if the type is changed?
+      if ($saved_entity->node_id) {
+        $entity->node_id = $saved_entity->node_id;
+      }
+    }
+  }
+
+  if (!isset($entity->metadata_id)) {
+    if (!isset($_xc_oaiharvester_bridge_max)) {
+      $_xc_oaiharvester_bridge_max = variable_get('xc_oaiharvester_bridge_max_metadata_id', -1);
+      if ($_xc_oaiharvester_bridge_max == -1) {
+        $_xc_oaiharvester_bridge_max = db_query('SELECT max(metadata_id) FROM {xc_entity_properties}')->fetchField();
+      }
+    }
+    $_xc_oaiharvester_bridge_max++;
+    $entity->metadata_id = $_xc_oaiharvester_bridge_max;
+  }
+
+  // build
+  if (!isset($build_hooks)) {
+    $build_hooks = array();
+    foreach (module_implements('xc_build') as $module) {
+      $build_hooks[] = $module . '_xc_build';
+    }
+  }
+  $entity->metadata = array();
+  if (!isset($build_params)) {
+    $build_params = array();
+  }
+  if (!isset($build_params[$schedule_id])) {
+    $build_params[$schedule_id] = array(
+      'caller' => $caller,
+      'identifier_prefix' => $schedule->oai_identifier['identifierPrefix']
+    );
+  }
+  foreach ($build_hooks as $function) {
+    $metadata = $function($entity, $format, $build_params[$schedule_id]);
+    if (is_array($metadata)) {
+      if (empty($entity->metadata)) {
+        $entity->metadata = $metadata;
+      }
+      else {
+        $entity->metadata = array_merge_recursive($entity->metadata, $metadata);
+      }
+    }
+  }
+  // end of build
+
+  if (!isset($_xc_metadata_statistics->types[$entity->metadata_type])) {
+    $_xc_metadata_statistics->types[$entity->metadata_type] = 0;
+  }
+  $_xc_metadata_statistics->types[$entity->metadata_type]++;
+
+  // node type
+  $entity->node_type = _metadata_type_to_node_type($entity->metadata_type);
+
+  $build_time = microtime(TRUE);
+  $build_duration = abs($build_time - $initialization_time);
+
+  $store_params = array(
+    'use_insert' => $use_insert,
+    'need_update' => $entity->stored,
+    'use_hook_call' => FALSE
+  );
+  if ($entity->stored == 1) {
+    if (!isset($_xc_metadata_statistics->updated['total'])) {
+      $_xc_metadata_statistics->updated['total'] = 0;
+    }
+    $_xc_metadata_statistics->updated['total']++;
+    if (!isset($_xc_metadata_statistics->updated[$entity->metadata_type])) {
+      $_xc_metadata_statistics->updated[$entity->metadata_type] = 0;
+    }
+    $_xc_metadata_statistics->updated[$entity->metadata_type]++;
+
+    // update
+    drupal_write_record('xc_entity_properties', $entity, 'metadata_id');
+  }
+  else {
+    if (!isset($_xc_metadata_statistics->new['total'])) {
+      $_xc_metadata_statistics->new['total'] = 0;
+    }
+    $_xc_metadata_statistics->new['total']++;
+    if (!isset($_xc_metadata_statistics->new[$entity->metadata_type])) {
+      $_xc_metadata_statistics->new[$entity->metadata_type] = 0;
+    }
+    $_xc_metadata_statistics->new[$entity->metadata_type]++;
+
+    // insert
+    $entity->stored = 1;
+    if ($use_insert == XC_SQL_CMD_INSERT) {
+      drupal_write_record('xc_entity_properties', $entity);
+    }
+    else {
+      fwrite($_xc_entity_properties_csv, join(XC_CSV_TAB, array($entity->metadata_id, $entity->metadata_type,
+        $entity->node_id, $entity->node_type, $entity->identifier, $entity->format, $entity->source_id,
+        $entity->created, $entity->updated, $entity->locks, $entity->locations, $entity->properties,
+        $entity->built, $entity->stored, $entity->deleted, $entity->identifier_int)) . XC_CSV_CR);
+    }
+  }
+  // TODO: write about is in the documentation
+  if (!$_oaiharvester_is_initial_harvest) {
+    xc_oaiharvester_bridge_set_changes($entity, FALSE);
+  }
+
+  $locations = xc_source_get_locations($entity->source_id);
+
+  // known implementation: xc_sql_xc_store
+  if (!isset($store_hooks)) {
+    $store_hooks['hooks'] = array();
+    foreach (module_implements('xc_store') as $module) {
+      if ($module != 'xc_solr') {
+        $store_hooks['hooks'][] = $module . '_xc_store';
+      }
+    }
+    $store_hooks['count'] = count($store_hooks['hooks']);
+  }
+
+  if ($store_hooks['count'] > 0) {
+    if ($store_hooks['count'] == 1) {
+      xc_sql_xc_store($entity, $locations, $store_params);
+    }
+    else {
+      foreach ($store_hooks as $function) {
+        $function($entity, $locations, $store_params);
+      }
+    }
+
+    if ($entity->stored) {
+      if (!isset($_xc_metadata_statistics->metadata['total'])) {
+        $_xc_metadata_statistics->metadata['total'] = 0;
+      }
+      $_xc_metadata_statistics->metadata['total']++;
+      if (!isset($_xc_metadata_statistics->metadata[$entity->metadata_type])) {
+        $_xc_metadata_statistics->metadata[$entity->metadata_type] = 0;
+      }
+      $_xc_metadata_statistics->metadata[$entity->metadata_type]++;
+    }
+    else {
+      xc_log_error('bridge', 'Entity is not stored: ' . var_export($entity, TRUE));
+    }
+  }
+
+  $store_time = microtime(TRUE);
+  $store_duration = abs($store_time - $build_time);
+  xc_oaiharvester_statistics_set($caller, abs(microtime(TRUE) - $start_time));
+
+  return 1;
+}
+
+/**
+ * Save changes
+ * @param $entity
+ * @param $is_deletable
+ */
+function xc_oaiharvester_bridge_set_changes($entity, $is_deletable = FALSE) {
+  global $_xc_oaiharvester_bridge_changes;
+
+  // TODO: if $is_deletable we should track the manifestation, otherwise we will lost that info
+  // xc_log_info('track', 'xc_oaiharvester_bridge_set_changes: ' . $entity->metadata_type . ' ' . (int)$is_deletable);
+
+  $type = $is_deletable ? XC_DELETED : XC_UPDATED;
+  if ($entity->metadata_type == 'manifestation' || $entity->metadata_type == 'oai_dc') {
+    $_xc_oaiharvester_bridge_changes[$type][XC_MANIFESTATION][] = $entity;
+  }
+  elseif ($entity->metadata_type == 'work') {
+    $_xc_oaiharvester_bridge_changes[$type][XC_WORK][] = $entity;
+  }
+  elseif ($entity->metadata_type == 'expression') {
+    $_xc_oaiharvester_bridge_changes[$type][XC_EXPRESSION][] = $entity;
+  }
+  elseif ($entity->metadata_type == 'holdings') {
+    $_xc_oaiharvester_bridge_changes[$type][XC_HOLDINGS][] = $entity;
+  }
+  else {
+    xc_log_error('track', 'xc_oaiharvester_bridge_set_changes: do nothing with this (possibly wrong) entity: ' . var_export($entity, TRUE));
+  }
+}
+
+/**
+ * Find the manifestations belonging to a work or expression record, and save that manifestations
+ * into xc_oaiharvester_bridge_changes table, then deletes the original (work, expression) records.
+ */
+function xc_oaiharvester_bridge_normalize_changes() {
+  global $XC_METADATA_TYPES, $XC_CHANGE_TYPES;
+  xc_log_info('bridge', 'run xc_oaiharvester_bridge_normalize_changes()');
+
+  $processed = array();
+  $types = array(XC_EXPRESSION, XC_WORK, XC_HOLDINGS);
+  // select all from changes
+  $changes_sql = 'SELECT * FROM {xc_oaiharvester_bridge_changes} WHERE type = :type';
+  // select whether a given change is already registered
+  $check_sql = 'SELECT metadata_id FROM {xc_oaiharvester_bridge_changes}
+                WHERE metadata_id = :metadata_id AND metadata_type = :metadata_type AND type = :type';
+  $created = $skipped = 0;
+  foreach ($types as $type) {
+    $result = db_query($changes_sql, array(':type' => $type));
+    foreach ($result as $change) {
+      $manifestation_ids = xc_metadata_get_manifestation_ids_for_frbr($change->metadata_id, $change->metadata_type);
+      foreach ($manifestation_ids as $metadata_id) {
+        if (isset($processed[$metadata_id])) {
+          continue;
+        }
+        $processed[$metadata_id]++;
+        $metadata_exists = db_query($check_sql, array(
+          ':metadata_id' => $metadata_id,
+          ':metadata_type' => XC_MANIFESTATION,
+          ':type'=> XC_UPDATED))
+          ->fetchField();
+        if (!$metadata_exists) {
+          $metadata = xc_metadata_ids_by_id($metadata_id);
+          $created++;
+          xc_log_info('track', 'Create ' . $metadata_id);
+          $record = (object) array(
+            'metadata_id' => $metadata_id,
+            'metadata_type' => XC_MANIFESTATION,
+            'identifier_int' => $metadata->identifier_int,
+            'type' => XC_UPDATED
+          );
+          xc_log_info('track', 'new record into bridge: ' . $metadata_id);
+          drupal_write_record('xc_oaiharvester_bridge_changes', $record);
+        }
+        else {
+          $skipped++;
+        }
+      }
+      if ($change->type == XC_DELETED) {
+        xc_metadata_delete_metadata($change->metadata_id, $change->identifier_int);
+      }
+    }
+  }
+  xc_log_info('track', sprintf('Type: %s: created %d, skipped %d records', $type, $created, $skipped));
+
+  // clear works and expressions
+  xc_log_info('bridge', 'Clear out works and expressions from normalization');
+  // xc_metadata_delete_metadata($entity->metadata_id, $identifier_int);
+  // TODO Please review the conversion of this statement to the D7 database API syntax.
+  // db_query('DELETE FROM {xc_oaiharvester_bridge_changes} WHERE metadata_type = %d OR metadata_type = %d OR metadata_type = %d', XC_WORK, XC_EXPRESSION, XC_HOLDINGS)
+  $or_condition = db_or()
+      ->condition('metadata_type', XC_WORK)
+      ->condition('metadata_type', XC_EXPRESSION)
+      ->condition('metadata_type', XC_HOLDINGS);
+  db_delete('xc_oaiharvester_bridge_changes')
+      ->condition($or_condition)
+      ->execute();
+  xc_log_info('bridge', 'Normalize_changes has been finished');
+}
+
+/**
+ * Saves changes
+ */
+function xc_oaiharvester_bridge_save_changes() {
+  global $_xc_oaiharvester_bridge_changes, $XC_METADATA_TYPES, $XC_CHANGE_TYPES;
+
+  $status_types = array(
+    XC_UPDATED => 'updated',
+    XC_DELETED => 'deleted',
+    XC_NEW => 'new'
+  );
+  foreach ($status_types as $status_type => $status_label) {
+    if (empty($_xc_oaiharvester_bridge_changes[$status_type])) {
+      continue;
+    }
+    xc_log_info('track', 'saving status type: ' . $status_label);
+    $sql = 'SELECT metadata_id FROM {xc_oaiharvester_bridge_changes}
+            WHERE metadata_id = :metadata_id AND metadata_type = :metadata_type AND type = :type';
+    foreach ($_xc_oaiharvester_bridge_changes[$status_type] as $metadata_type => $entities) {
+      $processed_metadata_ids = array();
+      foreach ($entities as $entity) {
+        if (isset($processed_metadata_ids[$entity->metadata_id])) {
+          continue;
+        }
+        $processed_metadata_ids[$entity->metadata_id] = 1;
+
+        // TODO Please convert this statement to the D7 database API syntax.
+        if (!db_query($sql, array(
+            ':metadata_id' => $metadata_id,
+            ':metadata_type' => $metadata_type,
+            ':type' => $status_type))
+            ->fetchField()) {
+          $record = (object) array(
+            'metadata_id' => $entity->metadata_id,
+            'metadata_type' => $metadata_type,
+            'identifier_int' => $entity->identifier_int,
+            'type' => $status_type
+          );
+          drupal_write_record('xc_oaiharvester_bridge_changes', $record);
+        }
+      }
+    }
+  }
+
+  unset($_xc_oaiharvester_bridge_changes);
+}
+
+/**
+ * Store OAI header information
+ *
+ * @param $identifier
+ *    OAI identifier
+ * @param $datestamp
+ *    Date stamp
+ * @param $setSpecs
+ *    setSpects
+ *
+ * @return (Object)
+ *    Header object (contains: oai_identifier, datestamp, header_id, setSpec)
+ */
+function _xc_oaiharvester_bridge_store_oaiheader($identifier, $datestamp, $setSpecs) {
+  global $_xc_oaiharvester_bridge_header_csv, $_xc_oaiharvester_bridge_set_csv;
+
+  // TODO: create a remove function with proper hook implementation
+  $header = new stdClass();
+  $header->oai_identifier = $identifier;
+  // hacking an MST error
+  // TODO: removing it when the MST will be fixed
+  if (strstr($datestamp, ' ')) {
+    $header->datestamp = '2009-08-20 11:33:25';
+  }
+  else {
+    $header->datestamp = str_replace('Z', '', str_replace('T', ' ', $datestamp));
+  }
+  //drupal_write_record('xc_oaiharvester_bridge_header', $header);
+  fputcsv($_xc_oaiharvester_bridge_header_csv, array($header->oai_identifier, $header->datestamp));
+
+  $id = $header->header_id;
+  if (!empty($setSpecs)) {
+    if (is_array($setSpecs)) {
+      foreach ($setSpecs as $setSpec) {
+        $set = new stdClass();
+        $set->header_id = $id;
+        $set->set_spec  = $setSpec;
+        drupal_write_record('xc_oaiharvester_bridge_set', $set);
+        // fputcsv($_xc_oaiharvester_bridge_header_csv, array($header->oai_identifier, $header->datestamp));
+      }
+    }
+    else {
+      $set = new stdClass();
+      $set->header_id = $id;
+      $set->set_spec  = $setSpecs;
+      drupal_write_record('xc_oaiharvester_bridge_set', $set);
+    }
+  }
+  $header->setSpec = $setSpecs;
+  return $header;
+}
+
+/**
+ * Implements hook_oaiharvester_request_processed().
+ */
+function xc_oaiharvester_bridge_oaiharvester_request_processed() {
+  global $_xc_oaiharvester_bridge_max, $_xc_entity_properties_csv, $_xc_sql_metadata_csv,
+    $_xc_oaiharvester_bridge_header_csv, $_xc_oaiharvester_bridge_set_csv,
+    $_xc_entity_relationships_csv, $_xc_oaiharvester_bridge_changes,
+    $_xc_metadata_statistics;
+
+  if (!is_null($_xc_oaiharvester_bridge_max)) {
+    variable_set('xc_oaiharvester_bridge_max_metadata_id', $_xc_oaiharvester_bridge_max);
+  }
+  if (is_resource($_xc_entity_properties_csv)) {
+    fclose($_xc_entity_properties_csv);
+    // unset($_xc_entity_properties_csv);
+  }
+  if (is_resource($_xc_sql_metadata_csv)) {
+    fclose($_xc_sql_metadata_csv);
+    // unset($_xc_sql_metadata_csv);
+  }
+  if (is_resource($_xc_oaiharvester_bridge_header_csv)) {
+    fclose($_xc_oaiharvester_bridge_header_csv);
+    // unset($_xc_oaiharvester_bridge_header_csv);
+  }
+  if (is_resource($_xc_oaiharvester_bridge_set_csv)) {
+    fclose($_xc_oaiharvester_bridge_set_csv);
+    // unset($_xc_oaiharvester_bridge_set_csv);
+  }
+  if (is_resource($_xc_entity_relationships_csv)) {
+    fclose($_xc_entity_relationships_csv);
+    // unset($_xc_entity_relationships_csv);
+  }
+
+  if (isset($_xc_oaiharvester_bridge_changes)) {
+    xc_oaiharvester_bridge_save_changes();
+    unset($_xc_oaiharvester_bridge_changes);
+  }
+  else {
+    xc_log_info('track1', 'do not save changes: ' . var_export($_xc_oaiharvester_bridge_changes, TRUE));
+  }
+
+  variable_set('xc_metadata_stat_harvested', $_xc_metadata_statistics);
+}
+
+/**
+ * Run CSV import and optimize tables
+ *
+ * @param $schedule_id (int)
+ *   The identifier of a schedule
+ */
+function xc_oaiharvester_bridge_load_csv_and_optimize($schedule_id = -1, $saved_batch_id = -1, $operation_id = -1, &$context = array()) {
+  global $_oaiharvester_statistics;
+  xc_log_info('bridge', 'xc_oaiharvester_bridge_load_csv_and_optimize');
+  drupal_set_message('xc_oaiharvester_bridge_load_csv_and_optimize');
+
+  if (xc_oaiharvester_bridge_get_frbization_value($schedule_id) == 0) {
+    return $schedule_id . ', ' . xc_oaiharvester_bridge_get_frbization_value($schedule_id);
+  }
+
+  drupal_set_time_limit(0);
+  if ($saved_batch_id != -1) {
+    $saved_batch = oaiharvester_saved_batch_load($saved_batch_id);
+    $sets = unserialize($saved_batch->sets);
+    $context['message'] .= t('Step %current of %total: Loading metadata to relational database<br />',
+      array(
+        '%current' => $operation_id + 1, // because operation_id starts from 0
+        '%total' => count($sets),
+    ));
+  }
+
+  if (!$_oaiharvester_statistics) {
+    $_oaiharvester_statistics = variable_get('oaiharvester_statistics', array());
+  }
+
+  $t = microtime(TRUE);
+  $locations = xc_source_get_locations(_schedule_id_to_source_id($schedule_id));
+
+  $insert_method = xc_oaiharvester_bridge_get_use_insert_value($schedule_id);
+  xc_log_info('bridge', 'use_insert_value: ' . $insert_method);
+  if ($insert_method == XC_SQL_CMD_LOAD_LOCAL || $insert_method == XC_SQL_CMD_LOAD) {
+    if (isset($saved_batch)) {
+      oaiharvester_saved_batch_update_status($saved_batch, $operation_id,
+        'xc_oaiharvester_bridge_load_csv_and_optimize', 'CSV_LOAD_STARTED', $context);
+    }
+    xc_log_info('oai2metadata', 'Load CSV');
+    xc_oaiharvester_bridge_load_csv(FALSE, $schedule_id);
+  }
+
+  // TODO: $locations, $params
+  $params['caller'] = '02 step2/04 optimize';
+  // xc_sql_xc_optimize($locations, $params);
+  variable_del('xc_max_metadata_id');
+  $t2 = microtime(TRUE);
+  $_oaiharvester_statistics['02 step2'] = ($t2 - $t);
+  variable_set('oaiharvester_statistics', $_oaiharvester_statistics);
+  if (isset($saved_batch)) {
+    oaiharvester_saved_batch_update_status($saved_batch, $operation_id,
+      'xc_oaiharvester_bridge_load_csv_and_optimize', 'CSV_LOAD_FINISHED', $context);
+  }
+
+  // normalize the changes
+  xc_oaiharvester_bridge_normalize_changes();
+
+  // put the schedule's status passive
+  if ($saved_batch_id != -1) {
+    if (count($sets) == ($operation_id + 1)) {
+      xc_log_info('set passive', 'bridge: set passive schedule #' . $schedule->harvest_schedule_id);
+      oaiharvester_schedule_set_passive($schedule_id);
+    }
+  }
+}
+
+/**
+ * @todo Please document this function.
+ * @see http://drupal.org/node/1354
+ */
+function xc_oaiharvester_bridge_load_csv($as_page = FALSE, $schedule_id = NULL) {
+  global $_oaiharvester_statistics;
+  drupal_set_time_limit(0);
+
+  drupal_set_message('xc_oaiharvester_bridge_load_csv');
+  xc_log_info('bridge', 'xc_oaiharvester_bridge_load_csv');
+
+  $load_data_command = 'LOAD DATA LOCAL INFILE';
+  if ($schedule_id !== NULL) {
+    $insert_command_id = xc_oaiharvester_bridge_get_use_insert_value($schedule_id);
+    if ($insert_command_id != XC_SQL_CMD_LOAD && $insert_command_id != XC_SQL_CMD_LOAD_LOCAL) {
+      xc_log_info('bridge', 'Skip this step, because the schedule does not support LOAD.');
+      return;
+    }
+    $load_data_command = ($insert_command_id == XC_SQL_CMD_LOAD_LOCAL)
+      ? 'LOAD DATA LOCAL INFILE'
+      : 'LOAD DATA INFILE';
+  }
+
+  if (is_null($_oaiharvester_statistics)) {
+    $_oaiharvester_statistics = variable_get('oaiharvester_statistics', array());
+  }
+
+  $loaded = variable_get('xc_oaiharvester_bridge_csv_loaded', 0);
+  if ($loaded != 0) {
+    xc_log_info('bridge', 'Already loaded, so skip this step.');
+    if ($as_page) {
+      return 'Already loaded';
+    }
+    else {
+      return;
+    }
+  }
+  variable_set('xc_oaiharvester_bridge_csv_loaded', 1); // is loading
+  $remove_and_recreate_index = FALSE;
+  $_xc_oaiharvester_bridge_files = variable_get('xc_oaiharvester_bridge_files', array());
+
+  $root = $path = ($_SERVER['DOCUMENT_ROOT']
+    ? $_SERVER['DOCUMENT_ROOT']
+    : ($_SERVER['PWD'] ? $_SERVER['PWD'] : '')) . $GLOBALS['base_path'];
+  $indexed_tables = array('xc_entity_properties');
+  $ret = array();
+  // drop indexes
+  /*
+   if ($remove_and_recreate_index) {
+   $t_removeindex = microtime(TRUE);
+   foreach ($indexed_tables as $table) {
+   $t_removeindex_a = microtime(TRUE);
+   $schema = drupal_get_schema($table);
+   $indexes = $schema['indexes'];
+   foreach ($indexes as $name => $fields) {
+   // ALTER TABLE xxx DROP INDEX yyy
+   if (xc_util_index_exists($table, $name)) {
+   xc_log_info('oai2metadata', 'Drop index ' . $table . '.' . $name);
+   db_drop_index($ret, $table, $name);
+   }
+   }
+   $t_removeindex_b = microtime(TRUE);
+   $_oaiharvester_statistics['02 step2/01 remove index/' . $table] = ($t_removeindex_b - $t_removeindex_a);
+   }
+   $t_removeindex2 = microtime(TRUE);
+   $_oaiharvester_statistics['02 step2/01 remove index'] = ($t_removeindex2 - $t_removeindex);
+   }
+   */
+
+  $t_loaddata = microtime(TRUE);
+  foreach ($_xc_oaiharvester_bridge_files as $table => $file) {
+    if ($table == 'dir') {
+      continue;
+    }
+    xc_log_info('oai2metadata', 'loading table ' . $table);
+    $has_records = FALSE;
+    foreach ($file['files'] as $csv) {
+      if (filesize($csv) == 0) {
+        continue;
+      }
+      else {
+        $has_records = TRUE;
+        break;
+      }
+    }
+    if (!$has_records) {
+      xc_log_info('oai2metadata', 'No record in ' . $table);
+      continue;
+    }
+    xc_log_info('oai2metadata', sprintf('Disable keys for %s', $table));
+    // TODO Please convert this statement to the D7 database API syntax.
+    $result = db_query('ALTER TABLE {' . check_plain($table) . '} DISABLE KEYS');
+    $t_loaddata_a = microtime(TRUE);
+    foreach ($file['files'] as $csv) {
+      $path = $csv;
+      if (filesize($path) == 0) {
+        continue;
+      }
+      xc_log_info('oai2metadata', 'Loading ' . $csv . ' into ' . $table);
+      // TODO: MySQL 5.5 does not support(?) LOCAL, check mySQL version, and use it accordingly
+      // FIXME: Below may have introduced a bug with no CSV being loaded
+      // $sql = "LOAD DATA INFILE '" . $path . "' INTO TABLE {" . check_plain($table) . '}'
+      $sql = $load_data_command . " '" . $path . "' INTO TABLE {" . check_plain($table) . '}'
+        . " CHARACTER SET utf8 FIELDS TERMINATED BY '\\0\\t' ESCAPED BY '' LINES TERMINATED BY '\\0\\n'";
+      xc_log_info('oai2metadata', $sql);
+      // TODO Please convert this statement to the D7 database API syntax.
+      $result = db_query($sql);
+      if (!$result) {
+        $err = mysqli_error($GLOBALS['active_db']);
+        $msg = t('%err -- Unsuccessfull load data with %sql', array('%err' => $err, '%sql' => $sql));
+        xc_log_error('oai2metadata', $msg);
+        drupal_set_message($msg, 'error');
+      }
+    }
+    $t_loaddata_b = microtime(TRUE);
+    $_oaiharvester_statistics['02 step2/02 load data/' . $table] = ($t_loaddata_b - $t_loaddata_a);
+    xc_log_info('oai2metadata', sprintf('Enable keys for %s', $table));
+    // TODO Please convert this statement to the D7 database API syntax.
+    $temp_sql = 'ALTER TABLE {' . check_plain($table) . '} ENABLE KEYS';
+    $result = db_query($temp_sql);
+    //$result = db_query('ALTER TABLE {:t1} ENABLE KEYS', array(':t1'=>$table));
+  }
+  $t_loaddata2 = microtime(TRUE);
+  $_oaiharvester_statistics['02 step2/02 load data'] = ($t_loaddata2 - $t_loaddata);
+
+  // recreate index
+  /*
+   if ($remove_and_recreate_index) {
+   $t_createindex = microtime(TRUE);
+   foreach ($indexed_tables as $table) {
+   xc_log_info('oai2metadata', 'Creating index for ' . $table);
+   $t_createindex_a = microtime(TRUE);
+   $schema = drupal_get_schema($table);
+   $indexes = $schema['indexes'];
+   foreach ($indexes as $name => $fields) {
+   // ALTER TABLE xxx ADD INDEX ('yyy')
+   xc_log_info('oai2metadata', 'Create index ' . $table . '.' . $name);
+   db_add_index($ret, $table, $name, $fields);
+   // $query = 'ALTER TABLE {' . $table . '} ADD INDEX ' . $name . ' (' . join(', ', $fields) . ')';
+   }
+   $t_createindex_b = microtime(TRUE);
+   $_oaiharvester_statistics['02 step2/03 create index/' . $table] = ($t_createindex_b - $t_createindex_a);
+   }
+   $t_createindex2 = microtime(TRUE);
+   $_oaiharvester_statistics['02 step2/03 create index'] = ($t_createindex2 - $t_createindex);
+   }
+   */
+  xc_log_info('oai2metadata', 'CVS data loaded');
+
+  variable_set('xc_oaiharvester_bridge_csv_loaded', 2); // loaded
+  if ($as_page) {
+    variable_set('oaiharvester_statistics', $_oaiharvester_statistics);
+    return 'Load data finished!';
+  }
+}
+
+/**
+ * Implements hook_oaiharvester_schedule_view().
+ *
+ * Add more properties to the schedule's view page
+ *
+ * @param $schedule_id (int)
+ *   The identifier of the schedule
+ *
+ * @return (Array)
+ *   The array of label-value pairs.
+ */
+function xc_oaiharvester_bridge_oaiharvester_schedule_view($schedule_id) {
+
+  $locations = xc_source_get_locations(_schedule_id_to_source_id($schedule_id));
+  $location_links = array();
+  foreach ($locations as $location) {
+    $location_links[] = l(
+      $location->name,
+      'admin/xc/metadata/location/' . $location->location_id
+    );
+  }
+/* TODO from Tom
+  $ping = xc_solr_ping($locations);
+  $ping_report = array();
+  foreach ($ping as $ping_result) {
+    $state = $ping_result['running'] == TRUE ? t('running') : t('stopped');
+    $style = $ping_result['running'] == TRUE ? NULL : 'color:red';
+    $ping_report[] = array(
+      'data' => $ping_result['url'] . ' ' . $state,
+      'style' => $style
+    );
+  }
+*/
+  switch (xc_oaiharvester_bridge_get_frbization_value($schedule_id)) {
+    case 1:
+      $steps_label = t('Create nodes, but not index with Solr.');
+      break;
+    case 2:
+      $steps_label = t('Index with Solr, do not create nodes.');
+      break;
+    case 3:
+      $steps_label = t('Index with Solr first, then create nodes.');
+      break;
+    case 4:
+      $steps_label = t('Create nodes first, then index with Solr.');
+      break;
+    case 5:
+      $steps_label = t('Do nothing.');
+      break;
+  }
+
+  switch (xc_oaiharvester_bridge_get_use_insert_value($schedule_id)) {
+    case 0:
+      $use_insert_label = t('Use CSV file and the SQL command LOAD DATA LOCAL INFILE');
+      break;
+    case 2:
+      $use_insert_label = t('Use CSV file and the SQL command LOAD DATA INFILE');
+      break;
+    case 1:
+      $use_insert_label = t('Use SQL command INSERT');
+      break;
+  }
+
+  $has_cached_files = FALSE;
+  $schedule = oaiharvester_schedule_load($schedule_id);
+  $cache_dir = drupal_realpath(file_default_scheme() . '://') . '/oaiharvester_sql_cache/' . $schedule->harvest_schedule_id;
+  if (file_prepare_directory($cache_dir, FALSE)) {
+    $files = scandir($cache_dir);
+    $cached_file_count = count($files);
+    if ($cached_file_count > 2) {
+      $has_cached_files = TRUE;
+    }
+  }
+
+  $rows = array();
+  $rows[] = array(t('Storage locations'), theme('item_list', array('items' => $location_links)));
+  //$rows[] = array(t('Is Solr running?'), theme('item_list', array('items' => $ping_report)));
+  $rows[] = array(t("Run 'preparing metadata for search' step?"), $steps_label);
+  $rows[] = array(t('Use MySQL INSERT method for creating records in batch mode instead of default LOAD DATA INFILE?'),
+    $use_insert_label);
+  $rows[] = array(
+    t("Has caches CSV files?"),
+    ($has_cached_files
+      ? t('Yes, %number files', array('%number' => $cached_file_count))
+        . ' '
+        . l(t('List files'), 'admin/xc/harvester/schedule/' . $schedule_id . '/list_csv_cache')
+      : t('No'))
+  );
+
+  return $rows;
+}
+
+/**
+ * Implements hook_oaiharvester_additional_harvest_steps().
+ *
+ * Adds additional steps into the harvesting process. The oaiharvester will use only the
+ * operations, and will add saved_batch_id and operation_id as additional parameters to the
+ * original functions, so if you implements additional steps, please add this two parameters
+ * to the subscription of your functions.
+ *
+ * @param $schedule_id (int)
+ *   The identifier of the schedule. Drupal adds batch sets to this schedule. The
+ *   sets will run after the schedule's main operations.
+ *
+ * @return (Array)
+ *   An array of a batch sets. Each batch set is an array of operation, title,
+ *   initial message, progress message, and function which runs when the set
+ *   finished its operations.
+ */
+function xc_oaiharvester_bridge_oaiharvester_additional_harvest_steps($schedule_id) {
+  $steps = array();
+
+  $schedule = oaiharvester_schedule_load($schedule_id);
+  // is Storage locations is Enabled
+  $source_id = _schedule_id_to_source_id($schedule_id);
+  $locations = xc_source_get_locations($source_id);
+
+  if (!$schedule->skip_main_task && !empty($locations)) {
+    $steps[] = oaiharvester_batch_set_create(
+      array(array('xc_oaiharvester_bridge_load_csv_and_optimize', array($schedule_id))), // operations
+      'Importing records to database', // title
+      'The harvesting process is beginning.', // init message
+      '', // progress message
+      NULL // finishing function
+    );
+  }
+
+  /*
+   1: Option a. Create nodes, but not index with Solr.
+   2: Option b. Index with Solr, do not create nodes.
+   3: Option c. Index with Solr first, then create nodes.
+   4: Option d. Create nodes first, then index with Solr.
+   5: Option e. Do nothing.
+   */
+  $additional_tasks_value = xc_oaiharvester_bridge_get_frbization_value($schedule_id);
+  if ($additional_tasks_value != 0) {
+    // node creation batch definition
+    $create_nodes = array(
+      'operations'       => array(array('xc_metadata_node_creation_batch_operation', array($source_id))),
+      'title'            => t('Node creation'),
+      'init_message'     => t('Initialize batch node creation'),
+      'progress_message' => t('Node creation'),
+      'finished'         => NULL,
+    );
+
+    // Solr indexing batch definition
+    $index_with_solr = array(
+      'operations'       => array(array('xc_solr_onestop_indexer_batch', array($source_id, $locations))),
+      'title'            => t('Indexing with Apache Solr'),
+      'init_message'     => t('Initialize indexing process'),
+      'progress_message' => t('Index creation'),
+      'finished'         => NULL,
+    );
+    // note: previously these utilized xc_oaiharvester_bridge_batch_set_create()
+
+    switch ($additional_tasks_value) {
+      case 1:
+        $steps[] = $create_nodes;
+        break;
+      case 2:
+        $steps[] = $index_with_solr;
+        break;
+      case 3:
+        $steps[] = $index_with_solr;
+        $steps[] = $create_nodes;
+        break;
+      case 4:
+        $steps[] = $create_nodes;
+        $steps[] = $index_with_solr;
+        break;
+      case 5:
+        break;
+    }
+  }
+
+  return $steps;
+}
+
+/**
+ * Create a batch set for XC records
+ *
+ * @param $operations (Array)
+ *   Batch operations
+ * @param $finishing_function (string)
+ *   The function to run after finishing operations
+ * @return (Array)
+ *   An associative array containing the batch's properties (operations, title, init_message, progress_message, finished)
+ */
+function xc_oaiharvester_bridge_batch_set_create($operations, $finishing_function = NULL) {
+  return oaiharvester_batch_set_create(
+    $operations, // operations
+    'Normalize database',          // title
+    'Initialize normalization',    // initialization message
+    '',                    // progress message
+    $finishing_function // finalization function
+  );
+}
+
+/**
+ * Implements hook_xc_build().
+ */
+function xc_oaiharvester_bridge_xc_build(&$object, $format, $params = array()) {
+  global $_xc_oai_harvester_bridge_active;
+  if ($_xc_oai_harvester_bridge_active) {
+    if (empty($object->identifier)) {
+      $object->identifier = $params['identifier'];
+    }
+  }
+}
+
+/**
+ * Implements hook_xc_remove().
+ *
+ * Removes the OAI header's identifier, datestamp and sets.
+ *
+ * @param $object
+ * @param $locations
+ * @param $params
+ */
+function xc_oaiharvester_bridge_xc_remove(&$object, $locations, $params = array()) {
+
+  // remove set
+  $sql = 'DELETE s.* FROM {xc_oaiharvester_bridge_set} AS s
+    JOIN {xc_oaiharvester_bridge_header} AS h ON (s.header_id = h.header_id)
+    WHERE h.oai_identifier = \'%s\'';
+  // TODO Please review the conversion of this statement to the D7 database API syntax.
+  /* db_query($sql, $object->identifier) */
+  ;
+
+  // remove header
+  db_delete('xc_oaiharvester_bridge_header')
+    ->condition('oai_identifier', $object->identifier)
+    ->execute();
+}
+
+/**
+ * Get source id from schedule id
+ *
+ * @param $schedule_id
+ *    Schedule id
+ * @return
+ *    Source id
+ */
+function _schedule_id_to_source_id($schedule_id) {
+  static $cache;
+  if (empty($cache[$schedule_id])) {
+    $cache[$schedule_id] = db_query('SELECT source_id
+            FROM {xc_oaiharvester_bridge_schedule_source}
+            WHERE schedule_id = :schedule_id', array(':schedule_id' => $schedule_id))->fetchField();
+  }
+  return $cache[$schedule_id];
+}
+
+/**
+ * Get schedule id from source id
+ *
+ * @param $source_id
+ *    Source id
+ * @return
+ *    Schedule id
+ */
+function _source_id_to_schedule_id($source_id) {
+  static $cache;
+  if (empty($cache[$source_id])) {
+    $cache[$source_id] = db_query('SELECT schedule_id
+            FROM {xc_oaiharvester_bridge_schedule_source}
+            WHERE source_id = :source_id', array(':source_id' => $source_id))->fetchField();
+  }
+  return $cache[$source_id];
+}
+
+function _source_id_to_identifier_prefix($source_id) {
+  static $cache;
+
+  if (empty($cache[$source_id])) {
+    $schedule = oaiharvester_schedule_load(_source_id_to_schedule_id($entity->source_id), TRUE);
+    $cache[$source_id] = $schedule->oai_identifier['identifierPrefix'];
+  }
+
+  return $cache[$source_id];
+}
+
+/**
+ * Alter the OAI Harvester schedule form to save metadata to storage locations
+ *
+ * Implements hook_form_alter().
+ */
+//function xc_oaiharvester_bridge_form_alter(&$form, &$form_state, $form_id) {
+function xc_oaiharvester_bridge_form_alter(&$form, &$form_state, $form_id) {
+
+  if (($form_id == 'oaiharvester_schedule_multiform'
+      || $form_id == 'oaiharvester_schedule_edit_form')) {
+    if ($form_state['storage']['step'] == 3) {
+      $form_state['bridge_storage'] = array();
+      $schedule_id = !empty($form_state['storage']['schedule_id'])
+        ? $form_state['storage']['schedule_id']
+        : NULL;
+
+      $form_state['bridge_storage']['schedule_id'] = $schedule_id;
+
+      // Get source object if there is one
+      if ($schedule_id) {
+        $source_id = _schedule_id_to_source_id($schedule_id);
+        $source = xc_source_get($source_id);
+        $do_defrbrize = xc_oaiharvester_bridge_get_frbization_value($schedule_id);
+        $use_insert = xc_oaiharvester_bridge_get_use_insert_value($schedule_id);
+      }
+      else {
+        $source = new stdClass();
+        $do_defrbrize = 4;
+        $use_insert = 0;
+      }
+
+      $form_state['bridge_storage']['source'] = $source;
+
+      // Get source's storage locations if there are any
+      if (isset($source) && isset($source->source_id)) {
+        $source_locations = xc_source_get_locations($source->source_id);
+      }
+      else {
+        $source_locations = array();
+      }
+
+      $form['storage'] = array(
+        '#type' => 'fieldset',
+        '#title' => t('Storage locations'),
+        '#collapsible' => TRUE,
+        '#collapsed' => FALSE
+      );
+
+      $form['storage']['locations'] = array(
+        '#tree' => TRUE,
+        '#theme' => 'xc_oaiharvester_bridge_locations'
+      );
+
+      $locations = xc_location_get_all();
+      $only_one = count($locations) == 1 ? TRUE : FALSE;
+      foreach ($locations as $location) {
+        $form['storage']['locations'][$location->location_id]['#tree'] = TRUE;
+        $form['storage']['locations'][$location->location_id]['location'] = array(
+          '#type' => 'value',
+          '#value' => $location
+        );
+        $location_enabled = FALSE;
+        if ((isset($source_locations[$location->location_id]) && is_object($source_locations[$location->location_id]))
+              || $only_one) {
+          $location_enabled = TRUE;
+        }
+        $form['storage']['locations'][$location->location_id]['enabled'] = array(
+          '#type' => 'checkbox',
+          '#default_value' => $location_enabled
+        );
+        // counting weight
+        $low  = 0 - count($locations);
+        $high = count($locations);
+        if (isset($source_locations[$location->location_id]->weight)) {
+          $_weight = $source_locations[$location->location_id]->weight;
+          if ($_weight < $low) {
+            $weight = $low;
+          }
+          elseif ($_weight > $high) {
+            $weight = $high;
+          }
+          else {
+            $weight = $_weight;
+          }
+        }
+        else {
+          $weight = 0;
+        }
+        $form['storage']['locations'][$location->location_id]['weight'] = array(
+          '#type' => 'select',
+          '#options' => array_combine(range($low, $high), range($low, $high)),
+          '#default_value' => $weight,
+        );
+      }
+      $form['storage']['advanced'] = array(
+        '#type' => 'fieldset',
+        '#collapsible' => TRUE,
+        '#collapsed' => TRUE,
+        '#title' => t('Advanced options'),
+        '#weight' => 100,
+      );
+
+      $form['storage']['advanced']['disable_location'] = array(
+        '#type' => 'checkbox',
+        '#title' => t('Disable storage locations'),
+        '#description' => t('Check this box to disable requirement for storage locations'),
+      );
+
+      $form['frbr'] = array(
+        '#type' => 'fieldset',
+        '#title' => t('Preparing metadata for search'),
+        '#collapsible' => TRUE,
+        '#collapsed' => FALSE
+      );
+
+      $form['frbr']['do_defrbrize'] = array(
+        '#title' => t('What to do after harvest?'),
+        '#type' => 'radios',
+        '#options' => array(
+          1 => t('Option a. <em>Create nodes, but not index with Solr.</em>'),
+          2 => t('Option b. <em>Index with Solr, do not create nodes.</em>'),
+          3 => t('Option c. <em>Index with Solr first, then create nodes.</em>'),
+          4 => t('Option d. <em>Create nodes first, then index with Solr.</em>'),
+          5 => t('Option e. <em>Do nothing.</em>'),
+        ),
+        '#description' => 'After harvest we can launch different tasks. You may want to
+          create nodes and/or index the metadata with Solr. After indexing with Solr, the
+          node will be created automatically, on-the-fly, when your users will receive a
+          search result page. But node creation has an overhead, and it slows down the
+          search a bit. You can start node creation batch any time after harvest finished.
+          If you want to publish your data the earliest possible time, choose Option b. or
+          Option c. If you to achive the quickest search, use Option d.',
+        '#default_value' => $do_defrbrize,
+      );
+
+      $form['frbr']['use_insert'] = array(
+        '#title' => t('Use MySQL INSERT method for creating records in batch mode instead of default LOAD DATA INFILE?'),
+        '#type' => 'radios',
+        '#options' => array(
+          0 => t('Use CSV file and the SQL command LOAD DATA LOCAL INFILE'),
+          2 => t('Use CSV file and the SQL command LOAD DATA INFILE'),
+          1 => t('Use SQL command INSERT'),
+        ),
+        '#description' => 'To import the harvested records into relational database the Toolkit can use
+          CSV files, and LOAD DATA INFILE commands or the more traditionally INSERT command. The first
+          is much more quicker, but it requires general (and not database) level privilege in MySQL,
+          which is not available in all situation. If you chose this, be very careful with privilege settings.
+          The INSERT is slower command, but it requires only database level privileges, so it is more secure.
+          If you have millions of records, and time is important factor, consider using LOAD DATA INFILE
+          with carefully, if you don\'t have as many record, or time is not an important factor, use
+          the INSERT command. Some MySQL version supports the "LOCAL" modifier in LOAD DATA INFILE
+          command. If you found problems with the LOCAL modifier, change to LOAD DATA INFILE (without
+          the LOCAL modifier.',
+        '#default_value' => $use_insert,
+      );
+
+      $form['submit']['#weight'] = $form['delete']['#weight'] = 1000;
+
+      // Add additional validation and submission function
+      $form['#validate'][] = 'xc_oaiharvester_bridge_schedule_validate';
+      $form['#submit'][]   = 'xc_oaiharvester_bridge_schedule_submit';
+    }
+  }
+}
+
+/**
+ * Validation for OAI Harvester schedule form to save metadata to storage locations
+ */
+function xc_oaiharvester_bridge_schedule_validate($form, &$form_state) {
+  // Getting rid of dummy element
+  unset($form_state['values']['locations']['']);
+
+  // At least one storage location must be selected
+  if (!$form_state['values']['disable_location']) {
+    $no_locations_enabled = TRUE;
+    foreach ($form_state['values']['locations'] as $location) {
+      if ($location['enabled']) {
+        $no_locations_enabled = FALSE;
+      }
+    }
+
+    if ($no_locations_enabled) {
+      form_set_error('storage', t('Storage locations are required, so at least one storage location must be enabled.'));
+      $form_state['storage']['step'] = ((int) $form_state['storage']['step']) - 1;
+    }
+  }
+}
+
+/**
+ * Submission for OAI Harvester schedule form to save metadata to storage locations
+ */
+function xc_oaiharvester_bridge_schedule_submit($form, &$form_state) {
+  if (!$form_state['values']['disable_location']
+          && (!isset($form_state['storage']['step'])
+          || $form_state['storage']['step'] == 3)) {
+    $schedule_id = empty($form_state['values']['schedule_id'])
+      ? db_last_insert_id('{oaiharvester_harvester_schedules}', 'harvest_schedule_id')
+      : $form_state['values']['schedule_id'];
+
+    $update = $source_id = db_query('SELECT source_id
+            FROM {xc_oaiharvester_bridge_schedule_source}
+            WHERE schedule_id = :schedule_id', array(':schedule_id' => $schedule_id))->fetchField();
+
+    // make sure source is real
+    $source = xc_source_get($source_id);
+    $source = is_object($source) ? $source : new stdClass();
+
+    $locations = array();
+    foreach ($form_state['values']['locations'] as $location) {
+      if ($location['enabled']) {
+        $_location = $location['location'];
+        $_location->weight = $location['weight'];
+        $locations[$_location->location_id] = $_location;
+      }
+    }
+
+    // assign new values to source
+    $source->name      = $form_state['values']['schedule_name'];
+    $source->type      = 'oai_schedule';
+    $source->locations = $locations;
+
+    // save source
+    $_source_id = xc_source_set($source);
+
+    // if this is not an update, insert new pairing of source ID and schedule ID
+    if (!$update) {
+      //$_source_id = db_last_insert_id("{xc_source}", 'source_id');
+      $record = new stdClass();
+      $record->schedule_id = $schedule_id;
+      $record->source_id   = $_source_id;
+      drupal_write_record('xc_oaiharvester_bridge_schedule_source', $record);
+    }
+
+    // TODO: frbr
+    $record = db_query('SELECT * FROM {xc_oaiharvester_bridge_schedule_info} WHERE schedule_id = :schedule_id', array(':schedule_id' => $schedule_id))->fetchObject();
+
+    if (is_object($record)) {
+      $update = TRUE;
+    }
+    else {
+      $update = FALSE;
+      $record = new stdClass();
+    }
+
+    $do_defrbrize = $form_state['values']['do_defrbrize'];
+    $record->do_defrbrize = $form_state['values']['do_defrbrize'];
+    $record->use_insert = $form_state['values']['use_insert'];
+    if (!$update) {
+      $record->schedule_id = $schedule_id;
+      drupal_write_record('xc_oaiharvester_bridge_schedule_info', $record);
+    }
+    else {
+      drupal_write_record('xc_oaiharvester_bridge_schedule_info', $record, 'schedule_id');
+    }
+  }
+}
+
+/**
+ * Retrieve the do_defrbrization value
+ *
+ * @param $schedule_id (int)
+ *   The identifier of the schedule
+ *
+ * @return (int)
+ *   The value of the do_defrbrization field connected to a given
+ *   schedule. Possible values: 0 and 1;
+ */
+function xc_oaiharvester_bridge_get_frbization_value($schedule_id) {
+  static $cache;
+  if (!isset($cache[$schedule_id])) {
+    $cache[$schedule_id] = intval(db_query('SELECT do_defrbrize
+            FROM {xc_oaiharvester_bridge_schedule_info}
+            WHERE schedule_id = :schedule_id', array(':schedule_id' => $schedule_id))->fetchField());
+  }
+  return $cache[$schedule_id];
+}
+
+/**
+ * Returns the value of use_insert field. 0 means use LOAD DATA INFILE, 1 means use INSERT sql command.
+ *
+ * @param $schedule_id (int)
+ *   The identifier of the schedule
+ *
+ * @return (int)
+ *   The value of the do_defrbrization field connected to a given schedule.
+ *   Possible values: 0 and 1;
+ */
+function xc_oaiharvester_bridge_get_use_insert_value($schedule_id) {
+  static $cache;
+  if (!isset($cache[$schedule_id])) {
+    $sql = 'SELECT use_insert
+            FROM {xc_oaiharvester_bridge_schedule_info}
+            WHERE schedule_id = :schedule_id';
+    $cache[$schedule_id] = intval(db_query($sql, array(':schedule_id' => $schedule_id))->fetchField());
+  }
+  return $cache[$schedule_id];
+}
+
+/**
+ * Theme function for setting metadata locations on the OAI Harvester form
+ */
+function theme_xc_oaiharvester_bridge_locations($args) {
+  $locations = $args['form'];
+  $header = array(t('Location name'), t('Enabled'), t('Weight'));
+  $rows = array();
+  $temp = array();
+  foreach (element_children($locations) as $location_id) {
+    $location = $locations[$location_id];
+    $rows[] = array(
+      $location['location']['#value']->name,
+      drupal_render($location['enabled']),
+      drupal_render($location['weight'])
+    );
+  }
+
+  return theme('table', array('header' => $header, 'rows' => $rows));
+}
+
+/**
+ * Checks the file name
+ *
+ * @param $table (String)
+ */
+function xc_oaiharvester_bridge_check_file($table) {
+  global $_xc_oaiharvester_bridge_files;
+
+  $last = $_xc_oaiharvester_bridge_files[$table]['counter'];
+  $file = $_xc_oaiharvester_bridge_files[$table]['files'][$last];
+
+  if (file_exists($file)) {
+    $filesize = filesize($file);
+    if ($filesize > XC_FILE_SIZE_LIMIT) {
+      $last++;
+      $_xc_oaiharvester_bridge_files[$table]['counter'] = $last;
+      $file = preg_replace('/\.\d+\.csv/', ".$last.csv", $file);
+      xc_log_info('bridge', 'Opening a new file for ' . $table . ': ' . $file);
+      $_xc_oaiharvester_bridge_files[$table]['files'][] = $file;
+    }
+  }
+
+  return $file;
+}
+
+/**
+ * Lists the files in the CSV cache
+ *
+ * @param $schedule_id (int)
+ *   The schedule ID
+ *
+ * @return (string)
+ *   The themed list of files
+ */
+function xc_oaiharvester_bridge_list_csv_cache($schedule_id) {
+
+  $cache_dir = drupal_realpath(file_default_scheme() . ':/' . '/oaiharvester_sql_cache/' . $schedule_id);
+  return xc_util_list_directory($cache_dir);
+}
+
+/**
+ * Implements hook_oaiharvester_batch_processed().
+ *
+ * @param $sets (array)
+ *   All the batch sets. Each set is an array with two elements, where the first
+ *   element is the name of the function, the second element is the list of
+ *   parameters as an array.
+ * @param $current_operation_id (int)
+ *   The current operation's identifier, which actually is the index of the operation in the sets array.
+ * @param $schedule_id (int)
+ *   The schedule ID
+ */
+function xc_oaiharvester_bridge_oaiharvester_batch_processed($sets, $current_operation_id, $schedule_id) {
+  $saved_batch_id = $sets[$current_operation_id][1][8];
+  $saved_batch = oaiharvester_saved_batch_load($saved_batch_id);
+  if (!$saved_batch) {
+    return;
+  }
+
+  $saved_report = empty($saved_batch->reports) ? array() : unserialize($saved_batch->reports);
+  $saved_report['xc_oaiharvester_bridge']['metadata_statistics'] = variable_get('xc_metadata_stat_harvested', array());
+  $saved_batch->reports = serialize($saved_report);
+  $ret = drupal_write_record('oaiharvester_batch', $saved_batch, 'id');
+}
+
+/**
+ * Implements hook_oaiharvester_harvest_finished().
+ *
+ * Calculates the cumulative metadata statistics after harvest.
+ */
+function xc_oaiharvester_bridge_oaiharvester_harvest_finished($success, $results, $operations) {
+  $saved_batch_id = $results['parameters']['saved_batch_id'];
+  $saved_batch = oaiharvester_saved_batch_load($saved_batch_id);
+  $reports = unserialize($saved_batch->reports);
+
+  if (!isset($reports['xc_oaiharvester_bridge']['metadata_statistics'])) {
+    return;
+  }
+
+  $metadata_statistics = $reports['xc_oaiharvester_bridge']['metadata_statistics'];
+  $cumulative_statistics = variable_get('xc_cumulative_metadata_statistics', (object) array());
+  $reports['xc_oaiharvester_bridge']['cumulative_metadata_statistics']['before'] = clone $cumulative_statistics;
+
+  $properties = array('new', 'updated', 'deleted', 'relations', 'metadata', 'nodes');
+  $entity_types = array('work', 'expression', 'manifestation', 'holdings', 'oai_dc', 'unknown', 'total');
+  foreach ($entity_types as $entity_type) {
+    foreach ($properties as $property) {
+      if (!isset($cumulative_statistics->{$property})) {
+        $cumulative_statistics->{$property} = array();
+      }
+
+      $number = 0;
+      if (isset($metadata_statistics->{$property}[$entity_type])) {
+        $number = $metadata_statistics->{$property}[$entity_type];
+      }
+
+      if (isset($cumulative_statistics->{$property}[$entity_type])) {
+        $cumulative_statistics->{$property}[$entity_type] += $number;
+      }
+      else {
+        $cumulative_statistics->{$property}[$entity_type] = $number;
+      }
+    }
+  }
+
+  // save a general variable
+  variable_set('xc_cumulative_metadata_statistics', $cumulative_statistics);
+
+  // save the current state into the oaiharvester_batch record
+  $reports['xc_oaiharvester_bridge']['cumulative_metadata_statistics']['after'] = $cumulative_statistics;
+  $saved_batch->reports = serialize($reports);
+  $ret = drupal_write_record('oaiharvester_batch', $saved_batch, 'id');
+}
+
+/**
+ * Implements hook_oaiharvester_harvest_report_view().
+ *
+ * Formats a report from the saved oaiharvester_batch record's records field.
+ *
+ * @param $report (array)
+ *   The raw report generated by the saved oaiharvester_batch record's records field.
+ *
+ * @return (string)
+ *   The formatted report
+ */
+function xc_oaiharvester_bridge_oaiharvester_harvest_report_view($reports) {
+  if (!isset($reports['xc_oaiharvester_bridge']['metadata_statistics'])) {
+    return FALSE;
+  }
+  $harvest_report = $reports['xc_oaiharvester_bridge']['metadata_statistics'];
+  $cumulative = $reports['xc_oaiharvester_bridge']['cumulative_metadata_statistics'];
+
+  include_once drupal_get_path('module', 'xc_metadata') . '/includes/xc_metadata.statistics.inc';
+
+  $output = '<h3>' . t('Harvest statistics:') . '</h3>';
+  $output .= '<p>' . t('The total number of incoming record in this harvest: <strong>@count</strong>', array('@count' => $harvest_report->entities)) . '</p>';
+
+  $output .= theme('xc_oaiharvester_bridge_harvest_report_table', array('0' => $cumulative['before'], '1' => t('Total harvested records before the harvest')));
+  $output .= theme('xc_oaiharvester_bridge_harvest_report_table', array('0' => $harvest_report, '1' => t('Results of Harvest')));
+  $output .= theme('xc_oaiharvester_bridge_harvest_report_table', array('0' => $cumulative['after'], '1' => t('Total harvested records after the harvest')));
+
+  $output .= '<p>'
+    . t('You can see the cumulative statistics at !metadata_statistics_page and !solr_index_information_page.',
+        array(
+          '!metadata_statistics_page' => l(t('metadata statistics page'), 'admin/xc/metadata/statistics'),
+          '!solr_index_information_page' => l(t('Solr index information page'), 'admin/xc/solr/info')
+       ))
+    . '</p>';
+
+  return $output;
+}
+
+/**
+ * @todo Please document this function.
+ * @see http://drupal.org/node/1354
+ */
+function theme_xc_oaiharvester_bridge_harvest_report_table($variables) {
+  $data = $variables['0'];
+  $caption = $variables['1'];
+  $rows = array();
+  $properties = array('types', 'new', 'updated', 'deleted', 'relations', 'metadata', 'nodes');
+  $entity_types = array('work', 'expression', 'manifestation', 'holdings', 'oai_dc', 'unknown', 'total');
+  foreach ($entity_types as $entity_type) {
+    $cells = array();
+    foreach ($properties as $property) {
+      if ($property == 'types') {
+        if ($entity_type == 'total') {
+          $cells[] = '<strong>' . t('Total') . '</strong>';
+        }
+        else {
+          $cells[] = xc_metadata_statistics_get_label($entity_type);
+        }
+        continue;
+      }
+
+      $number = 0;
+      if (isset($data->{$property}[$entity_type])) {
+        $number = $data->{$property}[$entity_type];
+      }
+      $cells[] = number_format($number, 0, ',', ' ');
+    }
+    $rows[] = $cells;
+  }
+
+  $header = array();
+  foreach ($properties as $property) {
+    $header[] = xc_metadata_statistics_get_label($property);
+  }
+  return theme('table', array('header' => $header, 'rows' => $rows, 'attributes' => array(), 'caption' => $caption));
+}
+
+function xc_oaiharvester_bridge_init() {
+  global $XC_METADATA_TYPES, $XC_CHANGE_TYPES;
+
+  $XC_METADATA_TYPES = array(
+    XC_WORK => 'XC_WORK',
+    XC_EXPRESSION => 'XC_EXPRESSION',
+    XC_MANIFESTATION => 'XC_MANIFESTATION',
+    XC_HOLDINGS => 'XC_HOLDINGS'
+  );
+
+  $XC_CHANGE_TYPES = array(
+    XC_DELETED => 'XC_DELETED',
+    XC_UPDATED => 'XC_UPDATED',
+    XC_NEW => 'XC_NEW'
+  );
+}
