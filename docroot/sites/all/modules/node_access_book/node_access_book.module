@@ -1,0 +1,450 @@
+<?php
+
+/**
+ * @file
+ * The Node access book module.
+ */
+
+/**
+ * Implementation of hook_perm().
+ */
+function node_access_book_perm() {
+  return array(
+    'administer node access book' => array(
+      'title' => t('Administer node access book'),
+      'description' => t('Configure the global settings for this module.'),
+    ),
+  );
+}
+
+
+/**
+ * Implements hook_menu().
+ */
+function node_access_book_menu() {
+  $items['admin/config/content/node_access_book'] = array(
+    'access arguments' => array('administer node access book'),
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('node_access_book_settings'),
+    'title' => 'Node access book',
+    'description' => 'Configure the global settings for Node access book.',
+  );
+  return $items;
+}
+
+/**
+ * Form builder for node access book settings.
+ */
+function node_access_book_settings($form, &$form_state) {
+  $form['node_access_book_published'] = array(
+    '#type' => 'select',
+    '#title' => t('Unpublished nodes'),
+    '#title_display' => 'none',
+    '#default_value' => variable_get('node_access_book_published', 0),
+    '#options' => array(
+      0 => t('Inherit grants for published nodes only'),
+      1 => t('Inherit grants for published and unpublished nodes'),
+    ),
+  );
+  $form['node_access_book_priority'] = array(
+    '#type' => 'weight',
+    '#title' => t('Priority'),
+    '#default_value' => variable_get('node_access_book_priority', 0),
+    '#description' => t('It is recommended to always leave this set to 0.'),
+  );
+  return system_settings_form($form);
+}
+
+/**
+ * Implements hook_node_grants().
+ */
+function node_access_book_node_grants($account, $op) {
+  // $grants stores known grants for account/op combos, because the grant
+  // calculations can be exhaustive.  Proper caching is also used.
+  static $grants = array();
+  // Check the static cache for grants.
+  if (!isset($grants[$account->uid][$op])) {
+    // The static cache is empty, check the drupal cache.
+    // First check if the cache can be trusted.
+    if (variable_get('node_access_book_cache_needs_clear', FALSE)) {
+      // Clear the cache.
+      cache_clear_all('node_access_book', 'cache', TRUE);
+      variable_del('node_access_book_cache_needs_clear');
+      $cached_grants = NULL;
+    }
+    else {
+      // Cache is good.
+      $cached_grants = cache_get('node_access_book_' . $account->uid . '_' . $op);
+    }
+    if (empty($cached_grants)) {
+      // There were no cached grants, calculate the grants.
+      $result = node_access_book_calculate_grants($grants, $op, $account);
+      if (!empty($result)) {
+        // Function returned a value, it was incomplete and $grants was not
+        // affected, so return the result.
+        return $result;
+      }
+    }
+    else {
+      // Cache was good, assign the data to the static cache.
+      $grants[$account->uid][$op] = $cached_grants->data;
+    }
+  }
+  return $grants[$account->uid][$op];
+}
+
+/**
+ * Calculate grants for node_access_book_node_grants().
+ *
+ * @todo since this always deals with roots not immediate parents,
+ * there is unnecessary overhead in this function where it compensates for
+ * nested calls and can therefore be simplified.  Also the use of the word
+ * 'parent' in variables and comments here is almost never correct and should
+ * be either ancestor, book id, or root.
+ */
+function node_access_book_calculate_grants(&$grants, $operation, $account) {
+  // $current_parents stores an array of node IDs for parent nodes that
+  // are currently being node_access() checked by this function, to prevent
+  // recursively nested node_access() checking which causes an endless loop.
+  static $current_parents = array();
+  // $known_node_access stores an array of results to calls to node_access()
+  // for that account/op/node ID.
+  static $known_node_access = array();
+  // $parent_parent is set to the current parent before calling
+  // node_access() so that the child iteration of this function is aware why it
+  // is being called.
+  static $parent_parent = NULL;
+  // $child_completed is used to pass the value of $complete to the parent
+  // iteration.
+  static $child_completed = TRUE;
+  // $complete marks whether the results of this iteration are to be considered
+  // completed and therefore stored in cache. An iteration is not considered
+  // complete when:
+  //  - Recursion occurs on the same account/parent/operation combo. This
+  //    iteration will assume FALSE to prevent an endless loop, but this means
+  //    the data should not be relied upon in future calls.
+  //  - A child iteration is not complete (because of the previous reason).
+  $complete = TRUE;
+  // $do_cache is similar to $complete except it doesn't affect the static
+  // variable $child_completed.  $do_cache is set to FALSE when:
+  //  - This function is being called on behalf of a parent iteration.  The
+  //    cache should be based on the parent's calculations, not this iteration.
+  $do_cache = TRUE;
+
+  // Track an array of node access grants, don't put them into static cache
+  // until later.
+  $rights = array();
+  // Get the root or parent.
+  $parents = node_access_book_get_roots($parent_parent);
+
+  if (!is_null($parent_parent)) {
+    // There is a parent parent, so do not cache this run.
+    $do_cache = FALSE;
+  }
+
+  // Iterate through each reference.
+  foreach ($parents as $parent) {
+    // Alias for easier code reading.
+    $known = &$known_node_access[$account->uid][$parent];
+    // Flags whether we already have the data needed for an $operation.
+    $needs_check = FALSE;
+    // Check each $operation to see if we're missing $known data.
+    if (!isset($known[$operation])) {
+      $needs_check = TRUE;
+    }
+
+    if ($needs_check) {
+      // This parent is missing $known value/s that we need, load it.
+      $parent_node = node_load($parent);
+      if (!empty($parent_node)) {
+        // Parent loaded successfully.
+
+        // Set the static $parent_parent variable to the parent being done.
+        $parent_parent = $parent;
+
+        if (!isset($known[$operation])) {
+          // We're missing an $operation or two, proceed with calculations.
+          if (!isset($current_parents[$parent][$operation])) {
+            // This parent isn't in the list of ancestors, add to the list.
+            $current_parents[$parent][$operation] = $parent;
+
+            // We don't want static caching in node_access() to intefere.
+            drupal_static_reset('node_access');
+
+            // Check node_access() and add the result to $known data.
+            $node_access = node_access($operation, $parent_node, $account);
+            // If the child completed fully, or node access was granted...
+            if ($child_completed || $node_access) {
+              // We can rely on this information in the future.
+              $known[$operation] = $node_access;
+            }
+            else {
+              // Flag this iteration as incomplete.
+              $complete = FALSE;
+              // Reset static variable.
+              $child_completed = TRUE;
+            }
+            // We're done with this parent, remove it from the list.
+            unset($current_parents[$parent]);
+          }
+          else {
+            // Recursion, assume FALSE.
+            $complete = FALSE;
+            $node_access = FALSE;
+          }
+        }
+        else {
+          // Grab the value from known data.
+          $node_access = $known[$operation];
+        }
+        // Check if the node_access() return value is TRUE.
+        if ($node_access) {
+          // Add the parent as a grant on the relevant realm.
+          $rights['node_access_book_' . $operation][] = $parent;
+        }
+      }
+    }
+    else {
+      // We have all the $known data we need, test the values of each
+      // operation and add the parent as a grant on the relevant
+      // realm.
+      if ($known[$operation]) {
+        $rights['node_access_book_' . $operation][] = $parent;
+      }
+    }
+  }
+  // Reset the $parent_parent variable.
+  $parent_parent = NULL;
+  // Add the author and all grants.
+  $rights['node_access_book_author'][] = $account->uid;
+  $rights['node_access_book_all'][] = 1;
+
+  if ($complete && $do_cache) {
+    // We have grants worked out completely, so add them to the caches.
+    // It is unsafe to store incomplete grants in any caches.
+    $grants[$account->uid][$operation] = $rights;
+    // Use drupal cache to minimise how often this function needs to work out the grants.
+    cache_set('node_access_book_'. $account->uid .'_'. $operation, $grants[$account->uid][$operation]);
+  }
+  else {
+    if (!$complete) {
+      // Affect the static $child_completed variable.
+      $child_completed = FALSE;
+    }
+    return $rights;
+  }
+}
+
+/**
+ * Get all book ids, optionally that are roots of $nid.
+ */
+function node_access_book_get_roots($nid = NULL) {
+  $roots = array();
+
+  $args = array();
+
+  $sql = 'SELECT DISTINCT bid AS root '
+     . 'FROM {book} '
+     . 'WHERE bid IS NOT NULL AND bid != nid ';
+
+  if (!is_null($nid)) {
+    $sql .= 'AND nid = :nid ';
+    $args[':nid'] = $nid;
+  }
+  $result = db_query($sql, $args);
+  foreach ($result as $row) {
+    $roots[$row->root] = $row->root;
+  }
+
+  return $roots;
+}
+
+/**
+ * Add node grants in a way that prevents overriding previous iterations.
+ *
+ * @param &$grants
+ *  The grants array where the grant will be added.
+ * @param $realm
+ *  The realm of this grant.
+ * @param $gid
+ *  The grant ID.
+ * @param $priority
+ *  The grant priority.
+ * @param $settings
+ *  An settings array of boolean equivalent values with keys 'view', 'edit',
+ *  and 'delete'.
+ */
+function node_access_book_add_grant(&$grants, $realm, $gid, $priority, $operation) {
+  $key = $realm . $gid;
+  if (!isset($grants[$key])) {
+    // Setup the record.
+    $grants[$key] = array(
+      'realm' => $realm,
+      'gid' => $gid,
+      'priority' => $priority,
+      'grant_view' => 0,
+      'grant_update' => 0,
+      'grant_delete' => 0,
+    );
+  }
+
+  // Add the grants needed, so as not to override previous iterations.
+  $grants[$key]['grant_' . $operation] = 1;
+
+  // Increase the priority if needed.
+  if ($priority > $grants[$key]['priority']) {
+    $grants[$key]['priority'] = $priority;
+  }
+}
+
+/**
+ * Implements hook_node_access_records().
+ */
+function node_access_book_node_access_records($node) {
+  $grants = array();
+
+  if (!empty($node->book['depth'])) {
+
+     if (!empty($node->status) || variable_get('node_access_book_published', 0)) {
+
+       $nid = $node->book['bid'];
+
+       if ($nid) {
+         foreach (array('view', 'update', 'delete') as $operation) {
+           node_access_book_add_grant(
+             $grants,
+             'node_access_book_' . $operation,
+             $nid,
+             variable_get('node_access_book_priority', 0),
+             $operation
+           );
+         }
+       }
+
+
+       /*
+       // Probably not relevant to books (unless they're orphaned???)
+
+       if ($data['unused']) {
+         foreach (array_keys($data['referenced']) as $operation) {
+           // Add a dummy grant for node 0 to block other users' access.
+           node_access_book_add_grant(
+             $grants,
+             'node_access_book_' . $operation,
+             0,
+             variable_get('node_access_book_priority', 0),
+             $data['referenced'][$operation]
+           );
+         }
+       }
+       */
+
+     }
+
+     /*
+     // Not sure how this applies to books.
+
+     // If there are grants set, also add the author and view-all grants.
+     // These will fire for each non-empty node_access_book field,
+     // but redundant calls will be correctly handled by the helper function:
+     // node_access_book_add_grant().
+     if (!empty($grants)) {
+       if (!empty($node->status) || !empty($data['author_published'])) {
+         // Add author grants.
+         node_access_book_add_grant(
+           $grants,
+           'node_access_book_author',
+           $node->uid,
+           variable_get('node_access_book_priority', 0),
+           $data['author']
+         );
+       }
+       if (!empty($node->status) || !empty($data['all_published'])) {
+         // Add all grants.
+         node_access_book_add_grant(
+           $grants,
+           'node_access_book_all',
+           1,
+           variable_get('node_access_book_priority', 0),
+           $data['all']
+         );
+       }
+     }
+     */
+
+  }
+
+  // Flag that the cache is not to be relied upon.
+  variable_set('node_access_book_cache_needs_clear', TRUE);
+
+  if (!empty($grants)) {
+    return $grants;
+  }
+  return NULL;
+}
+
+/**
+ * Implements of hook_node_access_explain().
+ *
+ * This gives the Devel module nice information to display when
+ * debugging node grants.
+ */
+function node_access_book_node_access_explain($row) {
+  if (
+    in_array(
+      $row->realm,
+      array(
+        'node_access_book_view',
+        'node_access_book_update',
+        'node_access_book_delete',
+        //'node_access_book_author',
+        //'node_access_book_all'
+      )
+    )
+  ) {
+
+    $ops = array();
+    foreach (array('view', 'update', 'delete') as $op) {
+      $gop = 'grant_' . $op;
+      if (!empty($row->$gop)) {
+        $ops[] = $op;
+      }
+    }
+
+    if (!empty($ops)) {
+      $do = implode('/', $ops);
+      switch ($row->realm) {
+        case 'node_access_book_view':
+          $parent = node_load($row->gid);
+          return t(
+            'Users that may view parent node !node may !do this node',
+            array('!node' => l($parent->title, 'node/' . $parent->nid), '!do' => $do)
+          );
+        case 'node_access_book_update':
+          $parent = node_load($row->gid);
+          return t(
+            'Users that may update parent node !node may !do this node',
+            array('!node' => l($parent->title, 'node/' . $parent->nid), '!do' => $do)
+          );
+        case 'node_access_book_delete':
+          $parent = node_load($row->gid);
+          return t(
+            'Users that may delete parent node !node may !do this node',
+            array('!node' => l($parent->title, 'node/' . $parent->nid), '!do' => $do)
+          );
+        //case 'node_access_book_author':
+        //  $account = user_load($row->gid);
+        //  return t(
+        //    'Node author %name may !do this node',
+        //    array('%name' => $account->name, '!do' => $do)
+        //  );
+        //case 'node_access_book_all':
+        //  return t(
+        //    'All users may !do this node',
+        //    array('!do' => $do)
+        //  );
+      }
+    }
+
+  }
+}

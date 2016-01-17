@@ -1,0 +1,419 @@
+<?php
+
+/**
+ * @file
+ * Hook implementations and shared functions.
+ */
+
+/**
+ * Implements hook_menu().
+ */
+function payment_commerce_menu() {
+  $item['admin/config/services/payment/payment_commerce'] = array(
+    'title' => 'Payment for Drupal Commerce',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('payment_commerce_form_configuration'),
+    'access arguments' => array('payment_commerce.administer'),
+  );
+
+  return $item;
+}
+
+/**
+ * Implements hook_permission().
+ */
+function payment_commerce_permission() {
+  $permissions = array(
+    'payment_commerce.administer' => array(
+      'title' => t('Administer Payment for Drupal Commerce'),
+    ),
+  );
+
+  return $permissions;
+}
+
+/**
+ * Implements hook_views_api().
+ */
+function payment_commerce_views_api() {
+  return array(
+    'api' => '2',
+    'path' => drupal_get_path('module', 'payment_commerce') . '/views',
+  );
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_ACTION().
+ */
+function payment_commerce_commerce_order_update($order) {
+  if ($order->uid != $order->original->uid) {
+    $pids = payment_commerce_pids_load($order->order_id);
+    $payments = entity_load('payment', $pids);
+    foreach ($payments as $payment) {
+      $payment->uid = $order->uid;
+      entity_save('payment', $payment);
+    }
+  }
+}
+
+/**
+ * Implements hook_commerce_payment_method_info().
+ */
+function payment_commerce_commerce_payment_method_info() {
+  $payment_methods = array();
+
+  // Use this low level query to ensure we don't trigger an entity_get_info()
+  // call as this function is triggered within a call to entity_get_info().
+  // Nesting entity_get_info() calls can lead to unpredictable cache states.
+  $query = db_select('payment_method', 'pm');
+  $query
+    ->fields('pm')
+    ->condition('pm.enabled', 1);
+  $payment_method_rows = $query->execute()->fetchAll(PDO::FETCH_OBJ);
+
+  foreach ($payment_method_rows as $payment_method) {
+    $payment_methods['payment_commerce_' . $payment_method->pmid] = array(
+      'base' => 'payment_commerce',
+      'title' => t('!title (Payment)', array(
+        '!title' => $payment_method->title_specific,
+      )),
+      'display_title' => $payment_method->title_generic,
+      'short_title' => $payment_method->title_generic,
+      'active' => TRUE,
+      'offsite' => TRUE,
+      'terminal' => FALSE,
+    );
+  }
+
+  return $payment_methods;
+}
+
+/**
+ * Implements hook_payment_status_change().
+ */
+function payment_commerce_payment_status_change(Payment $payment, PaymentStatusItem $previous_status_item) {
+  if ($payment->context == 'payment_commerce') {
+    $transaction_id = payment_commerce_transaction_id_load($payment->pid);
+    if ($transaction_id) {
+      $transaction = commerce_payment_transaction_load($transaction_id);
+      if ($transaction) {
+        // Update the Commerce Payment transaction.
+        payment_commerce_transaction_fill($transaction, $payment);
+        commerce_payment_transaction_save($transaction);
+
+        // A status change from new to pending is caused by Payment and as it
+        // is built-in we should not respond to it.
+        if (!(payment_status_is_or_has_ancestor($previous_status_item->status, PAYMENT_STATUS_NEW) && payment_status_is_or_has_ancestor($payment->getStatus()->status, PAYMENT_STATUS_PENDING))) {
+          payment_commerce_redirect_pane($payment);
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_payment_line_item_info().
+ */
+function payment_commerce_payment_line_item_info() {
+  return array(
+    new PaymentLineItemInfo(array(
+      'callback' => 'payment_commerce_payment_line_item_get',
+      'name' => 'payment_commerce',
+      'title' => t('Commerce line item'),
+    )),
+  );
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_ACTION().
+ */
+function payment_commerce_commerce_order_delete($order) {
+  if (variable_get('payment_commerce_order_delete', FALSE)) {
+    $pids = payment_commerce_pids_load($order->order_id);
+    if ($pids) {
+      entity_delete_multiple('payment', $pids);
+    }
+  }
+}
+
+/**
+ * Implements PaymentLineItemInfo::callback.
+ */
+function payment_commerce_payment_line_item_get($name, Payment $payment) {
+  $selection = array();
+
+  foreach ($payment->line_items as $line_item) {
+    if (substr($line_item->name, 0, 17) == 'payment_commerce_') {
+      $selection[] = $line_item;
+    }
+  }
+
+  return $selection;
+}
+
+/**
+ * Implements Payment::finish_callback.
+ */
+function payment_commerce_payment_finish(Payment $payment) {
+  payment_commerce_redirect_pane($payment);
+  $order = commerce_order_load($payment->context_data['order_id']);
+  if (payment_status_is_or_has_ancestor($payment->getStatus()->status, PAYMENT_STATUS_FAILED)) {
+    $view = '';
+    if (payment_access('view', $payment)) {
+      $view = ' ' . l(t('View payment'), 'payment/' . $payment->pid) . '.';
+    }
+    drupal_set_message(t('Your payment failed.') . $view);
+  }
+  drupal_goto(commerce_checkout_order_uri($order));
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_ACTION().
+ */
+function payment_commerce_payment_method_insert() {
+  drupal_static_reset('commerce_payment_methods');
+}
+
+/**
+ * Save a Commerce payment transaction for a payment.
+ *
+ * @param integer $pid
+ *   The PID of the Payment to load a Commerce payment transaction for.
+ * @param integer $transaction_id
+ *   The ID of the Commerce payment transaction.
+ *
+ * @return NULL
+ */
+function payment_commerce_transaction_save($pid, $transaction_id) {
+  db_insert('payment_commerce')
+    ->fields(array(
+      'pid' => $pid,
+      'transaction_id' => $transaction_id,
+    ))
+    ->execute();
+}
+
+/**
+ * Load the PIDs for all payments belonging to a Commerce order.
+ *
+ * @param integer $order_id
+ *
+ * @return array
+ */
+function payment_commerce_pids_load($order_id) {
+  return db_query("SELECT pid FROM {payment_commerce} pc LEFT JOIN {commerce_payment_transaction} cpt ON pc.transaction_id = cpt.transaction_id WHERE order_id = :order_id ORDER BY pid DESC", array(
+    ':order_id' => $order_id,
+  ))->fetchCol();
+}
+
+/**
+ * Load the Commerce transaction ID for a payment.
+ *
+ * @param integer $pid
+ *   The payment's PID.
+ *
+ * @return array
+ */
+function payment_commerce_transaction_id_load($pid) {
+  return db_query("SELECT transaction_id FROM {payment_commerce} WHERE pid = :pid", array(
+    ':pid' => $pid,
+  ))->fetchField();
+}
+
+/**
+ * Implements Commerce Payment's CALLBACK_submit_form().
+ */
+function payment_commerce_submit_form($payment_method, $pane_values, $checkout_pane, $order) {
+  $form['payment_commerce'] = array(
+    '#process' => array('payment_commerce_form_process_submit_form'),
+    '#order_id' => $order->order_id,
+    '#pmid' => str_replace('payment_commerce_', '', $payment_method['method_id']),
+  );
+
+  return $form;
+}
+
+/**
+ * Implements form process callback for payment_commerce_submit_form().
+ */
+function payment_commerce_form_process_submit_form(array $element, array &$form_state, array $form) {
+  $order = commerce_order_load($element['#order_id']);
+  $payment = payment_commerce_payment_create($order, $element['#pmid']);
+  $form_info = payment_form_embedded($form_state, $payment, array($payment->method->pmid), $element['#parents']);
+  unset($form_info['elements']['payment_method']['#title']);
+  unset($form_info['elements']['payment_line_items']);
+  $form_info['elements']['payment_status']['#type'] = 'value';
+  $element = array_merge($element, $form_info['elements']);
+  $form_state['complete form']['buttons']['continue']['#submit'] = array_merge($form_state['complete form']['buttons']['continue']['#submit'], $form_info['submit'], array('payment_commerce_form_process_submit_form_submit'));
+
+  return $element;
+}
+
+/**
+ * Implements CALLBACK_commerce_payment_method_submit_form_submit().
+ */
+function payment_commerce_form_process_submit_form_submit(array $form, array &$form_state) {
+  $payment = $form_state['payment'];
+  entity_save('payment', $payment);
+  $transaction = commerce_payment_transaction_new('payment_commerce_' . $payment->method->pmid, $payment->context_data['order_id']);
+  payment_commerce_transaction_fill($transaction, $payment);
+  commerce_payment_transaction_save($transaction);
+  payment_commerce_transaction_save($payment->pid, $transaction->transaction_id);
+}
+
+/**
+ * Implements CALLBACK_commerce_payment_method_redirect_form().
+ */
+function payment_commerce_redirect_form($form, &$form_state, $order, $payment_method) {
+  // Get the order's Payment.
+  $pids = payment_commerce_pids_load($order->order_id);
+  $payment = entity_load_single('payment', reset($pids));
+
+  // Update the Commerce Payment transaction that belongs to the Payment.
+  $transaction_id = payment_commerce_transaction_id_load($payment->pid);
+  $transaction = commerce_payment_transaction_load($transaction_id);
+  $transaction->instance_id = $payment_method['instance_id'];
+  commerce_payment_transaction_save($transaction);
+
+  $payment->execute();
+}
+
+/**
+ * Convert a Payment payment status to a Commerce transaction status.
+ */
+function payment_commerce_status_convert($status) {
+  if (in_array($status, array(PAYMENT_STATUS_NEW, PAYMENT_STATUS_PENDING))) {
+    return COMMERCE_PAYMENT_STATUS_PENDING;
+  }
+  elseif (payment_status_is_or_has_ancestor($status, PAYMENT_STATUS_MONEY_TRANSFERRED)) {
+    return COMMERCE_PAYMENT_STATUS_SUCCESS;
+  }
+  else {
+    return COMMERCE_PAYMENT_STATUS_FAILURE;
+  }
+}
+
+/**
+ * Fill a Commerce payment traction with Payment payment information.
+ */
+function payment_commerce_transaction_fill($transaction, Payment $payment) {
+  $transaction->amount = $payment->context_data['balance_amount'];
+  $transaction->currency_code = $payment->currency_code;
+  $transaction->message = payment_status_info($payment->getStatus()->status, TRUE)->title;
+  $transaction->remote_id = $payment->pid;
+  $transaction->remote_status = payment_status_info($payment->getStatus()->status, TRUE)->title;
+  $transaction->status = payment_commerce_status_convert($payment->getStatus()->status);
+}
+
+/**
+ * Create a Payment for a Commerce order.
+ *
+ * @param $order
+ *   The order to base the payment on.
+ * @param integer $pmid
+ *   The PMID of the payment method to use for the payment.
+ *
+ * @return Payment
+ */
+function payment_commerce_payment_create($order, $pmid) {
+  $balance = commerce_payment_order_balance($order);
+  $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+  $order_total = $order_wrapper->commerce_order_total->value();
+
+  $payment = new Payment(array(
+    'context' => 'payment_commerce',
+    'context_data' => array(
+      'balance_amount' => $balance['amount'],
+      'order_id' => $order->order_id,
+    ),
+    'description' => t('Order !order_number', array(
+      '!order_number' => $order->order_number,
+    )),
+    'currency_code' => $balance['currency_code'],
+    'method' => entity_load_single('payment_method', $pmid),
+    'finish_callback' => 'payment_commerce_payment_finish',
+  ));
+
+  // The order is being paid in full.
+  if ($balance['amount'] == $order_total['amount']) {
+    foreach ($order_wrapper->commerce_line_items->value() as $line_item) {
+      $line_item_wrapper = entity_metadata_wrapper('commerce_line_item', $line_item);
+      $line_item_unit_price = commerce_price_component_total($line_item_wrapper->commerce_unit_price->value());
+
+      // Make sure the line item amount is in the correct currency.
+      if ($line_item_unit_price['currency_code'] != $payment->currency_code) {
+        $amount = commerce_currency_convert($line_item_unit_price['amount'], $line_item_unit_price['currency_code'], $payment->currency_code);
+      }
+      else {
+        $amount = $line_item_unit_price['amount'];
+      }
+      // Convert the amount to a float.
+      $currency = commerce_currency_load($payment->currency_code);
+      $amount = ((float) $amount) / pow(10, $currency['decimals']);
+
+      $payment->setLineItem(new PaymentLineItem(array(
+        'amount' => $amount,
+        'description' => $line_item->line_item_label,
+        'name' => 'payment_commerce_' . $line_item->line_item_id,
+        'quantity' => $line_item->quantity,
+      )));
+    }
+  }
+  // Only part of the order is being paid.
+  else {
+    $payment->setLineItem(new PaymentLineItem(array(
+      'amount' => $balance['amount'],
+      'description' => 'Order !order_number',
+      'description_arguments' => array(
+        '!order_number' => $order->order_number,
+      ),
+      'name' => 'payment_commerce',
+    )));
+  }
+
+  return $payment;
+}
+
+/**
+ * Implements form build callback for the configuration form.
+ */
+function payment_commerce_form_configuration(array $form, array &$form_state) {
+  $form['payment_commerce_order_delete'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('When deleting a Commerce order, delete its payments as well.'),
+    '#default_value' => variable_get('payment_commerce_order_delete', FALSE),
+  );
+
+  return system_settings_form($form);
+}
+
+/**
+ * Implements hook_default_rules_configuration_alter().
+ */
+function payment_commerce_default_rules_configuration_alter(array &$configs) {
+  foreach ($configs as $name => $config) {
+    if (preg_match('#^commerce_payment_payment_commerce_\d+$#', $name)) {
+      $config->condition('payment_commerce_payment_method_validate');
+    }
+  }
+}
+
+/**
+ * Sets an order status based on a payment.
+ *
+ * @param Payment $payment
+ *   A payment that has a corresponding Commerce Payment transaction.
+ */
+function payment_commerce_redirect_pane(Payment $payment) {
+  // Only update the order status if this is the order's most recent payment.
+  $pids = payment_commerce_pids_load($payment->context_data['order_id']);
+  if (is_array($pids) && $payment->pid == reset($pids)) {
+    $order = commerce_order_load($payment->context_data['order_id']);
+    if (payment_status_is_or_has_ancestor($payment->getStatus()->status, PAYMENT_STATUS_FAILED)) {
+      commerce_payment_redirect_pane_previous_page($order);
+    }
+    else {
+      commerce_payment_redirect_pane_next_page($order);
+    }
+  }
+}

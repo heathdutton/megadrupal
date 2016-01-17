@@ -1,0 +1,620 @@
+<?php
+/**
+ * @file
+ * Provides Checkout.fi integration to Drupal Commerce
+ */
+
+/**
+ * Implements hook_commerce_payment_method_info().
+ */
+function commerce_checkout_fi_commerce_payment_method_info() {
+  $payment_methods = array();
+
+  $payment_methods['checkout_fi'] = array(
+    'base' => 'commerce_checkout_fi',
+    'title' => t('Checkout.fi'),
+    'short_title' => t('Checkout.fi'),
+    'display_title' => t('Checkout.fi'),
+    'description' => t('Checkout.fi Payment Service'),
+    'terminal' => FALSE,
+    'offsite' => TRUE,
+    'offsite_autoredirect' => TRUE,
+  );
+
+  return $payment_methods;
+}
+
+/**
+ * Implements hook_menu().
+ */
+/*function commerce_checkout_fi_menu() {
+  $items['admin/commerce/config/payment-methods/manage/commerce_payment_checkout_fi/edit/3'] = array(
+    'title' => 'Commerce Checkout.fi Settings',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('commerce_checkout_fi_settings_form'),
+    'access callback' => TRUE,
+    'type' => MENU_CALLBACK,
+  );
+  return $items;
+}*/
+
+/**
+ * Payment method settings form.
+ */
+function commerce_checkout_fi_settings_form(
+$settings) {
+  $form = array();
+  $form['merchant_id'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Merchant account number'),
+    '#description' => t('Use <em>375917</em> for testing purposes. Most up to date test account information can be found from the documentation on http://www.checkout.fi website.'),
+    '#default_value' => !empty($settings['merchant_id']) ? $settings['merchant_id'] : 375917,
+    '#size' => 16,
+  );
+  $form['passphrase'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Secret passphrase'),
+    '#description' => t('Use <em>SAIPPUAKAUPPIAS</em> for testing purposes. Most up to date test account information can be found from the documentation on http://www.checkout.fi website.'),
+    '#default_value' => !empty($settings['passphrase']) ? $settings['passphrase'] : 'SAIPPUAKAUPPIAS',
+  );
+  $form['language'] = array(
+    '#type' => 'select',
+    '#title' => t('Language preference'),
+    '#options' => array(
+      'FI' => t('Finnish'),
+      'SE' => t('Swedish'),
+      'EN' => t('English'),
+    ),
+    '#default_value' => !empty($settings['language']) ? $settings['language'] : 'FI',
+  );
+  return $form;
+}
+
+/**
+ * Payment method callback: submit form submission.
+ */
+function commerce_checkout_fi_submit_form_submit($payment_method, $pane_form, $pane_values, $order, $charge) {
+  $order->data['commerce_checkout_fi'] = $pane_values;
+  $transaction = commerce_checkout_fi_transaction($payment_method, $order, $charge);
+  $order->data['commerce_checkout_fi']['transaction'] = $transaction;
+
+  // Create a scheduled job for each order.
+  // It'll be used to check the payment status from Checkout.fi
+  // Use period => 5 to check the status as soon as next cron is run.
+  $job = array(
+    'id' => $order->order_id,
+    'type' => 'order',
+    'created' => time(),
+    'period' => 5,
+    'periodic' => TRUE,
+  );
+
+  $schedule = JobScheduler::get('commerce_checkout_fi_check_payments');
+  // Check that the job doesn't exist already.
+  if (!$schedule->check($job)) {
+    watchdog('commerce_checkout_fi', 'New JobScheduler created');
+    $schedule->set($job);
+  }
+  else {
+    watchdog('commerce_checkout_fi', 'Job already exists, don\'t create another');
+  }
+}
+
+
+/**
+ * Payment method callback for redirect form.
+ */
+function commerce_checkout_fi_redirect_form($form, &$form_state, $order, $payment_method) {
+  global $base_url;
+  // Return an error if the enabling action's settings haven't been configured.
+  if (empty($payment_method['settings']['merchant_id'])) {
+    drupal_set_message(t('You have not configured Checkout.fi payments. Using test account values. !link.', array('!link' => l(t('Add configuration'), 'admin/commerce/config/payment-methods/manage/commerce_payment_checkout_fi/edit/3'))));
+    $payment_method['settings']['merchant_id'] = variable_get('merchant_id', 375917);
+    $payment_method['settings']['passphrase'] = variable_get('passphrase', 'SAIPPUAKAUPPIAS');
+  }
+
+  // Check if Clean URLs are enabled and act on that.
+  if (!empty($GLOBALS['conf']['clean_url'])) {
+    // Set the feedback URLs.
+    $settings = array(
+      // Returns to the previous page when cancelled.
+      'cancel_return' => url('checkout/' . $order->order_id . '/payment/return/' . $order->data['payment_redirect_key'], array('absolute' => TRUE)),
+      // Return to the payment redirect page for processing successful payments.
+      'return' => url('checkout/' . $order->order_id . '/payment/return/' . $order->data['payment_redirect_key'], array('absolute' => TRUE)),
+      // Specify the current payment method instance ID in the notify_url.
+      'payment_method' => $payment_method['instance_id'],
+    );
+  } else {
+    // Set the feedback URLs.
+    $settings = array(
+      'cancel_return' => $base_url . url('checkout/' . $order->order_id . '/payment/return/' . $order->data['payment_redirect_key']),
+      'return' => $base_url . url('checkout/' . $order->order_id . '/payment/return/' . $order->data['payment_redirect_key']),
+      'payment_method' => $payment_method['instance_id'],
+    );
+  }
+
+  return commerce_checkout_fi_build_redirect_form($form, $form_state, $order, $payment_method, $payment_method['settings'] + $settings);
+}
+
+/**
+ * Helper function for the redirect_form callback.
+ * Builds a Checkout.fi payment form from an order object.
+ */
+function commerce_checkout_fi_build_redirect_form($form, &$form_state, $order, $payment_method, $settings) {
+  $wrapper = entity_metadata_wrapper('commerce_order', $order);
+  // Get financial info.
+  $currency_code = $wrapper->commerce_order_total->currency_code->value();
+  $amount = $wrapper->commerce_order_total->amount->value();
+  $customer_name = $wrapper->commerce_customer_billing->commerce_customer_address->name_line->value();
+  $stamp = $settings['merchant_id'] . 'A' . (int) trim($order->order_id) . (int) trim($order->data['commerce_checkout_fi']['transaction']->transaction_id);
+  // Build the data array that will be translated into hidden form values.
+  // NOTE: keys should be uppercase for the MD5 hash.
+  $data = array(
+    // Payment version, always 0001.
+    'VERSION' => '0001',
+    // Specify a unique identifier stamp for this order.
+    'STAMP' => $stamp,
+    // Set the amount to be charged in cents (100 = 1 €).
+    'AMOUNT' => $amount,
+    // Set a unique finnish banking reference number.
+    'REFERENCE' => _commerce_checkout_fi_calculate_reference_number($order),
+    // Set the message to be shown at Checkout.fi and bank statement.
+    'MESSAGE' => t('Order @order_number at @store', array('@order_number' => $order->order_number, '@store' => variable_get('site_name', url('<front>', array('absolute' => TRUE))))),
+    // Set the preferred Checkout.fi language.
+    'LANGUAGE' => _commerce_checkout_fi_get_setting('language', $payment_method),
+    // Set the merchant id to be used.
+    'MERCHANT' => $settings['merchant_id'],
+    // Set the return url for successful payments.
+    'RETURN' => $settings['return'],
+    // Set the return url for cancelled payments.
+    'CANCEL' => $settings['cancel_return'],
+    // Set the return url for rejected payments.
+    'REJECT' => $settings['return'],
+    // Set the return url for delayed payments.
+    'DELAYED' => $settings['return'],
+    // Set the language code.
+    'COUNTRY' => 'FIN',
+    // Set the currency code.
+    'CURRENCY' => $currency_code,
+    // Select the device to be used (html = 1, xml = 10).
+    'DEVICE' => 1,
+    // Set the content type (1 = normal, 2 = adult entertainment).
+    'CONTENT' => 1,
+    // Select the payment method at Checkout.fi.
+    'TYPE' => 1,
+    // Select the algorithm for the Checkout.fi security check (1 = MD5 hash).
+    'ALGORITHM' => 1,
+    // Set the date of delivery.
+    'DELIVERY_DATE' => date('Ymd', strtotime('now +30 day')),
+    // Set the first name (we'll use full name here).
+    'FIRSTNAME' => $customer_name,
+    // Set the last name (we'll leave this blank).
+    'FAMILYNAME' => '',
+    // Set the address.
+    'ADDRESS' => '',
+    // Set the post code.
+    'POSTCODE' => '',
+    // Set the post office.
+    'POSTOFFICE' => '',
+  );
+
+  // Build the Checkout.fi redirection URL.
+  $url = 'https://payment.checkout.fi';
+  $form['#action'] = $url;
+
+  // Generate MD5 hash & add hidden parameters to form.
+  $hash_elements = $data;
+  $hash_elements['PASSPHRASE'] = _commerce_checkout_fi_get_setting('passphrase', $payment_method);
+  $data['MAC'] = drupal_strtoupper(md5(implode('+', $hash_elements)));
+
+  foreach ($data as $key => $value) {
+    $form[$key] = array(
+      '#type' => 'hidden',
+      '#value' => $value,
+    );
+  }
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Proceed with payment'),
+  );
+
+  return $form;
+}
+
+/**
+ * Payment method callback: submit form.
+ */
+function commerce_checkout_fi_submit_form($payment_method, $pane_values, $checkout_pane, $order) {
+  $form = array();
+  // This avoids a notice message about undefined payment_details index.
+  // We need to find better solution for that.
+  $form['empty'] = array(
+    '#type' => 'hidden',
+    '#default_value' => '',
+  );
+  return $form;
+}
+
+/**
+ * Payment method callback: redirect form validation.
+ * Gets called when user comes back from offsite payment.
+ */
+function commerce_checkout_fi_redirect_form_validate($order, $payment_method) {
+  // We came back! Log validation request.
+  watchdog('commerce_checkout_fi', 'Received callback for redirect validation with $_REQUEST: <pre>@request</pre>', array('@request' => print_r($_REQUEST, TRUE)), WATCHDOG_INFO);
+  if ($feedback = commerce_checkout_fi_get_feedback()) {
+    // Check that we have a valid md5 hash in the callback.
+    if (commerce_checkout_fi_valid_md5_callback($order, $payment_method, $feedback)) {
+      // Process the transaction based on Checkout.fi parameters received.
+      commerce_checkout_fi_process_transaction($order, $payment_method, $feedback);
+      return TRUE;
+    }
+  }
+  return FALSE;
+}
+
+/**
+ * Get Checkout.fi feedback from GET/POST parameters
+ */
+function commerce_checkout_fi_get_feedback() {
+  $feedback = FALSE;
+  if (isset($_REQUEST['MAC'])) {
+    // Prepare the feedback values sent by Checkout.fi for processing.
+    // $_REQUEST since this includes the $_SESSION variables.
+    $feedback = array_map('check_plain', $_GET + $_POST);
+    unset($feedback['q']);
+    $feedback = array_change_key_case($feedback, CASE_UPPER);
+  }
+  return $feedback;
+}
+
+/**
+ * Check if MD5 hash in feedback is valid
+ */
+function commerce_checkout_fi_valid_md5_callback($order, $payment_method, $feedback) {
+  // Check if the received MD5 string is valid.
+  if (!commerce_checkout_fi_valid_md5($feedback, $payment_method)) {
+    watchdog('commerce_checkout_fi', "MD5 signature doesn't match", array(), WATCHDOG_ERROR);
+    return FALSE;
+  }
+  return TRUE;
+}
+
+/**
+ * Calculate the MD5 hash and compare it to the one we got from Checkout.fi.
+ */
+function commerce_checkout_fi_valid_md5($feedback, $payment_method) {
+  $hash_elements = array(
+    'VERSION',
+    'STAMP',
+    'REFERENCE',
+    'PAYMENT',
+    'STATUS',
+    'ALGORITHM',
+  );
+  foreach ($hash_elements as $key => $element) {
+    $hash_elements[$element] = $feedback[$element];
+    unset($hash_elements[$key]);
+  }
+  $hash_elements['passphrase'] = _commerce_checkout_fi_get_setting('passphrase', $payment_method);
+
+  // Generate hash with md5, convert to uppercase.
+  $hash = drupal_strtoupper(md5(implode('+', $hash_elements)));
+
+  return $hash === $feedback['MAC'];
+}
+
+/**
+ * Process the payment transaction with the info received from Checkout.fi.
+ *
+ * @param object $order
+ *   The loaded order that is being processed.
+ * @param object $payment_method
+ *   The payment method settings.
+ * @param array $feedback
+ *   The parameters received from Checkout.fi regarding the payment.
+ * @param boolean $redirect
+ *   Specifies whether to call redirect functions or not.
+ */
+function commerce_checkout_fi_process_transaction($order, $payment_method, $feedback, $redirect = TRUE) {
+  $transaction_id = commerce_checkout_fi_get_payment_transaction($order->order_id);
+  if (!$transaction_id) {
+    $transaction = commerce_payment_transaction_new('commerce_checkout_fi', $order->order_id);
+  }
+  else {
+    $transaction = commerce_payment_transaction_load($transaction_id);
+  }
+  $payment_status = commerce_checkout_fi_feedback_status($feedback['STATUS']);
+  // Identifying data.
+  $transaction->instance_id = $payment_method['instance_id'];
+  $transaction->remote_id = $feedback['PAYMENT'];
+  // Payment amount details.
+  $transaction->amount = $order->commerce_order_total[LANGUAGE_NONE][0]['amount'];
+  $transaction->currency_code = $order->commerce_order_total[LANGUAGE_NONE][0]['currency_code'];
+  // Payment status.
+  $transaction->remote_status = $feedback['STATUS'];
+  $transaction->status = $payment_status['code'];
+  $transaction->message = $payment_status['message'];
+  $transaction->payload = $feedback;
+  commerce_payment_transaction_save($transaction);
+  if ($redirect) {
+    if ($payment_status['code'] == COMMERCE_PAYMENT_STATUS_FAILURE) {
+      commerce_payment_redirect_pane_previous_page($order);
+    }
+    else {
+      commerce_payment_redirect_pane_next_page($order);
+    }
+  }
+}
+
+/**
+ * Get transaction with a specific Checkout.fi ID.
+ */
+function commerce_checkout_fi_get_payment_transaction($feedback) {
+  $query = new EntityFieldQuery();
+
+  $result = $query
+    ->entityCondition('entity_type', 'commerce_payment_transaction')
+    ->propertyCondition('payment_method', 'commerce_checkout_fi')
+    ->propertyCondition('order_id', $feedback)
+    ->execute();
+  if (isset($result['commerce_payment_transaction']) && count($result['commerce_payment_transaction']) > 0) {
+    $transaction = array_pop($result['commerce_payment_transaction']);
+    return $transaction->transaction_id;
+  }
+  return FALSE;
+}
+
+/**
+ * Declare job scheduling holding items that need to be run periodically.
+ */
+function commerce_checkout_fi_cron_job_scheduler_info() {
+  $schedulers = array();
+  $schedulers['commerce_checkout_fi_check_payments'] = array(
+    'worker callback' => 'commerce_checkout_fi_check_payment',
+  );
+  return $schedulers;
+}
+
+/**
+ * Get a payment status and message based on Checkout.fi status ID
+ *
+ * @param integer $status
+ *   Received Checkout.fi status ID.
+ *
+ * @return array
+ *   key 'code' contains commerce status
+ *   key 'message' contains a textual representation of Checkout.fi status ID.
+ */
+function commerce_checkout_fi_feedback_status($status) {
+  switch ($status) {
+    // SUCCESS.
+    case 2:
+      // Order stored.
+      $st = COMMERCE_PAYMENT_STATUS_SUCCESS;
+      $msg = t('Order stored.');
+      break;
+
+    case 5:
+      // Reserved for future, order stored.
+      $st = COMMERCE_PAYMENT_STATUS_SUCCESS;
+      $msg = t('Order stored.');
+      break;
+
+    case 6:
+      // Refund.
+      $st = COMMERCE_PAYMENT_STATUS_SUCCESS;
+      $msg = t('Refund.');
+      break;
+
+    case 7:
+      // Payment requested.
+      $st = COMMERCE_PAYMENT_STATUS_SUCCESS;
+      $msg = t('Payment requested.');
+      break;
+
+    case 8:
+      // Payment processed by merchant.
+      $st = COMMERCE_PAYMENT_STATUS_SUCCESS;
+      $msg = t('Payment processed by merchant.');
+      break;
+
+    case 9:
+      // Reserved for future, order stored.
+      $st = COMMERCE_PAYMENT_STATUS_SUCCESS;
+      $msg = t('Order stored.');
+      break;
+
+    case 10:
+      // Payment processed by merchant.
+      $st = COMMERCE_PAYMENT_STATUS_SUCCESS;
+      $msg = t('Order stored.');
+      break;
+
+    // PENDING.
+    case 3:
+      // Stored waiting external result.
+      $st = COMMERCE_PAYMENT_STATUS_PENDING;
+      $msg = t('Stored waiting external result.');
+      break;
+
+    case 4:
+      // Waiting client payment.
+      $st = COMMERCE_PAYMENT_STATUS_PENDING;
+      $msg = t('Waiting client payment.');
+      break;
+
+    // FAILURE.
+    case -10:
+      // Refunded to client.
+      $st = COMMERCE_PAYMENT_STATUS_FAILURE;
+      $msg = t('Refunded to client.');
+      break;
+
+    case -4:
+      // Payment not found.
+      $st = COMMERCE_PAYMENT_STATUS_FAILURE;
+      $msg = t('Payment not found.');
+      break;
+
+    case -3:
+      // Payment timed out.
+      $st = COMMERCE_PAYMENT_STATUS_FAILURE;
+      $msg = t('Payment timed out.');
+      break;
+
+    case -1:
+      // Cancelled by user.
+      $st = COMMERCE_PAYMENT_STATUS_FAILURE;
+      $msg = t('Cancelled by client.');
+      break;
+
+    default:
+      // Unknown code.
+      $st = COMMERCE_PAYMENT_STATUS_FAILURE;
+      $msg = t('Unknown feedback status');
+  }
+
+  return array(
+    'code' => $st,
+    'message' => $msg,
+  );
+}
+
+
+/**
+ * Job scheduler worker function to check status for each uncomplete order.
+ */
+function commerce_checkout_fi_check_payment($job) {
+  // Load the order tied to the job and get our password.
+  $order = commerce_order_load($job['id']);
+  $payment_method = commerce_payment_method_instance_load($order->data['payment_method']);
+  $transaction = commerce_payment_transaction_load($order->data['commerce_checkout_fi']['transaction']->transaction_id);
+  $private_key = _commerce_checkout_fi_get_setting('passphrase', $payment_method);
+
+  // Prepare a request.
+  $request = array(
+    'VERSION' => '0001',
+    'STAMP' => $transaction->payload['STAMP'],
+    'REFERENCE' => $transaction->payload['REFERENCE'],
+    'MERCHANT' => _commerce_checkout_fi_get_setting('merchant_id', $payment_method),
+    'AMOUNT' => $transaction->amount,
+    'CURRENCY' => 'EUR',
+    'FORMAT' => 1,
+    'ALGORITHM' => 1,
+  );
+  // Generate a hash checksum for all the fields, with our password as "salt".
+  $request['MAC'] = drupal_strtoupper(md5(
+    $request['VERSION'] . '+' .
+    $request['STAMP'] . '+' .
+    $request['REFERENCE'] . '+' .
+    $request['MERCHANT'] . '+' .
+    $request['AMOUNT'] . '+' .
+    $request['CURRENCY'] . '+' .
+    $request['FORMAT'] . '+' .
+    $request['ALGORITHM'] . '+' .
+    $private_key));
+
+  // Let's create a post-data string out of the prepared values.
+  $data_string = drupal_http_build_query($request);
+  // Update job scheduling.
+  // Check status once an hour from now on (3600 seconds).
+  $job['period'] = 3600;
+  JobScheduler::get('commerce_checkout_fi_check_payments')->set($job);
+
+  // Build the http request and execute.
+  $host = 'https://rpcapi.checkout.fi/poll';
+  $http_options = array(
+    'method' => 'POST',
+    'data' => $data_string,
+    'headers' => array('Content-Type' => 'application/x-www-form-urlencoded'),
+  );
+  $response = drupal_http_request($host, $http_options);
+
+  // Check if we got an error or not.
+  if ($response->data != "error") {
+    // Let's convert the response we got into an xml object.
+    $response_xml = new SimpleXMLElement(drupal_convert_to_utf8($response->data, 'ISO-8859-1'));
+    // Load the transaction tied to our order and clone it for checking.
+    $transaction = commerce_payment_transaction_load($order->data['commerce_checkout_fi']['transaction']->transaction_id);
+    $existing_transaction = clone $transaction;
+
+    $status = commerce_checkout_fi_feedback_status($response_xml->status);
+    if ($status['code'] == COMMERCE_PAYMENT_STATUS_SUCCESS || $status['code'] == COMMERCE_PAYMENT_STATUS_FAILURE) {
+      // Remove the job as unnecessary.
+      JobScheduler::get('commerce_checkout_fi_check_payments')->remove($job);
+    }
+
+    $transaction->status = $status['code'];
+    $transaction->message = $status['message'];
+
+    // Save transaction and order if status changed.
+    if ($existing_transaction->status != $status['code']) {
+      commerce_payment_transaction_save($transaction);
+
+      // Log status change.
+      watchdog('commerce_checkout_fi', 'Transaction status updated in Checkout.fi. Old transaction: <pre>@existing_transaction</pre> Updated transaction: <pre>@transaction</pre>', array('@existing_transaction' => print_r($existing_transaction, 1), '@transaction' => print_r($transaction, 1)), WATCHDOG_INFO);
+    }
+  }
+}
+
+/**
+ * A helper function for calculating a reference number for an order.
+ *
+ * Finnish banks use a standard type reference number, we need to calculate it.
+ * Reference number is 4-20 characters long.
+ * Usually it would be grouped in 5 numbers, seperated by spaces.
+ * But we don't need to bother with that, Checkout.fi does it for us.
+ * The last number of the reference number is a checksum,
+ * calculated by multiplying the numbers from right to left with 7,3,1,7,3,1..
+ * The numbers then get added up and the sum is deduced from the next 10.
+ * If the value would be 10, it will be marked as 0.
+ */
+function _commerce_checkout_fi_calculate_reference_number($order) {
+  // The first value of our reference number is our order id.
+  $tmp_str = $order->order_id;
+  // We will multiply the numbers from right to left with 7, 3 and 1.
+  $tmp_multip = array(7, 3, 1);
+  $tmp_sum = 0;
+  $tmp_index = 0;
+  for ($i = drupal_strlen($tmp_str) - 1; $i >= 0; $i--) {
+    // Do some multiplication magic.
+    $tmp_sum += intval(drupal_substr($tmp_str, $i, 1)) * intval($tmp_multip[$tmp_index % 3]);
+    $tmp_index++;
+  }
+  // Make sure our number doesn't have decimals.
+  $next_ten = ceil(intval($tmp_sum) / 10) * 10;
+  // Return our standard-compliant reference number.
+  return $tmp_str . (string) (abs($next_ten - $tmp_sum));
+}
+
+/**
+ * A settings helper function.
+ */
+function _commerce_checkout_fi_get_setting($setting_name, $payment_method) {
+  switch ($setting_name) {
+    case 'passphrase':
+      $setting = !empty($payment_method['settings']['passphrase']) ? $payment_method['settings']['passphrase'] : 'SAIPPUAKAUPPIAS';
+      break;
+    case 'merchant_id':
+      $setting = !empty($payment_method['settings']['merchant_id']) ? $payment_method['settings']['merchant_id'] : 375917;
+      break;
+    case 'language':
+      $setting = !empty($payment_method['settings']['language']) ? $payment_method['settings']['language'] : 'FI';
+      break;
+  }
+  return $setting;
+}
+
+/**
+ * Creates an example payment transaction for the specified charge amount.
+ */
+function commerce_checkout_fi_transaction($payment_method, $order, $charge) {
+  $transaction = commerce_payment_transaction_new('commerce_checkout_fi', $order->order_id);
+  $transaction->instance_id = $payment_method['instance_id'];
+  $transaction->amount = $charge['amount'];
+  $transaction->currency_code = $charge['currency_code'];
+  $transaction->status = COMMERCE_PAYMENT_STATUS_PENDING;
+  commerce_payment_transaction_save($transaction);
+  return $transaction;
+}

@@ -1,0 +1,322 @@
+<?php
+
+/**
+ * @file
+ *  Replaces default report of top search phrases.
+ */
+
+define('SEARCH_LOG_RESULT_UNKNOWN', 0);
+define('SEARCH_LOG_RESULT_SUCCESS', 1);
+define('SEARCH_LOG_RESULT_FAILED', -1);
+
+define('SEARCH_LOG_TERMS_LOWERCASE', 0);
+define('SEARCH_LOG_TERMS_UPPERCASE_FIRST', 1);
+define('SEARCH_LOG_TERMS_UPPERCASE_WORDS', 2);
+
+define('SEARCH_LOG_ADMIN_TERM_LENGTH', 50);
+define('SEARCH_LOG_ADMIN_ROWS', 40);
+
+define('SEARCH_LOG_DAY', 86400);
+
+/**
+ * Implements hook_menu().
+ */
+function search_log_menu() {
+  $items = array();
+
+  $items['admin/reports/search'] = array(
+    'title' => 'Top search terms',
+    'description' => 'View most popular search terms.',
+    'page callback' => 'search_log_report',
+    'page arguments' => array(3),
+    'access arguments' => array('administer search'),
+    'file' => 'search_log.admin.inc',
+  );
+
+  $items['admin/config/search/search_log'] = array(
+    'title' => 'Search log',
+    'description' => 'Setting for storing search results in the log.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('search_log_admin_settings'),
+    'access arguments' => array('administer search'),
+    'file' => 'search_log.admin.inc',
+  );
+
+  $items['admin/config/search/search_log/clear'] = array(
+    'title' => 'Clear log',
+    'description' => 'Clear the search log.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('search_log_confirm_truncate'),
+    'access arguments' => array('administer search'),
+    'type' => MENU_CALLBACK,
+    'file' => 'search_log.admin.inc',
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_theme().
+ */
+function search_log_theme() {
+  return array(
+    'search_log_report' => array(
+      'file' => 'search_log.admin.inc',
+      'variables' => array('summary' => NULL, 'filters' => NULL, 'table' => NULL, 'pager' => NULL),
+    ),
+    'search_log_summary' => array(
+      'file' => 'search_log.admin.inc',
+      'variables' => array('total' => 0, 'unique' => 0, 'failed' => 0),
+    ),
+  );
+}
+
+/**
+ * Implements hook_cron().
+ *
+ * Expire outdated entries.
+ */
+function search_log_cron() {
+  if ($days = (int) variable_get('search_log_cron', 0)) {
+    // Get timestamp for 12:00 today UTC minus days.
+    $day = _search_log_get_time() - $days * SEARCH_LOG_DAY;
+    db_delete('search_log')
+      ->condition('day', $day, '<')
+      ->execute();
+  }
+}
+
+/**
+ * Implement hook_views_api().
+ */
+function search_log_views_api() {
+  $ret = array(
+    'api'  => 3.0,
+    'path' => drupal_get_path('module', 'search_log') . '/views'
+  );
+  return $ret;
+}
+
+/**
+ * Implements hook_form_alter().
+ *
+ * Alter standard search forms to capture submission.
+ */
+function search_log_form_alter(&$form, &$form_state, $form_id) {
+  $form_id_processed = $form_id;
+
+  // Custom Search module.
+  if (strpos($form_id_processed, 'custom_search_blocks_form') !== FALSE) {
+    $form_id_processed = 'custom_search_blocks_form';
+  }
+  
+  switch ($form_id_processed) {
+    case 'search_form':
+      array_unshift($form['#submit'], 'search_log_search_form_submit');
+      break;
+
+    case 'search_block_form':
+      array_unshift($form['#submit'], 'search_log_search_block_form_submit');
+      break;
+
+    case 'search_theme_form':
+      array_unshift($form['#submit'], 'search_log_search_theme_form_submit');
+      break;
+
+    case 'custom_search_blocks_form':
+      array_unshift($form['#submit'], 'search_log_custom_search_blocks_form_submit');
+      break;
+  }
+}
+
+/**
+ * Process search form to capture keys.
+ */
+function search_log_search_form_submit($form, &$form_state) {
+  $module = isset($form_state['values']['module']) ? $form_state['values']['module'] : NULL;
+  $keys = isset($form_state['values']['processed_keys']) ? $form_state['values']['processed_keys'] : NULL;
+  if ($keys) {
+    _search_log_preprocess_search_form($form_state['values'], $keys, $module);
+  }
+}
+
+/**
+ * Process block search form to capture keys.
+ */
+function search_log_search_block_form_submit($form, &$form_state) {
+  $keys = isset($form_state['values']['search_block_form']) ? $form_state['values']['search_block_form'] : NULL;
+  if ($keys) {
+    _search_log_preprocess_search_form($form_state['values'], $keys);
+  }
+}
+
+/**
+ * Process theme search form to capture keys.
+ */
+function search_log_search_theme_form_submit($form, &$form_state) {
+  $keys = isset($form_state['values']['search_theme_form']) ? $form_state['values']['search_theme_form'] : NULL;
+  if ($keys) {
+    _search_log_preprocess_search_form($form_state['values'], $keys);
+  }
+}
+
+/**
+ * Process custom search form to capture keys.
+ */
+function search_log_custom_search_blocks_form_submit($form, &$form_state) {
+  $keys = NULL;
+  foreach ($form_state['values'] as $key => $value) {
+    if (strpos($key, 'custom_search_blocks_form') !== FALSE) {
+      $keys = $value;
+      break;
+    }
+  }
+  if ($keys) {
+    _search_log_preprocess_search_form($form_state['values'], $keys);
+  }
+}
+
+/**
+ * Preprocess search form results before writing to DB.
+ */
+function _search_log_preprocess_search_form($submitted, $keys, $module = NULL) {
+  global $language;
+
+  if (!$module) {
+    $info = search_get_default_module_info();
+    $module = $info['module'];
+  }
+
+  $modules = variable_get('search_log_modules_enabled', array());
+  if (!empty($modules) && !in_array($module, $modules, TRUE)) {
+    return;
+  }
+  
+  // Custom Search content filter integration.
+  if (module_exists('custom_search')) {
+    $types = isset($submitted['custom_search_types']) ? $submitted['custom_search_types'] : array();
+    if (!is_array($types)) {
+      $types = array($types);
+    }
+    $types = array_map('_custom_search_filter_keys', array_filter($types));
+    if (in_array('all', $types)) {
+      // do nothing to keys or module.
+    }
+    elseif (in_array('user', $types)) {
+      $module = 'user';
+    }
+    else { 
+      $keys .= ' type:' . implode(',', $types);
+    }
+  }
+
+  search_log($keys, $module, $language->language);
+}
+
+/**
+ * Store search keys, module, language and day.
+ *
+ * Developers can call this function directly to add additional entries to the
+ * log or record failed searches (e.g. Lucene integration).
+ */
+function search_log($keys, $module, $language = 'en', $counter = 1, $result = SEARCH_LOG_RESULT_UNKNOWN) {
+  $today = _search_log_get_time();
+  $keys = _search_log_normalize_keys($keys);
+  if (!$keys || !$module|| !$language) return;
+
+  // If search_log_preproces is enabled, the default is successful search.
+  if (!$result && variable_get('search_log_preprocess', TRUE)) {
+    $result = SEARCH_LOG_RESULT_SUCCESS;
+  }
+
+  if ($qid = db_query("SELECT qid FROM {search_log} WHERE q = :q AND module = :module AND language = :language AND day = :day", array(':q' => $keys, ':module' => $module, ':language' => $language, ':day' => $today))->fetchField()) {
+    db_update('search_log')
+      ->fields(array('result' => $result))
+      ->expression('counter', 'counter + :counter', array(':counter' => $counter))
+      ->condition('qid', $qid)
+      ->execute();
+  }
+  else {
+    db_insert('search_log')
+      ->fields(array(
+          'q' => $keys,
+          'module' => $module,
+          'language' => $language,
+          'day' => $today,
+          'counter' => $counter,
+          'result' => $result,
+          ))
+      ->execute();
+  }
+}
+
+/**
+ * Process search results.
+ *
+ * The $variables array contains the following arguments:
+ * - $results
+ * - $type
+ *
+ * Search does not have a hook to obtain the number of search results. This
+ * theme function is called only if a module has not implemented search_page.
+ * The logic is changed from D6 since this function is called on empty results.
+ *
+ * @see search_view(), search_data(), template_preprocess_search_results()
+ */
+function search_log_preprocess_search_results(&$variables) {
+  if (!variable_get('search_log_preprocess', TRUE) || !empty($variables['results'])) {
+    return;
+  }
+
+  global $language;
+  $keys = _search_log_normalize_keys(urldecode(arg(2)));
+  $module = $variables['module'];
+  $today = _search_log_get_time();
+
+  if ($qid = db_query("SELECT qid FROM {search_log} WHERE q = :q AND module = :module AND language = :language AND day = :day", array(':q' => $keys, ':module' => $module, ':language' => $language->language, ':day' => $today))->fetchField()) {
+    db_update('search_log')
+      ->fields(array(
+        'result' => SEARCH_LOG_RESULT_FAILED,
+        ))
+      ->condition('qid', $qid)
+      ->execute();
+  }
+}
+
+/**
+ * Internal function to normalize keys.
+ */
+function _search_log_normalize_keys($keys) {
+  $keys = preg_replace('/\s+/', ' ', trim($keys));
+
+  switch (variable_get('search_log_terms', SEARCH_LOG_TERMS_LOWERCASE)) {
+    case SEARCH_LOG_TERMS_LOWERCASE:
+      $keys = str_replace(' or ', ' OR ', drupal_strtolower($keys));
+      break;
+
+    case SEARCH_LOG_TERMS_UPPERCASE_FIRST:
+      $keys = str_replace(' or ', ' OR ', drupal_ucfirst($keys));
+      break;
+
+    case SEARCH_LOG_TERMS_UPPERCASE_WORDS:
+      $keys = str_replace(' Or ', ' OR ', ucwords(drupal_strtolower($keys)));
+      break;
+  }
+
+  return $keys;
+}
+
+/**
+ * Utility time function.
+ *
+ * Effectively returns time() rounded down to nearest day.
+ */
+function _search_log_get_time() {
+  static $today;
+
+  if (!isset($today)) {
+    $today = mktime(0, 0, 0);
+  }
+
+  return $today;
+}

@@ -1,0 +1,328 @@
+<?php
+/**
+ * @file
+ * The A12 Sponsored search module provides functions to connect to A12
+ * services.
+ */
+
+/**
+ * Implements hook_menu_alter().
+ *
+ * Reorganise the Apache Solr search modules menu items to make room for
+ * Enterprise Search menu items.
+ */
+function a12_sponsored_search_menu_alter(&$menu) {
+  $menu['admin/config/search/solr_best_bets']['page arguments'] = array('a12_sponsored_search_elevate_form');
+  $menu['admin/config/search/solr_best_bets']['description'] = 'Deploy elevations to Axis12 Find.';
+  $menu['admin/config/search/solr_best_bets/advanced'] = FALSE;
+  $menu['admin/config/search/solr_best_bets/keygen'] = FALSE;
+}
+
+/**
+ * Implements hook_form().
+ */
+function a12_sponsored_search_elevate_form($form) {
+  $form['actions']['elevate'] = array(
+    '#type' => 'submit',
+    '#value' => t('Deploy Elevation to A12 Find'),
+    '#submit' => array('a12_sponsored_search_elevate_submit'),
+  );
+  return $form;
+}
+
+/**
+ * Form submission handler for a12_sponsored_search_elevate_form().
+ */
+function a12_sponsored_search_elevate_submit() {
+  $env_id = apachesolr_default_environment();
+  $environment = apachesolr_environment_load($env_id);
+  $environment_current = array(
+    'label' => 'Apache Solr: ' . $environment['name'],
+    'id callbacks' => array('enterprise_search_document_id'),
+    'name' => 'apachesolr:' . $environment['env_id'],
+    'id options' => array("unique field" => 'id', 'url' => $environment['url']),
+  );
+  $solr = apachesolr_get_solr($env_id);
+  $solr->setElevate(a12_sponsored_search_elevate_json($environment_current));
+
+  // Set all best bets term status to sent.
+  db_update('solr_best_bets')
+    ->fields(array(
+      'status' => 1,
+    ))
+    ->execute();
+
+  // Set global best bets synched flag.
+  variable_set('enterprise_search_synonyms_sync', '1');
+
+  drupal_set_message(t('Elevation metadata successfully submitted to A12 Find.'), 'status');
+}
+
+/**
+ * Builds the elevate.xml compatible json.
+ *
+ * @param array $environment
+ *   The environment definition.
+ *
+ * @return string
+ *   The json encoded elevate document.
+ */
+function a12_sponsored_search_elevate_json(array $environment) {
+  $sql = '
+    SELECT content_id, query_text, exclude
+    FROM {solr_best_bets}
+    WHERE environment = :environment
+    AND status != 2
+    ORDER BY query_text, weight
+  ';
+  $result = db_query($sql, array(':environment' => $environment['name']));
+  foreach ($result as $record) {
+    // Contine to the next value if the ID cannot be resolved.
+    if (FALSE === ($transformed_id = solr_best_bets_transform_id($record->content_id, $environment))) {
+      watchdog('solr_best_bets', 'ID not transformed to index value: @id', array('@id' => $record->content_id), WATCHDOG_WARNING);
+      continue;
+    }
+    $record->id = $transformed_id;
+    $data[] = (array)$record;
+  }
+
+  return json_encode($data);
+}
+
+/**
+ * Implements hook_views_api().
+ */
+function a12_sponsored_search_views_api() {
+  return array(
+    'api' => 3,
+    'path' => drupal_get_path('module', 'a12_sponsored_search') . '/views',
+  );
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function a12_sponsored_search_form_solr_best_bets_node_form_alter(&$form, &$form_state, $form_id) {
+  $form['actions']['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Add as best bet for search query'),
+    '#submit' => array('a12_sponsored_search_save_best_bets_submit'),
+  );
+}
+
+/**
+ * Saves a best bet entry to the database.
+ *
+ * @param array $values
+ *   An associative array of the values being saved containing:
+ *     - content_id:
+ *     - query_text:
+ *     - environment:
+ *     - exclude: (optional)
+ *     - weight: (optional)
+ *
+ * @return bool
+ *   The success of the operation.
+ */
+function a12_sponsored_search_best_bets_save(array $values) {
+  $defaults = array(
+    'environment' => FALSE,
+    'content_id' => FALSE,
+    'query_text' => FALSE,
+    'exclude' => 0,
+    'weight' => 0,
+    'nid' => 0,
+    'status' => 0,
+  );
+  $keys = array(
+    'environment' => TRUE,
+    'content_id' => TRUE,
+    'query_text' => TRUE,
+  );
+
+  // Merge in defaults, strip out all of the other stuff.
+  $values = array_intersect_key($values + $defaults, $defaults);
+
+  // Ensure we have all required values.
+  if (!in_array(FALSE, $values, TRUE)) {
+    $values['query_text'] = drupal_strtolower($values['query_text']);
+    $nid = explode(':', $values['content_id']);
+    $values['nid'] = $nid[2];
+    db_merge('solr_best_bets')
+      ->key(array_intersect_key($values, $keys))
+      ->fields(array_diff_key($values, $keys))
+      ->execute();
+    return TRUE;
+  }
+
+  return FALSE;
+}
+
+/**
+ * Form submission handler for solr_best_bets_node_form().
+ */
+function a12_sponsored_search_save_best_bets_submit($form, &$form_state) {
+  $node = $form_state['build_info']['args'][0];
+  if (!empty($form_state['values']['query_text'])) {
+    // Save the best bet, build status message and type based on the result.
+    if (a12_sponsored_search_best_bets_save($form_state['values'])) {
+      $message = '%title is set as a best bet for the search query %query.';
+      $type = 'status';
+    }
+    else {
+      $message = 'Error setting %title as a best bet for the search query %query.';
+      $type = 'error';
+    }
+    // Display the status message to the user.
+    $args = array(
+      '%title' => $node->title,
+      '%query' => $form_state['values']['query_text']
+    );
+    drupal_set_message(t($message, $args), $type);
+  }
+  $form_state['redirect'] = 'node/' . $node->nid . '/solr_best_bets';
+}
+
+/**
+ * Implements hoom_form_alter().
+ */
+function a12_sponsored_search_form_enterprise_search_features_form_alter(&$form, &$form_state, $form_id) {
+  $form['elevate']['message'] = array(
+    '#prefix' => '<div>',
+    '#markup' => t('The Sponsored Search module enables you to configure the
+      top results for a given query regardless of the normal search scoring. This is sometimes called "best bets", "editorial boosting" or "elevations".'),
+    '#suffix' => '</div>',
+  );
+  $form['elevate']['table'] = array(
+    '#prefix' => '<div>',
+    '#markup' => views_embed_view('sponsored-search', 'default'),
+    '#suffix' => '</div>',
+  );
+  $form['elevate']['status'] = array(
+    '#prefix' => '<div>',
+    '#markup' => t("@sent of @all sent to server.", array(
+      '@sent' => a12_sponsored_search_terms_cardinality('sent'),
+      '@all' => a12_sponsored_search_terms_cardinality('all')
+    )),
+    '#suffix' => '</div>',
+  );
+  $form['elevate']['actions'] = array(
+    '#type' => 'submit',
+    '#value' => t('Deploy'),
+    '#submit' => array('a12_sponsored_search_elevate_submit'),
+  );
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function a12_sponsored_search_form_alter(&$form, &$form_state, $form_id) {
+  if ($form['form_id']['#value'] == 'solr_best_bets_node_overview') {
+    $form['options']['submit'] = array(
+      '#type' => 'submit',
+      '#value' => t('Update'),
+      '#submit' => array('a12_sponsored_node_overview_submit'),
+    );
+  }
+}
+
+/**
+ * Form submission handler for solr_best_bets_node_overview().
+ */
+function a12_sponsored_node_overview_submit($form, &$form_state) {
+  // Flag whether we the content should be excluded or not. This is ignored for
+  // delete operations.
+  $exclude = (int) ($form_state['values']['operation'] == 'exclude_yes');
+
+  // Get query test and environment for best bets being acted on.
+  $records = array_filter($form_state['values']['table']);
+  foreach ($records as $id) {
+    list($query_text, $environment) = array_map('rawurldecode', explode(':', $id));
+    $records[$id] = array(
+      'content_id' => $form_state['values']['content_id'],
+      'query_text' => $query_text,
+      'environment' => $environment,
+      'exclude' => $exclude,
+    );
+  }
+
+  // Take action on selected items.
+  if ($records) {
+    module_load_include('inc', 'solr_best_bets', 'solr_best_bets.crud');
+    switch ($form_state['values']['operation']) {
+      case 'delete':
+        a12_sponsored_search_delete($records);
+        break;
+
+      case 'exclude_yes':
+      case 'exclude_no':
+        $exclude = ($form_state['values']['operation'] == 'exclude_yes');
+        solr_best_bets_update_exclude($records, $exclude);
+        break;
+    }
+  }
+}
+
+/**
+ * Sets delete status on best bet entries in the database.
+ *
+ * @param array $records
+ *   An associative array of the values being saved containing:
+ *     - content_id:
+ *     - query_text:
+ *     - environment:
+ */
+function a12_sponsored_search_delete(array $records) {
+  $update = db_update('solr_best_bets')->fields(array(
+    'status' => 2,
+  ));
+  $or = db_or();
+  foreach ($records as $values) {
+    $or->condition(
+      db_and()
+        ->condition('environment', $values['environment'])
+        ->condition('content_id', $values['content_id'])
+        ->condition('query_text', $values['query_text'])
+    );
+  }
+  $update->condition($or);
+  $update->execute();
+}
+
+/**
+ * Returns back the number of terms.
+ */
+function a12_sponsored_search_terms_cardinality($set) {
+  switch ($set) {
+    case 'all':
+      $result = db_select('solr_best_bets', 'best_bets')
+        ->fields('best_bets')
+        ->execute();
+      $value = $result->rowCount();
+      break;
+    case 'sent':
+      $result = db_select('solr_best_bets', 'best_bets')
+        ->fields('best_bets')
+        ->condition('status', '1', '=')
+        ->execute();
+      $value = $result->rowCount();
+      break;
+    case 'not sent':
+      $result = db_select('solr_best_bets', 'best_bets')
+        ->fields('best_bets')
+        ->condition('status', '0', '=')
+        ->execute();
+      $value = $result->rowCount();
+      break;
+    case 'deleted':
+      $result = db_select('solr_best_bets', 'best_bets')
+        ->fields('best_bets')
+        ->condition('status', '2', '=')
+        ->execute();
+      $value = $result->rowCount();
+      break;
+    default:
+      break;
+  }
+  return $value;
+}

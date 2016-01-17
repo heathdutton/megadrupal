@@ -1,0 +1,344 @@
+<?php
+
+/**
+ * Interface to abstract a general key-value store.
+ */
+interface KeyValueQueueBackend {
+
+  /**
+   * Checks for the existence of a key.
+   *
+   * @abstract
+   * @param string $key
+   * @return boolean
+   */
+  public function exists($key);
+
+  /**
+   * Fetches an entry from the key-value store.
+   *
+   * @abstract
+   * @param string $key
+   * @return mixed
+   */
+  public function fetch($key);
+
+  /**
+   * Stores an entry in the key-value store.
+   *
+   * @abstract
+   * @param string $key
+   * @param mixed $value
+   * @return KeyValueQueueWrapper
+   * The instance reference for chaining.
+   */
+  public function store($key, $value);
+
+  /**
+   * Deletes an entry from the key-value store.
+   *
+   * @abstract
+   * @param string $key
+   * @return KeyValueQueueWrapper
+   * The instance reference for chaining.
+   */
+  public function delete($key);
+
+  /**
+   * Increments a numeric entry.
+   *
+   * @abstract
+   * @param string $key
+   * @return KeyValueQueueWrapper
+   * The instance reference for chaining.
+   */
+  public function increment($key);
+
+  /**
+   * Decrements a numeric entry.
+   *
+   * @abstract
+   * @param string $key
+   * @return KeyValueQueueWrapper
+   * The instance reference for chaining.
+   */
+  public function decrement($key);
+}
+
+/**
+ * Naive queue implementation.
+ *
+ * This queue stores the items in a key-value store.
+ * This has some implications:
+ * - faster than the database storage
+ * - when the server is restarted, all queue items are lost
+ *
+ * For the implementation, I chose a simple strategy. Every item
+ * has a serial ID. This ID can be changed when deleting an item,
+ * but the number of the items must equal to the maximum serial
+ * number + 1. To make this consistent, when deleting an item,
+ * which is not the "last", then it will be swapped with the last
+ * item, and then gets deleted (only the last item can be deleted).
+ *
+ * The consequence is that the order of items can be changed in
+ * the queue.
+ */
+abstract class NaiveKeyValueQueue implements DrupalQueueInterface {
+
+  /**
+   * Implementation wrapper of the key-value queue.
+   *
+   * @var KeyValueQueueWrapper
+   */
+  protected $backend = null;
+
+  /**
+   * @var string Name of the queue.
+   */
+  protected $name;
+
+  /**
+   * Returns the queue implementation.
+   *
+   * @abstract
+   * @return KeyValueQueueWrapper
+   */
+  protected abstract function getBackend();
+
+  /**
+   * Start working with a queue.
+   *
+   * @param $name
+   *   Arbitrary string. The name of the queue to work with.
+   */
+  public function __construct($name) {
+    $this->name = $name;
+    $this->backend = $this->getBackend();
+    if (!$this->backend->exists("{$name}_num")) {
+      $this->backend->store("{$name}_num", 0);
+    }
+  }
+
+  /**
+   * Claim an item in the queue for processing.
+   *
+   * @param $lease_time
+   *   How long the processing is expected to take in seconds, defaults to an
+   *   hour. After this lease expires, the item will be reset and another
+   *   consumer can claim the item. For idempotent tasks (which can be run
+   *   multiple times without side effects), shorter lease times would result
+   *   in lower latency in case a consumer fails. For tasks that should not be
+   *   run more than once (non-idempotent), a larger lease time will make it
+   *   more rare for a given task to run multiple times in cases of failure,
+   *   at the cost of higher latency.
+   * @return
+   *   On success we return an item object. If the queue is unable to claim an
+   *   item it returns false. This implies a best effort to retrieve an item
+   *   and either the queue is empty or there is some other non-recoverable
+   *   problem.
+   */
+  public function claimItem($lease_time = 3600) {
+    $num = $this->numberOfItems();
+    $now = time();
+
+    for ($i = 0; $i <= $num; ++$i) {
+      $current_item = $this->getKVItem($i);
+      if ($current_item && $current_item->claim_time < $now) {
+        $this->storeKVItem($i, $this->createKVItem($current_item->data,
+                                                     $now + $lease_time));
+        return $this->createOutputItem($current_item);
+      }
+    }
+
+    return FALSE;
+  }
+
+  /**
+   * Add a queue item and store it directly to the queue.
+   *
+   * @param $data
+   *   Arbitrary data to be associated with the new task in the queue.
+   * @return
+   *   TRUE if the item was successfully created and was (best effort) added
+   *   to the queue, otherwise FALSE. We don't guarantee the item was
+   *   committed to disk etc, but as far as we know, the item is now in the
+   *   queue.
+   */
+  public function createItem($data) {
+    return $this->addKVItem($this->createKVItem($data));
+  }
+
+  /**
+   * Create a queue.
+   *
+   * Called during installation and should be used to perform any necessary
+   * initialization operations. This should not be confused with the
+   * constructor for these objects, which is called every time an object is
+   * instantiated to operate on a queue. This operation is only needed the
+   * first time a given queue is going to be initialized (for example, to make
+   * a new database table or directory to hold tasks for the queue -- it
+   * depends on the queue implementation if this is necessary at all).
+   */
+  public function createQueue() {
+    // do nothing
+  }
+
+  /**
+   * Delete a finished item from the queue.
+   *
+   * @param $item
+   *   The item returned by DrupalQueueInterface::claimItem().
+   */
+  public function deleteItem($item) {
+    $itemnum = $this->itemNumber($item->data);
+    if ($itemnum !== FALSE) {
+      $this->deleteKVItem($itemnum);
+      return $item;
+    }
+
+    return FALSE;
+  }
+
+  /**
+   * Delete a queue and every item in the queue.
+   */
+  public function deleteQueue() {
+    $num = $this->numberOfItems();
+
+    for ($i = $num - 1; $i >= 0; --$i) {
+      $this->backend->delete("{$this->name}_item_{$i}");
+      $this->backend->decrement("{$this->name}_num");
+    }
+  }
+
+  /**
+   * Retrieve the number of items in the queue.
+   *
+   * This is intended to provide a "best guess" count of the number of items in
+   * the queue. Depending on the implementation and the setup, the accuracy of
+   * the results of this function may vary.
+   *
+   * e.g. On a busy system with a large number of consumers and items, the
+   * result might only be valid for a fraction of a second and not provide an
+   * accurate representation.
+   *
+   * @return int
+   *   An integer estimate of the number of items in the queue.
+   */
+  public function numberOfItems() {
+    return $this->backend->fetch("{$this->name}_num");
+  }
+
+  /**
+   * Release an item that the worker could not process, so another
+   * worker can come in and process it before the timeout expires.
+   *
+   * @param $item
+   * @return boolean
+   */
+  public function releaseItem($item) {
+    $itemnum = $this->itemNumber($item->data);
+
+    return ($itemnum !== FALSE) ?
+      $this->storeKVItem($itemnum, $this->createKVItem($item->data)) : FALSE;
+  }
+
+  /**
+   * Returns the identifier number of the item.
+   *
+   * @param mixed $item
+   * @return bool|mixed
+   */
+  protected function itemNumber($item) {
+    $num = $this->numberOfItems();
+
+    for ($i = $num - 1; $i >= 0; --$i) {
+      $current_item = $this->getKVItem($i);
+      if ($current_item && $current_item->data == $item) {
+        return $num;
+      }
+    }
+
+    return FALSE;
+  }
+
+  /**
+   * Returns a container for a queue item.
+   *
+   * @param mixed $data
+   * @param int $claim_time
+   * @return stdClass
+   */
+  protected function createKVItem($data, $claim_time = 0) {
+    return (object) array(
+      'data' => $data,
+      'claim_time' => $claim_time,
+    );
+  }
+
+  protected function createOutputItem($item) {
+    return (object) array(
+      'name' => $this->name,
+      'data' => $item->data,
+      'expire' => $item->claim_time,
+    );
+  }
+
+  /**
+   * Returns an item from the key-value cache.
+   *
+   * @param int $num
+   * @return mixed
+   */
+  protected function getKVItem($num) {
+    return $this->backend->fetch("{$this->name}_item_{$num}");
+  }
+
+  /**
+   * Adds an item to the key-value cache.
+   *
+   * @param mixed $item
+   * @return void
+   */
+  protected function addKVItem($item) {
+    $num = $this->numberOfItems();
+
+    $result = $this->storeKVItem($num, $item);
+    $this->backend->increment("{$this->name}_num");
+
+    return $result;
+  }
+
+  /**
+   * Stores an item in the key-value cache.
+   *
+   * @param int $num
+   * @param mixed $item
+   * @return bool
+   */
+  protected function storeKVItem($num, $item) {
+    return $this->backend->store("{$this->name}_item_{$num}", $item);
+  }
+
+  /**
+   * Deletes an item from the key-value cache.
+   *
+   * @param int $itemnum
+   * @return void
+   */
+  protected function deleteKVItem($itemnum) {
+    $num = $this->numberOfItems();
+    if ($itemnum < $num - 1) { // this is not the last item
+      // swapping the current item with the last item
+      $last_item = $this->getKVItem($num - 1);
+      $this->storeKVItem($itemnum, $last_item);
+      $this->backend->delete("{$this->name}_item_" . ($num - 1));
+    }
+    else {
+      $this->backend->delete("{$this->name}_item_{$itemnum}");
+    }
+
+    $this->backend->decrement("{$this->name}_num");
+  }
+}
+
