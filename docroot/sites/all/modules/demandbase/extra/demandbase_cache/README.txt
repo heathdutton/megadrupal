@@ -1,1 +1,0 @@
-The demandbase_cache module override the drupal default caching.
