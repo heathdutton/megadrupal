@@ -1,0 +1,664 @@
+<?php
+// $Id: ljxp.module,v 1.19 2010/12/13 09:20:37 valthebald Exp $
+/**
+ * @file ljxp.module
+ * 
+ * This module cross-posts from Drupal to LiveJournal. It is modelled after
+ * the LJXP WordPress plugin of the same name, written by Evan Broder. See
+ * http://www.ebroder.net.
+ */
+
+// Start drupal hooks area.
+
+/*
+ * Implementation of hook_permission
+ * @see http://api.drupal.org/api/drupal/modules--system--system.api.php/function/hook_permission/7
+ */
+function ljxp_permission() {
+  return array(
+    'can crosspost to livejournal' => array(
+      'title' => t('Can crosspost to LiveJournal'), 
+      'description' => t('Users can crosspost to LiveJournal or LiveJournal-based services'),
+    ),
+  );
+}
+
+/*
+ * Implementation of hook_menu.
+ * D6 => D7 No change in parameters. 
+ * @see http://api.drupal.org/api/drupal/modules--system--system.api.php/function/hook_menu/7
+ */
+function ljxp_menu() {
+  $items = array();
+  $items['admin/config/services/ljxp'] = array(
+    'title' => t('LiveJournal crossposter'),
+    'description' => t('Allows you or your users to automatically crosspost entries to a LiveJournal account.'),
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('ljxp_admin_settings'),
+    'access arguments' => array('administer site configuration'),
+    'type' => MENU_NORMAL_ITEM, // optional
+  );
+  return $items;
+}
+
+/*
+ * Implementation of hook_form_alter
+ * D6 => D7 No change in parameters. 
+ * @see http://api.drupal.org/api/drupal/modules--system--system.api.php/function/hook_form_alter/7
+ */
+function ljxp_form_alter(&$form, $form_state, $form_id) {
+  global $user;
+  // part of D6 hook_user came here.
+  if ($form_id == 'user_profile_form') {
+    ljxp_alter_user_profile($form, $form_state, $form_id);
+    return;
+  }
+  if (substr($form_id, -9) != 'node_form' || 
+    !user_access('can crosspost to livejournal') || 
+    empty($form['uid']['#value']) ||
+    $user->uid != $form['uid']['#value']) {
+    return;
+  }
+  $default_state = variable_get('ljxp_type_' . $form['type']['#value'], 0);
+
+  if (!$default_state) {
+    return;
+  }
+
+  $ljxp = ljxp_load_settings($user->uid);
+  if (!$ljxp->active) {
+    return;
+  }
+
+  if ($form['nid']['#value']) {
+    $lj = db_query("SELECT ljid FROM {ljxp_node} WHERE nid = :nid", array(':nid' => $form['nid']['#value']))->fetchAssoc();
+    $form['ljid'] = array(
+      '#type' => 'value',
+      '#value' => $lj['ljid'],
+    );
+    $checked = $lj['ljid'] ? TRUE : FALSE;
+  }
+  else {
+    $checked = ($default_state == 'yes');
+  }
+  $form['ljxp_set'] = array (
+    '#type' => 'fieldset',
+    '#title' => t('LiveJournal Crossposter'),
+    '#collapsible' => TRUE,
+    '#group' => 'additional_settings',  
+  );
+  $form['ljxp_set']['ljxp'] = array(
+     '#type' => 'value',
+     '#value' => '1',
+  );
+  $form['ljxp_set']['ljxp_crosspost'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Crosspost to LiveJournal'),
+    '#default_value' => $checked,
+    '#description' => t('Crosspost this to LiveJournal; if already crossposted and you uncheck this, it will be deleted from LiveJournal.'),
+  );
+  return $form;
+}
+
+/*
+ * hook_node_insert
+ * @see http://api.drupal.org/api/search/7/hook_node_
+ */
+function ljxp_node_insert($node) {
+  // only let people with access; also skip people editing other people's posts.
+  if (!user_access('can crosspost to livejournal') || $GLOBALS['user']->uid != $node->uid) {
+    return;
+  }
+  if (!empty($node->ljxp)) {
+    // Delete nodes that are crossposted and set to crosspost as well
+    // as nodes that are unpublished.
+    if (!empty($node->ljid) && (empty($node->ljxp_crosspost) || !$node->status)) {
+      ljxp_delete($node);
+    }
+    elseif ($node->status && !empty($node->ljxp_crosspost)) {
+      ljxp_post($node);
+    }
+  }
+}
+
+/*
+ * hook_node_update
+ * @see http://api.drupal.org/api/search/7/hook_node_
+ */
+function ljxp_node_update($node) {
+  ljxp_node_insert($node);
+}
+
+function ljxp_node_delete($node) {
+  // Skip permission check on delete - otherwiser administrators will not be able to clean LJ data.
+  if (!empty($node->ljid)) {
+    ljxp_delete($node);
+  }
+}
+
+/*
+ * hook_user_*  implementation
+ * @see http://api.drupal.org/api/function/hook_user/6
+ */
+function ljxp_user_insert(&$edit, $account, $category) {
+  if (user_access('can crosspost to livejournal', $account) && $category == 'account' && isset($edit['ljxp'])) {
+    $ljxp = (object) $edit['ljxp'];
+    $ljxp->uid = $account->uid;
+    if (!empty($ljxp->pass)) {
+      $ljxp->pass = md5($ljxp->pass);
+    }
+    ljxp_save_settings($ljxp);
+  }
+}
+
+function ljxp_user_update(&$edit, $account, $category) {
+  ljxp_user_insert($edit, $account, $category);
+}
+
+function ljxp_user_view($account, $view_mode, $langcode) {
+  global $user;
+  if (user_access('can crosspost to livejournal', $account) && ($user->uid == $account->uid || user_access('administer site configuration'))) {
+    $ljxp = ljxp_load_settings($account->uid);
+    if (!$ljxp->active) {
+      $output = t('Not active');
+    }
+    else {
+      $output = theme('ljxp_user_info', $ljxp, $account);
+    }
+    return array(t('Livejournal Crossposting') => array(array('value' => $output)));
+  }
+}
+
+function theme_ljxp_user_info($ljxp, $account) {
+  $output .= '<div>' . t('Username') . ': ' . $ljxp->name . '</div>';
+  if ($ljxp->community) {
+    $output .= '<div>' . t('Community') . ': ' . $ljxp->community . '</div>';
+  }
+  return $output;
+}
+// --------------------------------------------------------------------------
+// Displayable pages -- primarily for settings et al.
+
+function ljxp_admin_settings() {
+  $form = array();
+  $options = array(
+    '0' => t('Cannot crosspost to LJ'),
+    'yes' => t('Crosspost to LJ by default'),
+    'no' => t('Can crosspost to LJ, but not by default'),
+  );
+  $form['blurb'] = array(
+    '#value' => t('<p>Choose which types to allow for LiveJournal crossposting; if allowing a type to be crossposted, you must also select whether or not new posts will be crossposted by default. Each user must set up their own LJ account data from the normal "my account" edit screen.</p>')
+  );
+  foreach (_node_types_build()->types as $type => $label) {
+    $form['ljxp_type_' . $type] = array(
+      '#type' => 'select',
+      '#options' => $options,
+      '#default_value' => variable_get('ljxp_type_' . $type, '0'),
+      '#title' => $label->name,
+    );
+  }
+  /*$form['buttons']['submit'] = array('#type' => 'submit', '#value' => t('Save configuration') );
+  $form['buttons']['reset'] = array('#type' => 'submit', '#value' => t('Reset to defaults') );
+  $form['#submit'][]='ljxp_admin_settings_submit';*/
+  
+  return system_settings_form($form);
+}
+
+// --------------------------------------------------------------------------
+// Database interaction
+
+function ljxp_load_settings($uid = NULL, $get_defaults = false) {
+  if (!$uid) {
+    global $user;
+    $uid = $user->uid;
+  }
+
+  static $cache = array();
+  if (empty($cache[$uid])) {
+    $ljxp = db_query('SELECT * FROM {ljxp} WHERE uid = :uid', array(':uid' => $uid))->fetch();
+    if (!$ljxp) {
+      $cache[$uid] = ljxp_load_defaults($uid);
+      $cache[$uid]->user_settings_exist = false;
+    }
+    else {
+      $ljxp->user_settings_exist = true;
+      $cache[$uid] = $ljxp; 
+    }
+  }
+
+  return $cache[$uid];
+}
+
+function ljxp_load_defaults($uid) {
+  $ljxp = new stdClass();
+  $ljxp->host = 'http://www.livejournal.com';
+  $ljxp->name = '';
+  $ljxp->community = '';
+  $ljxp->site_name = ''; // @todo: get from drupal site name
+  $ljxp->cut_text = t('Read more');
+  $ljxp->custom_header = '';
+  $ljxp->custom_header_format = NULL;
+  $ljxp->privacy = 'public';
+  $ljxp->comments = TRUE;
+  $ljxp->tags = TRUE;
+  $ljxp->post_type = 'teaser';
+  $ljxp->default = TRUE;
+  $ljxp->uid = $uid;
+  $ljxp->active = 0;
+  
+  return $ljxp;
+}
+
+function ljxp_save_settings($ljxp) {
+  $values = array(
+    'active' => $ljxp->active,
+    'host' => $ljxp->host,
+    'name' => $ljxp->name,
+    'community' => $ljxp->community,
+    'tags' => $ljxp->tags,
+    'privacy' => $ljxp->privacy,
+    'comments' => $ljxp->comments,
+    'post_type' => $ljxp->post_type,
+    'cut_text' => $ljxp->cut_text,
+    'site_name' => $ljxp->site_name,
+    'custom_header' => $ljxp->custom_header['value'],
+    'custom_header_format' => $ljxp->custom_header['format'],
+  );
+  if ($ljxp->default) {
+    $values['uid'] = $ljxp->uid;
+    $values['pass'] = $ljxp->pass;
+    db_insert('ljxp')->fields($values)->execute();
+  }
+  else {
+    if ($ljxp->pass) {
+      $values['pass'] = $ljxp->pass;
+    }
+    db_update('ljxp')
+      ->fields($values)
+      ->condition('uid', $ljxp->uid)
+      ->execute();
+  }
+}
+
+// --------------------------------------------------------------------------
+// Actual cross-posting code.
+
+function ljxp_destination($ljxp) {
+  return $ljxp->host . '/interface/xmlrpc';
+}
+
+function ljxp_get_challenge(&$ljxp) {
+  $response = xmlrpc(ljxp_destination($ljxp), array('LJ.XMLRPC.getchallenge' => array()));
+  if (!$response) {
+    return FALSE;
+  }
+  $ljxp->challenge = $response['challenge'];
+  return TRUE;
+}
+
+function ljxp_new_message(&$ljxp) {
+  if (empty($ljxp->challenge)) {
+    $result = ljxp_get_challenge($ljxp);
+    if (!$result) {
+      return false;
+    }
+  }
+  
+  $message = array(
+    'username' => $ljxp->name,
+    'auth_method' => 'challenge',
+    'auth_challenge' => $ljxp->challenge,
+    'auth_response' => md5($ljxp->challenge . $ljxp->pass),
+    'ver' => '1', // Makes LJ expect UTF-8 text instead of ISO-8859-1
+  );
+  return $message;
+}
+
+function ljxp_post($node) {
+  $ljxp = ljxp_load_settings($node->uid);
+
+  $message = ljxp_new_message($ljxp);
+  
+  if (!$ljxp->site_name) {
+    $ljxp->site_name = variable_get('site_name', 'drupal');
+  }
+  
+  $dest = drupal_get_path_alias("node/$node->nid");
+  $comment_dest = drupal_get_path_alias("comment/reply/$node->nid");
+  if (!$ljxp->custom_header) {
+    $post_header = '<p style="border: 1px solid black; padding: 3px;"><b>';
+
+    $post_header .= t('Originally published at !link. ', array('!link' => l($ljxp->site_name, $dest, array('absolute'=>TRUE))));
+
+    if ($ljxp->comments) {
+      $post_header .= t('You can comment here or !link.', array('!link' => l(t('there'), $comment_dest, array('absolute'=>TRUE))));
+    }
+    else {
+      $post_header .= t('Please leave any !comments there.', array('!comments' => l(t('comments'), $comment_dest, array('absolute'=>TRUE))));
+    }
+    $post_header .= '</b></p>';
+  }
+  else {
+    $post_header = $ljxp->custom_header;
+    
+    $find = array('%blog_name', '%permalink', '%comments_link');
+    $replace = array(
+      $ljxp->site_name, 
+      $dest, 
+      l(t('comment'), $comment_dest, array('absolute'=>TRUE))
+    );
+    $post_header = check_markup(str_replace($find, $replace, $post_header), $ljxp->custom_header_format, TRUE);
+  }
+  
+  $crlf = array("\r\n", "\r", "\n");
+  $langcode = $node->language;
+ 
+  switch ($ljxp->post_type) {
+    case 'lj-cut':
+      if (!empty($node->body[$langcode][0]['summary'])) {
+        $content = node_view($node, 'teaser', $langcode);
+      }
+      else {
+        $content = node_view($node, 'full', $langcode);
+      }
+      $node_content = $content['body'][0]['#markup'];
+      $node_content = str_replace($crlf, '', $node_content);
+      $node_content = str_replace('<br>', '<br />', $node_content);
+      $summary = trim($node_content);
+      if (empty($node->body[$langcode][0]['summary'])) {
+        $full = $summary;
+      }
+      else {
+        $content = node_view($node, 'full', $langcode);
+        $node_content = $content['body'][0]['#markup'];
+        $node_content = str_replace($crlf, '', $node_content);
+        $node_content = str_replace('<br>', '<br />', $node_content);
+        $full = trim($node_content);
+      }
+      $message['event'] = $summary;
+      if ($full != $summary) {
+        $cut = $ljxp->cut_text ? ('<lj-cut text="' . $ljxp->cut_text . '">') : '<lj-cut>';
+        $l = strlen($summary);
+        if (substr($full, 0, $l) == $summary) {
+          $body = substr($full, $l);
+          if (!empty($body)) {
+            $body = $cut . $body;
+          }
+        }
+        else {
+          if (!empty($full)) {
+            $body = $cut . $full;
+          }
+        }
+        $message['event'] .= $body;
+      }
+      break;
+    case 'full post':
+      $content = node_view($node, 'full', $langcode);
+      $node_content = $content['body'][0]['#markup'];
+      $node_content = str_replace($crlf, '', $node_content);
+      $node_content = str_replace('<br>', '<br />', $node_content);
+      $full = trim($node_content);
+      $message['event'] = $full;
+      break;
+    case 'teaser':
+    default:
+      if (!empty($node->body[$langcode][0]['summary'])) {
+        $content = node_view($node, 'teaser', $langcode);
+      }
+      else {
+        $content = node_view($node, 'full', $langcode);
+      }
+      $node_content = $content['body'][0]['#markup'];
+      $node_content = str_replace($crlf, '', $node_content);
+      $node_content = str_replace('<br>', '<br />', $node_content);
+      $summary = trim($node_content);
+      if (empty($node->body[$langcode][0]['summary'])) {
+        $full = $summary;
+      }
+      else {
+        $content = node_view($node, 'full', $langcode);
+        $node_content = $content['body'][0]['#markup'];
+        $node_content = str_replace($crlf, '', $node_content);
+        $node_content = str_replace('<br>', '<br />', $node_content);
+        $full = trim($node_content);
+      }
+      $message['event'] = $summary;
+      if ($full != $summary /*&& strlen($full) < strlen($summary)*/) {
+        $message['event'] .= l(t('Read the rest of this post'), $dest, array('absolute' => TRUE));
+      }
+      break;
+  }
+
+  $message['event'] = $post_header . $message['event'];
+
+  // TODO: Only tags is taken into account
+  $tags = '';
+  if ($ljxp->tags) {
+    if (isset($node->field_tags)) {
+      $terms = $node->field_tags['und'];
+      if (!empty($terms)) {
+        foreach ($terms as $id => $term) {
+          if ($tags) {
+            $tags .= ', ';
+          }
+          $tags .= check_plain($term['name']);
+        }
+      }
+    }
+  }
+
+  $message['subject'] = check_plain($node->title);
+
+  //$message['year'] = format_date($node->created, 'custom', 'Y');
+  //$message['mon'] = format_date($node->created, 'custom', 'n');
+  //$message['day'] = format_date($node->created, 'custom', 'j');
+  //$message['hour'] = format_date($node->created, 'custom', 'G');
+  //$message['min'] = format_date($node->created, 'custom', 'i');
+  
+  // Get current date of node being edited
+  $date_time_array = getdate(time());
+  $message['year'] = $date_time_array['year'];
+  $message['mon'] = $date_time_array['mon'];
+  $message['day'] = $date_time_array['mday'];
+  $message['hour'] = $date_time_array['hours'];
+  $message['min'] = $date_time_array['minutes'];
+ 
+  $message['props'] = array("opt_nocomments" => !$ljxp->comments,
+    // Tells LJ to not run it's formatting (replacing \n
+    // with <br>, etc) because it's already been done by
+    // the texturization
+    "opt_preformatted" => true,
+    // backdate all posts -- this is really just me being lazy
+    //            "opt_backdated" => TRUE,
+  );
+
+  // If tagging is enabled,
+  if ($tags) {
+    // Set tags
+    $message['props']['taglist'] = $tags;
+  }
+
+  // Set the privacy level according to the settings
+  switch ($ljxp->privacy) {
+  case "public":
+    $message['security'] = "public";
+    break;
+  case "friends":
+    $message['security'] = "usemask";
+    $message['allowmask'] = 1;
+  }
+
+  // If crossposting to a community, specify that
+  if($ljxp->community) {
+    $message['usejournal'] = $ljxp->community;
+  }
+
+  if (!empty($node->ljid)) {
+    // If there is, add the itemid attribute and change from posting to editing
+    $message['itemid'] = $node->ljid;
+    $method = 'LJ.XMLRPC.editevent';
+  }
+  else {
+    $method = 'LJ.XMLRPC.postevent';
+  }
+
+  if (!$response = xmlrpc(ljxp_destination($ljxp), array($method => array($message)))) {
+    $errno = xmlrpc_errno();
+    // Check for manually deleted post.
+    if ($errno == 302) {
+      drupal_set_message(t('LiveJournal post not found. Node was marked as not crossposted'));
+      db_delete('ljxp')->condition('nid', $node->nid)->execute();
+    }
+    else {
+      drupal_set_message(t('LiveJournal crossposting error: ') . $errno . ': ' . xmlrpc_error_msg());
+    }
+    return FALSE;
+  }
+  else {
+    drupal_set_message(t('LiveJournal crosspost successful.'));
+    if (!$node->ljid) {
+      $node->ljid = $response['itemid'];
+      db_insert('ljxp_node')
+        ->fields(array(
+          'nid' => $node->nid,
+          'ljid' => $node->ljid,
+          ))
+        ->execute();
+    }
+    return $node->ljid;
+  }
+}
+
+function ljxp_delete($node) {
+  $ljxp = ljxp_load_settings($node->uid);
+
+  $message = ljxp_new_message($ljxp);
+  $message['itemid'] = $node->ljid;
+  $message['event'] = "";
+  $message['subject'] = "Delete this entry";
+
+  if (!$response = xmlrpc(ljxp_destination($ljxp), array('LJ.XMLRPC.editevent' => array($message)))) {
+    $errno = xmlrpc_errno();
+    if ($errno == 302) {
+      drupal_set_message(t('LiveJournal post not found. Node was marked as not crossposted'));
+    } else {
+      drupal_set_message(t('LiveJournal crossposting error: ') . $errno . ': ' . xmlrpc_error_msg());
+    }
+    db_delete('ljxp_node')->condition('nid', $node->nid)->execute();
+  }
+  else {
+    drupal_set_message(t('LiveJournal post successfully deleted.'));
+    db_delete('ljxp_node')->condition('nid', $node->nid)->execute();
+  }    
+}
+
+// D7-specific functions.
+
+// Alter user profile form
+function ljxp_alter_user_profile(&$form, &$form_state, $form_id) {
+  $account = $form['#user'];
+  if (!user_access('can crosspost to livejournal', $account)) {
+    return;
+  }
+  $ljxp = ljxp_load_settings($account->uid);
+  $form['ljxp'] = array(
+    '#type' => 'fieldset',
+    '#tree' => 'true',
+    '#title' => t('LiveJournal cross-posting'),
+    '#weight' => 1,
+  );
+  $form['ljxp']['active'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Use Livejournal crossposting'),
+    '#description' => t('Check this box to enable crossposting to livejournal.'),
+    '#default_value' => $ljxp->active,
+  );
+  $form['ljxp']['host'] = array(
+    '#type' => 'textfield',
+    '#default_value' => $ljxp->host,
+    '#title' => t('Host'),
+    '#size' => 30,
+    '#description' => t('If you are using a LiveJournal-compliant site other than LiveJournal (like DeadJournal), enter the domain name here. LiveJournal users can use the default value'),
+    // hack -- inline style
+    // '#prefix' => '<div style="width: 49%; margin: 0 .5em 0 0; padding: 0; float: left;">'
+  );
+  $form['ljxp']['name'] = array(
+    '#type' => 'textfield',
+    '#default_value' => $ljxp->name,
+    '#title' => t('Username'),
+    '#size' => 20,
+    '#description' => t('Your username on LiveJournal'),
+  );
+  $form['ljxp']['pass'] = array(
+    '#type' => 'password',
+    '#title' => t('Password'),
+    '#size' => 15,
+    '#description' => t('Only enter a value if you wish to change the stored password. Leaving this field blank will not erase any passwords already stored.'),
+  );
+  $form['ljxp']['community'] = array(
+    '#type' => 'textfield',
+    '#default_value' => $ljxp->community,
+    '#title' => t('Community'),
+    '#size' => 20,
+    '#description' => t('If you wish your posts to be copied to a community, enter the community name here. Leaving this space blank will copy the posts to the specified user\'s journal instead'),
+  );
+  $form['ljxp']['site_name'] = array(
+    '#type' => 'textfield',
+    '#default_value' => $ljxp->site_name,
+    '#title' => t('Your site name'),
+    '#size' => 20,
+    '#description' => t('Enter the name of your blog to use in the cross-posting header; if blank the name of this site (@s) will be used. This field will only be used if you do not specify a custom header', array('@s' => variable_get('site_name', 'drupal'))),
+  );
+  $form['ljxp']['tags'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Tag posts with categories'),
+    '#default_value' => $ljxp->tags,
+    '#description' => t('Check this box to attempt to translate local categories to LiveJournal tags. This option may be troublesome if you use non-Roman characters, as LJ has trouble with that.'),
+    //'#suffix' => '</div>',
+  );
+  $form['ljxp']['privacy'] = array(
+    '#type' => 'radios',
+    '#title' => t('Livejournal posts will be'),
+    '#options' => array('public' => t('Public'), 'friends' => t('Friends only')),
+    '#default_value' => $ljxp->privacy,
+    //'#prefix' => '<div style="width: 49%; margin: 0 0 0 .5em; padding: 0; float: left;">'
+  );
+  $form['ljxp']['comments'] = array(
+    '#type' => 'radios',
+    '#title' => t('Comments'),
+    '#options' => array('1' => t('Allow comments on LiveJournal'), '0' => t('Require users to comment here')),
+    '#default_value' => $ljxp->comments,
+  );           
+  $form['ljxp']['post_type'] = array(
+    '#type' => 'radios',
+    '#title' => t('How to handle teasers'),
+    '#options' => array(
+      'teaser' => t('Post only the teaser'), 
+      'lj-cut' => t('Post the teaser with the rest behind a cut'),
+      'full post' => t('Post the entire post'),
+    ),
+    '#default_value' => $ljxp->post_type,
+    '#description' => t('If your posts do not have automatically generated teasers, the cut option may work improperly.'),
+  );
+  $form['ljxp']['cut_text'] = array(
+    '#type' => 'textfield',
+    '#default_value' => $ljxp->cut_text,
+    '#title' => t('Cut Text'),
+    '#size' => 50,
+    '#description' => t('If using an LJ cut, enter the text to use for the cut link'),
+    //'#suffix' => '</div>',
+  );
+  $form['ljxp']['default'] = array(
+    '#type' => 'value',
+    '#value' => (isset($ljxp->default)) ? $ljxp->default : FALSE,
+  );
+  $form['ljxp']['clear'] = array('#value' => '<br clear="left" />');
+  $form['ljxp']['custom_header'] = array(
+    '#type' => 'text_format',
+    '#title' => t('Custom header'),
+    '#default_value' => $ljxp->custom_header,
+    '#description' => t('This header will appear on cross-posted posts; if left blank, a default custom header will be put into place. You may use the following variables: %blog_name, %permalink, %comments_link.'),
+    '#format' => $ljxp->custom_header_format ? $ljxp->custom_header_format : NULL,
+  );
+}

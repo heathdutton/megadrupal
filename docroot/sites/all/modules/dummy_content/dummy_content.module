@@ -1,0 +1,1034 @@
+<?php
+
+define('DUMMY_CONTENT_PATH', drupal_get_path('module', 'dummy_content'));
+
+/*************************************************************
+        DRUPAL HOOKS
+*************************************************************/
+
+/**
+ * Implementation of hook_menu();
+ */
+function dummy_content_menu() {
+  $items['admin/config/dummy_content'] = array(
+    'page callback'     => 'drupal_get_form',
+    'page arguments'    => array('dummy_content_settings'),
+    'access arguments'  => array('administer site configuration'),
+    'title'             => 'Dummy Content Settings',
+  );
+  
+  return $items;
+}
+
+/**
+ * Implementation of hook_modules_enabled();
+ */
+function dummy_content_modules_enabled($modules) {
+  $batch = array(
+    'finished'    => '_dummy_content_batch_finished',
+    'operations'  => array(),  
+  );
+  
+  $fields = _dummy_content_field_data(); 
+  
+  // find dummy content implementations & process the data
+  foreach ($modules as $module) {
+    $settings = dummy_content_module_settings($module);
+    
+    if ($settings['create_on_enable']) {
+      $function = $module . '_dummy_content';
+      if (!function_exists($function)) {
+        continue;
+      }
+      
+      $content = $function();
+  
+      // validate & save the data
+      foreach ($content as $bundle => &$data) {
+        _dummy_content_validate_data_fields($data, $fields, $bundle);
+        
+        $batch['operations'][] = array(
+          '_dummy_content_add',
+          array(
+            'bundle'  => $bundle,
+            'module'  => $module,
+            'total'   => $data['count']['none'],
+            'data'    => $data, 
+            'fields'  => $fields, 
+          ),
+        );
+      }
+    }
+  }
+
+  if (!empty($batch['operations'])) {
+    batch_set($batch);
+    batch_process('admin/modules');
+  }
+}
+
+/**
+ * Implementation of hook_modules_disabled();
+ */
+function dummy_content_modules_disabled($modules) {
+  $fields = _dummy_content_field_data();  
+  
+  // find dummy content implementations & process the data
+  foreach ($modules as $module) {
+    $settings = dummy_content_module_settings($module);
+    
+    if ($settings['delete_on_disable']) {
+      $function = $module . '_dummy_content';
+      
+      if (!function_exists($function)) {
+        continue;
+      }
+      
+      $content = $function();
+      
+      $data = db_select('dummy_content', 'dc')
+                ->fields('dc', array('obj_id'))
+                ->condition('entity', 'node')
+                ->condition('module', $module)
+                ->execute();
+      
+      foreach ($data as $item) {
+        node_delete($item->obj_id);
+      }
+    }
+  }
+}
+ 
+/**
+ * Implementation of hook_node_insert();
+ */
+function dummy_content_node_insert($node) {
+  // log the dummy node
+  if (!empty($node->dummy_content)) {
+    db_insert('dummy_content')
+      ->fields(array(
+        'obj_id'  => $node->nid,
+        'entity'  => 'node', 
+        'bundle'  => $node->dummy_content['bundle'],
+        'module'  => $node->dummy_content['module'],
+      ))
+      ->execute();
+  }
+}
+
+/**
+ * Implementation of hook_node_load();
+ */
+function dummy_content_node_load($nodes, $types) {
+  $query = "SELECT obj_id, entity, bundle, module FROM {dummy_content} WHERE obj_id IN (:nids)";
+
+  $result = db_query($query, array(':nids' => array_keys($nodes)));
+  
+  foreach ($result as $obj) {
+    $nodes[$obj->obj_id]->dummy_content = (array) $obj;
+  }
+}
+
+/**
+ * Implementation of hook_node_delete();
+ */
+function dummy_content_node_delete($node) {
+  // delete taxonomy terms which are not associated with any other nodes  
+  $fields = _dummy_content_field_data();   
+  
+  if (!empty($fields['node'][$node->type])) {
+    foreach ($fields['node'][$node->type] as $field => $field_type) {
+      if ($field_type == 'taxonomy' && !empty($node->{$field}[LANGUAGE_NONE])) {
+        $tids = array();  
+          
+        foreach ($node->{$field}[LANGUAGE_NONE] as $term) {
+          $tids[] = $term['tid'];
+        }
+
+        // we need to figure out whether each term is associated with more than just the
+        // current node. if the term is only associated with the current node, we can 
+        // safely delete the term, too.
+        // 
+        // GROUP_CONCAT will return a string of nids associated with a term (ex. 156,234,923);
+        // INSTR will return the index of the first occurence of the substring (','); if the
+        // index is > 0, then we've got more than one node associated with the term
+        $query = "SELECT INSTR(GROUP_CONCAT(nid), ',') AS keep_term, tid FROM {taxonomy_index} WHERE tid IN (:tids) GROUP BY tid";
+        $result = db_query($query, array(':tids' => $tids));
+
+        foreach ($result as $obj) {
+          if (!$obj->keep_term) {
+            taxonomy_term_delete($obj->tid); 
+          }
+        }
+      }
+    }
+  }
+  
+  // delete record of this dummy node  
+  db_delete('dummy_content')
+    ->condition('obj_id', $node->nid)
+    ->condition('entity', 'node')
+    ->execute();
+}
+
+/**
+ * Implementation of hook_file_insert();
+ */
+function dummy_content_file_insert($file) {
+  // log the dummy file
+  if (!empty($file->dummy_content)) {
+    db_insert('dummy_content')
+      ->fields(array(
+        'obj_id'  => $file->fid,
+        'entity'  => 'media', 
+        'bundle'  => $file->dummy_content['bundle'],
+        'module'  => $file->dummy_content['module'],
+      ))
+      ->execute();
+  }
+}
+
+/**
+ * Implementation of hook_file_delete();
+ */
+function dummy_content_file_delete($file) {
+  db_delete('dummy_content')
+    ->condition('obj_id', $file->fid)
+    ->condition('entity', 'media')
+    ->condition('bundle', 'file')
+    ->execute();
+}
+ 
+/*************************************************************
+        MODULE HOOKS
+*************************************************************/
+
+/*************************************************************
+        CALLBACKS
+*************************************************************/
+
+/*************************************************************
+        FORMS
+*************************************************************/
+
+/**
+ * Callback for /admin/config/dummy_content;
+ */
+function dummy_content_settings() {
+  $form = array();
+
+  $form['#attached'] = array(
+    'css' => array(
+       'type' => 'file',
+       'data' => DUMMY_CONTENT_PATH . '/css/dummy_content.css', 
+     ),  
+  );
+
+  $form['manage'] = array(
+    '#description'  => t('Manage dummy content.'),
+    '#title'        => t('Manage Content'),
+    '#type'         => 'fieldset',  
+  );
+
+  $form['manage']['dc'] = array(
+    '#type'     => 'tableform',
+    '#header'   => array(
+      t('Module'),
+      t('Bundle'),
+      t('Fields provided'),
+      t('Existing Dummy Nodes'),
+      t('Actions'),
+      t('Add New'),
+    ),
+  );
+  
+  foreach (module_implements('dummy_content') as $module) {
+    $function = $module.'_dummy_content';
+    
+    $content = $function();
+    
+    foreach ($content as $bundle => $data) {
+      $result = db_select('dummy_content', 'dc')
+                ->fields('dc')
+                ->condition('entity', 'node')
+                ->condition('bundle', $bundle)
+                ->condition('module', $module)
+                ->countQuery()
+                ->execute()
+                ->fetchAssoc();
+
+      $name = node_type_get_name($bundle);
+
+      $fields = array(
+        t('Title'),
+      );
+        
+      foreach (array_keys($data['fields']) as $field_name) {
+        foreach (field_read_instances() as $field) {
+          if ($field['bundle'] == $bundle && $field['field_name'] == $field_name) {
+            $fields[] = $field['label'];
+          }
+        }
+      }  
+
+      $form['manage']['dc']['#options'][] = array(
+        $module,
+        $name,
+        theme('item_list', array('items' => $fields)),
+        $result['expression'],
+        'dummy_content___' . $bundle . '___' . $module . '___container' => array(
+          'dummy_content___' . $bundle . '___' . $module . '___remove' => array(
+            '#type'           => 'checkbox',
+            '#title'          => t('Remove existing dummy nodes.'),  
+          ),
+        ),
+        'dummy_content___' . $bundle . '___' . $module . '___add' => array(
+          '#type'           => 'textfield',
+          '#title'          => t('Quantity'),
+          '#title_display'  => 'invisible',
+          '#size'           => 20,
+          '#description'    => t('The number of %bundle nodes you\'d like to add.', array('%bundle' => $name)),  
+        ),
+      );
+    }
+  }
+  
+  $form['submit'] = array(
+    '#type'     => 'submit',
+    '#value'    => t('Submit'),
+  );
+  
+  return $form;
+}
+
+/**
+ * Validate handler for dummy_content_settings();
+ */
+function dummy_content_settings_validate($form, &$form_state) {
+ foreach ($form_state['values'] as $key => $value) {
+  if ($value && preg_match('/^dummy_content___(.+)___(.+)___(.+)/', $key, $matches)) {
+    $op = array_pop($matches);
+    
+    // make sure that quantity fields are numeric
+    if ($op == 'add' && !is_numeric($value)) {
+      form_set_error(array_shift($matches), t('Quantity must be an integer!'));
+    }
+  }
+ }
+}
+
+/**
+ * Submit handler for dummy_content_settings();
+ */
+function dummy_content_settings_submit($form, &$form_state) {
+  // we can use a single batch process with multiple operations
+    $batch = array(
+      'finished'    => '_dummy_content_batch_finished',
+      'operations'  => array(),
+    );  
+  
+  // build batch data    
+    foreach ($form_state['values'] as $key => $value) {
+      if ($value && preg_match('/^dummy_content___(.+)___(.+)___(.+)/', $key, $matches)) {
+        // extract relevant data from field name
+          array_shift($matches);
+          list($bundle, $module, $op) = $matches;
+          
+          if (!isset($batch['title'])) {
+            $batch['title'] = t('Processing dummy %bundle nodes.', array('%bundle' => node_type_get_name($bundle)));
+          }
+          
+          $args = array(
+            'bundle'  => $bundle,
+            'module'  => $module,
+          );
+          
+        // figure out what operation we're performing
+          switch ($op) {
+            case 'add':
+              $function = $module . '_dummy_content';
+              
+              static $cache;
+              
+              if (!isset($cache[$function])) {
+                if (!function_exists($function)) {
+                  continue;
+                }
+                
+                $cache[$function] = $function();
+              }
+              
+              // cast the value as an integer, because floats can get through validation
+              $args['total']  = (int) $value;
+              $args['data']   = $cache[$function][$bundle];
+              $args['fields'] = _dummy_content_field_data();
+
+              $batch['operations'][] = array('_dummy_content_add', $args);
+  
+              break;
+  
+            case 'remove':
+              $result = db_select('dummy_content', 'dc')
+                        ->fields('dc')
+                        ->condition('entity', 'node')
+                        ->condition('bundle', $bundle)
+                        ->condition('module', $module)
+                        ->countQuery()
+                        ->execute()
+                        ->fetchAssoc();
+              
+              $args['total'] = $result['expression'];
+                        
+              $batch['operations'][] = array('_dummy_content_remove', $args);
+
+              break;
+          }
+      }
+    }
+
+  // check for added operations, do basic validation, run batch
+    if (!empty($batch['operations'])) {
+      //make sure batch functions exist
+        $error = FALSE;
+        
+        $funcs = array(
+          $batch['finished'],  
+        );
+        
+        foreach ($batch['operations'] as $operation) {
+          $funcs[] = $operation[0];
+        }
+        
+        foreach($funcs as $func) {
+          if(!function_exists($func)) {
+            $error = TRUE;
+            drupal_set_message(t('Batch function %func does not exist; aborting.', array('%func' => $func)), 'error');
+          }
+        }
+        
+      //trigger batch or error out
+        if (!$error) {
+          batch_set($batch);
+        }
+        else {
+          return FALSE; 
+        }
+    }
+}
+
+/************************************************************
+          BATCHES
+************************************************************/
+
+/**
+ * Generic batch initialization & setup;
+ */
+function _dummy_content_batch_init($total, &$context)
+{
+  //general setup
+    global $user;
+    set_time_limit(0);
+            
+    if(empty($context['sandbox'])) {
+      $context['sandbox']['count']  = 0;
+      $context['sandbox']['last_id'] = 0;
+    }
+  
+  //per-batch limits
+    //keep low to avoid memory issues;
+    $limit = 5;
+    
+    if($limit > $total) {
+      $limit = $total;
+    }
+  
+    $min = $context['sandbox']['count'];
+    $max = $min + $limit;
+  
+    if($max > $total) {
+      $max = $total;
+    }
+
+    return array($user, $min, $max, $limit);
+}
+
+/**
+ * Batch iteration wrap-up operations;
+ */
+function _dummy_content_batch_end(&$context, $found, $total)
+{
+  //update the batch progress
+    if(!$found) {
+      $context['finished'] = 1;
+    }
+    else {
+      $context['finished'] = $context['sandbox']['count'] / $total;
+    }
+}
+
+/**
+ * Batch completion notifier.
+ */
+function _dummy_content_batch_finished($success, $results, $operations)
+{
+  if($success) {
+    drupal_set_message(t('Batch operations successfully completed.'));
+  }
+  else {
+    drupal_set_message(t('An error has occurred during the batch process.'));
+  }
+}
+
+/**
+ * Creates dummy nodes.
+ */
+function _dummy_content_add($bundle, $module, $total, $data, $fields, &$context)
+{
+  list($user, $min, $max, $limit) = _dummy_content_batch_init($total, $context);
+  
+  // update status message
+    $context['message'] = t('Creating nodes @min - @max of @total', array('@min' => $min, '@max' => $max, '@total' => $total));
+          
+  // process the content
+    $continue = FALSE;   
+
+  // node-related data
+    static $fields_info = array();
+
+  // process the actual data
+    // at this point the fields are validated, so we can go ahead and create the nodes;
+    // invalid fields get removed during validation above, so we must make sure we still
+    // have data to work with;
+    if (!empty($data['fields'])) {
+      $content_data = array();
+      $images_exist = FALSE;
+      $images_alerted = FALSE;
+      $c_function = $module . '_dummy_content_data';
+      
+      // check for an implementation of hook_dummy_content_data();
+      if (function_exists($c_function)) {
+        $content_data = $c_function();
+        
+        // check for images
+        if (!empty($content_data['images'])) {
+          foreach ($content_data['images'] as $category => $paths) {
+            // handle single-string cases
+            if (!is_array($paths)) {
+              $paths = array($paths);
+            }
+            
+            foreach($paths as $path) {
+              if (!class_exists('dcImage')) {
+                require_once('includes/class.dcimage.inc');
+              }
+
+              foreach (file_scan_directory('./' . $path, dcImage::mask) as $file) {
+                $images_exist = TRUE;
+                break;
+              }
+            }
+            
+            if ($images_exist) {
+              break;
+            }
+          }
+        }
+      }
+
+      if (!empty($data['comments']) && $data['comments'] && !$comment_enabled = module_exists('comment')) {
+        drupal_set_message(t('Cannot generate comments because the %comment module is disabled.', array('%comment' => t('Comment'))), 'warning');
+      }
+      
+      for ($i = $min; $i < $max; $i++) {
+        $continue = TRUE;
+        
+        $node = new stdClass();
+        $node->type = $bundle;
+        node_object_prepare($node);
+        
+        if ($data['comments']) {
+          $node->comment = 1;
+        }
+        
+        $node->language = LANGUAGE_NONE;
+        
+        $node->dummy_content = array(
+          'bundle'  => $bundle,
+          'module'  => $module,
+        );
+        
+        // the title field is special, so we set it manually
+          $node->title = dummy_content_content('text', array('subject' => $data['subject'], 'length' => mt_rand(2, 7) . ' words'), $content_data);
+          // make sure the client module didn't also set it
+          unset($data['fields']['title']);
+        
+        // generate content for the client module's fields
+          foreach ($data['fields'] as $field => $quan) {
+            // make sure we've got a valid field quantity
+              // if $quantity is an array, then we're expecting a range in
+              // which we're supposed to pick a random number
+              if (is_array($quan) && sizeof($quan) == 2) {
+                list($minimum, $maximum) = $quan;
+                $quan = mt_rand($minimum, $maximum);
+              }
+              // if the client is requesting an "unlimited" number of values,
+              // we choose a random number between 1 and 5
+              elseif ($quan == -1) {
+                $quan = mt_rand(1, 5);
+              }
+              // if no valid data is provided, default to 1
+              elseif (empty($quan) || !is_numeric($quan) || $quan < 1) {
+                $quan = 1;
+              }
+            
+            // load complete field info  
+              if (!isset($fields_info[$bundle][$field])) {
+                $fields_info[$bundle][$field] = field_info_field($field);
+              }
+            
+            // figure out how many instances of this field we'll want to fill in
+              // convert unlimited quantity fields to a max of 5
+              if ($fields_info[$bundle][$field]['cardinality'] == -1) {
+                $fields_info[$bundle][$field]['cardinality'] = 5;
+              }
+              
+              if ($fields_info[$bundle][$field]['cardinality'] < $quan) {
+                $quan = $fields_info[$bundle][$field]['cardinality'];
+              }
+        
+            // generate the content
+              $field_options = array();
+              $field_value_name = '';
+                  
+              for ($j = 0; $j < $quan; $j++) {
+                switch ($fields['node'][$bundle][$field]) {
+                  case 'textfield':
+                    $field_content = dummy_content_content('text', array('subject' => $data['subject'], 'length' => mt_rand(3, 7) . ' words'), $content_data);
+                
+                    // last check for field settings; trim the data if it's beyond the max length
+                    if (!empty($fields_info[$bundle][$field]['settings']['max_length'])) {
+                      $field_content = substr($field_content, 0, $fields_info[$bundle][$field]['settings']['max_length']);
+                    }
+                
+                    // populate the field
+                    $node->{$field}[$node->language][$j] = array(
+                      'value'   => $field_content,
+                      'summary' => text_summary($field_content),
+                      'format'  => 'filtered_html',
+                    );
+                
+                    break;
+                    
+                  case 'textarea':
+                    $field_content = dummy_content_content('text', array('subject' => $data['subject'], 'length' => mt_rand(1, 3) . ' paragraphs'), $content_data);
+
+                    // last check for field settings; trim the data if it's beyond the max length
+                    if (!empty($fields_info[$bundle][$field]['settings']['max_length'])) {
+                      $field_content = substr($field_content, 0, $fields_info[$bundle][$field]['settings']['max_length']);
+                    }
+
+                    // populate the field
+                    $node->{$field}[$node->language][$j] = array(
+                      'value'   => $field_content,
+                      'summary' => text_summary($field_content),
+                      'format'  => 'filtered_html',
+                    );
+                    
+                    break;
+                  
+                  case 'file':
+                    if ($file = dummy_content_content('file', array('module' => $module), $content_data)) {
+                      $node->{$field}[$node->language][$j] = (array) $file;
+                    }
+                    
+                    break;
+                    
+                  case 'image':
+                  case 'media':
+                    if ($images_exist) {                        
+                      if ($file = dummy_content_content('image', array('module' => $module), $content_data)) {
+                        $node->{$field}[$node->language][$j] = (array) $file;
+                      }
+                    }
+                    elseif (!$images_alerted) {
+                      drupal_set_message(t('Cannot generate images because no image files have been found! Implement %hook to specify image locations.', array('%hook' => 'hook_dummy_content_data()')), 'warning');
+                      
+                      $images_alerted = TRUE;
+                    }
+                    
+                    break;
+                  
+                  case 'taxonomy':
+                    $node->{$field}[$node->language][$j] = (array) dummy_content_content('term', array('module' => $module, 'subject' => $data['subject'], 'vocabulary' => $fields_info[$bundle][$field]['settings']['allowed_values'][0]['vocabulary']), $content_data);
+                  
+                    break;
+
+                  case 'select':
+                  case 'buttons':
+                    if (!isset($field_options[$bundle][$field]) && empty($field_options[$bundle][$field])) {
+                      $field_options[$bundle][$field] = $fields_info[$bundle][$field]['settings']['allowed_values'];
+                      
+                      $options = &$field_options[$bundle][$field];
+                    
+                      // taxonomy
+                      if (isset($options[0]) && is_array($options[0]) && isset($options[0]['vocabulary'])) {
+                        $vocabs = _dummy_content_static_vocabs();
+                        $tree = taxonomy_get_tree($vocabs[$options[0]['vocabulary']]->vid);
+                        
+                        $options = array();
+                        foreach ($tree as $term) {
+                          $options[$term->tid] = $term->name;
+                        }
+                        
+                        $field_value_name = 'tid';
+                      }
+                      // regular select fields
+                      else {
+                        $field_value_name = 'value';
+                      }
+
+                      $options = array_keys($options);
+                      
+                      if ($quan > ($size = sizeof($options))) {
+                        $quan = $size;
+                      }
+                    }
+
+                    if (!empty($field_options[$bundle][$field])) {
+                      $node->{$field}[$node->language][$j] = (array) dummy_content_content('select', array('module' => $module, 'options' => $field_options[$bundle][$field], 'value_name' => $field_value_name), $content_data);
+                    
+                      // remove the chosen item from the list of options to make sure we don't select it again
+                      unset($field_options[$bundle][$field][array_search($node->{$field}[$node->language][$j][$field_value_name], $field_options[$bundle][$field])]);
+
+                      //fix array keys
+                      $field_options[$bundle][$field] = array_merge($field_options[$bundle][$field]);
+                    }
+                    
+                    break;
+                    
+                  case 'date':
+                    
+                    $node->{$field}[$node->language][$j] = (array) dummy_content_content('date', array('module' => $module,), $content_data);
+                    
+                    break;
+                }
+              }  
+          }
+
+        node_save($node);
+        
+        // generate comments
+          if (!empty($data['comments']) && $data['comments'] && !empty($node->nid) && $comment_enabled) {
+            $count = mt_rand(1, 10);
+            
+            for ($c = 0; $c <= $count; $c++) {
+              $comment = (object) array(
+                'nid' => $node->nid,
+                'cid' => 0,
+                'pid' => 0,
+                'uid' => 1,
+                'mail' => '',
+                'is_anonymous' => 0,
+                'homepage' => '',
+                'status' => COMMENT_PUBLISHED,
+                'subject' => truncate_utf8(dummy_content_content('text', array('length' => mt_rand(1, 5) . ' words', 'subject' => $data['subject']), $content_data), 64, TRUE),
+                'language' => LANGUAGE_NONE,
+                'comment_body' => array(
+                  LANGUAGE_NONE => array(
+                    0 => array (
+                      'value' => dummy_content_content('text', array('length' => mt_rand(1, 5) . ' sentences'), $content_data),
+                      'format' => 'filtered_html'
+                    )
+                  )
+                ),
+              );
+              
+              comment_submit($comment);
+              comment_save($comment);
+            }
+          }
+      
+      // track data for next batch iteration
+        $context['sandbox']['count']++;
+        $context['sandbox']['last_id'] = $i;
+      }
+    }
+  
+  //wrap up
+    _dummy_content_batch_end($context, $continue, $total);
+  
+  return;
+}
+
+/**
+ * Removes dummy nodes.
+ */
+function _dummy_content_remove($bundle, $module, $total, &$context)
+{
+  list($user, $min, $max, $limit) = _dummy_content_batch_init($total, $context);
+  
+  // update status message
+    $context['message'] = t('Deleting nodes @min - @max of @total', array('@min' => $min, '@max' => $max, '@total' => $total));
+  
+    $query =  " SELECT    obj_id AS nid
+                FROM      {dummy_content}
+                WHERE     entity = 'node'
+                AND       bundle = :bundle
+                AND       module = :module
+              ";
+
+    $result = db_query_range($query, $context['sandbox']['last_id'], $limit, array(':bundle' => $bundle, ':module' => $module));
+        
+  // process the content
+    $found = FALSE;   
+    foreach ($result as $row) {
+      $found = TRUE;
+  
+      node_delete($row->nid);
+  
+      // track data for next batch iteration
+        $context['sandbox']['count']++;
+        $context['sandbox']['last_id'] = $row->id;
+    }
+  
+  _dummy_content_batch_end($context, $found, $total);
+  
+  return;
+}
+
+/*************************************************************
+        HELPERS / API
+*************************************************************/
+
+/**
+ * Main entry point for generating dummy content;
+ */
+function dummy_content_content($type, $options = array(), $content_data = array()) {
+  require_once(DUMMY_CONTENT_PATH.'/includes/interface.dccontent.inc');
+  require_once(DUMMY_CONTENT_PATH.'/includes/class.dcbase.inc');
+  
+  // figure out what subject we're generating content for
+  if (!empty($options['subject'])) {
+    $subject = $options['subject'];
+  }
+  else {
+    $subject = 'random';
+  }
+  
+  switch ($type) {
+    case 'text':
+      if (!empty($options['length'])) {
+        require_once(DUMMY_CONTENT_PATH.'/includes/class.dctext.inc');
+
+        $content = new dcText($subject, array(), $content_data);
+        
+        $output = '';
+        
+        if (preg_match('/([0-9]*)\s*word/', $options['length'], $matches)) {
+          $output = $content->generate($matches[1], array('type' => 'word')); 
+        }
+        elseif (preg_match('/([0-9]*)\s*sentence/', $options['length'], $matches)) {
+          $output = $content->generate($matches[1], array('type' => 'sentence'));  
+        }
+        elseif (preg_match('/([0-9]*)\s*paragraph/', $options['length'], $matches)) {
+          $output = $content->generate($matches[1], array('type' => 'paragraph'));
+        }
+        
+        return $output;
+      }
+    
+      break;
+    
+    case 'file':
+      require_once(DUMMY_CONTENT_PATH.'/includes/class.dcfile.inc');
+      
+      $content = new dcFile($subject, $options, $content_data);
+      
+      $quantity = isset($options['quantity']) ? $options['quantity'] : 1;
+      
+      return $content->generate($quantity, array('delete' => TRUE));
+      
+      break;
+      
+    case 'image':
+      require_once(DUMMY_CONTENT_PATH.'/includes/class.dcimage.inc');
+      
+      $options['type'] = $type;
+      
+      $content = new dcImage($subject, $options, $content_data);
+      
+      $quantity = isset($options['quantity']) ? $options['quantity'] : 1;
+
+      return $content->generate($quantity);
+      
+      break;
+    
+    case 'term':
+      require_once(DUMMY_CONTENT_PATH.'/includes/class.dctext.inc');
+      
+      $content = new dcText($subject, array(), $content_data);
+      
+      $vocabs = _dummy_content_static_vocabs();
+      
+      $term = new stdClass();
+      $term->vid = $vocabs[$options['vocabulary']]->vid;
+      $term->tid = 'autocreate';
+      $term->name = strtolower($content->generate(mt_rand(1, 2), array('type' => 'word')));
+      $term->vocabulary_machine_name = $vocabs[$options['vocabulary']]->machine_name;
+
+      return $term;
+      
+      break;
+    
+    case 'select':
+      require_once(DUMMY_CONTENT_PATH.'/includes/class.dcselect.inc');
+      
+      $content = new dcSelect($subject, $options, $content_data);
+      
+      $quantity = isset($options['quantity']) ? $options['quantity'] : 1;
+      
+      return $content->generate($quantity);
+    
+      break;
+    
+    case 'date':
+      require_once(DUMMY_CONTENT_PATH.'/includes/class.dcdate.inc');
+      
+      $content = new dcDate($subject, $options, $content_data);
+      
+      $quantity = isset($options['quantity']) ? $options['quantity'] : 1;
+      
+      return $content->generate($quantity);
+    
+      break;
+      
+    default:
+      break;
+  }
+  
+  return FALSE;
+}
+
+/**
+ * Returns an array of default settings.
+ */
+function dummy_content_default_settings() {
+  $settings = array(
+    // should dummy content be created when the module is enabled?
+    'create_on_enable'  => TRUE,
+    // should dummy content be deleted when the module is disabled?
+    'delete_on_disable' => TRUE,  
+  );
+  
+  return $settings;
+}
+
+/**
+ * Returns an array of settings for the specified module.
+ */
+function dummy_content_module_settings($module) {
+  // get default settings  
+  $settings = dummy_content_default_settings();
+
+  // check for module-defined settings
+  $s_function = $module . '_dummy_content_settings';
+  if (function_exists($s_function)) {
+    // module's settings will overwrite defaults
+    $settings = array_merge($settings, $s_function());
+  }
+
+  return $settings;
+}
+
+/*************************************************************
+        INTERNAL
+*************************************************************/
+
+/**
+ * Returns an array of all available entities, their bundles and the available fields & their types.
+ */
+function _dummy_content_field_data() {
+  static $fields;
+  
+  if (empty($fields)) {
+    // build the fields
+    foreach (field_read_instances() as $field) {
+      if (!empty($field['widget']['type'])) {
+        // clean up/standardize field types so that they match the FAPI
+          // turn text_textfield and text_textarea into textfield and textarea, respectively
+          if (preg_match('/^text_(.*)/', $field['widget']['type'], $matches)) {
+            $field['widget']['type'] = $matches[1];
+          }
+          
+          // get rid of random text
+          $field['widget']['type'] = preg_replace('/_(with_summary|autocomplete|image|generic|text)/', '', $field['widget']['type']);
+          $field['widget']['type'] = preg_replace('/(options)_/', '', $field['widget']['type']);
+        
+        // save the field type
+          $fields[$field['entity_type']][$field['bundle']][$field['field_name']] = $field['widget']['type'];
+      }
+    }
+    
+    // title fields are not part of the "regular" fields, so we need to add them manually to
+    // all content types
+    if (!empty($fields['node'])) {
+      foreach ($fields['node'] as &$type) {
+        $type['title'] = 'textfield';
+      }
+    }
+  }
+
+  return $fields;
+}
+
+/**
+ * Returns an array of defined vocabularies.
+ */
+function _dummy_content_static_vocabs() {
+  static $vocabs;
+  if (empty($vocabs)) {
+    $vocabs = taxonomy_vocabulary_get_names();
+  }
+  
+  return $vocabs;
+}
+
+function _dummy_content_validate_data_fields(&$data, $fields, $bundle) {
+  if (!empty($data['fields'])) {
+    // validate the data
+    foreach ($data['fields'] as $field => &$quantity) {
+      // make sure the requested field actually exists within the bundle  
+        if (!isset($fields['node'][$bundle][$field])) {
+          unset($data['fields'][$field]);  
+            
+          drupal_set_message( t('Field %field does not exist within the %bundle bundle, and as such,
+                                 cannot be populated with content.',
+                                 array('%field'  => $field,'%bundle' => $bundle)),
+                                 'warning');
+          
+          continue;
+        }
+    }
+  }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

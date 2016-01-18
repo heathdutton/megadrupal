@@ -1,0 +1,236 @@
+<?php
+
+/**
+ * @file
+ * Synchronize user subscriptions based on user roles membership.
+ *
+ * Each newsletter consists of a list of roles to automatically subscribe/unsubscribe.
+ */
+
+/**
+ * Implements hook_help().
+ */
+function simplenews_roles_help($path, $arg) {
+  switch ($path) {
+    case 'admin/help#simplenews_roles':
+      return '<p>' . t('Simplenews roles keeps subscriptions to particular newsletters synchronized with one or more roles. Enable roles in the options for <a href="@newsletters">each newsletter</a>.', array('@newsletters' => url('admin/content/simplenews/types'))) . '</p>';
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * Add our settings to the newsletter add/edit settings page.
+ */
+function simplenews_roles_form_simplenews_admin_category_form_alter(&$form, $form_state) {
+  $role_newsletters = variable_get('simplenews_roles_tids_rids', array());
+  $auto_remove = variable_get('simplenews_roles_auto_remove', array());
+
+  $form['simplenews_roles'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Role synchronization'),
+    '#collapsible' => FALSE,
+    '#description' => t('This newsletter subscription list will consist of only users in the selected roles. This newsletter subscription is automatically syncronized so any users manually added to this list will be removed if they are not in any of the selected roles. If you want to change this behavior, turn off the auto remove checkbox at the bottom of the list.'),
+  );
+  $form['simplenews_roles']['roles'] = array(
+    '#type' => 'checkboxes',
+    '#title' => t('Automatically subscribe users in the following roles to this newsletter'),
+    '#options' => user_roles(TRUE),
+    '#default_value' => isset($role_newsletters[$form['tid']['#value']]) ? $role_newsletters[$form['tid']['#value']] : array(),
+  );
+  $form['simplenews_roles']['auto_remove'] = array(
+    '#type' => 'checkbox',
+    '#title' => 'Auto remove',
+    '#default_value' => isset($auto_remove[$form['tid']['#value']]) ? $auto_remove[$form['tid']['#value']] : 1,
+  );
+
+  $form['#submit'][] = 'simplenews_roles_newsletter_submit';
+}
+
+/**
+ * Forms API callback; additional submit handler for newsletter form.
+ *
+ * Every submit leads to a resync.
+ */
+function simplenews_roles_newsletter_submit($form, &$form_state) {
+  $tid = $form_state['values']['tid'];
+  $roleids = array_values(array_filter($form_state['values']['roles']));
+
+  // Save auto remove settings
+  $auto_remove = variable_get('simplenews_roles_auto_remove', array());
+  $auto_remove[$tid] = $form_state['values']['auto_remove'];
+  variable_set('simplenews_roles_auto_remove', $auto_remove);
+
+  // Update subscriptions
+  $role_newsletters = variable_get('simplenews_roles_tids_rids', array());
+  $resync = variable_get('simpelnews_roles_resync', array());
+  if (count($roleids) > 0) {
+    if (!isset($role_newsletters[$tid]) || $role_newsletters[$tid] <> $roleids) {
+      // Sync selection changed. Trigger resync once.
+      $role_newsletters[$tid] = $roleids;
+      $sync_done = simplenews_roles_update_subscriptions($tid, $roleids);
+      if (!$sync_done) {
+        // Incomplete, continue resync via cron.
+        $resync[$tid] = $roleids;
+      }
+    }
+  }
+  else {
+    if (isset($role_newsletters[$tid])) {
+      // Previously synced. Unsubscribe only if needed
+      if (!isset($auto_remove[$tid]) || $auto_remove[$tid]) {
+        // @todo: This can be heavy operation to a large numbers of rows. Try to optimize.
+        // Unsubscribe all users from $tid category
+        // @todo Possibly only unsubscribe auto subscribed users?
+        db_update('simplenews_subscription')
+          ->fields(array('status' => 0))
+          ->condition('tid', $tid)
+          ->execute();
+      }
+    }
+    // Remove orphans
+    unset($role_newsletters[$tid]);
+    unset($resync[$tid]);
+  }
+
+  variable_set('simplenews_roles_tids_rids', $role_newsletters);
+  variable_set('simpelnews_roles_resync', $resync);
+}
+
+/**
+ * Implements hook_user_insert().
+ */
+function simplenews_roles_user_insert(&$edit, $account, $category) {
+  $roles = array_keys($account->roles);
+
+  foreach (variable_get('simplenews_roles_tids_rids', array()) as $tid => $rids) {
+    if (count(array_intersect($rids, $roles)) > 0) {
+      // If the user has role that matches the current subscription, subscribe.
+      simplenews_subscribe_user($account->mail, $tid, FALSE, 'simplenews_roles');
+    }
+  }
+}
+
+/**
+ * Implements hook_user_update().
+ *
+ * Check synchronized lists depending on users roles.
+ * @todo If a site contains many newsletters this adds currently too much weight to a user_update.
+ */
+function simplenews_roles_user_update(&$edit, $account, $category) {
+  $roles = array_keys($account->roles);
+
+  foreach (variable_get('simplenews_roles_tids_rids', array()) as $tid => $rids) {
+    if (count(array_intersect($rids, $roles)) > 0) {
+      // If the user has one or more roles that matches the current subscription, subscribe.
+      simplenews_subscribe_user($account->mail, $tid, FALSE, 'simplenews_roles');
+    }
+    else {
+      // If the user has no role that matches the current subscription, unsubscribe.
+      simplenews_unsubscribe_user($account->mail, $tid, FALSE);
+    }
+  }
+}
+
+/**
+ * API function
+ *
+ * A function that synchronizes users and newsletter categories according to user roles.
+ */
+function simplenews_roles_update_subscriptions($tid, $rids = array()) {
+  $sync_done = TRUE;
+
+  if (is_array($rids) && !empty($rids)) {
+    if (!in_array(DRUPAL_AUTHENTICATED_RID, $rids)) {
+      $db_or = db_or();
+      foreach ($rids as $rid) {
+        $db_or->condition('ur.rid', $rid);
+      }
+
+      // Unsubscribe query
+      $auto_remove = variable_get('simplenews_roles_auto_remove', array());
+      if (!isset($auto_remove[$tid]) || $auto_remove[$tid]) {
+
+        // Define how many items to unsubscribe per each cron.
+        $unsubscribe_limit = variable_get('simplenews_roles_unsubscribe_limit', 1000);
+
+        $subquery = db_select('users', 'u');
+        $subquery->fields('u', array('uid'));
+        $subquery->leftJoin('users_roles', 'ur', 'ur.uid = u.uid');
+        $subquery->condition($db_or);
+
+        $query = db_select('simplenews_subscriber', 'subscriber');
+        $query->fields('subscriber', array('mail'));
+        $query->leftJoin('simplenews_subscription', 'subscription', 'subscriber.snid = subscription.snid');
+        $query->condition('subscription.tid', $tid);
+        $query->condition('subscription.status', SIMPLENEWS_SUBSCRIPTION_ACTIVE);
+        $query->condition('subscriber.uid', $subquery, 'NOT IN');
+        $query->range(0, $unsubscribe_limit);
+        $unsubscribe = $query->execute();
+
+        $i = 1;
+        foreach ($unsubscribe as $account) {
+          simplenews_unsubscribe_user($account->mail, $tid, FALSE, 'simplenews_roles');
+          $i++;
+        }
+
+        if ($i > $unsubscribe_limit) {
+          $sync_done = FALSE;
+        }
+      }
+    }
+
+    // Define how many items to subscribe per each cron.
+    $subscribe_limit = variable_get('simplenews_roles_subscribe_limit', 1000);
+
+    // Build subscribe query
+    $subquery = db_select('simplenews_subscriber', 'subscriber');
+    $subquery->fields('subscriber', array('uid'));
+    $subquery->leftJoin('simplenews_subscription', 'subscription', 'subscriber.snid = subscription.snid');
+    $subquery->condition('subscription.tid', $tid);
+    $subquery->condition('subscription.status', SIMPLENEWS_SUBSCRIPTION_ACTIVE);
+
+    $query = db_select('users', 'u');
+    $query->fields('u', array('mail'));
+    $query->leftJoin('users_roles', 'ur', 'ur.uid = u.uid');
+
+    if (isset($db_or)) {
+      $query->condition($db_or);
+    }
+
+    $query->condition('u.uid', 0, '>');
+    $query->condition('u.uid', $subquery, 'NOT IN');
+    $query->range(0, $subscribe_limit);
+    $subscribe = $query->execute();
+
+    // Users to subscribe
+    $i = 1;
+    foreach ($subscribe as $account) {
+      simplenews_subscribe_user($account->mail, $tid, FALSE, 'simplenews_roles');
+      $i++;
+    }
+
+    if ($i > $subscribe_limit) {
+      $sync_done = FALSE;
+    }
+  }
+
+  return $sync_done;
+}
+
+/**
+ * Implements hook_cron().
+ */
+function simplenews_roles_cron() {
+  // Check if we need to resync anything.
+  $resync = variable_get('simpelnews_roles_resync', array());
+  if (!empty($resync)) {
+    $tid = key($resync);
+
+    $sync_done = simplenews_roles_update_subscriptions($tid, $resync[$tid]);
+    if ($sync_done) {
+      unset($resync[$tid]);
+      variable_set('simpelnews_roles_resync', $resync);
+    }
+  }
+}

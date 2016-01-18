@@ -1,0 +1,435 @@
+<?php
+/**
+ * @file
+ * Module for purging Varnish caches. Requires cache_control
+ *
+ * TODO look whether this module can be ditched (at least the horrid admin interface) and use varnish or purge module instead
+ *
+ * That's pretty unlikely. At least as of 2011-08-19, the module does purging
+ * that's very specific to the way Cache Control works re: session specific
+ * cacheable URLs and purging them. -Erno
+ *
+
+ */
+
+/**
+ * Implements hook_menu().
+ */
+function cache_control_purge_menu() {
+  $items = array();
+
+  $items['admin/config/development/cache_control/manual_purge'] = array(
+    'title' => 'Manual cache purge',
+    'description' => 'Allows you to manually purge a path from the cache',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('cache_control_purge_manual_purge'),
+    'access arguments' => array('administer site configuration'),
+    'type' => MENU_LOCAL_TASK,
+    'weight' => 15,
+  );
+
+  return $items;
+}
+
+/**
+ * Notifies other modules of content updates that may potentially invalidate some cached pages.
+ *
+ * For example if a node is updated, a listing that displays the node teaser may become out of date (the path to the node itself is purged automatically)
+ *
+ * Any implementation of the hook should take in two arguments:
+ *
+ * @param string $op one of the following (notice the correspondence to hook_nodeapi(), hook_comment() and hook_user()):
+ *          'node update'
+ *          'node delete'
+ *          'node insert'
+ *          'comment update'
+ *          'comment insert'
+ *          'comment delete'
+ *          'user update'
+ *
+ * @param mixed $content Whatever was passed to corresponding hook:
+ *              node object for node operations,
+ *              comment object for comment operations,
+ *              or user object for user operations
+ *
+ * @return bool Your implmentation may return FALSE if you wish to prevent default purge actions.
+ *              (By default, node paths are purged on node insert/update/delete and comment insert/update/delete)
+ */
+function hook_cache_control_purge() {
+  //Example implementation: refresh og group page
+  if ($op == 'node update' || $op == 'node delete' || $op == 'node insert') {
+    if (module_exists('og') && ($group = og_get_group_context())) {
+      $path = drupal_get_path_alias('node/' . $group->nid);
+      cache_control_purge_purge_path($path);
+    }
+  }
+}
+
+/**
+ * Implements hook_node_update().
+ */
+function cache_control_purge_node_update($node) {
+  _cache_control_purge_purge_node($node, 'update');
+}
+
+/**
+ * Implements hook_node_delete().
+ */
+function cache_control_purge_node_delete($node) {
+  _cache_control_purge_purge_node($node, 'delete');
+}
+
+/**
+ * Implements hook_node_delete().
+ */
+function cache_control_purge_node_insert($node) {
+  _cache_control_purge_purge_node($node, 'insert');
+}
+
+/**
+ * Purges the path of an individual node.
+ *
+ * @param object $node Node whose path is being purged
+ * @param string $op The operation being performed on the node
+ */
+function _cache_control_purge_purge_node($node, $op) {
+  if (!variable_get('cache_control_enabled', FALSE)) {
+    return;
+  }
+
+  if (_cache_control_purge_invoke("node $op", $node)) {
+    $language = isset($node->language) ? $node->language :  NULL;
+    $path = drupal_get_path_alias('node/' . $node->nid, $language);
+    cache_control_purge_purge_path($path);
+  }
+}
+
+/**
+ * Implements hook_comment_delete().
+ */
+function cache_control_purge_comment_delete($comment) {
+  _cache_control_purge_comment($comment, 'delete');
+}
+
+/**
+ * Implements hook_comment_insert().
+ */
+function cache_control_purge_comment_insert($comment) {
+  _cache_control_purge_comment($comment, 'insert');
+}
+
+
+/**
+ * Implements hook_comment_update().
+ */
+function cache_control_purge_comment_update($comment) {
+  _cache_control_purge_comment($comment, 'update');
+}
+
+/**
+ * Purges the path of a comment's parent node.
+ *
+ * @param object $comment Comment whose parent's path is being purged
+ * @param string $op The operation being performed on the comment
+ */
+function _cache_control_purge_comment($comment, $op) {
+  static $purged_nids = array();
+  if (!variable_get('cache_control_enabled', FALSE)) {
+    return;
+  }
+
+  //Attempt parent node purge if it hasn't been done before
+  if ($comment->nid && !in_array($comment->nid, $purged_nids) && _cache_control_purge_invoke("comment $op", $comment)) {
+  	$node = node_load($comment->nid);
+    $language = isset($node->language) ? $node->language :  NULL;
+    $path = drupal_get_path_alias('node/' . $comment->nid, $language);
+
+    cache_control_purge_purge_path($path);
+
+    $purged_nids[] = $comment->nid;
+  }
+}
+
+/**
+ * Implements hook_user_update().
+ *
+ * Gives other modules the chance to purge the cache when an user is modified
+ */
+function cache_control_purge_user_update(&$edit, $account, $category) {
+  if (!variable_get('cache_control_enabled', FALSE)) {
+    return;
+  }
+
+  _cache_control_purge_invoke('user update', $account);
+  //No default purging
+}
+
+/**
+ * Implements hook_user_logout().
+ */
+function cache_control_purge_user_logout($account) {
+  // Purging Cache Control's _own_ paths. When a user logs out, the cached
+  // user-specific content (in URLs that have the session based hash) become
+  // invalid. For example, we have a session based cached login box that shows
+  // the user's username. After the user logs out, the session id stays the
+  // same, so he'd still get the logged in user's login box.
+  // If the settings so define, append the user's uid in the URL to be purged
+
+  if (variable_get('cache_control_use_uid_in_ajax', 0)) {
+      $uid = $account->uid;
+  }
+  else {
+      $uid = 1;
+  }
+}
+
+/**
+ * Helper function for invoking hook_cache_control_purge() implementations.
+ *
+ * @param string $op Op parameter for hook_cache_control_purge().
+ * @param object $content Related content (node, comment or user).
+ *
+ * @return bool FALSE if at least one implementation returned FALSE, TRUE otherwise
+ */
+function _cache_control_purge_invoke($op, $content) {
+  $result = module_invoke_all('cache_control_purge', $op, $content);
+  if (in_array(FALSE, $result, TRUE)) {
+    //Someone objected to the default purge functionality
+    return FALSE;
+  }
+
+  return TRUE;
+}
+
+/**
+ * Sends a PURGE request to Varnish servers
+ *
+ * @param string $ip The IP address of the server
+ * @param string $domain The doman name of the
+ *
+ */
+function cache_control_purge_purge($ip, $domain, $path, $isregex = FALSE) {
+  $errstr = '';
+  $errno  = '';
+  $port = variable_get('cache_control_purge_port', 80);
+  $fp     = @fsockopen($ip, $port, $errno, $errstr, 2);
+
+  if (!$fp) {
+    return FALSE;
+  }
+  else {
+    if ($isregex) {
+      header("X-Purge-Regex: (.*)");
+    }
+
+    $async = variable_get('cache_control_async_purge', 0);
+    if ($async) {
+      //Just fire purges away and don't wait for the reply
+      stream_set_blocking($fp, 0);
+    }
+
+    //Urlencode path components (that is, anything but slashes)
+    $path_components = explode('/', $path);
+    $path_components = array_map('urlencode', $path_components);
+    $path = implode('/', $path_components);
+
+    $out = "PURGE $path HTTP/1.1\r\n";
+    $out .= "Host: $domain\r\n";
+    $out .= "Accept-Encoding: gzip\r\n";
+    $out .= "Connection: close\r\n\r\n";
+    fputs($fp, $out);
+
+    $out = fgets($fp, 4096);
+
+    fclose($fp);
+
+    return $out;
+  }
+}
+
+/**
+ * Form builder for manual cache purge page
+ *
+ * @see cache_control_purge_manual_purge_validate()
+ * @see cache_control_purge_manual_purge_submit()
+ * @ingroup forms
+ *
+ */
+function cache_control_purge_manual_purge($from_state) {
+  global $base_url;
+  //check if settings for proxy is added
+  //if no proxy added => redirect there with error message tell user to set that value
+  $proxies = variable_get('cache_control_purge_servers', array());
+  if (empty($proxies)) {
+    drupal_set_message(t('Please set cache_control_purge_servers on the Cache Control settings page before purging cache'), 'error');
+    drupal_goto('admin/settings/cache_control/settings');
+  }
+
+  $form['purging_path'] = array(
+    '#type' => 'textfield',
+    '#title' => 'Path to purge',
+    '#default_value' => '',
+    '#description' => t('Path to purge, without domain name. Enter * to purge the whole cache.') . '<br/>' .
+                      t('For example, if the full url of the page is %full_url then the path should be %path.',
+                        array('%full_url' => $base_url . '/node/40', '%path' => 'node/40')),
+    '#required' => TRUE,
+  );
+
+  $form['send_purging'] = array(
+    '#type' => 'submit',
+    '#value' => t('Purge cache'),
+  );
+  return $form;
+}
+
+/**
+ * Form validator.
+ *
+ * @see cache_control_purge_manual_purge()
+ *
+ */
+function cache_control_purge_manual_purge_validate($form_state, &$form) {
+  global $base_url;
+
+  $postVals = $form_state;
+  //check if links is correct or exists
+  $domain   = rtrim($base_url, '/');
+  $path     = $postVals['purging_path']['#value'];
+  $regex    = drupal_substr($path, -1);
+  $path     = rtrim($path, '*');
+  $path     = ltrim($path, '/');
+  $response = @drupal_http_request($domain . '/' . $path);
+
+  if (isset($response->error)) {
+    if ($regex != '*') {
+      form_set_error('purging_path', t('Error: "'.$response->error.'". Please check the path. '));
+    }
+  }
+}
+
+/**
+ * Submit handler.
+ *
+ * @see cache_control_purge_manual_purge()
+ *
+ */
+function cache_control_purge_manual_purge_submit($form, &$form_state) {
+  global $base_url;
+  $postVals = $form;
+
+  $path = $postVals['purging_path']['#value'];
+
+  $last = drupal_substr($path, -1);
+
+  if ($last === '*') {
+    $path = drupal_substr($path, 0, -1);
+  }
+
+  //get the url
+  $path   = ltrim($path, '/');
+  $domain = drupal_substr($base_url, drupal_strlen('http://'));
+  $domain = rtrim($domain, '/');
+
+  //Get proxy servers
+  $proxies = variable_get('cache_control_purge_servers', array());
+  $proxies = explode("\n", $proxies);
+  $error   = array();
+  $success = array();
+  foreach ($proxies as $proxy) {
+    $proxy = trim($proxy);
+    $result = !cache_control_purge_purge($proxy, $domain, '/' . $path, ($last == '*') ? TRUE : FALSE);
+    if ($result === FALSE) {
+      $error[] = t("Error purging cache of proxy server: @proxy", array('@proxy' => $proxy));
+    }
+    else {
+      $success[] = t("Cache has been purged from proxy server: @proxy", array('@proxy' => $proxy));
+    }
+  }
+
+  foreach ($error as $e) {
+    drupal_set_message($e, 'error');
+  }
+  foreach ($success as $s) {
+    drupal_set_message($s);
+  }
+
+  // Not really needed since the errors/success messages are already printed above.
+  //if (count($error) == 0) {
+  //  drupal_set_message(t("The page cache has been purged."));
+  //}
+}
+
+/**
+ * Sends a purge request to all Varnish servers, purging a path from the cache.
+ *
+ * @param string $path The path to be purged (without protocol or domain name, e.g. 'node/1234')
+ */
+function cache_control_purge_purge_path($path) {
+  global $base_url;
+
+  $domain = drupal_substr($base_url, drupal_strlen('http://'));
+  $domain = rtrim($domain, '/');
+
+  $proxies = variable_get('cache_control_purge_servers', array());
+  $proxies = explode("\n", $proxies);
+
+  foreach ($proxies as $proxy) {
+    $proxy = trim($proxy);
+    if ($proxy) {
+      cache_control_purge_purge($proxy, $domain, '/' . $path, FALSE);
+    }
+  }
+}
+
+/**
+ * Implements hook_form_alter().
+ *
+ * Adds the purge-specific elements to the Cache Control settings form.
+ *
+ */
+function cache_control_purge_form_alter(&$form, &$form_state, $form_id) {
+  if ($form_id == 'cache_control_admin') {
+    $form['cache_control_purge'] = array(
+      '#type' => 'fieldset',
+      '#title' => t('Cache Control Purge settings for Varnish'),
+      '#weight' => 0.5
+    );
+
+    $form['cache_control_purge']['cache_control_purge_servers'] = array(
+      '#type' => 'textarea',
+      '#title' => t('Varnish servers'),
+      '#description' => t('Varnish server IPs or hostnames, one server per line'),
+      '#default_value' => variable_get('cache_control_purge_servers', ''),
+    );
+
+    $form['cache_control_purge']['cache_control_purge_port'] = array(
+      '#type' => 'textfield',
+      '#title' => t('Port for Varnish PURGE requests'),
+      '#default_value' => variable_get('cache_control_purge_port', 80),
+    );
+
+    $form['cache_control_purge']['cache_control_async_purge'] = array(
+      '#type' => 'checkbox',
+      '#title' => t('Non-blocking PURGE requests'),
+      '#default_value' => variable_get('cache_control_async_purge', 0),
+      '#description' => t('If enabled, no reply for PURGE requests is waited. Use if you are having issues with purging performance.'),
+    );
+
+    $form['#submit'][] = 'cache_control_purge_admin_submit';
+  }
+}
+
+
+/**
+ * Admin settings form submit handler
+ *
+ * @see cache_control_admin()
+ * @see cache_control_purge_form_alter()
+ */
+function cache_control_purge_admin_submit($form, &$form_state) {
+  $posted_values = $form_state['input'];
+
+  variable_set('cache_control_purge_servers', $posted_values['cache_control_purge_servers']);
+  variable_set('cache_control_purge_port', $posted_values['cache_control_purge_port']);
+  variable_set('cache_control_async_purge', $posted_values['cache_control_async_purge']);
+}

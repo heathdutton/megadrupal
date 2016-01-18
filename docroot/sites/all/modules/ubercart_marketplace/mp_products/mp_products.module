@@ -1,0 +1,265 @@
+<?php
+
+/**
+ * @file
+ * Handles all things concerning Ubercart marketplace products.
+ *
+ * The Ubercart marketplace product enhancement allows sellers to view their
+ * items and edit them.  This module also includes concept code for manipulating
+ * the product edit page to suit the sellers' needs.
+ *
+ */
+
+/*******************************************************************************
+ * Hook Functions (Drupal)
+ ******************************************************************************/
+
+/**
+ * Implements hook_permission().
+ */
+function mp_products_permission() {
+  return array(
+    'view own products' => array(
+      'title' => t('view own products'),
+      'description' => t('Allows a seller to view products she has posted.'),
+    ),
+  );
+}
+
+/**
+ * Implements hook_help().
+ */
+function mp_products_help($path, $arg) {
+  switch ($path) {
+    case 'user/%/selling/view':
+      return '<h1 class="title">' . t("Products") . '</h1>' .
+        '<p>' . t("The following is a list of all the products you have submitted. You can edit a product by clicking the edit icon next to its name.") . '</p>';
+  }
+}
+
+/**
+ * Implements hook_menu().
+ */
+function mp_products_menu() {
+  $items = array();
+
+  $items['user/%user/selling/view'] = array(
+    'title' => 'Products',
+    'weight' => 9,
+    'description' => 'View and edit your products.',
+    'page callback' => 'mp_products_selling',
+    'page arguments' => array(1),
+    'access callback' => 'mp_marketplace_can_view_seller',
+    //'access arguments' => array(1),
+    'type' => MENU_LOCAL_TASK,
+    'file' => 'mp_products.admin.inc',
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_form_alter().
+ *
+ * Adds minimum sell price field and adds validate handler.
+ */
+function mp_products_form_alter(&$form, &$form_state, $form_id) {
+  //dpm($form);
+  if (isset($form['#node']) && is_object($node = $form['#node'])) {
+    $product_types = variable_get('mp_product_tools_enabled_classes', array());
+    if (module_exists('uc_product_kit')) {
+      unset($product_types[array_search('product_kit', $product_types)]); // TODO fix admin base price for product kits
+    }
+    if ($form_id == $node->type . '_node_form' && in_array($node->type, $product_types)) {
+      // Modify cost field depending on auto calc commission status
+      $form['base']['prices']['cost']['#title'] = t('Seller commission');
+      if (!variable_get('mp_products_auto_calc', FALSE)) {
+        $form['base']['prices']['cost']['#required'] = TRUE;
+        $form['base']['prices']['cost']['#description'] = t('The amount you will be paid.');
+        if (!variable_get('mp_products_enable_list', TRUE) && !user_access('administer sellers')) {
+          $form['base']['prices']['list_price']['#access'] = FALSE;
+        }
+      }
+      else {
+        $form['base']['prices']['cost']['#access'] = user_access('administer sellers');
+        $form['base']['prices']['cost']['#description'] = t('The amount seller will be paid.');
+        if (!variable_get('mp_products_admin_override', FALSE)) {
+          $form['base']['prices']['cost']['#attributes'] = array('readonly' => 'readonly');
+          $commission_rate = mp_products_get_commission_rate($node->type);
+          $form['base']['prices']['cost']['#description'] = t('Amount seller will be paid (%percent%).', array('%percent' => $commission_rate * 100));
+        }
+        // determine if list_price should be required
+        if (variable_get('mp_products_auto_calc_field', 'sell_price') == 'list_price') {
+          $form['base']['prices']['list_price']['#required'] = TRUE;
+        }
+        elseif (!variable_get('mp_products_enable_list', TRUE) && !user_access('administer sellers')) {
+          $form['base']['prices']['list_price']['#access'] = FALSE;
+        }
+      }
+
+      // Add Base Price amount to Sell Price description, if there is a base price.
+      if (variable_get('mp_products_admin_base', FALSE)) {
+        $form['base']['prices']['sell_price']['#description'] .= t(' (Must be at least ' . uc_currency_format(variable_get('mp_products_admin_base', FALSE)) . ')');
+      }
+
+      // hide unneccessary fields if desired
+      if (!user_access('administer sellers') && variable_get('mp_products_hide_fields', TRUE)) {
+        $form['base']['weight']['#access'] = FALSE;
+        $form['base']['dimensions']['#access'] = FALSE;
+        $form['base']['pkg_qty']['#access'] = FALSE;
+        $form['base']['default_qty']['#access'] = FALSE;
+        $form['base']['ordering']['#access'] = FALSE;
+        $form['shipping']['#access'] = FALSE;
+      }
+
+      // The default breadcrumb points to inaccessible admin pages unless we change it
+      $breadcrumb[] = l('Home', NULL);
+      drupal_set_breadcrumb($breadcrumb);
+    }
+  }
+
+  // Admin attribute interface
+  if ($form_id == 'uc_attribute_option_form') {
+    $form['adjustments']['cost']['#title'] = t('Cost or Seller Commission');
+  }
+
+  // Alter the attributes form for validation & submission (for commission, etc.)
+  $product_types = variable_get('mp_product_tools_enabled_classes', array());
+  if ($form_id == 'uc_object_options_form' && in_array($form['type']['#value'], $product_types)) {
+    foreach ($form['attributes']['1']['options'] as $key => $value) {
+      if ($form['attributes']['1']['options'][$key]['cost']) {
+        // Make seller commission read only?
+        $form['attributes']['1']['options'][$key]['cost']['#attributes'] = array('readonly' => 'readonly');
+
+        // js magic on the cost field
+        if (variable_get('mp_products_insert_js', FALSE)) {
+          $commission_rate = mp_products_get_commission_rate($node->type);
+          $price_id = '#edit-attributes-1-options-' . $key . '-price';
+          $cost_id = '#edit-attributes-1-options-' . $key . '-cost';
+          drupal_add_js("$(document).ready(function(){ " .
+            "$('" . $price_id . "').blur(function(){ " .
+              "$('" . $cost_id . "').val(Math.floor($('" . $price_id . "').val() * " . drupal_json_encode($commission_rate) * 100 . ")/100);" .
+            "});" .
+          "});", array('type' => 'inline', 'scope' => JS_DEFAULT));
+        }
+      }
+    }
+
+    // Validation magic
+    $form['#validate'][] = 'mp_products_object_options_form_validate';
+  }
+}
+
+/**
+ * Validate callback for uc_object_options_form.
+ */
+function mp_products_object_options_form_validate($form, &$form_state) {
+  // Validate the commission rate is correct for each option
+  $commission_rate = mp_products_get_commission_rate($form_state['values']['type']);
+  foreach ($form_state['values']['attributes']['1']['options'] as $key => $value) {
+    if (!variable_get('mp_products_auto_calc', FALSE) && !(user_access('administer sellers') && variable_get('mp_products_admin_override', FALSE))) {
+      if ($value['cost'] > ($commission_rate * $value['price'])) {
+        form_set_error("attributes][1][options][$key][cost", t('Commission must be less than or equal to @rate% of the sell price. Consider decreasing commission or increasing sell price.', array('@rate' => $commission_rate * 100)));
+      }
+    }
+    elseif (variable_get('mp_products_auto_calc', FALSE) && !(user_access('administer sellers') && variable_get('mp_products_admin_override', FALSE))) {
+      $form_state['values']['attributes']['1']['options'][$key]['cost'] = $commission_rate * $value['price'];
+    }
+  }
+}
+
+/**
+ * Quick and dirty replacement of the uc_attribute table title 'Cost' with 'Seller Commission'.
+ */
+function mp_products_preprocess_page(&$vars) {
+  //dpm($vars);
+  if (arg(0) == 'node' && arg(3) == 'options') {
+    $vars['content'] = preg_replace("/<th>Cost</", "<th>Seller Commission<", $vars['content']);
+  }
+
+  // Admin table header change
+  if (arg(0) == 'admin' && arg(1) == 'store' && arg(2) == 'attributes' && arg(4) == 'options') {
+    $vars['content'] = preg_replace("/<th>Default cost</", "<th>Default cost or commission<", $vars['content']);
+  }
+}
+
+function _mp_products_get_types($type = FALSE, $reset = FALSE) {
+  static $types = FALSE;
+  if ($types === FALSE || $reset) {
+    $types = drupal_map_assoc(variable_get('mp_product_tools_enabled_classes', array()));
+    if (module_exists('uc_product_kit')) {
+      unset($types['product_kit']);
+    }
+  }
+  return $type ? isset($types[$type]) : $types;
+}
+
+
+function mp_products_node_presave($node) {
+  if (_mp_products_get_types($node->type)) {
+    $commission_rate = mp_products_get_commission_rate($node->type);
+    // auto calc commission if enabled and needed
+    if (variable_get('mp_products_auto_calc', FALSE) && !(user_access('administer sellers') && variable_get('mp_products_admin_override', FALSE))) {
+      if (variable_get('mp_products_auto_calc_field', 'sell_price') == 'list_price') {
+        $node->cost = $node->list_price * $commission_rate;
+      }
+      else {
+        $node->cost = $node->sell_price * $commission_rate;
+      }
+    }
+    // invoke hook_list_product()
+    module_invoke_all('list_product', $node);
+  }
+}
+
+function mp_products_node_prepare($node) {
+  if (_mp_products_get_types($node->type) && variable_get('mp_products_insert_js', FALSE)) {
+    $commission_rate = mp_products_get_commission_rate($node->type);
+    $fieldid = variable_get('mp_products_auto_calc_field', 'sell_price') == 'list_price' ? 'list-price' : 'sell-price';
+    drupal_add_js("$(document).ready(function(){ $('#edit-" . $fieldid . "').blur(function(){ $('#edit-cost').val(Math.floor($('#edit-" . $fieldid . "').val() * " . drupal_json_encode($commission_rate) * 100 . ")/100);});});", array('type' => 'inline', 'scope' => JS_DEFAULT));
+  }
+}
+
+function mp_products_node_validate($node) {
+  if (_mp_products_get_types($node->type)) {
+    // handle cost field validation depending on auto calc commission or admin status
+    if (!variable_get('mp_products_auto_calc', FALSE) && !(user_access('administer sellers') && variable_get('mp_products_admin_override', FALSE))) {
+      $commission_rate = mp_products_get_commission_rate($node->type);
+      if ($node->cost > ($commission_rate * $node->sell_price)) {
+        form_set_error('cost', t('Commission must be less than or equal to @rate% of the sell price. Consider decreasing commission or increasing sell price.', array('@rate' => $commission_rate * 100)));
+      }
+      elseif ($node->cost == 0 && $node->sell_price > 0) {
+        form_set_error('cost', t('Commission must be greater than zero.'));
+      }
+    }
+
+    // handle base price error, if a base price exists
+    if (variable_get('mp_products_admin_base', FALSE)) {
+      if ($node->sell_price < variable_get('mp_products_admin_base', FALSE)) {
+        form_set_error('sell_price', t('Sell price must be greater than or equal to sitewide base price of ' . uc_currency_format(variable_get('mp_products_admin_base', FALSE))));
+      }
+    }
+  }
+}
+
+/**
+ * Gets the commission rate on a given product type.
+ */
+function mp_products_get_commission_rate($type) {
+  global $user;
+  $user_roles = array_keys($user->roles);
+  $roles_array = array_keys(user_roles(true, 'act as seller'));
+  $rid = -1;
+  foreach ($user_roles as $role) {
+    if (in_array($role, $roles_array)) {
+      $rid = $role;
+    }
+  }
+  $result = db_query("SELECT rate FROM {mp_seller_rates} WHERE class = :class AND rid = :rid", array(':class' => $type, ':rid' => $rid))->fetchField();
+  if ($result > 0) {
+    return floatval($result);
+  }
+  else {
+    return floatval(variable_get('mp_products_commission_rate', '.75'));
+  }
+}
