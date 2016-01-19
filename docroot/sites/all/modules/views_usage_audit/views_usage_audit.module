@@ -1,0 +1,227 @@
+<?php
+/**
+ * @file
+ * Modules hooks for the views_usage_audit module.
+ */
+
+/**
+ * Implements hook_menu().
+ */
+function views_usage_audit_menu() {
+  $items['admin/reports/views-usage-audit'] = array(
+    'page callback' => 'views_usage_audit_reports',
+    'title' => 'Views usage audit ',
+    'type' => MENU_NORMAL_ITEM,
+    'description' => 'Reports on what views have and have not been executed.',
+    'access callback' => 'user_access',
+    'access arguments' => array('administer views'),
+  );
+  return $items;
+}
+
+/**
+ * Page callback for the views usage audit reports.
+ */
+function views_usage_audit_reports() {
+  $data = _views_usage_audit_fetch_audit_data();
+
+  $rows = array();
+
+  foreach ($data as $view => $displays) {
+    $row[0] = theme('views_usage_audit_report_link', array('view' => $view));
+
+    foreach ($displays as $display => $paths) {
+      $row[1] = $display;
+
+      $path_column = array();
+      foreach ($paths as $path => $value) {
+        $path_column[] = $path;
+      }
+      $row[2] = implode('<br/>', $path_column);
+      $rows[] = $row;
+    }
+  }
+
+  $unused = _views_usage_audit_fetch_unused_views();
+  foreach ($unused as $key => $value) {
+    $unused[$key][0] = theme('views_usage_audit_report_link', array('view' => $value[0]));
+  }
+
+  return array(
+    array(
+      '#caption' => t('Executed displays'),
+      '#theme' => 'table',
+      '#header' => array(t('View'), t('Display'), t('Paths')),
+      '#rows' => $rows,
+      '#empty' => t('No views have been executed yet'),
+    ),
+    array(
+      '#caption' => t('Displays not executed'),
+      '#theme' => 'table',
+      '#header' => array(t('View'), t('Display')),
+      '#rows' => $unused,
+      '#empty' => t('All displays have been executed or results have not been gathered yet.'),
+    ),
+  );
+}
+
+/**
+ * Implements hook_theme().
+ */
+function views_usage_audit_theme() {
+  return array(
+    'views_usage_audit_report_link' => array(
+      'variables' => array(
+        'view' => NULL,
+      ),
+    ),
+  );
+}
+
+/**
+ * Implements theme_views_usage_audit_report_link().
+ */
+function theme_views_usage_audit_report_link($variables) {
+  $view = $variables['view'];
+
+  if (module_exists('views_ui')) {
+    return l($view, 'admin/structure/views/view/' . $view);
+  }
+  else {
+    return $view;
+  }
+}
+
+/**
+ * Implements hook_views_pre_view().
+ */
+function views_usage_audit_views_pre_view(&$view, &$display_id, &$args) {
+  $data = _views_usage_audit_fetch_audit_data();
+  $name = $view->name;
+  $menu_item = menu_get_item();
+  $path = $menu_item['path'];
+
+  $ignored_paths = array(
+    'admin/structure/views/nojs/preview/%/%',
+    'admin/structure/views/ajax/preview/%/%',
+  );
+
+  if (in_array($path, variable_get('views_usage_audit_ignored_paths', $ignored_paths))) {
+    return;
+  }
+
+  if (isset($data[$name][$display_id][$path])) {
+    return;
+  }
+
+  drupal_register_shutdown_function('_views_usage_audit_shutdown', $name, $display_id, $path);
+}
+
+
+/**
+ * Shutdown function to insert data into the views_audit table.
+ */
+function _views_usage_audit_shutdown($name, $display_id, $path) {
+
+  // db_merge() causes deadlock even with very low number of INNODB row lock
+  // contentions, so use the Drupal locking api to prevent this.
+  $lock = 'views_usage_audit:row:' . $name . ':' . $display_id . ':' . $path;
+
+  // No need to retry attempting to get the lock is unique to each row
+  // that is attempting to be inserted. If a value is already being
+  // inserted there is no need to update it to the same values.
+  if (!lock_acquire($lock, 0.001)) {
+    return;
+  }
+
+  // db_merge() is mandatory, db_insert() would cause problems as this
+  // is a shutdown function and another process could have inserted
+  // data before this function is run. We last checked the existance
+  // of data before this shutdown function was registered.
+  //
+  // The only way to work around this would be to do the INSERT inline
+  // with the page request and accept the performance penalty which
+  // seems like a poor trade off to make.
+  db_merge('views_usage_audit')
+    ->key(
+      array(
+        'view' => $name,
+        'display' => $display_id,
+        'path' => $path,
+      )
+    )
+    ->fields(
+      array(
+        'view' => $name,
+        'display' => $display_id,
+        'path' => $path,
+      )
+    )
+    ->execute();
+
+  cache_clear_all('views_usage_audit_data', 'cache');
+
+  lock_release($lock);
+}
+
+/**
+ * Fetch the data about what view displays have been executed and where.
+ *
+ * @return array
+ *   A structured array of views that have been executed and their router path.
+ */
+function _views_usage_audit_fetch_audit_data() {
+  $data = &drupal_static(__FUNCTION__);
+
+  if (!isset($data)) {
+    if ($cache = cache_get('views_usage_audit_data')) {
+      $data = $cache->data;
+    }
+    else {
+      $results = db_select('views_usage_audit', 'va')
+        ->fields('va')
+        ->execute();
+
+      foreach ($results as $result) {
+        $data[$result->view][$result->display][$result->path] = TRUE;
+      }
+
+      cache_set('views_usage_audit_data', $data);
+    }
+  }
+
+  return is_null($data) ? array() : $data;
+}
+
+/**
+ * Compute a list of unused views and displays.
+ *
+ * @return array
+ *   A structured array of views and displays that have not been executed.
+ */
+function _views_usage_audit_fetch_unused_views() {
+  $data = _views_usage_audit_fetch_audit_data();
+  $views = views_get_all_views();
+
+  $unused = array();
+
+  foreach ($views as $view) {
+
+    if ($view->disabled) {
+      continue;
+    }
+
+    if (!isset($data[$view->name])) {
+      $unused[] = array($view->name, t('No displays executed'));
+      continue;
+    }
+
+    foreach ($view->display as $display_name => $display) {
+      if (!isset($data[$view->name][$display_name])) {
+        $unused[] = array($view->name, $display_name);
+      }
+    }
+  }
+
+  return $unused;
+}

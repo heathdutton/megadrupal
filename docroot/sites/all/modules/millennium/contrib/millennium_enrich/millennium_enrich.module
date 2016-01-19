@@ -1,0 +1,339 @@
+<?php
+
+/**
+ * Returns an instance of a certain class.
+ * return @object
+ */
+function millennium_enrich_get_class($classname) {
+  static $classes = array();
+  if (isset($classes[$classname])) {
+    return $classes[$classname];
+  }
+  else {
+    module_load_include('inc', 'millennium_enrich', "includes/{$classname}");
+    $classes[$classname] = new $classname($classname);
+    return $classes[$classname];
+  }
+}
+
+/**
+ * Returns a information of available sources.
+ */
+function millennium_enrich_sources() {
+  $sources = array(
+    'locToc' => array(
+      'name' => 'Table of Contents: Library of Congress',
+      'description' => t('Tables of contents information from the Library of Congress (http://loc.gov)'),
+    ),
+    'locBio' => array(
+      'name' => "Author's Biography: Library of Congress",
+      'description' => t("Author's biographical information from the Library of Congress (http://loc.gov)"),
+    ),
+    'locDescription' => array(
+      'name' => "Publisher's Description: Library of Congress",
+      'description' => t("Publisher's description information from the Library of Congress (http://loc.gov)"),
+    ),
+    'locSampleText' => array(
+      'name' => 'Sample Text: Library of Congress',
+      'description' => t('Sample text from the Library of Congress (http://loc.gov)'),
+    ),
+    /*
+    'openlibrary' => array(
+      'name' => 'Open Library',
+      'description' => t('Obtains links to fulltext from the Open Library, and adds links to WorldCat, Google and LibraryThing pages.'),
+      ),
+    */
+    /*
+    'coverimages' => array(
+      'name' => 'Find coverimage URLs',
+      'description' => t("Scans several sources for cover images based on the item's ISBN/ISSN."),
+    ),
+    */
+  );
+  return $sources;
+}
+
+/**
+ * Implements hook_menu().
+ */
+function millennium_enrich_menu() {
+  $items = array();
+  $items[MILLENNIUM_SETTINGS_PATH . '/enrich'] = array(
+    'title' => 'Enrichment',
+    'description' => 'Configure enrichment of records (Tables of Contents, cover images, etc.) from external data sources.',
+    'type' => MENU_LOCAL_TASK,
+    'weight' => 1,
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('millennium_enrichment_settings_form'),
+    'access callback' => 'user_access',
+    'access arguments' => array('administer millennium'),
+  );
+  return $items;
+}
+
+function millennium_enrichment_settings_form() {
+  $form = array();
+  $form['description'] = array(
+    '#type' => 'markup',
+    '#markup' => t('Enrichment adds useful information to imported Millennium records. Information is gathered from known remote resources like the Library of Congress.'),
+  );
+  $form['enable_fieldset'] = array(
+    '#weight' => '0',
+    '#description' => t('Select the data sources you want to enable.'),
+    '#type' => 'fieldset',
+    '#collapsible' => '1',
+    '#title' => t('Enabled sources'),
+  );
+  $sources = millennium_enrich_sources();
+  foreach ($sources as $source_id => $source) {
+    $form["enable_fieldset"]["millennium_enrich_enabled_{$source_id}"] = array(
+      '#type' => 'checkbox',
+      '#title' => check_plain($source["name"]),
+      '#description' => check_plain($source["description"]),
+      '#default_value' => variable_get("millennium_enrich_enabled_{$source_id}", FALSE),
+    );
+  }
+  $form['harvest'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Harvesting settings'),
+    '#description' => t('Metadata from enabled sources needs to be harvested before it can be displayed and indexed.'),
+    '#weight' => 10,
+  );
+  $form['harvest']['millennium_enrich_harvest_cron'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Enable harvesting during cron runs'),
+    '#default_value' => variable_get("millennium_enrich_harvest_cron", TRUE),
+  );
+  $form['harvest']['button'] = array(
+    '#type' => 'submit',
+    '#value' => t('Harvest from all enabled sources now'),
+    '#submit' => array('millennium_enrichment_batch_form_submit'),
+    '#redirect' => MILLENNIUM_SETTINGS_PATH . '/enrich',
+  );
+  return system_settings_form($form);
+}
+
+/**
+ * Implements hook_millennium_biblio_data_alter().
+ */
+function millennium_enrich_millennium_biblio_data_alter(&$biblio, $marc) {
+  #drupal_set_message("millennium_enrich_millennium_biblio_data_alter() called");
+  millennium_enrich_invoke("biblio_data_alter", $biblio, $marc);
+}
+
+/**
+ * Implements hook_millennium_load_biblio_data_alter().
+ */
+function millennium_enrich_millennium_load_biblio_data_alter(&$biblio, $node) {
+  #drupal_set_message("millennium_enrich_millennium_load_biblio_data_alter() called. Biblio = ");
+  millennium_enrich_invoke("alterBiblioDataLoad", $biblio, $node);
+}
+
+/**
+ * Implements hook_node_view().
+ */
+function millennium_enrich_node_view($node, $view_mode = 'full') {
+  drupal_add_css(drupal_get_path('module', 'millennium_enrich') . '/millennium_enrich.css');
+  millennium_enrich_invoke("nodeView", $node, $view_mode); // TODO: $a3 and $a4 are not available!
+}
+
+/**
+ * Implements hook_cron().
+ */
+function millennium_enrich_cron() {
+  $active = variable_get("millennium_enrich_harvest_cron", TRUE);
+  if (!$active) {
+    return;
+  }
+
+  // Initialize for stats keeping
+  timer_start("millennium_enrich_cron");
+  $total_items = 0;
+
+  // Get all configured sources
+  $sources = millennium_enrich_sources();
+
+  // Process all sources
+  foreach ($sources as $source_id => $source) {
+    // Only if source is currently enabled
+    if (variable_get("millennium_enrich_enabled_{$source_id}", FALSE)) {
+      // Get metadata object for this source id
+      $object = millennium_enrich_get_class($source_id);
+      // Get all nodes that need metadata
+      $nodes = millennium_enrich_get_nodes_to_enrich($source_id);
+      // Build queue of harvesting jobs, callbacks
+      $queue = $object->harvestBuildRequestQueue($nodes);
+      // Get only first N queue jobs to process
+      $chunk = array_splice($queue, 0, $object->getMaxConnections());
+      // Do actual harvesting
+      $results = $object->harvestFetchQueuedJobs($chunk);
+      // Store fetched results
+      $object->harvestProcessAndStoreFetched($chunk, $results);
+      // Count # of items processed
+      $total_items += sizeof($results);
+    }
+  }
+  // Log to watchdog
+  watchdog("MillenniumEnrich", "Cron run ended: processed $total_items in @secs seconds", array('@secs' => sprintf('%2.1f', timer_read("millennium_enrich_cron") / 1000)));
+}
+
+/**
+ * Helper function that invokes proper methods in enabled metadata objects.
+ */
+function millennium_enrich_invoke($function, &$arg1, $arg2 = NULL, $arg3 = NULL) {
+  static $sources = array();
+  static $nofunction = array();
+  if (!$sources) {
+    $sources = millennium_enrich_sources();
+  }
+
+  // Check what enrichment sources exist, and run them if enabled
+  foreach ($sources as $source_id => $source) {
+    // Check if it's enabled
+    if (isset($nofunction[$source_id]) && isset($nofunction[$source_id][$function])) {
+      continue;
+    }
+    if (variable_get("millennium_enrich_enabled_{$source_id}", FALSE)) {
+      $object = millennium_enrich_get_class($source_id);
+      if (method_exists($object, $function)) {
+        $object->$function($arg1, $arg2, $arg3);
+      }
+      else {
+        $nofunction[$source_id][$function] = TRUE;
+      }
+    }
+  }
+}
+
+/**
+ * Submit function for millennium_enrichment_batch_form().
+ */
+function millennium_enrichment_batch_form_submit($form, &$form_state) {
+  // Get all sources
+  $sources = millennium_enrich_sources();
+  // Define the operations to run in batch
+  foreach ($sources as $source_id => $source) {
+    if (variable_get("millennium_enrich_enabled_{$source_id}", FALSE)) {
+      $operations[] = array('millennium_enrich_harvest_batch_operation', array($source_id));
+    }
+  }
+  // Define a batch
+  $batch = array(
+    'operations' => $operations,
+    'finished' => 'millennium_enrich_batch_import_finished',
+    'title' => t('Harvest is running...'),
+    'init_message' => t('Batch processing is starting.'),
+    //'progress_message' => t('Reindexed @current out of @total.'),
+    'error_message' => t('Batch importing has encountered an error.'),
+  );
+  batch_set($batch);
+}
+
+/**
+ * @todo Please document this function.
+ * @see http://drupal.org/node/1354
+ */
+function millennium_enrich_harvest_batch_operation($source_id, &$context) {
+  timer_start("millennium_enrich_batch_operation");
+
+  $object = millennium_enrich_get_class($source_id);
+  if (!isset($context['sandbox']['progress'])) {
+    $context['sandbox']['progress'] = 0;
+    $context['sandbox']['elapsed'] = 0;
+    $context['sandbox']['tot_attempted'] = 0;
+
+    // Get array of nodeobjects to enrich
+    $nodes = millennium_enrich_get_nodes_to_enrich($source_id);
+
+    // Build "flat" queue of requests vs callbacks
+    $queue = $object->harvestBuildRequestQueue($nodes);
+    if (is_array($queue)) {
+      if (sizeof($queue) == 0) {
+        $context['results']['messages']["harvest_{$source_id}"] = t("Nothing to process for source @source", array('@source' => $source_id));
+        $context['message'] = theme('item_list', array('items' => $context['results']['messages']));
+        return;
+      }
+      // Split queue into bits, split by max number of wanted connections.
+      $chunks = array_chunk($queue, $object->getMaxConnections(), TRUE);
+      // Store
+      $context['sandbox']['chunks'] = $chunks;
+      $context['sandbox']['max_chunks'] = sizeof($chunks);
+      $context['sandbox']['tot_items'] = sizeof($queue);
+    }
+    else {
+      return;
+    }
+  }
+
+  // Harvest a chunk
+  $chunk = $context['sandbox']['chunks'][$context['sandbox']['progress']];
+  $results = $object->harvestFetchQueuedJobs($chunk);
+  $context['sandbox']['tot_attempted'] += sizeof($chunk);
+
+  // Store fetched results
+  $object->harvestProcessAndStoreFetched($chunk, $results);
+
+  // Update context
+  $context['sandbox']['progress']++;
+
+  // Build message to show
+  $elapsed = (timer_read("millennium_enrich_batch_operation") / 1000);
+  $context['sandbox']['elapsed'] += $elapsed;
+  $context['results']['tot_elapsed'] += $elapsed;
+  $context['sandbox']['crawlspeed'] = sprintf("%2.1f", $context['sandbox']['tot_attempted'] / $context['sandbox']['elapsed']);
+  $progress_msg = t("Harvest from @source: @crawled crawled, @pending pending. @crawlspeed items per second",
+    array(
+      "@source" => $source_id,
+      "@crawled" => $context['sandbox']['tot_attempted'],
+      "@pending" => $context['sandbox']['tot_items'] - $context['sandbox']['tot_attempted'],
+      "@crawlspeed" => $context['sandbox']['crawlspeed'],
+    )
+  );
+  $context['results']['messages']["harvest_{$source_id}"] = $progress_msg;
+  $context['message'] = theme('item_list', array('items' => $context['results']['messages']));
+
+  if ($context['sandbox']['progress'] < $context['sandbox']['max_chunks']) {
+    $context['finished'] = $context['sandbox']['progress'] / $context['sandbox']['max_chunks'];
+  }
+
+}
+
+/**
+ * Generate an array of skeleton node objects.
+ */
+function millennium_enrich_get_nodes_to_enrich($source_id) {
+  // Generate items that do not have any metadata yet for this $source_id
+  $handle = db_query("SELECT n.nid, mnb.biblio_data FROM {node} n
+      LEFT JOIN {metadata_storage} ms ON n.nid=ms.nid AND ms.source= :source_id
+      LEFT JOIN {millennium_node_bib} mnb ON mnb.nid = n.nid AND NOT ISNULL(mnb.biblio_data)
+      WHERE
+        ISNULL(ms.nid)
+        AND mnb.nid=n.nid", array(':source_id' => $source_id));
+  $nodes = array();
+  foreach ($handle as $data) {
+    $node = new stdClass();
+    $node->nid = $data->nid;
+    $node->millennium_biblio_data = unserialize($data->biblio_data);
+    $nodes[$data->nid] = $node;
+  }
+  return $nodes;
+}
+
+/**
+ * Batch 'finished' callback
+ */
+function millennium_enrich_batch_import_finished($success, $results, $operations) {
+  $message_type = '';
+  if ($success) {
+    #$results['messages'][] = t("Total time elapsed: @elapsed seconds", array('@elapsed' => sprintf("%2.1f", $results['tot_elapsed'])));
+    $message = theme('item_list', array('items' => $results['messages']));
+  }
+  else {
+    // An error occurred.
+    // $operations contains the operations that remained unprocessed.
+    $error_operation = reset($operations);
+    $message = t('An error occurred while processing @num with arguments @args', array('@num' => $error_operation[0], '@args' => print_r($error_operation[0], TRUE)));
+    $message_type = 'error';
+  }
+  drupal_set_message($message, $message_type);
+}

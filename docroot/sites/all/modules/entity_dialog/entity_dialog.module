@@ -1,0 +1,1179 @@
+<?php
+/**
+ * @file
+ * Handles the entity-dialog functionality.
+ */
+ 
+/**
+* consider getting args into the form via form_alter eg you might want to autopopulate fields for relations links eg friend-entity/add/55 to add user 55 as a friend <<insert snarky Drupal deprecation here>>
+
+
+ * some kind of config info that contains stuff such as:
+   - the url(s) of each entity's add / edit / view / delete pages
+   - the title for the Dialog (different for each action)
+   - (future) what to do on completion: completely limit to views (for now) 
+     - see http://drupal.org/project/views_flag_refresh for ideas
+
+   - keyed potentially by something like $info['entity:bundle'] or else [entity][bundle]
+ 
+ * config page should use entity_type_supports($entity_type, $action) to determine which ops a can be
+   performed on a given entity.  
+ 
+----
+
+ * add config screen to allow ticking of each entity / bundle you want to use this module for
+
+ * Make the dialog accesible: http://www.nczonline.net/blog/2013/02/12/making-an-accessible-dialog-box/
+    - a good article outlining a few simple things we can do to make the dialog work with screen readers.
+ 
+ 
+ * Get preview working. I can't seem to get the preview button to call my ajax callback.
+
+*/
+
+/**
+ * Implementation of hook_init().
+ **/
+function entity_dialog_init() {
+  $path = drupal_get_path('module', 'entity_dialog');
+  if (arg(0) == 'entity-dialog') {  
+    drupal_add_css($path . '/entity_dialog.css');
+    drupal_add_js($path . '/js/entity_dialog.js');
+    
+    // Add jQuery UI effects for exceptional raddness.
+    drupal_add_library('system', 'effects');
+  }
+  
+  // Only allow entity dialog if the user has access to it.
+  if (user_access('use entity dialog')) {
+    // We do not want to add our js unless the user has permission to use entity
+    // dialog.
+    drupal_add_js($path . '/js/entity_dialog_attach.js');
+    // NOTE! For whatever weird reason the preceeding call needs to come before drupal_add_js('misc/ajax.js') 
+    // otherwise any calls to an entity-dialog url will return JSON data instead of being processed
+    // and markup being added to the page.
+
+    // Force ajax to be available everywhere :)
+    drupal_add_js('misc/ajax.js');
+
+    // Pass the crud paths of each of the enabled entities through to js. 
+    $settings = array();
+    $entities = entity_get_info();
+    $active_entities = variable_get('entity_dialog_active', array());
+    foreach ($entities as $entity) {
+      if (is_array($entity) && isset($entity['bundles'])) {
+        foreach ($entity['bundles'] as $bundle_name => $bundle) {
+          if (isset($bundle['crud'])) { 
+            foreach ($bundle['crud'] as $action_key => $action) {
+              if (in_array( $bundle_name . "_" . entity_dialog_convert_op_strings($action_key), $active_entities)) {
+                $settings[] = $action['path'];
+              }  
+            }  
+          }
+        }
+      }
+    }
+    
+    drupal_add_js(array('entityDialog' => $settings), 'setting'); 
+  }
+}
+
+
+// ! Drupal hooks
+
+/**
+ * Implementation of hook_menu().
+ *
+ * Register a menu handler to handle arbitrary paths received from our AJAX calls.
+ * Typically these will look something like:
+ *     entity-dialogs/node/add/article
+ */
+function entity_dialog_menu() {
+  $items = array();
+
+  $items['entity-dialog'] = array(
+    'page callback' => 'entity_dialog_deliver',
+    'delivery callback' => 'ajax_deliver', 
+    'access arguments' => array('use entity dialog'),
+  );
+
+  $items['entity-dialog/delete-cancel'] = array(
+    'page callback' => 'entity_dialog_delete_cancel',
+    'delivery callback' => 'ajax_deliver', 
+    'access arguments' => array('use entity dialog'),   
+  );
+  
+  $items['admin/config/user-interface/entity_dialog'] = array(
+    'title' => 'Entity Dialog',
+    'description' => 'Configure which entities to open in a dialog.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('entity_dialog_admin_settings'),
+    'file' => 'includes/entity_dialog.admin.inc',
+    'access arguments' => array('administer entity dialog'),
+    'type' => MENU_NORMAL_ITEM,
+  );
+
+  return $items;
+}
+
+/**
+ * Implementation of hook_permission().
+ */
+function entity_dialog_permission() {
+  return array(
+    'administer entity dialog' => array(
+      'title' => 'Administer Entity Dialog', 
+      'description' => t('Allow configuration of entity dialog.') 
+    ),
+      
+    'use entity dialog' => array(
+      'title' => 'Use Entity Dialog', 
+      'description' => t('View allowed content in an entity dialog.' )
+    )
+  );
+}
+
+/**
+ * Implementation of hook_entity_info_alter().
+ *
+ * Add CRUD url information for the kinds of entities we know about eg core entities
+ * and ECK entities, as well as other popular contrib entities.
+ *
+ * Unfortunately Drupal doesn't mandate anything like this, but we need to know the
+ * URLs in order to hijack the links on the page to open our dialog.
+ */
+function entity_dialog_entity_info_alter(&$entity_info) {
+  $crud_presets = entity_dialog_crud_presets();
+  
+  foreach ($entity_info as $entity_type => $info) {
+    foreach ($info['bundles'] as $bundle_name => $bundle) {
+      if (!isset($bundle['crud'])) {
+        // Check if there's a specific crud array set for this bundle otherwise use the default one.
+        $crud_key = isset($crud_presets[$entity_type][$bundle_name]) ? $bundle_name : '-all-';
+        
+        if (isset($crud_presets[$entity_type][$crud_key])) {
+          $crud_paths = $crud_presets[$entity_type][$crud_key];
+          
+          // Replace %bundle with the bundle name.
+          $bundle_name_url = str_replace('_', '-', $bundle_name);
+          foreach ($crud_paths as $op => $path) {
+            $crud_paths[$op]['path'] = str_replace('%bundle', $bundle_name_url, $crud_paths[$op]['path']);            
+          }
+          
+          $entity_info[$entity_type]['bundles'][$bundle_name]['crud'] = $crud_paths;
+        }
+        else {
+          // We don't know about this entity bundle.
+        }
+      }
+    }
+  }
+
+  // Go through each class that implements our entityDialogContribInterface.
+  // Each implementation will define a list of entity types that need a form callback. 
+  // For each one of these entity types we will add our generic form callback and also 
+  // the name of the implementing class so that we can call the form_callback provided 
+  // by that class in our generic form callback  
+  $classes = _get_entity_dialog_classes();
+  foreach ($classes as $class_name) {
+    $class_implements = class_implements($class_name);
+    if (in_array('entityDialogContribInterface', $class_implements)) {
+      // Get a list of entity types that need a form callback as requested by this class.
+      
+      // When Drupal mandates PHP 5.3 we should use the following:
+      //$needs_form_callback = $class_name::entitiesToEnable(); 
+       $needs_form_callback = call_user_func($class_name . '::entitiesToEnable'); // PHP 5.2.3 friendly.
+      
+      foreach ($needs_form_callback as $entity_type) {
+        // Add a form callback and the class name into the entity info array. 
+        $entity_info[$entity_type]['form callback'] = 'entity_dialog_generic_form_callback';
+        $entity_info[$entity_type]['entity dialog class'] =  $class_name;
+      }
+    }
+  }
+  
+  // Hack for relation module. @TODO: get rid of me.
+  if (module_exists('relation')) {
+    //$entity_info['relation']['creation callback'] = 'entityDialogRelation_creation_callback';
+  }
+//kpr($entity_info);
+}
+
+/**
+ * Add extra knowledge of core and various contrib entities.
+ *
+ * @param $arg
+ *   Description.
+ * @return
+ *   Description.
+ */
+function entity_dialog_crud_presets() {
+  $presets = array(
+  
+    // Drupal Core entities.
+    'node' => array(
+      '-all-' => array(
+        'add'    => 'node/add/%bundle',
+        'edit'   => 'node/%nid/edit',
+        'delete' => 'node/%nid/delete',
+        'view'   => 'node/%nid',
+      ),
+    ),
+    'user' => array(
+      '-all-' => array(
+        'add'    => 'admin/people/create',
+        'edit'   => 'user/%uid/edit',
+        'delete'   => 'user/%uid/delete',
+        'view'   => 'user/%uid',
+      ),
+    ),
+    'taxonomy_vocabulary' => array(
+      'taxonomy_vocabulary' => array(
+        'add'    => 'admin/structure/taxonomy/add',
+        'edit'   => 'admin/structure/taxonomy/%vid/edit',
+        'delete'   => 'admin/structure/taxonomy/%vid/delete',
+        'view'   => 'admin/structure/taxonomy/%vid',
+      ),
+    ),
+    'taxonomy_term' => array(
+      '-all-' => array(
+        'add'    => 'admin/structure/taxonomy/%bundle/add',
+        'edit'   => 'taxonomy/term/%tid/edit',
+        'view'   => 'taxonomy/term/%tid',
+        'delete'   => 'taxonomy/term/%tid/delete',
+      ),
+    ),
+/*
+    'comment' => array(
+      'comment' => array(
+        'add'    => '',
+        'edit'   => '',
+        'delete' => '',
+        'view'   => '',
+      ),
+    ),
+*/
+    
+    // A fine selection of Drupal Contrib entities.
+    
+    // We have custom coded an add page for the relation module's entities.
+    'relation' => array(
+      '-all-' => array(
+        // 'relation/add/relation_bundle/endpoint_1_bundle/endpoint_1_id/endpoint_2_bundle/endpoint_2_id'        
+        'add'    => 'relation/add/%bundle/%/%/%/%', 
+        'edit'   => 'relation/%rid/edit',
+        'delete' => 'relation/%rid/delete',
+        'view'   => 'relation/%rid',
+      ),
+    ),
+  );
+  
+  // Preprocess the above array to nest the path under a 'path' array element.
+  $output = array();
+  foreach ($presets as $entity_type => $bundles) {
+    foreach ($bundles as $bundle_name => $bundle) {
+      // Go through each CRUD operation and move its path under a path array key.
+      foreach ($bundle as $crud_op => $path) {
+        $output[$entity_type][$bundle_name][$crud_op]['path'] = $path;
+      }
+    }
+  }
+  
+  return $output;
+}
+
+
+// ! Forms
+
+/**
+ * Implementation of hook_form_alter() for form ID message_node_form.
+ *
+ */
+function entity_dialog_form_alter(&$form, &$form_state, $form_id) {
+  // Only do this for forms being requested by this module. 
+  if (arg(0) != 'entity-dialog' && !isset($form_state['entity_dialog_processed'])) return;
+  
+  // Store a processed flag in the form state so that we still run this form_alter when this
+  // form is being rebuilt from ajax that wasn't invoked by us. e.g using ajax upload on a file field
+  // submits the form to a different url (ie one that doesn't begin with 'entity-dialog').
+  $form_state['entity_dialog_processed'] = TRUE;
+
+  // The 'entity_dialog_form_op' will be set only when the form is built the first time. 
+  // We don't want this to be reset if the form is being rebuilt e.g. via ajax upload button et. al.
+  $url_info = entity_dialog_deliver_url_info(arg(), array('op', 'bundle'));
+  $op = $url_info[0];
+  if (isset($form_state['entity_dialog_form_op'])) {
+    $form_state['entity_dialog_form_op'] = $form_state['entity_dialog_form_op'];
+  }
+  else {
+    $form_state['entity_dialog_form_op'] = $op;
+  }
+   
+  $ajax = array(
+    'callback' => 'entity_dialog_ajax_entity_submit',
+    'wrapper' => 'formwrapper-entity-dialog',
+    'method' => 'replace',
+    'effect' => 'fade',
+  );
+  
+  // Set up the delete link if needed.
+  if (!empty($form['delete']) || !empty($form['actions']['delete'])) {
+    $path_old = request_path();
+    $last = strrpos($path_old, '/');
+    $delete_path = substr_replace($path_old, '/delete', $last);
+  }
+
+  // AJAXify the form.
+  // The location of the submit button in the form is not consistent across all
+  // entities. It is inside $form['actions']['submit'] for core entities,m
+  // inside $form['submit'] for ECK entities and inside $form['actions']['save']
+  // for Relation entities. If it's in none of these then unfortunately 
+  // we don't know where to find it and thus can't AJAXify it.
+  if (empty($form['actions'])) {
+    $form['submit']['#ajax'] = $ajax;
+    if (!empty($form['delete'])) {
+      $form['delete']['#type'] = 'button'; // Buttons don't submit the form.
+      $form['delete']['#ajax']['path'] = $delete_path; 
+    }
+  }
+  else {
+    if (isset($form['actions']['submit'])) {
+      $form['actions']['submit']['#ajax'] = $ajax;
+    }
+    else if (isset($form['actions']['save'])){
+      $form['actions']['save']['#ajax'] = $ajax;
+    }
+    
+    if (!empty($form['actions']['delete'])) {    
+      $form['actions']['delete']['#type'] = 'button';
+      $form['actions']['delete']['#ajax']['path'] = $delete_path;
+    }
+  }
+      
+  $css_form_class = 'entity-dialog-' . str_replace('_', '-', $form_id);
+
+  $form['#prefix'] = '<div id="formwrapper-entity-dialog" class="' . $css_form_class . '">';
+  $form['#suffix'] = '</div>';
+}
+
+/**
+ * Redirect a non-ajaxified form to the page that the dialog was loaded on
+ * instead of wherever the form would normally redirect to. 
+ */
+function entity_dialog_non_ajax_redirect($form, &$form_state) {
+  $path = entity_dialog_current_path();
+  $form_state['redirect'] = array($path);
+}
+/**
+ * Ajax callback for submission of an entity form.
+ */ 
+function entity_dialog_ajax_entity_submit($form, &$form_state) {
+  // Get a list of all the entity key ids and check if one of them
+  // exists in the $form_state['values'].     
+  list($entity_id, $entity_type, $bundle) = entity_dialog_entity_info_from_form($form, $form_state);
+
+  $errors = NULL;
+
+  // Don't need to Ajax validate fields for delete.
+  if (isset($form_state['values']['op']) && $form_state['values']['op'] != 'Delete') { 
+    // Check for errors.
+    $errors = form_get_errors();
+  }
+
+  // If we found an entity id then we want to close the dialog, otherwise we probably
+  // failed validation so return the form.
+  if ($entity_id && !$errors) {
+    // Close the popup or reload the page.
+    entity_dialog_close_command($bundle, $commands);
+
+    // Allow other modules to add ajax commands when the dialog closes.
+    list($entity, $op, $originating_uri) = entity_dialog_close_hook_vars($form, $form_state);
+    $extra_commands = array();
+    $extra_commands = module_invoke_all('entity_dialog_close', $commands, $entity, $op, $originating_uri);
+    // TODO: The preceeding line is a bit ugly. We should possibly consider using drupal_alter so we can pass
+    // $commands by reference.
+    
+    $commands = array_merge($commands, $extra_commands);
+    
+    return array('#type' => 'ajax', '#commands' => $commands);
+  }
+  else {
+    return $form;
+  }
+}
+
+/**
+ * Implementation of hook_form_FORM_ID_alter.
+ */
+function entity_dialog_form_entity_dialog_delete_confirm_form_alter(&$form, &$form_state) {
+  $form['actions']['submit']['#ajax'] = array(
+    'callback' => 'entity_dialog_ajax_confirm_submit',
+    'wrapper' => 'formwrapper-entity-dialog',
+    'method' => 'replace',
+    'effect' => 'fade',
+  );
+}
+
+/**
+ * Ajax submit callback for the entity delete confirmation page.
+ *
+ * TODO: This function seems to be being called before the entity_dialog_delete_confirm_form_submit()
+ * function which is deleting the entity. This is causing issues when trying to use our close hook. 
+ * Perhaps we could do the deleting in here. 
+ */
+function entity_dialog_ajax_confirm_submit($form, &$form_state) {
+  // @TODO: This function is a bit too dumb for my liking. 
+  // Only closing the dialog if there's no errors is not solid logic
+  // because on submission of the form there might be an error caused by 
+  // something other than validation. 
+
+  $errors = form_get_errors();
+  if (!$errors) {
+    // Close the popup or reload the page.
+	  list(, , $bundle) = entity_dialog_entity_info_from_form($form, $form_state);
+    entity_dialog_close_command($bundle, $commands);
+    
+    // Allow other modules to add ajax commands when the dialog closes.
+    list($entity, $op, $originating_uri) = entity_dialog_close_hook_vars($form, $form_state);
+
+    $extra_commands = module_invoke_all('entity_dialog_close', $commands, $entity, $op, $originating_uri);
+    // TODO: The preceeding line is a bit ugly. We should possibly consider using drupal_alter so we can pass
+    // $commands by reference.
+    
+    $commands = array_merge($commands, $extra_commands);
+
+    $entity_type = $form['#entity_type'];
+    $entity_id = $form['#entity_id'];
+    
+    // Delete the passed entity.
+    $deleted = entity_delete($entity_type, $entity_id);
+    
+    // entity_delete returns false if it failed and nothing if it succeeded.
+    if ($deleted !== FALSE) {
+      drupal_set_message(t("Entity $entity_id of type @entity_type has been deleted.", array('@entity_type' => $entity_type)), 'status');
+    }
+
+    return array('#type' => 'ajax', '#commands' => $commands);
+  }
+  else {
+    // There was a validation error. 
+    return $form;
+  }
+}
+
+/**
+ * Form builder function for our custom delete confirmation form.
+ */
+function entity_dialog_delete_confirm_form($form, &$form_state, $entity_type, $bundle, $entity_id) {
+  // Add our own info to pass to the submit handler.
+  $form['#entity_type'] = $entity_type;
+  $form['#bundle'] = $bundle;
+  $form['#entity_id'] = $entity_id;
+  
+  // Build the cancel link so that it calls our own menu handler.
+  $cancel_link = array(
+    'path' => 'entity-dialog/delete-cancel',
+    'attributes' => array(
+      'class' => array('use-ajax'),
+    ),
+  );
+  
+  return confirm_form($form, '', $cancel_link);
+}
+
+
+// ! Ajax commands
+
+/**
+ * Generate ajax_commands for closing the dialog.
+ */
+function entity_dialog_close_command($bundle, &$commands) {
+  $fade_out = ajax_command_invoke('#entity-dialog', 'fadeOut', array('fast'));
+
+  // If there's no bundle passed then we probably came here from a cancel link.
+  if (is_null($bundle)) {
+		// Fade out the dialog.
+		$commands[] = $fade_out;
+  }
+  else {
+  	// If 'Reload on save' setting is checked then add the command that 
+  	// will reload the page after the dialog closes.
+    $active_settings = variable_get('entity_dialog_active');  
+  
+    if (in_array($bundle . '_reload_page', $active_settings)) {
+  		$commands[] = array(
+        'command' => 'edReloadPage',
+        'selector' => '#entity-dialog',
+      );
+  	}
+  	else {
+      // Output status messages.
+      $commands[] = entity_dialog_status_message_commands();
+          
+  		// Fade out the dialog.
+  		$commands[] = $fade_out;
+  	}
+  }
+}
+
+/**
+ * Generate ajax_commands for showing status messages after a dialog closes.
+ */
+function entity_dialog_status_message_commands() {
+  $commands = array();
+
+  // Check if there's any status messages.
+  $messages = drupal_get_messages(NULL, FALSE);
+  if ($messages) {
+    // Remove old status messages.
+    $commands[] = ajax_command_invoke('#entity-dialog-status', 'remove');    
+    
+    // Print out messages with custom styling so we don't get mixed up with real dsms. 
+    $commands[] = ajax_command_after('#entity-dialog', '<div id="entity-dialog-status"></div>');    
+    //$commands[] = ajax_command_invoke('#entity-dialog-status', 'hide');    
+    $commands[] = ajax_command_html('#entity-dialog-status', theme('status_messages'));
+    
+    // Custom ajax command for the status message.
+    $commands[] = array(
+      'command' => 'edStatus',
+      'selector' => '#entity-dialog-status',
+    );  
+  }  
+  return $commands;
+}
+
+// ! Entity manipulation
+
+/**
+ * Generate an ajax response according to the action requested.
+ * eg URLs would be:
+ *     entity-dialogs/node/add/article *
+ *     entity-dialogs/node/5
+ *     entity-dialogs/node/5/edit
+ *     entity-dialogs/taxonomy/term/5/
+ *     entity-dialogs/admin/structure/taxonomy/myvocab/add
+ *     etc
+ */
+function entity_dialog_deliver() {
+  // Determine the action and bundle based on the url.
+  $args = arg();
+  list($entity_type, $bundle_name, $op, $wildcards) = entity_dialog_deliver_url_info($args);
+  
+  $defaults = array();  
+  if ($op == 'create') {
+    // Some specific entity types require a few extra defaults to load properly. 
+    $defaults = entity_dialog_deliver_entity_defaults($entity_type, $bundle_name);
+  }  
+
+  // Generate a render array and title (if necessary).
+  $render = entity_dialog_deliver_dialog_content($entity_type, $bundle_name, $op, $wildcards, $defaults);
+
+  // If $render is an integer then it is a menu constant that needs
+  // returning straight away. Most likely a MENU_ACCESS_DENIED.
+  if (is_int($render)) {
+    return $render;
+  }
+    
+  // Render the content to show in the dialog.
+  $content = drupal_render($render['content']);
+
+  // Set up our ajax commands:
+  $commands = array();
+
+  $entity_classes = variable_get('entity_dialog_class');
+  $class_key = $render['class_key'];
+  $class = isset($entity_classes[$class_key])? $entity_classes[$class_key]: 'ed-default';
+
+  $filename = $class . '.css';
+  $path = drupal_get_path('module', 'entity_dialog');
+  
+  drupal_add_css($path . '/dialog_styles/' . $filename);
+  
+  // Add markup to the page for the dialog box.
+  $variables = array(
+   'entity_type' => $entity_type, 
+   'bundle_name' => $bundle_name, 
+   'op' => $op, 
+   'class' => $class
+  );
+  
+  $dialog_markup = theme('entity_dialog', $variables);
+  
+  $commands[] = ajax_command_invoke('#entity-dialog', 'remove');
+  $commands[] = ajax_command_append('body', $dialog_markup); 
+  $commands[] = ajax_command_invoke('#entity-dialog', 'hide');
+
+  // Add the content of the dialog.
+  $commands[] = ajax_command_html('#entity-dialog .dialog-content', $content);
+  
+  // Only add the title if there is one.
+  if (isset($render['title'])) {
+    $commands[] = ajax_command_html('#entity-dialog .dialog-header h3', $render['title']);
+    $commands[] = ajax_command_invoke('#entity-dialog .dialog-header h3', 'show');
+  }
+  else {
+    $commands[] = ajax_command_invoke('#entity-dialog .dialog-header h3', 'hide');
+  }
+  
+  // Fade in the dialog.
+  $commands[] = ajax_command_invoke('#entity-dialog', 'fadeIn', array('fast'));
+
+  return array('#type' => 'ajax', '#commands' => $commands);
+}
+
+/**
+ * Build the content of the dialog.
+ */
+function entity_dialog_deliver_dialog_content($entity_type, $bundle, $op, $wildcards, $defaults) {
+  $title = NULL;
+
+  // Pull out some useful info about this entity type. Unfortunately Drupal
+  // doesn't mandate a consistent key for things like entity ID (eg nid, uid etc),
+  // or bundle name (node type, taxonomy vocab machine name) etc
+  $entity_type_info = entity_get_info($entity_type);
+  $entity_keys = $entity_type_info['entity keys'];
+  $entity_keys_id = $entity_keys['id'];
+  $bundle_key = $entity_keys['bundle'];
+  
+  // Grab the entity id from the wildcards.
+  $entity_id = isset($wildcards['%' . $entity_keys_id]) ? $wildcards['%' . $entity_keys_id] : NULL;
+  
+  // If we have an entity id then load the entity, otherwise we're going to build the add form
+  // so create a 'blank' entity.
+  if ($entity_id) {
+    $entity = reset(entity_load($entity_type, array($entity_id)));
+  }
+  else {
+    // Provide a bundle if we have one.
+    if (!empty($bundle_key)) {
+      $defaults[$bundle_key] = $bundle;
+    }
+
+    // Create a 'blank' entity.
+    $entity = entity_create($entity_type, $defaults);
+  }
+  
+  // If user doesn't have permission to $op this $entity then return a 403.
+  if (!entity_access($op, $entity_type, $entity)) {
+    return MENU_ACCESS_DENIED;
+  }
+
+  $entity_label = $entity_type_info['label'];
+  $bundle_label = $entity_type_info['bundles'][$bundle]['label'];
+  $title = entity_dialog_title($entity_type, $op, $entity, $bundle_label);
+  
+  switch ($op) {
+    case 'create':
+      // Build the entity add form.
+      $render = entity_form($entity_type, $entity);
+
+      // Build the title for the dialog.
+      $title = "Create new " . $title;
+      break;
+
+    case 'update':
+      $title = "Edit " . $title;
+      $render = entity_form($entity_type, $entity);
+      break;
+    
+    case 'delete':
+      $bundle = $entity->{$bundle_key};
+      $question_prefix = 'Are you sure you want to delete ';
+
+      if (isset($entity->title)) {
+        $question_suffix = $bundle_label . ': <em>' . $entity->title . '</em>?';
+      }
+      else {
+        $question_suffix = 'this ' . $entity_label . ' ' . $entity_type . '?';
+      }
+            
+      $title = $question_prefix . $question_suffix;
+      $render = drupal_get_form('entity_dialog_delete_confirm_form', $entity_type, $bundle, $entity_id);
+      break;
+      
+    case 'view':
+      // Build the enitity view.
+      $view = entity_view($entity_type, array($entity));
+      $render = reset($view[$entity_type]);
+      break;
+  }
+    
+  return array(
+    'title' => $title,
+    'content' => $render, 
+    'class_key' => $bundle . '_' . $op . '_class',
+  );
+}
+
+/**
+ * Return any extra defaults required by the specified entity type 
+ * in order that it can load properly.
+ */
+function entity_dialog_deliver_entity_defaults($entity_type, $bundle_name) {
+  $defaults = array();
+
+  // Check if any other modules want to provide defaults for this entity type.
+  $entity_info = entity_get_info($entity_type);
+  if (isset($entity_info['entity dialog class'])) {
+    $class = $entity_info['entity dialog class'];
+    if (method_exists($class, 'getFormDefaults')) {
+      // When Drupal mandates PHP 5.3 we should use the following:
+      //$entity_info['entity dialog class']::getFormDefaults($entity_type, $bundle_name, $defaults);
+      call_user_func($entity_info['entity dialog class'] . '::getFormDefaults', $entity_type, $bundle_name, $defaults); // PHP 5.2.3 friendly.
+    }
+  }
+
+  switch ($entity_type) {
+    case 'taxonomy_term':
+      $query = new EntityFieldQuery();
+      $query->entityCondition('entity_type', 'taxonomy_vocabulary')
+        ->propertyCondition('machine_name', $bundle_name);
+      
+      $result = $query->execute();
+      
+      $defaults['vid'] = key($result['taxonomy_vocabulary']);
+      break;    
+  }
+  
+  return $defaults;
+}
+
+/**
+ * Determine the action, bundle, op and wildcards for the given url args.
+ */
+function entity_dialog_deliver_url_info($args, $return_specific_items = NULL) {
+  // Remove the entity-dialogs URL piece. @todo should this happen super early in
+  // bootstrap instead, so that other code will be happy? eg 
+  // if other code does if (arg(0) == 'node') {
+  array_shift($args);
+
+  $entities = entity_get_info();
+
+  $best_score = 0;
+  $best_match = array();        
+  foreach ($entities as $entity => $entity_info) {
+    // Some entities doen't have bundles--we don't care about these ones.
+    if (isset($entity_info['bundles'])) {
+      foreach ($entity_info['bundles'] as $bundle_name => $bundle) {
+        if (isset($bundle['crud'])) {
+          foreach ($bundle['crud'] as $op => $crud_info) {
+            $paths = str_replace('-', '_', $crud_info['path']);
+            $crud_args = explode('/', $paths);
+            $score = entity_dialog_calculate_rank($args, $crud_args);
+            if ($score > $best_score) {
+              $best_score = $score;
+              $wildcards = entity_dialog_fetch_wildcards($args, $crud_args);
+              // Convert user facing op strings into ones that Drupal understands.
+              $best_match = array($entity, $bundle_name, entity_dialog_convert_op_strings($op), $wildcards);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // If the caller requests only specific items then unset all the ones 
+  if ($return_specific_items) {
+    // Make sure it's an array.
+    $return_specific_items = (array) $return_specific_items;
+    
+    // Using this function with list() requires us to return an unkeyed array
+    // so we need a way to match the requested items to their corresponding position
+    // in the $best_match array. 
+    $item_numbers = array(
+      'entity' => 0,
+      'bundle' => 1,
+      'op' => 2,
+      'wildcards' => 3,
+    );
+    
+    // Make a new array with only the requested items.
+    $new_best_match = array();
+    foreach ($return_specific_items as $item) {
+      $item_number = $item_numbers[$item];
+      $new_best_match[] = $best_match[$item_number];
+    }
+    
+    $best_match = count($new_best_match) > 1 ? $new_best_match : $new_best_match[0];
+  }
+  
+  return ($best_score > 0) ? $best_match : FALSE;
+}
+
+
+/**
+ * Work out how many parts of the supplied URL match the CRUD url.
+ *
+ * eg if we are at node/5/spare-arg then the following CRUD urls would calculate:
+ *
+ * node/add/article returns 1
+ * node/% returns 1
+ * node/%/edit returns 2
+ * node/something/blah returns 1
+ */
+function entity_dialog_calculate_rank($args, $crud_args) {
+  if (count($crud_args) > count($args)) return 0; // Break if this CRUD arg has more pieces than the URL.
+
+  $score = 0; 
+  foreach ($crud_args as $i => $crud_arg) {
+    $arg = str_replace('-', '_', $args[$i]); 
+    if ($crud_arg == $arg){
+       $score ++;
+    } 
+    else {
+      // If this crud arg is not a % placeholder, and it doesn't match the URL arg
+      // at that position then there is definitely no match possible.
+      $first_char = substr($crud_arg, 0, 1);
+      if ($first_char !== '%') {
+        return 0;
+      }  
+    }
+  }
+  return $score;
+}
+
+
+/**
+ * Description.
+ *
+ * @param $arg
+ *   Description.
+ * @return
+ *   Description.
+ */
+function entity_dialog_fetch_wildcards($args, $crud_args) {
+  $wildcards = array();
+  
+  foreach ($crud_args as $i => $crud_arg) {
+    // If this arg piece starts with % then store the arg.
+    $first_char = substr($crud_arg, 0, 1);
+    if ($first_char == '%') {
+      // Cater for eck not adding the entity key string in the crud path.
+      $key = $crud_arg == '%' ? '%id' : $crud_arg;
+      
+      $wildcards[$key] = $args[$i];
+    }
+  }
+    
+  return $wildcards;
+}
+
+/**
+ * Delete confirmation cancel link callback.
+ */
+function entity_dialog_delete_cancel() {
+  // Close the dialog.
+  $commands = array();
+  entity_dialog_close_command(NULL, $commands);
+  
+  return array('#type' => 'ajax', '#commands' => $commands);
+}
+
+// ! Helper functions
+
+/**
+ * Get a list of all entity types installed on this site.
+ */
+function entity_dialog_entity_list() {
+  $list = entity_get_info();
+  return array_keys($list);
+}
+
+/**
+ * Generate a list of unique entity key ids for 
+ * all entities on the site.
+ */
+function entity_dialog_entity_id_key($entity_type, $bundle) {
+  $entity_info = entity_get_info($entity_type);
+  
+  return $entity_info['entity keys']['id'];
+}
+
+/**
+ * Convert using facing op strings into ones that Drupal understands.
+ */
+function entity_dialog_convert_op_strings($op) {
+  switch ($op) {
+    case 'add':
+      $sub = 'create';
+      break;  
+    
+    case 'edit':
+      $sub = 'update';
+      break;
+    
+    default:
+      $sub = $op;
+      break;
+  }
+  
+  return $sub;
+}
+
+/**
+ * Prepare the variables that we are going to send to implementations of hook_entity_dialog_close
+ */
+function entity_dialog_close_hook_vars($form, $form_state){
+
+  global $base_root, $base_path;
+  list($entity_id, $entity_type, $bundle) = entity_dialog_entity_info_from_form($form, $form_state);
+  
+  // The referer is the page that the ajax call orginated from. 
+  // Removing base_root and base_path so that hook implementations get a clean path.
+  $referer_base = $base_root . $base_path; 
+  $originating_uri = str_replace($referer_base, '', $_SERVER['HTTP_REFERER']);
+  
+  // Load the entity
+  $entities = entity_load($entity_type, array($entity_id));
+  
+  return array(
+    reset($entities), // Entites come back as an array--we only want the first, there will only be one. 
+    $form_state['entity_dialog_form_op'], // The entity_dialog_form_op that was set when the form was built.
+    $originating_uri
+  );
+}
+
+/**
+ * Return information about an entity from it's form. 
+ */
+function entity_dialog_entity_info_from_form($form, $form_state){
+  // Get a list of all the entity key ids and check if one of them
+  // exists in the $form_state['values'].   
+  $entity_type = $form['#entity_type'];
+  $bundle      = $form['#bundle'];
+  $id_key = entity_dialog_entity_id_key($entity_type, $bundle); // Eg uid, nid, etc
+  
+  // Check for the existence of an entity id--could be in one of a few places. 
+  $entity_id = NULL;
+  if (isset($form_state['values'][$id_key])) {
+    $entity_id = $form_state['values'][$id_key];
+  }
+  elseif (isset($form_state['values']['entity']->$id_key)) {
+    // The eck module stores the entity id in a different place.
+    $entity_id = $form_state['values']['entity']->$id_key;
+  }
+  elseif (isset($form['#entity_id'])){
+    // Our custom built delete form stores the entity id here for us.
+    $entity_id = $form['#entity_id'];
+  }
+  elseif (isset($form_state[$entity_type])){
+    // Relation module stores the entity in $form_state['relation'].
+    $entity_id = $form_state[$entity_type]->$id_key;
+  }
+  
+  return array($entity_id, $entity_type, $bundle);
+}
+
+/**
+ * Return the path of the current page.
+ */
+function entity_dialog_current_path(){
+  global $base_url;
+  return str_replace($base_url . '/', '', $_SERVER['HTTP_REFERER']);
+}
+
+/**
+ * Get all classes that implement entityDialogContribInterface.
+ * 
+ * NOTE: We are making a HUGE assumption about the naming convention of
+ * the include files that implement the interface. They MUST be as follows:
+ * entity_dialog.*usually_implementing_module_name*.inc 
+ */
+function _get_entity_dialog_classes() {
+  $result = db_select('registry', 'registry')
+    ->distinct()
+    ->fields('registry', array('name'))
+    ->where("type=:type AND filename like :filename",
+      array(
+        ':type' => 'class',
+        ':filename' => '%/entity_dialog.%.inc',
+      )
+    )
+    ->execute()
+    ->fetchAll(PDO::FETCH_ASSOC);
+  
+  // @TODO: There SHOULD be a way to get the data out of the database in a nice format
+  // without having to go through it like this.   
+  $class_names = array();
+  foreach ($result as $info) {
+    $class_names[] = $info['name'];
+  }
+  
+  return $class_names;
+}
+
+function entity_dialog_css_safe($string){
+  return strtr(drupal_strtolower($string), array(' ' => '-', '_' => '-', '[' => '-', ']' => ''));
+}
+
+// ! Theme
+
+
+/**
+*  Implementation of hook_theme().
+**/
+function entity_dialog_theme() {
+  return array(
+    'entity_dialog' => array(
+      'variables' => array(
+        'entity_type' => NULL, 
+        'bundle_name' => NULL, 
+        'op' => NULL,
+        'class' => NULL,
+      ),
+    ),  
+  );
+}
+
+/**
+ * Build the dialog markup.
+ */
+function theme_entity_dialog($variables) {
+
+  // Build a list of attributes for the dialog.
+  $attributes = array(
+    'id' => 'entity-dialog',
+    'class' => array(
+      'entity-type-' . entity_dialog_css_safe($variables['entity_type']),
+      'entity-bundle-' . entity_dialog_css_safe($variables['bundle_name']),
+      'entity-op-' . entity_dialog_css_safe($variables['op']),
+      $variables['class'],
+    ),
+  ); 
+  
+  $dialog = array(
+    '#prefix' => '<div ' . drupal_attributes($attributes) . '><div class="inner">',
+    '#suffix' => '</div></div>',
+    'header' => array(
+      '#prefix' => '<div class="dialog-header">',
+      '#suffix' => '</div>',
+      '#markup' => '<h3>Empty on purpose</h3><a class="dialog-close">&nbsp;</a>',
+    ),
+    'content' => array(
+      '#markup' => '<div class="dialog-content"></div>',
+    ),
+  );
+  
+  return render($dialog);
+}
+
+/**
+ * Generate a render array for an ajaxified link.
+ */
+function entity_dialog_link($title, $href, $merge = array()) {
+  $link =  array(
+    '#type' => 'link',
+    '#title' => $title,
+    '#href' => 'entity-dialog/' . $href,
+    '#options' => array(
+      'attributes' => array(
+        'class' => array('use-ajax'),
+      )
+    ),
+    '#ajax' => array(), // To include ajax.js
+  );
+  
+  return array_merge_recursive($link, $merge);
+}
+
+/**
+* entity_dialog_title().
+* Set's the title of an entity dialog.
+**/
+function entity_dialog_title($entity_type, $op, $entity, $bundle_label) {
+  $pre = ''; 
+  switch ($op) {
+    case 'add':
+      $pre = 'Create';
+      break;
+    
+    case 'edit':
+      $pre = 'Update';
+      break;
+      
+    case 'view':
+      $pre = 'View';
+      break;
+      
+    case 'delete':
+      $pre = 'Delete';
+      break;
+  }
+    
+  switch ($entity_type) {
+    case 'taxonomy_term':
+      $vocab = taxonomy_vocabulary_load($entity->vid);
+      $title = t($pre . ' ' . $vocab->name);
+      break;
+      
+    case 'vocabulary':
+      $title = t($pre . ' Vocabulary');
+      break;
+      
+    case 'user':
+      $title = t($pre . ' Account');
+      break;
+    
+    default:
+      $title = t($pre . ' ' . $bundle_label);
+      break;
+  }
+  
+  return $title;
+}
+
+
+// ! Class interface definitions
+
+// Declare the interface for integrating contrib modules.
+interface entityDialogContribInterface {
+  /**
+   * Provide additional information for entities that this Contrib module provides.
+   */
+  public static function entitiesToEnable();
+    
+  /**
+   * Returns the add/edit form for entities that this Contrib module provides.
+   */
+  public static function formCallback($entity, $entity_type);
+  
+  /**
+   * OPTIONAL METHODS - here for documentation purposes only.
+   *
+   * Provide a way for implementing modules to add defaut values to the form
+   * eg. Taxonomy terms need a vocab id, relations need endpoints.
+   */
+  // public function getFormDefaults($entity_type, $bundle, &$defaults);
+  
+}
+
+/**
+ * Define a generic form callback for entities which don't already provide it
+ * (eg many contrib entities, and any that the user created using ECK).
+ *
+ * This form callback calls the form_callback() method in the entity dialog include file for the
+ * contrib module in question (eg ECK) which in turn works out how to provide the form.
+ */
+function entity_dialog_generic_form_callback($entity, $entity_type) {
+  $entity_info = entity_get_info($entity_type);
+  $class = $entity_info['entity dialog class'];
+
+  // When Drupal mandates PHP 5.3 we should use the following:
+  // return $classdformCallback($entity, $entity_type);
+
+  return call_user_func($class . '::formCallback', $entity, $entity_type); // PHP 5.2.3 friendly.
+}
+
+
+// ! Hacks
+
+/**
+ * Callback for the relation add form submission. 
+ *
+ * 
+ */
+function entity_dialog_relation_form_submit(&$form, &$form_state) {
+  $relation = $form_state['relation'];
+  field_attach_submit('relation', $relation, $form, $form_state);
+  relation_save($relation);
+}

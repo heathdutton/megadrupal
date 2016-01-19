@@ -1,0 +1,1338 @@
+<?php
+
+/**
+ * @file
+ * GlobalLink translation module.
+ *
+ * This module adds node translation using the Internationalization module (i18n). Also, includes GlobalLink core settings UI and configuration.
+ */
+
+define('TPT_ROOT', dirname(__FILE__));
+
+define('TPT_ROLE_MANAGE_TRANSLATIONS', t('can manage GlobalLink translation tasks and settings'));
+define('TPT_ROLE_DO_TRANSLATIONS', t('can manage GlobalLink translation tasks'));
+define('TPT_ROLE_VIEW_TRANSLATIONS', t('can view GlobalLink translation tasks'));
+
+define('TPT_PAGER_LIMIT', variable_get('globallink_pager_limit', 10));
+
+define('TPT_LOGGING_CONFIG_DISABLED', '0');
+define('TPT_LOGGING_CONFIG_INFO', '1');
+define('TPT_LOGGING_CONFIG_DEBUG', '2');
+
+/**
+ * Implements hook_permission().
+ */
+function globallink_permission() {
+  return array(
+    TPT_ROLE_MANAGE_TRANSLATIONS => array('title' => TPT_ROLE_MANAGE_TRANSLATIONS),
+    TPT_ROLE_DO_TRANSLATIONS => array('title' => TPT_ROLE_DO_TRANSLATIONS),
+    TPT_ROLE_VIEW_TRANSLATIONS => array('title' => TPT_ROLE_VIEW_TRANSLATIONS)
+  );
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function globallink_form_field_ui_field_delete_form_alter(&$form, &$form_state) {
+  $field_name = $form['field_name']['#value'];
+  $field_info = field_info_field($field_name);
+
+  switch ($field_info['type']) {
+    case 'list_boolean':
+    case 'image':
+    case 'file':
+    case 'taxonomy_term_reference':
+      break;
+    default:
+      array_unshift($form['#submit'], 'globallink_form_field_ui_field_delete_form_submit');
+  }
+}
+
+/**
+ * Adds a validation handler to check for change in multilingual options.
+ */
+function globallink_form_node_type_form_alter(&$form, $form_state) {
+  array_unshift($form['#validate'], 'globallink_form_node_type_form_validate');
+}
+
+/**
+ * Validation to check if any active submission exists for this content type.
+ * Only if there is a change in multilingual options.
+ */
+function globallink_form_node_type_form_validate($form, &$form_state) {
+  module_load_include('inc', 'globallink', 'globallink');
+  $language_content_type = $form_state['values']['language_content_type'];
+
+  if ($language_content_type != 2 && globallink_pending_submission_exists_for_content_type($form_state['values']['old_type'])) {
+    form_set_error('language_content_type', t('Active submission exists for this content type in GlobalLink.'));
+  }
+}
+
+/**
+ * Submit handler for delete link on Manage Fields Page of Content Type and Field Collection.
+ * This deletes a field from fields config table.
+ */
+function globallink_form_field_ui_field_delete_form_submit($form, &$form_state) {
+  $entity_type = isset($form['entity_type']['#value']) ? $form['entity_type']['#value'] : FALSE;
+  $bundle_name = isset($form['bundle']['#value']) ? $form['bundle']['#value'] : FALSE;
+  $field_name = isset($form['field_name']['#value']) ? $form['field_name']['#value'] : FALSE;
+
+  if (!$entity_type) {
+    return;
+  }
+
+  switch ($entity_type) {
+    case 'node':
+      // Request coming from Manage Fields of Content Type
+      $field_info = field_info_field($field_name);
+
+      switch ($field_info['type']) {
+        case 'list_boolean':
+        case 'image':
+        case 'file':
+        case 'taxonomy_term_reference':
+          break;
+        case 'field_collection':
+          // field-collection being deleted, delete all fields recursively for this content type only
+          globallink_delete_fc($bundle_name, $field_name, $entity_type, $bundle_name);
+        default:
+          // Regular field, just delete from the config
+          db_delete('globallink_field_config')
+          ->condition('content_type', $bundle_name, ' = ')
+          ->condition('entity_type', $entity_type, ' = ')
+          ->condition('bundle', $bundle_name, ' = ')
+          ->condition('field_name', $field_name, ' = ')
+          ->execute();
+      }
+
+      break;
+    case 'field_collection_item':
+      // Request coming from Manage Fields of Field Collections
+      // Entity type for all the fields here will be field_collection_item
+      $field_info = field_info_field($field_name);
+
+      switch ($field_info['type']) {
+        case 'list_boolean':
+        case 'image':
+        case 'file':
+        case 'taxonomy_term_reference':
+        case 'field_collection':
+          // Field-collection being deleted, delete all fields recursively for all the content types
+          $content_types = globallink_get_all_content_types_for_field($bundle_name, 'field_collection');
+
+          foreach ($content_types as $content_type) {
+            globallink_delete_fc($content_type, $field_name, $entity_type, $bundle_name);
+          }
+
+          break;
+        default:
+          // Regular field-collection field, just delete from the config for all content types
+          $content_types = globallink_get_all_content_types_for_field($bundle_name, 'field_collection');
+
+          foreach ($content_types as $content_type) {
+            db_delete('globallink_field_config')
+            ->condition('content_type', $content_type, ' = ')
+            ->condition('entity_type', $entity_type, ' = ')
+            ->condition('bundle', $bundle_name, ' = ')
+            ->condition('field_name', $field_name, ' = ')
+            ->execute();
+          }
+      }
+
+      break;
+  }
+}
+
+/**
+ * Determines whether or not the translation is supported.
+ *
+ * @param string $type
+ *   The type of translation.
+ *
+ * @return bool
+ *   True if the translation is supported.
+ */
+function globallink_translation_supported($type) {
+  if (translation_supported_type($type) || (module_exists('globallink_entity') && entity_translation_node_supported_type($type))) {
+    return TRUE;
+  }
+
+  return FALSE;
+}
+
+/**
+ * Removes an existing field-collection field from field config.
+ *
+ * @param string $content_type
+ *   The node content type.
+ * @param string $fc_name
+ *   The field-collection field name.
+ * @param string $entity_type
+ *   The field entity type.
+ * @param string $bundle
+ *   The field bundle name.
+ */
+function globallink_delete_fc($content_type, $fc_name, $entity_type, $bundle) {
+  db_delete('globallink_field_config')
+  ->condition('content_type', $content_type, ' = ')
+  ->condition('entity_type', $entity_type, ' = ')
+  ->condition('bundle', $bundle, ' = ')
+  ->condition('field_name', $fc_name, ' = ')
+  ->execute();
+
+  $fc_field_infos = field_info_instances('field_collection_item');
+
+  if (isset($fc_field_infos) && isset($fc_field_infos[$fc_name]) && is_array($fc_field_infos[$fc_name])) {
+    $fc_items = array_keys($fc_field_infos[$fc_name]);
+
+    foreach ($fc_items as $fc_item) {
+      // All field collection items have entity type as field_collection_item
+      globallink_delete_fc_items($content_type, $fc_name, $fc_item, 'field_collection_item');
+    }
+  }
+}
+
+/**
+ * Removes an existing child field of field-collection from field config.
+ *
+ * @param string $content_type
+ *   The node content type.
+ * @param string $parent_field_name
+ *   The field-collection parent name.
+ * @param string $field_name
+ *   The field name.
+ * @param string $entity_type
+ *   The field entity type.
+ */
+function globallink_delete_fc_items($content_type, $parent_field_name, $field_name, $entity_type) {
+  $fc_field_info = field_info_field($field_name);
+
+  switch ($fc_field_info['type']) {
+    case 'list_boolean':
+    case 'image':
+    case 'file':
+    case 'taxonomy_term_reference':
+      break;
+    case 'field_collection':
+      // First delete the field-collection field
+      db_delete('globallink_field_config')
+      ->condition('content_type', $content_type, ' = ')
+      ->condition('entity_type', $entity_type, ' = ')
+      ->condition('bundle', $parent_field_name, ' = ')
+      ->condition('field_name', $field_name, ' = ')
+      ->execute();
+
+      $fc_field_infos = field_info_instances('field_collection_item');
+
+      if (isset($fc_field_infos) && isset($fc_field_infos[$field_name]) && is_array($fc_field_infos[$field_name])) {
+        $fc_items = array_keys($fc_field_infos[$field_name]);
+
+        foreach ($fc_items as $fc_item) {
+          // Delete all child fields recursively
+          globallink_delete_fc_items($content_type, $field_name, $fc_item, $entity_type);
+        }
+      }
+
+      break;
+    default:
+      // Regular field-collection field, just delete from config
+      db_delete('globallink_field_config')
+      ->condition('content_type', $content_type, ' = ')
+      ->condition('entity_type', $entity_type, ' = ')
+      ->condition('bundle', $parent_field_name, ' = ')
+      ->condition('field_name', $field_name, ' = ')
+      ->execute();
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function globallink_form_field_ui_field_overview_form_alter(&$form, &$form_state) {
+  $form['#submit'][] = 'globallink_form_field_ui_field_overview_form_submit';
+}
+
+/**
+ * Submit handler for Manage Fields Page of Content Type and Field Collection.
+ * Adds a new field being added to the fields config table for translation.
+ */
+function globallink_form_field_ui_field_overview_form_submit(&$form, &$form_state) {
+  $entity_type = isset($form['#entity_type']) ? $form['#entity_type'] : FALSE;
+  $bundle = isset($form['#bundle']) ? $form['#bundle'] : FALSE;
+  $new_field = isset($form['fields']['_add_new_field']) ? $form['fields']['_add_new_field'] : FALSE;
+  $existing_field = isset($form['fields']['_add_existing_field']) ? $form['fields']['_add_existing_field'] : FALSE;
+
+  if (!$entity_type) {
+    return;
+  }
+
+  switch ($entity_type) {
+    case 'node':
+      if (!globallink_translation_supported($bundle)) {
+        break;
+      }
+
+      // Request coming from Manage Fields of Content Type
+      if ($new_field && isset($new_field['type']['#value'])) {
+        switch ($new_field['type']['#value']) {
+          case 'list_boolean':
+          case 'image':
+          case 'file':
+          case 'taxonomy_term_reference':
+            break;
+          case 'field_collection':
+            // New field-collection added, just add the empty field-collection to config
+            $new_field_name = $new_field['field_name']['#value'];
+
+            if ($new_field_name != '') {
+              db_insert('globallink_field_config')
+              ->fields(array(
+                'content_type' => $bundle,
+                'entity_type' => $entity_type,
+                'bundle' => $bundle,
+                'field_name' => 'field_' . $new_field_name,
+                'field_type' => $new_field['type']['#value'],
+                'field_label' => $new_field['label']['#value'],
+                'translatable' => 1,
+              ))->execute();
+            }
+
+            break;
+          default:
+            // Regular New field, just add to config
+            $new_field_name = $new_field['field_name']['#value'];
+
+            if ($new_field_name != '') {
+              db_insert('globallink_field_config')
+              ->fields(array(
+                'content_type' => $bundle,
+                'entity_type' => $entity_type,
+                'bundle' => $bundle,
+                'field_name' => 'field_' . $new_field_name,
+                'field_type' => $new_field['type']['#value'],
+                'field_label' => $new_field['label']['#value'],
+                'translatable' => 1,
+              ))->execute();
+            }
+        }
+      }
+
+      if (!$existing_field || !isset($existing_field['field_name']['#value'])) {
+        break;
+      }
+
+      // Existing field is being added to this content type
+      $existing_field_name = $existing_field['field_name']['#value'];
+
+      if ($existing_field_name == '') {
+        break;
+      }
+
+      $existing_field_info = field_info_field($existing_field_name);
+
+      switch ($existing_field_info['type']) {
+        case 'list_boolean':
+        case 'image':
+        case 'file':
+        case 'taxonomy_term_reference':
+          break;
+        case 'field_collection':
+          // Existing FC being added to this content type
+          // Add FC and all the FC fields recursively to the config
+          globallink_insert_fc($entity_type, $existing_field_name, $bundle, $bundle);
+
+          break;
+        default:
+          // Regular existing field, just add to config
+          $existing_field_instance = field_info_instance($entity_type, $existing_field_name, $bundle);
+
+          db_insert('globallink_field_config')
+          ->fields(array(
+            'content_type' => $bundle,
+            'entity_type' => $entity_type,
+            'bundle' => $bundle,
+            'field_name' => $existing_field_name,
+            'field_type' => $existing_field_info['type'],
+            'field_label' => $existing_field_instance['label'],
+            'translatable' => 1,
+          ))->execute();
+
+          break;
+      }
+
+      break;
+    case 'field_collection_item':
+      // Request coming from Manage Fields of Field Collections
+      // Entity type for all the fields here will be field_collection_item
+      $fc_name = $bundle;
+
+      if ($new_field && isset($new_field['type']['#value'])) {
+        // A new field is being added to this field-collection
+        switch ($new_field['type']['#value']) {
+          case 'list_boolean':
+          case 'image':
+          case 'file':
+          case 'taxonomy_term_reference':
+            break;
+          default:
+            // Regular new field is being added to this field-collection, just add to config
+            $new_field_name = $new_field['field_name']['#value'];
+
+            if ($new_field_name == '') {
+              break;
+            }
+
+            // First get all the content types for this field-collection from config,
+            // then add this field for all the content types in the config
+            $content_types = globallink_get_all_content_types_for_field($fc_name, 'field_collection');
+
+            foreach ($content_types as $content_type) {
+              db_insert('globallink_field_config')
+              ->fields(array(
+                'content_type' => $content_type,
+                'entity_type' => $entity_type,
+                'bundle' => $fc_name,
+                'field_name' => 'field_' . $new_field_name,
+                'field_type' => $new_field['type']['#value'],
+                'field_label' => $new_field['label']['#value'],
+                'translatable' => 1
+              ))->execute();
+            }
+        }
+      }
+
+      if (!$existing_field || !isset($existing_field['field_name']['#value'])) {
+        break;
+      }
+
+      // Existing field is being added to this field-collection
+      $existing_field_name = $existing_field['field_name']['#value'];
+
+      if ($existing_field_name == '') {
+        break;
+      }
+
+      $existing_field_info = field_info_field($existing_field_name);
+
+      switch ($existing_field_info['type']) {
+        case 'list_boolean':
+        case 'image':
+        case 'file':
+        case 'taxonomy_term_reference':
+          break;
+        case 'field_collection':
+          // If existing field-collection is added to the field-collection, then add fields recursively
+          $content_types = globallink_get_all_content_types_for_field($fc_name, 'field_collection');
+
+          // First get all the content types for this field-collection from config
+          // then add this field for all the content types in the config
+          foreach ($content_types as $content_type) {
+            globallink_insert_fc($entity_type, $existing_field_name, $content_type, $fc_name);
+          }
+
+          break;
+        default:
+          // First get all the content types for this field-collection from config
+          // then add this field for all the content types in the config
+          $content_types = globallink_get_all_content_types_for_field($fc_name, 'field_collection');
+
+          foreach ($content_types as $content_type) {
+            $existing_field_instance = field_info_instance($entity_type, $existing_field_name, $bundle);
+
+            db_insert('globallink_field_config')
+            ->fields(array(
+              'content_type' => $content_type,
+              'entity_type' => $entity_type,
+              'bundle' => $fc_name,
+              'field_name' => $existing_field_name,
+              'field_type' => $existing_field_info['type'],
+              'field_label' => $existing_field_instance['label'],
+              'translatable' => 1,
+            ))->execute();
+          }
+      }
+
+      break;
+  }
+}
+
+/**
+ * Adds field-collection field to field config.
+ *
+ * @param string $entity_type
+ *   The field entity type.
+ * @param string $fc_name
+ *   The field-collection name.
+ * @param string $content_type
+ *   The node content type.
+ * @param string $bundle
+ *   The field bundle name.
+ */
+function globallink_insert_fc($entity_type, $fc_name, $content_type, $bundle) {
+  $fc_field_info = field_info_field($fc_name);
+  $fc_field_instance = field_info_instance($entity_type, $fc_name, $bundle);
+
+  // Add FC field to the config
+  db_insert('globallink_field_config')
+  ->fields(array(
+    'content_type' => $content_type,
+    'entity_type' => $entity_type,
+    'bundle' => $bundle,
+    'field_name' => $fc_name,
+    'field_type' => $fc_field_info['type'],
+    'field_label' => $fc_field_instance['label'],
+    'translatable' => 0
+  ))->execute();
+
+  $fc_field_infos = field_info_instances('field_collection_item');
+
+  if (isset($fc_field_infos) && isset($fc_field_infos[$fc_name]) && is_array($fc_field_infos[$fc_name])) {
+    $fc_items = array_keys($fc_field_infos[$fc_name]);
+
+    foreach ($fc_items as $fc_item) {
+      // Add all the FC field items recursively
+      globallink_insert_fc_items($content_type, $fc_name, $fc_item);
+    }
+  }
+}
+
+/**
+ * Adds child field of field-collection to field config.
+ *
+ * @param string $content_type
+ *   The node content type.
+ * @param string $parent_field_name
+ *   The parent field-collection name.
+ * @param string $field_name
+ *   The field name.
+ */
+function globallink_insert_fc_items($content_type, $parent_field_name, $field_name) {
+  // Everything added here will have entity type as field_collection_item
+  $fc_field_info = field_info_field($field_name);
+  $fc_field_instance = field_info_instance('field_collection_item', $field_name, $parent_field_name);
+
+  switch ($fc_field_info['type']) {
+    case 'image':
+    case 'file':
+    case 'taxonomy_term_reference':
+      break;
+    case 'field_collection':
+      // Field-collection in a field-collection, first add this field-collection to the config
+      db_insert('globallink_field_config')
+      ->fields(array(
+        'content_type' => $content_type,
+        'entity_type' => 'field_collection_item',
+        'bundle' => $parent_field_name,
+        'field_name' => $field_name,
+        'field_type' => $fc_field_info['type'],
+        'field_label' => $fc_field_instance['label'],
+        'translatable' => 0,
+      ))->execute();
+
+      $fc_field_infos = field_info_instances('field_collection_item');
+
+      if (isset($fc_field_infos) && isset($fc_field_infos[$field_name]) && is_array($fc_field_infos[$field_name])) {
+        $fc_items = array_keys($fc_field_infos[$field_name]);
+
+        foreach ($fc_items as $fc_item) {
+          // Now add the child fields for this field-collection recursively
+          globallink_insert_fc_items($content_type, $field_name, $fc_item);
+        }
+      }
+
+      break;
+    default:
+      $translatable = 1;
+
+      db_insert('globallink_field_config')
+      ->fields(array(
+        'content_type' => $content_type,
+        'entity_type' => 'field_collection_item',
+        'bundle' => $parent_field_name,
+        'field_name' => $field_name,
+        'field_type' => $fc_field_info['type'],
+        'field_label' => $fc_field_instance['label'],
+        'translatable' => $translatable,
+      ))->execute();
+  }
+}
+
+/**
+ * Gets all content types for a specified field.
+ *
+ * @param string $field_name
+ *   The name of the field to search.
+ * @param string $type
+ *   The field's type.
+ *
+ * @return array
+ *   An array containing all content types for the specified field.
+ */
+function globallink_get_all_content_types_for_field($field_name, $type) {
+  $array = array();
+
+  $result = db_select('globallink_field_config', 'tf')
+  ->fields('tf', array('content_type'))
+  ->distinct()
+  ->condition('field_name', $field_name, '=')
+  ->condition('field_type', $type, '=')
+  ->execute();
+
+  foreach ($result as $row) {
+    $array[] = $row->content_type;
+  }
+
+  return $array;
+}
+
+/**
+ * Implements hook_node_type_insert().
+ */
+function globallink_node_type_insert($info) {
+  if (!globallink_translation_supported($info->type)) {
+    return;
+  }
+
+  db_insert('globallink_field_config')
+  ->fields(array(
+    'content_type' => $info->type,
+    'entity_type' => 'node',
+    'bundle' => $info->type,
+    'field_name' => 'title',
+    'field_type' => 'text',
+    'field_label' => 'Title',
+    'translatable' => 1,
+  ))->execute();
+
+  db_insert('globallink_field_config')
+  ->fields(array(
+    'content_type' => $info->type,
+    'entity_type' => 'node',
+    'bundle' => $info->type,
+    'field_name' => 'body',
+    'field_type' => 'text_with_summary',
+    'field_label' => 'Body',
+    'translatable' => 1,
+  ))->execute();
+
+  $metatag_module_exists = module_exists("metatag");
+
+  if ($metatag_module_exists) {
+    db_insert('globallink_field_config')
+    ->fields(array(
+      'content_type' => $info->type,
+      'entity_type' => 'node',
+      'bundle' => $info->type,
+      'field_name' => 'metatags',
+      'field_type' => 'text',
+      'field_label' => 'Meta tags',
+      'translatable' => 1,
+    ))->execute();
+  }
+}
+
+/**
+ * Implements hook_node_type_update().
+ */
+function globallink_node_type_update($info) {
+  if (!$info->modified) {
+    return;
+  }
+
+  if (count(globallink_get_translatable_fields($info->old_type)) == 0) {
+    if (globallink_translation_supported($info->type)) {
+      globallink_insert_all_fields($info->type);
+    }
+
+    return;
+  }
+
+  if (!globallink_translation_supported($info->type)) {
+    globallink_delete_field_configs($info->type);
+
+    return;
+  }
+
+  db_update('globallink_field_config')
+  ->fields(array('content_type' => $info->orig_type))
+  ->condition('content_type', $info->old_type, '=')
+  ->execute();
+
+  db_update('globallink_field_config')
+  ->fields(array('bundle' => $info->orig_type))
+  ->condition('bundle', $info->old_type, '=')
+  ->execute();
+
+  db_update('globallink_core')
+  ->fields(array('type' => $info->orig_type))
+  ->condition('type', $info->old_type, '=')
+  ->execute();
+}
+
+/**
+ * Adds all fields of content type to field config.
+ *
+ * @param string $content_type
+ *   The node content type.
+ */
+function globallink_insert_all_fields($content_type) {
+  $p_arr = globallink_get_pending_fields($content_type);
+  $f_keys = array_keys($p_arr);
+
+  foreach ($f_keys as $f_key) {
+    if ($f_key == '[all]') {
+      continue;
+    }
+
+    if ($f_key != 'title' && $f_key != 'metatags') {
+      $field = field_info_field($f_key);
+
+      switch ($field['type']) {
+        case 'list_boolean':
+        case 'image':
+        case 'file':
+        case 'taxonomy_term_reference':
+        case 'field_collection':
+          break;
+        default:
+          db_insert('globallink_field_config')
+          ->fields(array(
+            'content_type' => $content_type,
+            'entity_type' => 'node',
+            'bundle' => $content_type,
+            'field_name' => $f_key,
+            'field_type' => $field['type'],
+            'field_label' => $p_arr[$f_key],
+            'translatable' => 1,
+          ))->execute();
+      }
+    }
+    else {
+      db_insert('globallink_field_config')
+      ->fields(array(
+        'content_type' => $content_type,
+        'entity_type' => 'node',
+        'bundle' => $content_type,
+        'field_name' => $f_key,
+        'field_type' => 'text',
+        'field_label' => $p_arr[$f_key],
+        'translatable' => 1,
+      ))->execute();
+    }
+  }
+
+  if (module_exists('field_collection')) {
+    globallink_insert_fc_fields($content_type);
+  }
+}
+
+/**
+ * Removes all fields for content type from field config.
+ *
+ * @param string $type
+ *   The node content type.
+ */
+function globallink_delete_field_configs($type) {
+  db_delete('globallink_field_config')
+  ->condition('content_type', $type, ' = ')
+  ->execute();
+}
+
+/**
+ * Implements hook_node_type_delete().
+ */
+function globallink_node_type_delete($info) {
+  globallink_delete_field_configs($info->type);
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function globallink_form_field_ui_field_edit_form_alter(&$form, $form_state) {
+  $field_type = $form['#field']['type'];
+
+  switch ($field_type) {
+    case 'list_boolean':
+    case 'image':
+    case 'file':
+    case 'taxonomy_term_reference':
+    case 'field_collection':
+      break;
+    default:
+      $field_name = $form['#field']['field_name'];
+      $entity_type = $form['#instance']['entity_type'];
+      $bundle_name = $form['#instance']['bundle'];
+
+      if ($entity_type == 'field_collection_item') {
+        break;
+      }
+
+      if (!globallink_translation_supported($bundle_name)) {
+        break;
+      }
+
+      $translatable = globallink_is_field_configured_for_translation($entity_type, $bundle_name, $field_name, $bundle_name);
+      $label = t('GlobalLink Translation');
+      $title = t('This field can be translated using Translations.com translation services.');
+
+      $form['instance']['globallink_translate_field'] = array(
+        '#prefix' => '<label>' . $label . '</label>',
+        '#type' => 'checkbox',
+        '#title' => $title,
+        '#default_value' => $translatable ? 1 : 0,
+      );
+  }
+
+  $form['#submit'][] = 'globallink_form_field_ui_field_edit_form_submit';
+}
+
+/**
+ * Update field config for modified bundle field.
+ */
+function globallink_form_field_ui_field_edit_form_submit($form, &$form_state) {
+  $field_name = $form['#instance']['field_name'];
+  $entity_type = $form['#instance']['entity_type'];
+  $bundle_name = $form['#instance']['bundle'];
+
+  if (!globallink_check_field_configured($bundle_name, $entity_type, $bundle_name, $field_name)) {
+    return;
+  }
+
+  if ($entity_type != 'node') {
+    return;
+  }
+
+  if (!globallink_translation_supported($bundle_name)) {
+    return;
+  }
+
+  if (!isset($form['instance']['globallink_translate_field'])) {
+    return;
+  }
+
+  $translatable = $form['instance']['globallink_translate_field']['#value'];
+
+  db_update('globallink_field_config')
+  ->fields(array(
+    'field_label' => $form['instance']['label']['#value'],
+    'translatable' => $translatable,
+  ))
+  ->condition('content_type', $bundle_name, '=')
+  ->condition('entity_type', $entity_type, '=')
+  ->condition('bundle', $bundle_name, '=')
+  ->condition('field_name', $field_name, '=')
+  ->execute();
+}
+
+/**
+ * Implements hook_node_presave().
+ */
+function globallink_node_presave($node) {
+  if (isset($node->tpt_skip) && $node->tpt_skip == TRUE) {
+    return;
+  }
+
+  if (!translation_supported_type($node->type)) {
+    return;
+  }
+
+  if (!isset($node->original)) {
+    return;
+  }
+
+  $handler = entity_translation_get_handler("node", $node);
+  $config_fields = globallink_get_translatable_fields($node->type, $node->type);
+  $orig = $node->original;
+  $lang = $handler->getFormLanguage();
+
+  foreach ($config_fields as $field) {
+    if ($field->translatable != 1) {
+      continue;
+    }
+
+    $field_name = $field->field_name;
+    switch ($field_name) {
+      case 'title':
+        if ($orig->title != $node->title) {
+          globallink_update_change_detection($node, $lang);
+
+          break 2;
+        }
+
+        break 1;
+      case 'metatags':
+        continue 2;
+    }
+
+    $field_info = field_info_field($field_name);
+
+    if ($field_info['type'] == 'list_boolean' && $field_info['type'] == 'image' && $field_info['type'] == 'file' && $field_info['type'] == 'taxonomy_term_reference' && $field_info['type'] == 'field_collection') {
+      continue;
+    }
+
+    if (!isset($node->$field_name) || !isset($orig->$field_name)) {
+      globallink_update_change_detection($node, $lang);
+
+      break;
+    }
+
+    $o_arr = isset($orig->$field_name) ? $orig->$field_name : array();
+    $n_arr = isset($node->$field_name) ? $node->$field_name : array();
+
+    if (empty($o_arr) || empty($n_arr) || count($o_arr) != count($n_arr)) {
+      globallink_update_change_detection($node, $lang);
+
+      continue;
+    }
+
+    if (!is_array($o_arr) || !is_array($n_arr)) {
+      if ($o_arr != $n_arr) {
+        globallink_update_change_detection($node, $lang);
+
+        break;
+      }
+
+      continue;
+    }
+
+    if (empty($o_arr[$lang]) && empty($n_arr[$lang]) && isset($o_arr[LANGUAGE_NONE]) && isset($n_arr[LANGUAGE_NONE])) {
+      $lang = LANGUAGE_NONE;
+    }
+
+    if (isset($o_arr[$lang]) && isset($n_arr[$lang]) && count($o_arr[$lang]) != count($n_arr[$lang])) {
+      globallink_update_change_detection($node, $lang);
+
+      break;
+    }
+
+    if ((isset($o_arr[$lang]) && empty($n_arr[$lang])) || (empty($o_arr[$lang]) && isset($n_arr[$lang]))) {
+      globallink_update_change_detection($node, $lang);
+
+      break;
+    }
+
+    if (count($o_arr[$lang]) != count($n_arr[$lang])) {
+      globallink_update_change_detection($node, $lang);
+
+      break;
+    }
+
+    foreach ($o_arr[$lang] as $delta => $n_field) {
+      if (isset($n_arr[$lang][$delta]) && isset($n_arr[$lang][$delta]['value'])) {
+        if ($n_field['value'] != $n_arr[$lang][$delta]['value']) {
+          globallink_update_change_detection($node, $lang);
+
+          break 2;
+        }
+      }
+      else {
+        globallink_update_change_detection($node, $lang);
+
+        break 2;
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_menu_local_tasks_alter().
+ */
+function globallink_menu_local_tasks_alter(&$data, $router_item, $root_path) {
+  $node_check = variable_get('globallink_implementation_type', 0);
+
+  if ($root_path != 'node/%/translate') {
+    return;
+  }
+
+  if (!preg_match("!^node/(\d+)(/.+|)$!", $router_item['href'], $matches)) {
+    return;
+  }
+
+  if ($node = node_load((int) $matches[1])) {
+    $nid = $node->tnid;
+
+    if ($node->tnid == 0) {
+      $nid = $node->nid;
+    }
+
+    if (translation_supported_type($node->type)) {
+      $send_link = 'admin/globallink-translations/dashboard';
+      $active_link = 'admin/globallink-translations/activeSubmissions';
+    }
+    elseif (entity_translation_node_supported_type($node->type)) {
+      $send_link = 'admin/globallink-translations/dashboard/entity';
+      $active_link = 'admin/globallink-translations/activeSubmissions/entity';
+    }
+    else {
+      return;
+    }
+
+    if ($node_check == 1) {
+      if (!globallink_is_node_translatable(node_load($nid))) {
+        return;
+      }
+    }
+
+    $pending = TRUE;
+    $source = language_default()->language;
+    $t_nodes = translation_node_get_translations($nid);
+
+    if (count($t_nodes) > 0) {
+      if (isset($t_nodes[$source])) {
+        unset($t_nodes[$source]);
+        $langs = language_list();
+        unset($langs[$source]);
+
+        if (count($langs) > 0) {
+          $tgt_arr = globallink_get_tpt_sent_rows($nid, $source);
+          $tpt_count = count($tgt_arr);
+
+          if ($tpt_count > 0 && $tpt_count == count($langs)) {
+            $pending = FALSE;
+          }
+        }
+      }
+    }
+
+    $data['actions']['output']['globallink'] = array(
+      '#theme' => 'menu_local_action',
+      '#link' => array(),
+    );
+
+    if ($pending) {
+      if (user_access(TPT_ROLE_MANAGE_TRANSLATIONS) || user_access(TPT_ROLE_DO_TRANSLATIONS)) {
+        $data['actions']['output']['globallink']['#link']['title'] = t('Send for translation');
+        $data['actions']['output']['globallink']['#link']['href'] = $send_link;
+        $data['actions']['output']['globallink']['#link']['localized_options'] = array(
+          'query' => array(
+            'rnid' => $nid,
+          ),
+        );
+      }
+    }
+    else {
+      $data['actions']['output']['globallink']['#link']['title'] = t('This content has been sent out for translation.');
+      $data['actions']['output']['globallink']['#link']['href'] = $active_link;
+      $data['actions']['output']['globallink']['#link']['localized_options'] = array(
+        'query' => array(
+          'rnid' => $nid,
+        ),
+      );
+    }
+  }
+}
+
+/**
+ * Retrieve languages with in progress translations.
+ *
+ * @param int $nid
+ *   The node id.
+ * @param string $source
+ *   The drupal locale code.
+ *
+ * @return array
+ *   An array containing all drupal locale codes with in progress translations.
+ */
+function globallink_get_tpt_sent_rows($nid, $source) {
+  module_load_include("inc", "globallink", "globallink");
+  
+  $arr = array();
+
+  $query = db_select('globallink_core', 'tc')
+  ->fields('tc')
+  ->condition('nid', $nid, '=')
+  ->condition('status', array('Sent for Translations', 'Error', 'Cancelled'), 'IN')
+  ->condition('source', globallink_get_locale_code($source), '=');
+
+  $result = $query->execute();
+
+  foreach ($result as $row) {
+    $arr[] = globallink_get_drupal_locale_code($row->target);
+  }
+
+  return $arr;
+}
+
+/**
+ * Update row to flag that node has been modified.
+ *
+ * @param object $node
+ *   The node object.
+ * @param string $lang
+ *   The locale of the node.
+ */
+function globallink_update_change_detection($node, $lang) {
+  $tpt_locale_code = globallink_get_locale_code($lang);
+
+  db_update('globallink_core')
+  ->fields(array('last_modified' => REQUEST_TIME, 'changed' => 1))
+  ->condition('nid', $node->nid, '=')
+  ->condition('source', $tpt_locale_code, '=')
+  ->execute();
+}
+
+/**
+ * Gets translatable fields.
+ *
+ * @param string $type
+ *   The fields' content type.
+ * @param bool $bundle
+ *   The field bundle name.  Defaults to false.
+ *
+ * @return array
+ *   An array containing all fields of the specified type that are translatable.
+ */
+function globallink_get_translatable_fields($type, $bundle = FALSE) {
+  $fields = array();
+
+  if ($bundle) {
+    $result = db_select('globallink_field_config', 'tfc')
+    ->fields('tfc')
+    ->condition('content_type', $type, '=')
+    ->condition('bundle', $bundle, '=')
+    ->execute();
+  }
+  else {
+    $result = db_select('globallink_field_config', 'tfc')
+    ->fields('tfc')
+    ->condition('content_type', $type, '=')
+    ->execute();
+  }
+
+  foreach ($result as $row) {
+    $fields[] = $row;
+  }
+
+  return $fields;
+}
+
+/**
+ * Checks if a field is configured.
+ *
+ * @param string $content_type
+ *   The field's content type.
+ * @param string $entity_type
+ *   The field's entity type.
+ * @param bool $bundle
+ *   The field bundle name.
+ * @param string $field_name
+ *   The name of the field.
+ *
+ * @return bool
+ *   True if the field is configured, and false if it isn't.
+ */
+function globallink_check_field_configured($content_type, $entity_type, $bundle, $field_name) {
+  $result = db_select('globallink_field_config', 'tfc')
+  ->fields('tfc')
+  ->condition('content_type', $content_type, '=')
+  ->condition('entity_type', $entity_type, '=')
+  ->condition('bundle', $bundle, '=')
+  ->condition('field_name', $field_name, '=')
+  ->execute();
+
+  foreach ($result as $row) {
+    return TRUE;
+  }
+
+  return FALSE;
+}
+
+/**
+ * Implements hook_menu().
+ */
+function globallink_menu() {
+  $items = array();
+
+  $items ['admin/globallink-translations'] = array(
+    'title' => 'GlobalLink',
+    'description' => 'Allows users to manage and translate content using Translations.com translation services',
+    'page callback' => 'globallink_dashboard_page',
+    'access callback' => 'globallink_access_callback_any',
+    'file' => 'globallink_send_translations.inc',
+    'page arguments' => array('node'),
+  );
+
+  $items ['admin/globallink-translations/dashboard'] = array(
+    'title' => 'Send For Translation',
+    'type' => MENU_DEFAULT_LOCAL_TASK,
+    'weight' => -10,
+    'page arguments' => array('node'),
+  );
+
+  $items ['admin/globallink-translations/dashboard/node'] = array(
+    'title' => ' Content ',
+    'type' => MENU_DEFAULT_LOCAL_TASK,
+    'weight' => -5,
+    'page arguments' => array('node'),
+  );
+
+  $items ['admin/globallink-translations/activeSubmissions'] = array(
+    'title' => 'Active Submissions',
+    'description' => 'Presents a Dashboard interface to view active submissions',
+    'page callback' => 'globallink_dashboard_active_submissions_page',
+    'access callback' => 'globallink_access_callback_any',
+    'file' => 'globallink_active_submissions.inc',
+    'weight' => -1,
+    'type' => MENU_LOCAL_TASK,
+    'page arguments' => array('node'),
+  );
+
+  $items ['admin/globallink-translations/activeSubmissions/node'] = array(
+    'title' => ' Content ',
+    'type' => MENU_DEFAULT_LOCAL_TASK,
+    'page arguments' => array('node'),
+    'access callback' => 'globallink_access_callback_any',
+  );
+
+  $items ['admin/globallink-translations/receiveTranslation'] = array(
+    'title' => 'Receive Translation',
+    'description' => 'Presents a Dashboard interface to receive and publish translations',
+    'page callback' => 'globallink_dashboard_receive_page',
+    'access callback' => 'globallink_access_callback_any',
+    'type' => MENU_LOCAL_TASK,
+    'file' => 'globallink_receive_translations.inc',
+    'weight' => -1,
+    'page arguments' => array('node'),
+  );
+
+  $items ['admin/globallink-translations/receiveTranslation/node'] = array(
+    'title' => ' Content ',
+    'access callback' => 'globallink_access_callback_any',
+    'type' => MENU_DEFAULT_LOCAL_TASK,
+    'page arguments' => array('node'),
+  );
+
+  $items ['admin/globallink-translations/settings'] = array(
+    'title' => 'Settings',
+    'description' => 'Manage settings for GlobalLink',
+    'page callback' => 'globallink_settings_page',
+    'access arguments' => array(TPT_ROLE_MANAGE_TRANSLATIONS),
+    'type' => MENU_LOCAL_TASK,
+    'file' => 'globallink_settings.inc',
+  );
+
+  $items ['admin/globallink-translations/locale'] = array(
+    'title' => 'Locale Mapping',
+    'description' => 'Manage locale mappings for GlobalLink',
+    'page callback' => 'globallink_locale_page',
+    'access arguments' => array(TPT_ROLE_MANAGE_TRANSLATIONS),
+    'type' => MENU_LOCAL_TASK,
+    'file' => 'globallink_locale_mapping.inc',
+  );
+
+  $items ['admin/globallink-translations/fieldConfig'] = array(
+    'title' => 'Field Configuration',
+    'description' => 'Manage translatable fields for content types',
+    'page callback' => 'globallink_field_page',
+    'access arguments' => array(TPT_ROLE_MANAGE_TRANSLATIONS),
+    'type' => MENU_LOCAL_TASK,
+    'file' => 'globallink_field_configuration.inc',
+  );
+
+  $items['admin/globallink-translations/cron'] = array(
+    'title' => 'Receive Translations Cron',
+    'page callback' => 'globallink_receive_translated_contents_automatically',
+    'file' => 'globallink_receive_translations.inc',
+    'access arguments' => array(TPT_ROLE_MANAGE_TRANSLATIONS),
+    'type' => MENU_CALLBACK,
+  );
+
+  $items['admin/globallink-translations/preview'] = array(
+    'title' => 'Preview Translation',
+    'page callback' => 'globallink_preview_translated_content',
+    'file' => 'globallink_receive_translations.inc',
+    'access arguments' => array(TPT_ROLE_MANAGE_TRANSLATIONS),
+    'type' => MENU_CALLBACK,
+  );
+
+  $items['admin/globallink-translations/view_log'] = array(
+    'title' => 'View Log',
+    'page callback' => 'globallink_view_log',
+    'file' => 'globallink_settings.inc',
+    'access arguments' => array(TPT_ROLE_MANAGE_TRANSLATIONS),
+    'type' => MENU_CALLBACK,
+  );
+
+  return $items;
+}
+
+/**
+ * @todo Document this function.
+ */
+function globallink_access_callback_any() {
+  return user_access(TPT_ROLE_MANAGE_TRANSLATIONS) || user_access(TPT_ROLE_DO_TRANSLATIONS) || user_access(TPT_ROLE_VIEW_TRANSLATIONS);
+}
+
+/**
+ * Implements hook_cron().
+ */
+function globallink_cron() {
+  // Only run this if settings are set to Drupal Cron.
+  if (!variable_get('globallink_cron_type', 0)) {
+    return;
+  }
+
+  // Create Drupal queue item.
+  $queue = DrupalQueue::get('auto_receive');
+  $queue->createItem('hook_cron');
+}
+
+/**
+ * Implements hook_cron_queue_info().
+ */
+function globallink_cron_queue_info() {
+  $queues['auto_receive'] = array(
+    'worker callback' => 'globallink_auto_receive',
+  );
+
+  return $queues;
+}
+
+/**
+ * Implements hook_globallink_is_node_translatable().
+ */
+function globallink_is_node_translatable($node, $drupal_target_locale = NULL) {
+  $result = module_invoke_all('globallink_is_node_translatable', $node, $drupal_target_locale);
+
+  if (count($result) > 0) {
+    return TRUE;
+  }
+
+  return FALSE;
+}
+
+/**
+ * Implements hook_globallink_is_field_translatable().
+ */
+function globallink_is_field_translatable($node, $field, $drupal_target_locale = NULL) {
+  $result = module_invoke_all('globallink_is_field_translatable', $node, $field, $drupal_target_locale);
+
+  if (count($result) > 0) {
+    return TRUE;
+  }
+
+  return FALSE;
+}
+
+/**
+ * Implements hook_globallink_translate_node_for_language().
+ */
+function globallink_translate_node_for_language($node, $drupal_target_locale) {
+  $result = module_invoke_all('globallink_translate_node_for_language', $node, $drupal_target_locale);
+
+  if (count($result) > 0) {
+    return TRUE;
+  }
+
+  return FALSE;
+}
+
+/**
+ * Implements hook_globallink_import_translation().
+ */
+function globallink_update_node_hook($source_node, $target_node) {
+  foreach (module_implements('globallink_import_translation') as $module) {
+    $function = $module . '_globallink_import_translation';
+    $function($source_node->nid, $target_node);
+  }
+}

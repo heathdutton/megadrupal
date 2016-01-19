@@ -1,0 +1,267 @@
+diff --git a/app.yaml b/app.yaml
+new file mode 100644
+index 0000000..7b3c8b6
+--- /dev/null
++++ b/app.yaml
+@@ -0,0 +1,32 @@
++# See https://developers.google.com/appengine/docs/php/config/appconfig.
++
++application: drupal
++version: 1
++runtime: php
++api_version: 1
++threadsafe: true
++
++handlers:
++# Files may end with static resource extensions used below and will attempt to
++# be served directly instead of through Drupal as expected. This router needs to
++# be first in order to take priority over static file router.
++- url: /system/(files|public|temporary)/(.+)
++  script: mod_rewrite.php
++
++# Handle static requests.
++- url: /(.*\.(ico|jpg|png|gif|htm|html|css|js))$
++  # Location from which to serve static files.
++  static_files: \1
++  # Upload static files for static serving.
++  upload: (.*\.(ico|jpg|png|gif|htm|html|css|js))$
++  # Ensures that a copy of the static files is left for Drupal during runtime.
++  application_readable: true
++
++- url: /system/queue
++  script: mod_rewrite.php
++  login: admin
++
++# Catch all unhandled requests and pass to mod_rewrite.php which will simulate
++# mod_rewrite by forwarding the requests to index.php?q=...
++- url: /.*
++  script: mod_rewrite.php
+diff --git a/cron.yaml b/cron.yaml
+new file mode 100644
+index 0000000..7b5147e
+--- /dev/null
++++ b/cron.yaml
+@@ -0,0 +1,18 @@
++# See https://developers.google.com/appengine/docs/php/config/cron.
++#
++# In order to use, the cron_key variable must be filled in with the value for
++# the Drupal site for which the cron is to be run. Simply visit
++# admin/config/system/cron and copy everything after cron.php. The resulting
++# path should look like the following /cron.php?cron_key=BLAHBLAH. Once
++# configured the built-in cron should be set to 'never' since it should not need
++# to run. Note that the two will not duplicate eachother since they will check
++# when the last cron run was completed, but App Engine cron should be preferred
++# if configured.
++#
++# The schedule may need to be customized to suite the needs of the site.
++
++cron:
++# Uncomment once cron_key is filled in.
++#- description: Drupal system cron
++#  url: /cron.php
++#  schedule: every 24 hours
+diff --git a/includes/file.inc b/includes/file.inc
+index ee6ce51..280d1b8 100644
+--- a/includes/file.inc
++++ b/includes/file.inc
+@@ -1625,7 +1625,18 @@ function file_save_upload($form_field_name, $validators = array(), $destination
+  * @ingroup php_wrappers
+  */
+ function drupal_move_uploaded_file($filename, $uri) {
+-  $result = @move_uploaded_file($filename, $uri);
++  // move_uploaded_file() does not support moving a file between two different
++  // stream wrappers. Other file handling functions like rename() have the same
++  // problem, but copy() works since it explicitely sends the contents to the
++  // new source. As such move_uploaded_file() is replaced by is_uploaded_file(),
++  // copy(), and unlink() the old file.
++  //
++  // This is necessary since $filename will start with gs:// since the form
++  // will have been redirected through the GCS upload proxy. The destination
++  // $uri will contain something like public://, private://, etc which will end
++  // up translating to a gs:// location, but PHP is not aware of that.
++  $result = is_uploaded_file($filename) &&
++    copy($filename, $uri) && unlink($filename);
+   // PHP's move_uploaded_file() does not properly support streams if safe_mode
+   // or open_basedir are enabled so if the move failed, try finding a real path
+   // and retry the move operation.
+@@ -2110,15 +2121,10 @@ function file_upload_max_size() {
+   static $max_size = -1;
+ 
+   if ($max_size < 0) {
+-    // Start with post_max_size.
+-    $max_size = parse_size(ini_get('post_max_size'));
+-
+-    // If upload_max_size is less, then reduce. Except if upload_max_size is
+-    // zero, which indicates no limit.
+-    $upload_max = parse_size(ini_get('upload_max_filesize'));
+-    if ($upload_max > 0 && $upload_max < $max_size) {
+-      $max_size = $upload_max;
+-    }
++    // Since uploads are proxied through GCS they are not limited by
++    // 'post_max_size'. As such, use the 'upload_max_filesize' ini setting which
++    // should provide the GCS limit instead of the normal core logic.
++    $max_size = parse_size(ini_get('upload_max_filesize'));
+   }
+   return $max_size;
+ }
+@@ -2423,22 +2429,15 @@ function drupal_rmdir($uri, $context = NULL) {
+  * @ingroup php_wrappers
+  */
+ function drupal_tempnam($directory, $prefix) {
++  // TODO Revert once tempnam() is properly supported.
+   $scheme = file_uri_scheme($directory);
+-
+-  if ($scheme && file_stream_wrapper_valid_scheme($scheme)) {
+-    $wrapper = file_stream_wrapper_get_instance_by_scheme($scheme);
+-
+-    if ($filename = tempnam($wrapper->getDirectoryPath(), $prefix)) {
+-      return $scheme . '://' . drupal_basename($filename);
+-    }
+-    else {
+-      return FALSE;
+-    }
+-  }
+-  else {
+-    // Handle as a normal tempnam() call.
+-    return tempnam($directory, $prefix);
++  if (!$scheme) {
++    $directory = 'temporary://' . $directory;
+   }
++
++  $name = $directory . '/' . $prefix . mt_rand(100000, 10000000);
++  file_put_contents($name, '');
++  return $name;
+ }
+ 
+ /**
+diff --git a/mod_rewrite.php b/mod_rewrite.php
+new file mode 100644
+index 0000000..3db3f26
+--- /dev/null
++++ b/mod_rewrite.php
+@@ -0,0 +1,36 @@
++<?php
++/**
++ * @file
++ * Provide basic mod_rewrite like functionality.
++ *
++ * Pass through requests for root php files and forward all other requests to
++ * index.php with $_GET['q'] equal to path. The following are examples that
++ * demonstrate how a request using mod_rewrite.php will appear to a PHP script.
++ *
++ * - /install.php: install.php
++ * - /update.php?op=info: update.php?op=info
++ * - /foo/bar: index.php?q=/foo/bar
++ * - /: index.php?q=/
++ */
++
++$path = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH);
++
++// Provide mod_rewrite like functionality. If a php file in the root directory
++// is explicitly requested then load the file, otherwise load index.php and
++// set get variable 'q' to $_SERVER['REQUEST_URI'].
++if (dirname($path) == '/' && pathinfo($path, PATHINFO_EXTENSION) == 'php') {
++  $file = pathinfo($path, PATHINFO_BASENAME);
++}
++else {
++  $file = 'index.php';
++
++  // Provide mod_rewrite like functionality by using the path which excludes
++  // any other part of the request query (ie. ignores ?foo=bar).
++  $_GET['q'] = $path;
++}
++
++// Override the script name to simulate the behavior without mod_rewrite.php.
++// Ensure that $_SERVER['SCRIPT_NAME'] always begins with a / to be consistent
++// with HTTP request and the value that is normally provided.
++$_SERVER['SCRIPT_NAME'] = '/' . $file;
++require $file;
+diff --git a/modules/system/image.gd.inc b/modules/system/image.gd.inc
+index 91c0b05..33f7999 100644
+--- a/modules/system/image.gd.inc
++++ b/modules/system/image.gd.inc
+@@ -259,8 +259,6 @@ function image_gd_save(stdClass $image, $destination) {
+       $permanent_destination = $destination;
+       $destination = drupal_tempnam('temporary://', 'gd_');
+     }
+-    // Convert stream wrapper URI to normal path.
+-    $destination = drupal_realpath($destination);
+   }
+ 
+   $extension = str_replace('jpg', 'jpeg', $image->info['extension']);
+diff --git a/modules/system/system.admin.inc b/modules/system/system.admin.inc
+index 465fd9f..cc1c694 100644
+--- a/modules/system/system.admin.inc
++++ b/modules/system/system.admin.inc
+@@ -1791,6 +1791,7 @@ function system_file_system_settings() {
+     '#maxlength' => 255,
+     '#description' => t('A local file system path where public files will be stored. This directory must exist and be writable by Drupal. This directory must be relative to the Drupal installation directory and be accessible over the web.'),
+     '#after_build' => array('system_check_directory'),
++    '#wrapper_scheme' => 'public',
+   );
+ 
+   $form['file_private_path'] = array(
+@@ -1800,6 +1801,7 @@ function system_file_system_settings() {
+     '#maxlength' => 255,
+     '#description' => t('An existing local file system path for storing private files. It should be writable by Drupal and not accessible over the web. See the online handbook for <a href="@handbook">more information about securing private files</a>.', array('@handbook' => 'http://drupal.org/documentation/modules/file')),
+     '#after_build' => array('system_check_directory'),
++    '#wrapper_scheme' => 'private',
+   );
+ 
+   $form['file_temporary_path'] = array(
+@@ -1809,6 +1811,7 @@ function system_file_system_settings() {
+     '#maxlength' => 255,
+     '#description' => t('A local file system path where temporary files will be stored. This directory should not be accessible over the web.'),
+     '#after_build' => array('system_check_directory'),
++    '#wrapper_scheme' => 'temporary',
+   );
+   // Any visible, writeable wrapper can potentially be used for the files
+   // directory, including a remote file system that integrates with a CDN.
+diff --git a/modules/system/system.install b/modules/system/system.install
+index 43c7383..1d2ee01 100644
+--- a/modules/system/system.install
++++ b/modules/system/system.install
+@@ -361,6 +361,8 @@ function system_requirements($phase) {
+     }
+     $is_writable = is_writable($directory);
+     $is_directory = is_dir($directory);
++    // Force Drupal to think the directories are writable during installation.
++    $is_writable = $is_directory = TRUE;
+     if (!$is_writable || !$is_directory) {
+       $description = '';
+       $requirements['file system']['value'] = $t('Not writable');
+diff --git a/modules/system/system.module b/modules/system/system.module
+index d4f3bc4..e5cf36c 100644
+--- a/modules/system/system.module
++++ b/modules/system/system.module
+@@ -2173,11 +2173,12 @@ function system_admin_menu_block($item) {
+  *   The form element containing the name of the directory to check.
+  */
+ function system_check_directory($form_element) {
+-  $directory = $form_element['#value'];
+-  if (strlen($directory) == 0) {
++  if (strlen($form_element['#value']) == 0) {
+     return $form_element;
+   }
+ 
++  // The stream wrapper should already have loaded the updated directory path.
++  $directory = $form_element['#wrapper_scheme'] . '://';
+   if (!is_dir($directory) && !drupal_mkdir($directory, NULL, TRUE)) {
+     // If the directory does not exists and cannot be created.
+     form_set_error($form_element['#parents'][0], t('The directory %directory does not exist and could not be created.', array('%directory' => $directory)));
+diff --git a/php.ini b/php.ini
+new file mode 100644
+index 0000000..e9cb5df
+--- /dev/null
++++ b/php.ini
+@@ -0,0 +1,10 @@
++; See https://developers.google.com/appengine/docs/php/config/php_ini.
++
++; Required for ob_*() calls which you can find by grepping.
++; grep -nR '\sob_.*()' .
++output_buffering = "1"
++
++; See https://developers.google.com/appengine/docs/php/runtime#Functions-That-Must-Be-Manually-Enabled
++; phpinfo: Provided on admin/reports/status under PHP -> "more information".
++; getmypid: Used by drupal_random_bytes(), but not required.
++google_app_engine.enable_functions = "getmypid, phpinfo"

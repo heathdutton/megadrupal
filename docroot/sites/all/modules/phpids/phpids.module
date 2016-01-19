@@ -1,0 +1,368 @@
+<?php
+/**
+ * @file
+ * Integrates PHPIDS to drupal.
+ *
+ * PHPIDS is a security layer for PHP applications to reduce attacks like x-site-scripting,
+ * sql-injections and so on.
+ *
+ * @see http://www.it-cru.de
+ * @see http://www.php-ids.org
+ */
+
+/**
+ * Create html report from PHPIDS generated report.
+ *
+ * @param $report
+ *      A report object from PHPIDS library.
+ *
+ * @return
+ *      Returns $message as a html string.
+ */
+function phpids_createReport($report) {
+  $message = 'Total impact: '. $report->getImpact() .'<br />';
+  $message .= 'All tags: '. join(", ", $report->getTags()) .'<br />';
+  // iterate through the result an get every event (IDS_Event)
+  foreach ($report as $event) {
+    $message .= '<hr>Variable: '. $event->getName() .' | Value: '. htmlspecialchars($event->getValue()) .'<br />';
+    $message .= 'Impact: '. $event->getImpact() .' | Tags: '. join(", ", $event->getTags()) .'<br />'; 
+    // iterator throught every filter
+    $message .= '<ul>';
+    foreach ($event as $filter) {
+      $message .= '<li>Rule: '. $filter->getRule() .'<br />';
+      $message .= 'Description: '. $filter->getDescription() .'<br />';
+      $message .= 'Tags: '. join(", ", $filter->getTags()) .'</li>';
+    }
+    $message .= '</ul>';
+  }
+  return $message;  
+}
+
+/**
+ * Logs given $msg to watchdog.
+ *
+ * @param $msg
+ *      Report message as a string.
+ * @params $prio
+ *      Watchdog priority.
+ *
+ * @see phpids_createReport()
+ * @see watchdog()
+ *
+ * todo: Change to hook_watchdog if D5 isn't supported any more.
+ */
+function phpids_doLogging($msg, $prio = WATCHDOG_NOTICE) {
+  if (phpids_getDrupalMajorVersion() > 5) {
+    $vars=array();
+    watchdog('phpids', wordwrap($msg, '100', ' ', TRUE), $vars, $prio);
+  }
+  else
+    watchdog('phpids', wordwrap($msg, '100', ' ', TRUE), $prio);  
+}
+
+/**
+ * Sent an infomail about attack detected by PHPIDS to configured mail address.
+ *
+ * @param $action
+ *      Action which is taken after checked by PHPIDS (warning, blocking, unknown)
+ *
+ * @see phpids_mail()
+ * @see drupal_mail()
+ */
+function phpids_doWarning($action) {
+  global $language;
+  
+  $to = variable_get('phpids_mail', '');
+  if (!$to == '' && (!variable_get('phpids_testonly_activated', FALSE) || (variable_get('phpids_testonly_activated', FALSE) && variable_get('phpids_testonly_withmail', FALSE)))) {
+    switch ($action) {
+      case 'warning':
+        $params['subject'] = 'PHPIDS detect a warning on '. variable_get('site_name', 'Drupal');
+        break;
+      case 'blocking':
+        $params['subject'] = 'PHPIDS detect a blocking on '. variable_get('site_name', 'Drupal');
+        break;
+      default:
+        $params['subject'] = 'PHPIDS detect an unknown attack type on '. variable_get('site_name', 'Drupal');
+    }
+    $params['body'] = 'Please check your logging on your website to get detailed informations.'."\r\n\r\n".'Attacker: '. $_SERVER['REMOTE_ADDR'] ."\r\n".'Attack-Time: '. date('c');
+    if (phpids_getDrupalMajorVersion() == '5' )
+      drupal_mail($action, $to, $params['subject'], $params['body']);
+    else
+      drupal_mail('phpids', $action, $to, $language, $params, variable_get('site_mail', NULL));
+    phpids_doLogging('Send warning mail to '. $to);
+  }
+}
+
+/**
+ * Returns action after checking impact level against current
+ * phpids settings.
+ *
+ * @param $impact
+ *      Impact level given from PHPIDS.
+ * @param $handling
+ *      Handling level for current user.
+ *
+ * @return
+ *     Returns action level checked against impact level.
+ *     0: do nothing
+ *     1: do logging (default)
+ *     2: log and sent warning
+ *     3: block request
+ *
+ * @see phpids_getHandling()
+ */
+function phpids_getAction($impact, $handling) {
+  $action = 1;
+  $log_level = variable_get('phpids_loglevel', 1);  
+  $warn_level = variable_get('phpids_warnlevel', 9);
+  $block_level = variable_get('phpids_blocklevel', 27);
+
+  if ($impact >= $block_level && $handling == 2)
+    return 3;
+  elseif ($impact >= $warn_level && $handling == 2)
+    return 2;
+  elseif ($impact < $log_level)
+    return 0;
+  return $action;
+}
+
+/**
+ * Returns major number of used drupal version
+ *
+ * @return
+ *      Returns major version of current used drupal version.
+ */
+function phpids_getDrupalMajorVersion() {
+  return substr(VERSION, 0, 1);
+}
+
+/**
+ * Returns PHPIDS handling status by current user.
+ * 
+ * @return
+ *      Returns value how to handle current user.
+ *      0: handle for user #1
+ *      1: handle user with logging without action
+ *      2: handle user with logging with action
+ */
+function phpids_getHandling() {
+  global $user;
+
+  $handling = 1;
+  switch ($user->uid) {
+    case 0:
+      if (variable_get('phpids_anonymous', 2) == 2)
+        $handling = 2;
+      break;
+    case 1:
+      $handling = 0;
+      break;
+    default:
+      $auth = variable_get('phpids_authenticated', 2);
+      switch ($auth) {
+        case 1:
+          $handling = 0;
+          break;
+        case 3:
+          $handling = 2;
+          break;
+      }
+  }
+  return $handling;  
+}
+
+/**
+ * Implements hook_init().
+ */
+function phpids_init() {
+  if (file_exists(variable_get('phpids_path', realpath(dirname(__FILE__))) .'/IDS/Config/Config.ini')
+    || file_exists(variable_get('phpids_path', realpath(dirname(__FILE__))) .'/IDS/Config/Config.ini.php')) {
+
+    $phpids_handling = phpids_getHandling();
+    if ($phpids_handling > 0) {
+      $phpids_report = phpids_runPHPIDS();
+      if (!$phpids_report->isEmpty()) {
+        switch (phpids_getAction($phpids_report->getImpact(), $phpids_handling)) {
+          case 3:
+            if (!function_exists('drupal_goto')) {
+              require_once './includes/common.inc';
+              require_once './includes/path.inc';
+            }
+            $message = phpids_createReport($phpids_report);
+            phpids_doLogging($message,  (phpids_getDrupalMajorVersion() > 5) ? WATCHDOG_ALERT : WATCHDOG_ERROR);
+            phpids_doWarning('blocking');
+            if (!variable_get('phpids_testonly_activated', FALSE))
+              drupal_goto('warning.html');
+            break;
+          case 2:
+            $message = phpids_createReport($phpids_report);
+            phpids_doLogging($message, WATCHDOG_WARNING);
+            phpids_doWarning('warning');
+            break;
+          case 1:
+            $message = phpids_createReport($phpids_report);
+            phpids_doLogging($message);
+            break;
+          case 0:
+            break;
+          default:
+            $message = phpids_createReport($phpids_report);
+            phpids_doLogging($message,  (phpids_getDrupalMajorVersion() > 5) ? WATCHDOG_CRITICAL : WATCHDOG_ERROR);
+            phpids_doWarning('unknown');
+            if (!variable_get('phpids_testonly_activated', FALSE))
+              drupal_goto('warning.html');
+        }
+      }
+    }
+  }
+  else {
+    switch (phpids_getDrupalMajorVersion()) {
+      case 7:
+        phpids_doLogging('PHPIDS problem detected. Please check your status report for more informations.', WATCHDOG_EMERGENCY);
+        break;
+      case 6:
+        phpids_doLogging('PHPIDS problem detected. Please check your status report for more informations.', WATCHDOG_EMERG);
+        break;
+      case 5:
+        phpids_doLogging('PHPIDS problem detected. Please check your status report for more informations.', WATCHDOG_ERROR);
+        break;
+      default:
+        phpids_doLogging('PHPIDS problem detected. Please check your status report for more informations.', WATCHDOG_ERROR);
+    }
+  }
+}
+
+/**
+ * Implements hook_mail().
+ */
+function phpids_mail($key, &$message, $params) {
+  $message['subject'] .= $params['subject'];
+  $message['body'][] .= $params['body'];
+}
+
+/**
+ * Impementation of hook_menu().
+ *
+ * Select drupal base version to fill $items with correct menu entrys.
+ *
+ * @return
+ *      Returns menu items by current used drupal version.
+ *
+ * @see phpids_getDrupalMajorVersion()
+ */
+function phpids_menu() {
+  $items = array();  
+  switch (phpids_getDrupalMajorVersion()) {
+    case '7':
+      $items['admin/config/system/phpids'] = array(
+        'title' => 'PHPIDS settings',
+        'description' => t('Configure PHPIDS settings'),
+        'page callback' => 'drupal_get_form',
+        'page arguments' => array('phpids_admin_settings'),
+        'access arguments' => array('administer phpids'),
+        'file' => 'phpids.admin.inc'
+      );
+      $items['warning.html'] = array(
+        'title' => variable_get('phpids_warn_title', 'Security warning'),
+        'page callback' => 'phpids_warning',
+        'access callback' => TRUE,
+        'type' => MENU_CALLBACK
+      );
+      break;
+    case '6':
+      $items['admin/settings/phpids'] = array(
+        'title' => 'PHPIDS settings',
+        'description' => t('Configure PHPIDS settings'),
+        'page callback' => 'drupal_get_form',
+        'page arguments' => array('phpids_admin_settings'),
+        'access arguments' => array('administer phpids'),
+        'file' => 'phpids.admin.inc'
+      );
+      $items['warning.html'] = array(
+        'title' => variable_get('phpids_warn_title', 'Security warning'),
+        'page callback' => 'phpids_warning',
+        'access callback' => TRUE,
+        'type' => MENU_CALLBACK
+      );
+      break;
+    case '5':
+      require_once('phpids.admin.inc');  
+      $items[] = array(
+        'path' => 'admin/settings/phpids',
+        'title' => t('PHPIDS settings'),
+        'description' => t('Configure PHPIDS settings'),
+        'callback' => 'drupal_get_form',
+        'callback arguments' => array('phpids_admin_settings'),
+        'type' => MENU_NORMAL_ITEM,
+        'access' => user_access('administer phpids')
+      );
+      $items[] = array(
+        'path' => 'warning.html',
+        'title' => variable_get('phpids_warn_title', 'Security warning'),
+        'callback' => 'phpids_warning',
+        'access' => TRUE,
+        'type' => MENU_CALLBACK
+      );
+      break;
+  }
+  return $items;
+}
+
+/**
+ * Implements hook_perm().
+ * 
+ * @return
+ *      Returns array for possible permission settings.
+ */
+function phpids_perm() {
+  return array('administer phpids');
+}
+
+/**
+ * Runs PHPIDS and returns report.
+ *
+ * @return
+ *      Returns PHPIDS report object after running PHPIDS.
+ */
+function phpids_runPHPIDS() {
+
+  // set include path and required the needed files
+  $phpids_path = variable_get('phpids_path', realpath(dirname(__FILE__)));
+  $phpids_tmppath = variable_get('phpids_tmppath', ini_get('upload_tmp_dir') .'phpids');
+  set_include_path(get_include_path() . PATH_SEPARATOR . $phpids_path);
+  require_once 'IDS/Init.php';
+
+  // instanciate the needed stuff
+  $http_request = array_merge_recursive($_GET, $_POST, $_COOKIE);
+  if (file_exists($phpids_path .'/IDS/Config/Config.ini.php'))
+    $init = IDS_Init::init($phpids_path .'/IDS/Config/Config.ini.php');
+  else
+    $init = IDS_Init::init($phpids_path .'/IDS/Config/Config.ini');
+  $init->config['General']['tmp_path'] = $phpids_tmppath;
+  $init->config['General']['filter_path'] = $phpids_path .'/IDS/default_filter.xml';
+  $init->config['General']['HTML_Purifier_Cache'] = $phpids_tmppath;
+  $init->config['General']['html'] = array();
+  $init->config['General']['json'] = array();
+  $init->config['General']['exceptions'] = array();
+  if (variable_get('phpids_html_fields', '') != '')
+    $init->config['General']['html'] = explode(',', (variable_get('phpids_html_fields', '')));
+  if (variable_get('phpids_json_fields', '') != '')
+    $init->config['General']['json'] = explode(',', (variable_get('phpids_json_fields', '')));
+  if (variable_get('phpids_excl_fields', '') != '')
+    $init->config['General']['exceptions'] = explode(',', (variable_get('phpids_excl_fields', '')));
+  $init->config['Caching']['caching'] = 'file';
+  $init->config['Caching']['path'] = $phpids_tmppath .'/default_filter.cache';
+
+  $request = new IDS_Monitor($http_request, $init);
+  return $request->run();
+}
+
+/**
+ * Generates page as direct output, if configured block level is reached.
+ *
+ * @return
+ *      Returns warning text if blocking level is reached.
+ */
+function phpids_warning() {
+  return variable_get('phpids_warn_text', 'We have detected malicious input and blocked your attempt.<br />If you keep experiencing problems but feel like you are doing nothing wrong, please contact the site administrator.');
+}

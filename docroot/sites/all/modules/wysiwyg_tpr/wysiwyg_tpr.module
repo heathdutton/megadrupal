@@ -1,0 +1,261 @@
+<?php
+
+/**
+ * @file
+ * Main functions for "WYSIWYG toolbar per role".
+ */
+
+/**
+ * Implements hook_menu().
+ */
+function wysiwyg_tpr_menu() {
+  $items = array();
+  $items["admin/config/content/wysiwyg/profile/%wysiwyg_profile/edit/all"] = array(
+    'title' => 'Default',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('wysiwyg_tpr_profile_form', 5, 'all'),
+    'access arguments' => array('administer filters'),
+    'file' => 'wysiwyg_tpr.admin.inc',
+    'type' => MENU_DEFAULT_LOCAL_TASK,
+    'weight' => -10,
+  );
+  foreach (user_roles() as $rid => $name) {
+    $items["admin/config/content/wysiwyg/profile/%wysiwyg_profile/edit/{$rid}"] = array(
+      'title' => $name,
+      'page callback' => 'drupal_get_form',
+      'page arguments' => array('wysiwyg_tpr_profile_form', 5, 7),
+      'access callback' => 'wysiwyg_tpr_menu_access',
+      'access arguments' => array('administer filters', 5, (string) $rid),
+      'file' => 'wysiwyg_tpr.admin.inc',
+      'type' => MENU_LOCAL_TASK,
+    );
+  }
+  return $items;
+}
+
+/**
+ * Custom access callback for editor profile menu tabs.
+ *
+ * @param string $permission
+ *   The permission, such as "administer nodes", being checked for.
+ * @param object $profile
+ *   A fully loaded Wysiwyg editor profile.
+ * @param int $rid
+ *   A user role ID.
+ *
+ * @return bool
+ *   TRUE if the current user has the requested permission.
+ */
+function wysiwyg_tpr_menu_access($permission, $profile, $rid) {
+  if (!user_access($permission)) {
+    return FALSE;
+  }
+  if (($format = filter_format_load($profile->format)) === FALSE) {
+    return FALSE;
+  }
+  $roles = filter_get_roles_by_format($format);
+  if (empty($roles)) {
+    return FALSE;
+  }
+
+  return !empty($roles[$rid]);
+}
+
+/**
+ * Clear all WYSIWYG tpr profile caches.
+ */
+function wysiwyg_tpr_profile_cache_clear() {
+  drupal_static_reset('wysiwyg_tpr_profile_load_all');
+  cache_clear_all('wysiwyg_tpr_profiles', 'cache');
+}
+
+/**
+ * Loads a profile for a given text format and a given role.
+ *
+ * @param string $format
+ *   The text format to load the profile for.
+ * @param mixed $role
+ *   ID of role or "all".
+ *
+ * @return object
+ *   Loaded profile or FALSE.
+ */
+function wysiwyg_tpr_profile_load($format, $role) {
+  $profiles = wysiwyg_tpr_profile_load_all();
+
+  foreach ($profiles as $profile) {
+    if ($profile->format == $format && $profile->rid == $role) {
+      if (!is_array($profile->settings)) {
+        $profile->settings = unserialize($profile->settings);
+      }
+      return $profile;
+    }
+  }
+  return FALSE;
+}
+
+/**
+ * Loads all profiles.
+ */
+function wysiwyg_tpr_profile_load_all() {
+  $profiles = &drupal_static(__FUNCTION__);
+
+  if (!isset($profiles)) {
+    // Additional database cache to support alternative caches like memcache.
+    if ($cached = cache_get('wysiwyg_tpr_profiles')) {
+      $profiles = $cached->data;
+    }
+    else {
+      $profiles = db_query('SELECT * FROM {wysiwyg_tpr}')->fetchAll();
+      cache_set('wysiwyg_tpr_profiles', $profiles);
+    }
+  }
+
+  return $profiles;
+}
+
+/**
+ * Deletes a profile from the database.
+ */
+function wysiwyg_tpr_profile_delete($format) {
+  db_delete('wysiwyg_tpr')
+    ->condition('format', $format)
+    ->execute();
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function wysiwyg_tpr_form_wysiwyg_profile_delete_confirm_alter(&$form, &$form_state, $form_id) {
+  // Add custom submit callback.
+  $form['#submit'][] = 'wysiwyg_tpr_profile_delete_confirm_submit';
+}
+
+/**
+ * Custom submit callback for wysiwyg profile delete form.
+ *
+ * @see wysiwyg_profile_delete_confirm_submit()
+ */
+function wysiwyg_tpr_profile_delete_confirm_submit($form, &$form_state) {
+  $format = $form_state['values']['format'];
+  wysiwyg_tpr_profile_delete($format->format);
+  wysiwyg_tpr_profile_cache_clear();
+}
+
+/**
+ * Implements hook_wysiwyg_editor_settings_alter().
+ */
+function wysiwyg_tpr_wysiwyg_editor_settings_alter(&$settings, $context) {
+  global $user;
+
+  if ($user->uid == 1 || user_access('ignore wysiwyg settings per role')) {
+    // Do not alter editor settings for admin and privileged users.
+    return;
+  }
+
+  // Get role with highest weight for current user.
+  $role = _wysiwyg_tpr_user_get_role();
+  if (empty($role)) {
+    return;
+  }
+
+  // Load role-specific editor profile.
+  if (($profile = wysiwyg_tpr_profile_load($context['profile']->format, $role)) === FALSE) {
+    // There is no custom profile for this format and role.
+    // Use default settings.
+    return;
+  }
+
+  $editor = $context['editor'];
+  $theme = wysiwyg_get_editor_themes($profile, (isset($profile->settings['theme']) ? $profile->settings['theme'] : ''));
+  if (!empty($editor['settings callback']) && function_exists($editor['settings callback'])) {
+    $settings = $editor['settings callback']($editor, $profile->settings, $theme);
+  }
+}
+
+/**
+ * Implements hook_element_info_alter().
+ */
+function wysiwyg_tpr_element_info_alter(&$types) {
+  $types['text_format']['#pre_render'][] = 'wysiwyg_tpr_pre_render_text_format';
+}
+
+/**
+ * Process a text format widget to modify editor settings.
+ *
+ * Unfortunately this is necessary because some settings are set during
+ * pre_render.
+ */
+function wysiwyg_tpr_pre_render_text_format($element) {
+  global $user;
+
+  if (!isset($element['format']) || !empty($element['value']['#disabled'])) {
+    return $element;
+  }
+  // Allow modules to programmatically enforce no client-side editor by setting
+  // the #wysiwyg property to FALSE.
+  if (isset($element['#wysiwyg']) && !$element['#wysiwyg']) {
+    return $element;
+  }
+
+  if ($user->uid == 1 || user_access('ignore wysiwyg settings per role')) {
+    // Do not alter editor settings for admin and privileged users.
+    return $element;
+  }
+  // Get role with highest weight for current user.
+  $role = _wysiwyg_tpr_user_get_role();
+  if (empty($role)) {
+    return $element;
+  }
+  $format_field = &$element['format'];
+  $settings = array();
+
+  // Alter the available text formats.
+  foreach ($format_field['format']['#options'] as $format_id => $format_name) {
+    if (($profile = wysiwyg_tpr_profile_load($format_id, $role)) === FALSE) {
+      continue;
+    }
+    if (isset($profile->settings['show_toggle'])) {
+      $settings["format{$format_id}"]['toggle'] = (int) $profile->settings['show_toggle'];
+    }
+    if (isset($profile->settings['resizing'])) {
+      $settings["format{$format_id}"]['resizing'] = (int) $profile->settings['resizing'];
+    }
+  }
+  if ($format_field['format']['#access'] && !empty($element['#attached']['js']) && is_array($element['#attached']['js'])) {
+    foreach ($element['#attached']['js'] as $key => &$setting) {
+      if (empty($setting['type']) || $setting['type'] != 'setting' || empty($setting['data']['wysiwyg']['triggers'])) {
+        continue;
+      }
+      foreach ($setting['data']['wysiwyg']['triggers'] as $field_id => &$field) {
+        foreach ($settings as $format => $format_setting) {
+          if (empty($field[$format])) {
+            continue;
+          }
+          $field[$format] = array_merge($field[$format], $format_setting);
+        }
+      }
+    }
+  }
+
+  return $element;
+}
+
+/**
+ * Helper function to get the role with the highest weight for a user.
+ *
+ * @param object $account
+ *   (optional) User account. If empty, the current user will be used.
+ *
+ * @return mixed
+ *   Role ID of role with highest weight or FALSE on errors.
+ */
+function _wysiwyg_tpr_user_get_role($account = NULL) {
+  global $user;
+  if (empty($account)) {
+    $account = $user;
+  }
+  // Get role with highest weight for current user.
+  $rid = db_query('SELECT rid FROM {role} WHERE rid IN (:rids) ORDER BY weight DESC LIMIT 1', array(':rids' => array_keys($account->roles)))->fetchField();
+  return empty($rid) ? FALSE : $rid;
+}

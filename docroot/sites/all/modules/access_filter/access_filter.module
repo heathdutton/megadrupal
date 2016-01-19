@@ -1,0 +1,559 @@
+<?php
+
+/**
+ * @file
+ * Allows users to manage access filters.
+ */
+
+/**
+ * Filter is disabled.
+ */
+define('ACCESS_FILTER_STATUS_DISABLED', 0);
+
+/**
+ * Filter is enabled.
+ */
+define('ACCESS_FILTER_STATUS_ENABLED', 1);
+
+/**
+ * Process path as plain drupal path.
+ */
+define('ACCESS_FILTER_PATH_TYPE_DRUPAL', 'D');
+
+/**
+ * Process path as plain drupal path.
+ */
+define('ACCESS_FILTER_PATH_TYPE_URI', 'R');
+
+/**
+ * Use regex for path.
+ */
+define('ACCESS_FILTER_PATH_MODIFIER_REGEX', 'R');
+
+/**
+ * Do not look up aliases.
+ */
+define('ACCESS_FILTER_PATH_MODIFIER_BLIND', 'B');
+
+/**
+ * Deny to access from specified host.
+ */
+define('ACCESS_FILTER_PROCESS_TYPE_DENY', 'D');
+
+/**
+ * Allow to access from specified host.
+ */
+define('ACCESS_FILTER_PROCESS_TYPE_ALLOW', 'A');
+
+/**
+ * Display 403 error on access denied.
+ */
+define('ACCESS_FILTER_DENY_ACTION_403', '403');
+
+/**
+ * Display 404 error on access denied.
+ */
+define('ACCESS_FILTER_DENY_ACTION_404', '404');
+
+/**
+ * Redirect to specified url with 301 status on access denied.
+ */
+define('ACCESS_FILTER_DENY_ACTION_301', '301');
+
+/**
+ * Redirect to specified url with 302 status  on access denied.
+ */
+define('ACCESS_FILTER_DENY_ACTION_302', '302');
+
+/**
+ * Implements hook_boot().
+ */
+function access_filter_boot() {
+  // Always allow access when running in CLI mode for Drush.
+  if (drupal_is_cli()) {
+    return;
+  }
+
+  global $conf;
+  if (!empty($conf['access_filter_disabled'])) {
+    return;
+  }
+
+  include_once DRUPAL_ROOT . '/includes/common.inc';
+  include_once DRUPAL_ROOT . '/includes/path.inc';
+  include_once DRUPAL_ROOT . '/includes/password.inc';
+  include_once DRUPAL_ROOT . '/includes/session.inc';
+
+  // Ensure $language_url for drupal_lookup_path().
+  global $language_url;
+  if (!$language_url) {
+    include_once DRUPAL_ROOT . '/includes/locale.inc';
+    include_once DRUPAL_ROOT . '/includes/language.inc';
+
+    $languages = language_list();
+    $saveq = $_GET['q'];
+    $_GET['q'] = request_path();
+    $language_code = locale_language_from_url($languages);
+    $_GET['q'] = $saveq;
+    if ($language_code) {
+      $language_url = $languages[$language_code];
+    }
+  }
+  if (!$language_url) {
+    $language_url = language_default();
+  }
+
+  // Also ensure $language for check_markup().
+  global $language;
+  if (!$language) {
+    $language = $language_url;
+  }
+
+  // Retrieve filters.
+  global $access_filter_fast_mode_enabled;
+  $access_filter_fast_mode_enabled = TRUE;
+  $filters = NULL;
+  if (isset($conf['access_filter_fast'])) {
+    $filters = unserialize($conf['access_filter_fast']);
+  }
+  if (!$filters) {
+    $filters = access_filter_load_all();
+    $access_filter_fast_mode_enabled = FALSE;
+  }
+
+  // Check access.
+  foreach ($filters as $filter) {
+    if (access_filter_check_access($filter)) {
+      continue;
+    }
+
+    if ($filter->deny_action_settings->force_logout) {
+      global $user;
+      if ($user->uid) {
+        watchdog('access_filter', 'Session closed for %name.', array('%name' => $user->name));
+        module_invoke_all('user_logout', $user);
+        session_destroy();
+      }
+    }
+
+    switch ($filter->deny_action_settings->type) {
+      case ACCESS_FILTER_DENY_ACTION_403:
+      case ACCESS_FILTER_DENY_ACTION_404:
+      default:
+        // Replace response code.
+        header('HTTP', TRUE, $filter->deny_action_settings->type);
+
+        // Print formatted message.
+        module_load_include('module', 'filter');
+        $message = $filter->deny_action_settings->error_message;
+        print check_markup($message['value'], $message['format']);
+        break;
+
+      case ACCESS_FILTER_DENY_ACTION_301:
+      case ACCESS_FILTER_DENY_ACTION_302:
+        drupal_goto($filter->deny_action_settings->redirect_destination, array(), $filter->deny_action_settings->type);
+        break;
+    }
+
+    drupal_exit();
+  }
+}
+
+/**
+ * Implements hook_init().
+ */
+function access_filter_init() {
+  access_filter_ensure_admin_paths_cache();
+}
+
+/**
+ * Implements hook_modules_enabled().
+ */
+function access_filter_modules_enabled($modules) {
+  access_filter_ensure_admin_paths_cache(TRUE);
+}
+
+/**
+ * Implements hook_modules_disabled().
+ */
+function access_filter_modules_disabled($modules) {
+  access_filter_ensure_admin_paths_cache(TRUE);
+}
+
+/**
+ * Ensure cache data of admin paths.
+ *
+ * @param boolean $reset
+ *   TRUE to reset admin paths cache.
+ */
+function access_filter_ensure_admin_paths_cache($reset = FALSE) {
+  $admin_paths_cache = cache_get('access_filter_admin_paths');
+  if ($reset || !$admin_paths_cache) {
+    cache_set('access_filter_admin_paths', path_get_admin_paths());
+  }
+}
+
+/**
+ * Check the access matches to filter.
+ *
+ * @param object $filter
+ *   An object of filter.
+ * @param string $path
+ *   String of path to check.
+ * @param string $ip
+ *   String of IP address.
+ *
+ * @return bool
+ *   Boolean TRUE if access is allowed.
+ */
+function access_filter_check_access($filter, $path = NULL, $ip = NULL) {
+  // Pass checking if disabled.
+  // In fast mode, $filter->status is not set and passed only enabled filters.
+  if (isset($filter->status) && $filter->status < ACCESS_FILTER_STATUS_ENABLED) {
+    return TRUE;
+  }
+
+  // Check path.
+  if (is_null($path)) {
+    $path = current_path();
+    $uri = ltrim(request_uri(), '/');
+  }
+  else {
+    // Test mode.
+    $uri = $path;
+    if (!empty($GLOBALS['conf']['clean_url'])) {
+      $path = strstr($uri, '?', TRUE);
+    }
+    else {
+      $parsed_url = drupal_parse_url($path);
+      $path = $parsed_url['path'];
+    }
+    if ($path === FALSE) {
+      $path = $uri;
+    }
+  }
+
+  // Use cache data to admin paths to avoid breaking admin pages.
+  $admin_paths_cache = cache_get('access_filter_admin_paths');
+  if ($admin_paths_cache) {
+    $admin_paths = $admin_paths_cache->data;
+  }
+  else {
+    $admin_paths = array('admin' => 'admin', 'non admin' => '');
+  }
+
+  $path_matched = FALSE;
+  $path_aliases = $uri_aliases = NULL;
+  foreach ($filter->parsed_paths as $parsed) {
+    if (!$parsed->is_blind) {
+      // Get all aliases once.
+      if (is_null($path_aliases)) {
+        $path_aliases = access_filter_get_all_aliases($path);
+
+        $uri_aliases = array($uri);
+        $query = strval(strstr($uri, '?'));
+        foreach ($path_aliases as $path_alias) {
+          $uri_aliases[] = $path_alias . $query;
+        }
+      }
+    }
+
+    if ($parsed->is_uri) {
+      $check_uris = ($parsed->is_blind ? array($uri) : $uri_aliases);
+      if ($parsed->is_regex) {
+        foreach ($check_uris as $check_uri) {
+          if (preg_match('/' . $parsed->pattern . '/i', $check_uri)) {
+            $path_matched = TRUE;
+            break 2;
+          }
+        }
+      }
+      else {
+        foreach ($check_uris as $check_uri) {
+          if ($parsed->pattern == $check_uri) {
+            $path_matched = TRUE;
+            break 2;
+          }
+        }
+      }
+    }
+    else {
+      $check_paths = ($parsed->is_blind ? array($path) : $path_aliases);
+      if ($parsed->is_regex) {
+        foreach ($check_paths as $check_path) {
+          if (preg_match('/' . $parsed->pattern . '/i', $check_path)) {
+            $path_matched = TRUE;
+            break 2;
+          }
+        }
+      }
+      else {
+        if ($parsed->pattern == '<admin>') {
+          foreach ($check_paths as $check_path) {
+            if (drupal_match_path($check_path, $admin_paths['admin']) && !drupal_match_path($check_path, $admin_paths['non_admin'])) {
+              $path_matched = TRUE;
+              break 2;
+            }
+          }
+        }
+        else {
+          foreach ($check_paths as $check_path) {
+            if (drupal_match_path($check_path, $parsed->pattern)) {
+              $path_matched = TRUE;
+              break 2;
+            }
+          }
+        }
+      }
+    }
+  }
+  if (!$path_matched) {
+    return TRUE;
+  }
+
+  // Check IP address.
+  if (is_null($ip)) {
+    $ip = ip_address();
+  }
+
+  $is_allowed = TRUE;
+  foreach (explode("\n", $filter->rules) as $line) {
+    $line = trim($line);
+    if (!strlen($line)) {
+      continue;
+    }
+
+    list($type, $pattern) = explode(':', $line, 2);
+    if (access_filter_ip_match($pattern, $ip)) {
+      $is_allowed = ($type == ACCESS_FILTER_PROCESS_TYPE_ALLOW);
+    }
+  }
+  return $is_allowed;
+}
+
+/**
+ * Get all aliases for path.
+ *
+ * @param string $path
+ *   A string of path.
+ *
+ * @return array
+ *   An array of alias strings.
+ */
+function access_filter_get_all_aliases($path) {
+  $source_path = drupal_lookup_path('source', $path);
+  if ($source_path === FALSE) {
+    $source_path = $path;
+  }
+
+  $paths = array($source_path);
+  $result = db_select('url_alias', 'ua')
+    ->fields('ua', array('alias'))
+    ->condition('source', $source_path)
+    ->execute();
+  while ($obj = $result->fetchObject()) {
+    $paths[] = $obj->alias;
+  }
+  return $paths;
+}
+
+/**
+ * Check ip address is match to filter condition.
+ *
+ * @param string $pattern
+ *   A string of pattern.
+ * @param string $ip
+ *   A string of IP address to check.
+ *
+ * @return bool
+ *   Boolean TRUE if $ip matches to $pattern.
+ */
+function access_filter_ip_match($pattern, $ip) {
+  if ($pattern == '*') {
+    return TRUE;
+  }
+
+  $ip_long = ip2long($ip);
+
+  // Check as 2 IP address range format.
+  $patterns = explode('-', $pattern);
+  if (isset($patterns[1])) {
+    return ($ip_long >= ip2long($patterns[0]) && $ip_long <= ip2long($patterns[1]));
+  }
+
+  // Check as single IP address and subnet format.
+  $check = explode('/', $pattern);
+  if (!isset($check[1])) {
+    $check[1] = 32;
+  }
+
+  $network_long = ip2long($check[0]);
+  $mask_long = bindec(str_repeat('1', $check[1]) . str_repeat('0', 32 - $check[1]));
+  return (($ip_long & $mask_long) == $network_long);
+}
+
+/**
+ * Implements hook_permission().
+ */
+function access_filter_permission() {
+  return array(
+    'administer access filter rules' => array(
+      'title' => t('Administer access filter rules'),
+    ),
+  );
+}
+
+/**
+ * Implements hook_theme().
+ */
+function access_filter_theme() {
+  return array(
+    'access_filter_overview_filters' => array(
+      'render element' => 'form',
+    ),
+  );
+}
+
+/**
+ * Implements hook_menu().
+ */
+function access_filter_menu() {
+  $items['admin/config/people/access_filter'] = array(
+    'title' => 'Access filters',
+    'description' => 'Manage access filters.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('access_filter_overview_filters'),
+    'access arguments' => array('administer access filter rules'),
+    'file' => 'access_filter.admin.inc',
+  );
+  $items['admin/config/people/access_filter/add'] = array(
+    'title' => 'Add filter',
+    'type' => MENU_LOCAL_ACTION,
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('access_filter_form_filter'),
+    'access arguments' => array('administer access filter rules'),
+    'file' => 'access_filter.admin.inc',
+  );
+  $items['admin/config/people/access_filter/fast'] = array(
+    'title' => 'Fast mode settings',
+    'type' => MENU_LOCAL_ACTION,
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('access_filter_form_fast'),
+    'access arguments' => array('administer access filter rules'),
+    'file' => 'access_filter.admin.inc',
+  );
+  $items['admin/config/people/access_filter/%access_filter/edit'] = array(
+    'title' => 'Edit filter',
+    'type' => MENU_CALLBACK,
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('access_filter_form_filter', 4),
+    'access arguments' => array('administer access filter rules'),
+    'file' => 'access_filter.admin.inc',
+  );
+  $items['admin/config/people/access_filter/%access_filter/delete'] = array(
+    'title' => 'Delete filter',
+    'type' => MENU_CALLBACK,
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('access_filter_form_confirm_delete', 4),
+    'access arguments' => array('administer access filter rules'),
+    'file' => 'access_filter.admin.inc',
+  );
+  return $items;
+}
+
+/**
+ * Load access filter.
+ *
+ * @param int $fid
+ *   A filter ID.
+ *
+ * @return object
+ *   A filter object.
+ */
+function access_filter_load($fid) {
+  if (!is_numeric($fid)) {
+    return FALSE;
+  }
+  $filter = db_query('SELECT * FROM {access_filter} WHERE fid = :fid', array(':fid' => $fid))->fetchObject();
+  access_filter_parse_filter($filter);
+  return $filter;
+}
+
+/**
+ * Load all access filters.
+ *
+ * @return array
+ *   An array of access filter items.
+ */
+function access_filter_load_all() {
+  $filters = array();
+  $result = db_query('SELECT * FROM {access_filter} ORDER BY weight ASC');
+  while ($filter = $result->fetchObject()) {
+    access_filter_parse_filter($filter);
+    $filters[] = $filter;
+  }
+  return $filters;
+}
+
+/**
+ * Parse filter properties.
+ *
+ * @param object $filter
+ *   A filter object.
+ */
+function access_filter_parse_filter($filter) {
+  if (is_string($filter->deny_action_settings)) {
+    $filter->deny_action_settings = unserialize($filter->deny_action_settings);
+  }
+  if (empty($filter->deny_action_settings->error_message)) {
+    $filter->deny_action_settings->error_message = array('value' => '', 'format' => NULL);
+  }
+
+  $filter->parsed_paths = array();
+  foreach (explode("\n", $filter->paths) as $line) {
+    $line = trim($line);
+    if (!strlen($line)) {
+      continue;
+    }
+
+    $parsed = new stdClass();
+    list($type_modifier, $parsed->pattern) = explode(':', $line, 2);
+    $type_modifier = explode('+', $type_modifier, 2);
+
+    $parsed->is_uri = ($type_modifier[0] == ACCESS_FILTER_PATH_TYPE_URI);
+
+    $parsed->is_regex = $parsed->is_blind = FALSE;
+    if (isset($type_modifier[1])) {
+      $parsed->is_regex = (strpos($type_modifier[1], ACCESS_FILTER_PATH_MODIFIER_REGEX) !== FALSE);
+      $parsed->is_blind = (strpos($type_modifier[1], ACCESS_FILTER_PATH_MODIFIER_BLIND) !== FALSE);
+    }
+
+    $filter->parsed_paths[] = $parsed;
+  }
+}
+
+/**
+ * Save access filter.
+ *
+ * @param object $filter
+ *   A filter object.
+ *
+ * @return bool
+ *   Boolean TRUE if succeeded.
+ */
+function access_filter_save($filter) {
+  $deny_action_settings_obj = $filter->deny_action_settings;
+  if (is_object($filter->deny_action_settings)) {
+    $filter->deny_action_settings = serialize($filter->deny_action_settings);
+  }
+
+  if (empty($filter->fid)) {
+    $status = drupal_write_record('access_filter', $filter);
+  }
+  else {
+    $status = drupal_write_record('access_filter', $filter, 'fid');
+  }
+  $filter->deny_action_settings = $deny_action_settings_obj;
+
+  return $status;
+}

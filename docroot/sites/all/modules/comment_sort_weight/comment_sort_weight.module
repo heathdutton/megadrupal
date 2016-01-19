@@ -1,0 +1,271 @@
+<?php
+
+/**
+ * @file
+ * Sorts comments by weight.
+ */
+
+/**
+ * Default sort order: Oldest first.
+ */
+define('COMMENT_SORT_WEIGHT_OLDER_FIRST', 'ASC');
+
+/**
+ * Sort order: Newest first.
+ */
+define('COMMENT_SORT_WEIGHT_NEWER_FIRST', 'DESC');
+
+/**
+ * Implements hook_views_api().
+ */
+function comment_sort_weight_views_api() {
+  return array('api' => 3);
+}
+
+/**
+ * Implements hook_query_TAG_alter().
+ *
+ * Alter comments query to join with the comment_sort_weight table and sort
+ * by the 'weight' column instead.
+ */
+function comment_sort_weight_query_comment_filter_alter(QueryAlterableInterface $query) {
+
+  if ((get_class($query) == 'PagerDefault') && ($node = $query->getMetaData('node'))) {
+
+    // Should the order of comments for this content type be corrected?
+    if (!variable_get('comment_sort_weight_' . $node->type, FALSE)) {
+      return;
+    }
+
+    $orderby = &$query->getOrderBy();
+    $expressions = &$query->getExpressions();
+
+    // Sorting for threaded comments.
+    if (isset($orderby['torder'])) {
+      // Remove standard sorting expressions.
+      unset($expressions['torder']);
+      unset($orderby['torder']);
+
+      // Join with our table.
+      $query->join('comment_sort_weight', 'csc', 'c.cid = csc.cid');
+      $query->orderBy('weight', 'ASC');
+    }
+
+    // Sorting for flat comments.
+    else {
+      // Get the configured default sort ordering for this node type.
+      $order = variable_get('comment_sort_weight_order_' . $node->type, COMMENT_SORT_WEIGHT_OLDER_FIRST);
+
+      // To make cid a secondary criterion we have to remove it first.
+      if (isset($orderby['c.cid'])) {
+        unset($orderby['c.cid']);
+      }
+      // Now first sort after created timestamp, and if timestamps are
+      // equal, use comment id instead.
+      $orderby['c.created'] = $order;
+      $orderby['c.cid'] = $order;
+    }
+
+  }
+}
+
+/**
+ * Implements hook_comment_insert().
+ */
+function comment_sort_weight_comment_insert($comment) {
+  comment_sort_weight_check_tables_in_sync_operation($comment->nid);
+}
+
+/**
+ * Implements hook_comment_update().
+ */
+function comment_sort_weight_comment_update($comment) {
+  comment_sort_weight_check_tables_in_sync_operation($comment->nid);
+}
+
+/**
+ * Implements hook_comment_delete().
+ */
+function comment_sort_weight_comment_delete($comment) {
+  comment_sort_weight_check_tables_in_sync_operation($comment->nid);
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function comment_sort_weight_form_node_type_form_alter(&$form, $form_state) {
+  $form['comment']['comment_sort_weight'] = array(
+    '#title' => t('Sort comments by weight?'),
+    '#description' => t('Instead of sorting by comment id, this will sort the comments by their weight (hierarchical order).'),
+    '#type' => 'checkbox',
+    '#default_value' => variable_get('comment_sort_weight_' . $form['#node_type']->type, FALSE),
+  );
+
+  $form['comment']['comment_sort_weight_order'] = array(
+    '#title' => t('Default sort order'),
+    '#type' => 'select',
+    '#states' => array(
+      'visible' => array(
+        ':input[name="comment_sort_weight"]' => array('checked' => TRUE),
+      ),
+    ),
+    '#options' => array(
+      COMMENT_SORT_WEIGHT_OLDER_FIRST => t('Oldest first (ASC)'),
+      COMMENT_SORT_WEIGHT_NEWER_FIRST => t('Newest first (DESC)')),
+    '#default_value' => variable_get('comment_sort_weight_order_' . $form['#node_type']->type, COMMENT_SORT_WEIGHT_OLDER_FIRST),
+  );
+
+  $form['comment']['comment_sort_weight_order_reverse'] = array(
+    '#title' => t('Reverse order for children ?'),
+    '#type' => 'checkbox',
+    '#states' => array(
+      'visible' => array(
+        ':input[name="comment_sort_weight"]' => array('checked' => TRUE),
+      ),
+    ),
+    '#default_value' => variable_get('comment_sort_weight_order_reverse_' . $form['#node_type']->type, FALSE),
+  );
+
+  $form['#submit'][] = 'comment_sort_weight_check_tables_in_sync';
+}
+
+/**
+ * This function synchronizes the comment and comment_sort_weight tables.
+ */
+function comment_sort_weight_check_tables_in_sync($form, $form_state) {
+  $operations = array();
+
+  $comments = db_select('comment', 'c')
+    ->fields('c', array('nid'))
+    ->groupBy('nid')
+    ->execute();
+
+  foreach ($comments as $comment) {
+    $operations[] = array('comment_sort_weight_check_tables_in_sync_operation', array($comment->nid));
+  }
+
+  $batch = array(
+    'operations' => $operations,
+    'title' => t('Filling comment sort weight table.'),
+  );
+  batch_set($batch);
+}
+
+/**
+ * Batch operation callback for table sync.
+ */
+function comment_sort_weight_check_tables_in_sync_operation($nid) {
+  if (is_null($nid)) {
+    return;
+  }
+
+  $select = db_select('comment', 'c')
+    ->fields('c', array('cid'))
+    ->condition('nid', $nid, '=')
+    ->execute();
+
+  foreach($select as $comment) {
+    db_delete('comment_sort_weight')
+      ->condition('cid', $comment->cid)
+      ->execute();
+  }
+
+  $tree = comment_sort_weight_get_flat_tree($nid);
+
+  foreach($tree as $key => $item) {
+    $record = array(
+      'cid' => $item->cid,
+      'weight' => $key,
+    );
+    drupal_write_record('comment_sort_weight', $record);
+  }
+}
+
+/**
+ * Get a tree representation of the comments of a node.
+ *
+ * @param mixed $nid
+ *   The node object or the node id.
+ * @param int $pid
+ *   The parent pid to start getting the tree from. 0 is root.
+ * @return array
+ *   The array tree containing the comments.
+ */
+function comment_sort_weight_get_tree($nid, $pid = 0) {
+  $tree = array();
+
+  if (is_null($nid)) {
+    $node = menu_get_object();
+    if (is_null($node)) {
+      return array();
+    }
+    $nid = $node->nid;
+  } elseif (is_object($nid)) {
+    $node = $nid;
+    $nid = $node->nid;
+  } elseif (is_numeric($nid)) {
+    $node = node_load($nid);
+  } else {
+    return array();
+  }
+
+  $order = variable_get('comment_sort_weight_order_' . $node->type, COMMENT_SORT_WEIGHT_OLDER_FIRST);
+  $order_reverse = variable_get('comment_sort_weight_order_reverse_' . $node->type, FALSE);
+
+  if ($pid != 0) {
+    if ($order_reverse) {
+      if ($order == COMMENT_SORT_WEIGHT_OLDER_FIRST) {
+        $order = COMMENT_SORT_WEIGHT_NEWER_FIRST;
+      } else {
+        $order = COMMENT_SORT_WEIGHT_OLDER_FIRST;
+      }
+    }
+  }
+
+  $result = db_select('comment', 'c')
+    ->fields('c', array('cid'))
+    ->condition('pid', $pid, '=')
+    ->condition('nid', $nid, '=')
+    ->orderBy('created', $order)
+    ->execute();
+
+  foreach ($result as $comment) {
+    if ($children = comment_sort_weight_get_tree($node, $comment->cid)) {
+      $comment->children = $children;
+    }
+
+    $tree[] = $comment;
+  }
+
+  return $tree;
+}
+
+/**
+ * Transform the comments tree array into a flat array.
+ *
+ * @param mixed $nid
+ *   The node object or the node id.
+ * @param mixed $tree
+ *   The tree to start getting children from.
+ * @return array
+ *   The flat array containing the comments.
+ */
+function comment_sort_weight_get_flat_tree($nid, $tree = NULL) {
+  $flat = array();
+
+  if (is_null($tree)) {
+    $tree = comment_sort_weight_get_tree($nid, 0);
+  }
+
+  foreach ($tree as $item) {
+    $item_copy = clone $item;
+    $item_copy->children = NULL;
+    $flat[] = $item_copy;
+
+    if (isset($item->children) && is_array($item->children)) {
+      $flat = array_merge($flat, comment_sort_weight_get_flat_tree($nid, $item->children));
+    }
+  }
+
+  return $flat;
+}

@@ -1,0 +1,568 @@
+<?php
+/**
+ * @file
+ * Integration with FunnyMonkey-EPUB-Package
+ * @see https://github.com/FunnyMonkey/FunnyMonkey-EPUB-Package
+ */
+
+// Include our field API functions.
+include_once __DIR__ . '/includes/epub_export.field.inc';
+
+/**
+ * @todo table of contents options
+ *   export based on entity reference
+ *   export based on views.
+ */
+define('EPUB_EXPORT_STATUS_NOT_BUILT', 0);
+define('EPUB_EXPORT_STATUS_NEEDS_REBUILD', 1);
+define('EPUB_EXPORT_STATUS_ERRORS', 2);
+define('EPUB_EXPORT_STATUS_READY', 4);
+
+define('EPUB_EXPORT_DEFAULT_FILE_INDEX', 0);
+define('EPUB_EXPORT_MOBI_FILE_INDEX', 1);
+
+
+/**
+ * Implements hook_menu().
+ */
+function epub_export_menu() {
+  $items = array();
+
+  // Settings page.
+  $items['admin/config/system/epub-export'] = array(
+    'title' => 'EPUB Export',
+    'description' => 'Setup configuration for EPUB Export.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('epub_export_settings'),
+    'access callback' => 'user_access',
+    'access arguments' => array('administer site configuration'),
+    'file' => 'epub_export.admin.inc',
+  );
+  return $items;
+}
+/**
+ * Implements hook_cron().
+ */
+function epub_export_cron() {
+  // Here we just queue up our items for cron queue to handle as the discovery
+  // process and file I/O may be time consuming.
+  $queue = DrupalQueue::get('epub_export_build_epub');
+
+  $results = epub_export_get_entities_by_field_status();
+  epub_export_queue_add_items($queue, $results);
+
+  // Reset any failed attempts so we try to rebuild them.
+  $results = epub_export_get_entities_by_field_status(array(EPUB_EXPORT_STATUS_ERRORS));
+  epub_export_queue_add_items($queue, $results);
+}
+
+/**
+ * Helper function to add items to process to our queue.
+ *
+ * @param DrupalQueue $queue
+ *   DrupalQueue the queue we should add any additional items to.
+ *
+ * @param array $results
+ *   Entities we want to add to our queue.
+ *
+ * @see epub_export_get_entities_by_field_status()
+ */
+function epub_export_queue_add_items(&$queue, $results) {
+  $types = epub_export_supported_types();
+  if (!empty($results)) {
+    foreach ($results as $entity_type => $entities) {
+      if (in_array($entity_type, $types)) {
+        foreach ($entities as $entity) {
+          // Add this entity to the queue.
+          list($id, $vid, $bundle) = entity_extract_ids($entity_type, $entity);
+          if (!empty($id)) {
+            // these may be entity stubs and not full objects passed through
+            // hook_entity_load().
+            $queue->createItem(array('epub_export_type' => $entity_type, 'id' => $id));
+          }
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_cron_queue_info().
+ */
+function epub_export_cron_queue_info() {
+  $queues['epub_export_build_epub'] = array(
+    'worker callback' => 'epub_export_build_epub_worker',
+    'time' => 180,
+  );
+  return $queues;
+}
+
+/**
+ * Worker callback for queue processing.
+ *
+ * This function does most of our heavy lifting of calling the appropriate
+ * class funtions to build our epub.
+ *
+ * @todo abstract out error handling for readability
+ */
+function epub_export_build_epub_worker($item) {
+  if (epub_export_needs_rebuild($item['epub_export_type'], $item['id'])) {
+    $entity = entity_load_single($item['epub_export_type'], $item['id']);
+    epub_export_build_epub($entity);
+  }
+}
+
+/**
+ * Returns a filename for epub usage.
+ */
+function epub_export_get_filename($entity, $field, $instance) {
+  $directory = $field['settings']['uri_scheme']  . '://' . trim($instance['settings']['file_directory'], '/');
+  file_prepare_directory($directory, FILE_CREATE_DIRECTORY | FILE_MODIFY_PERMISSIONS);
+
+  // @todo make generice (not node specific)
+  $label = entity_label($entity->epub_export_type, $entity);
+
+  // remove any problematic characters since file_create_filename() doesn't
+  // account for '/' which is misinterpreted as a path.
+  $label = str_replace(array(':', '*', '?', '"', '<', '>', '|', '/', '\\'), '_', $label);
+  $basename = $label . '.epub';
+  return file_create_filename($basename, $directory);
+}
+
+/**
+ *
+ */
+function epub_export_build_epub($entity) {
+  $bundler = variable_get('epub_export_run_as_user', '');
+  if (!empty($bundler)) {
+    global $user;
+    $original_user = $user;
+    $old_state = drupal_save_session();
+    drupal_save_session(FALSE);
+    $user = user_load_by_name($bundler);
+  }
+
+  list($id, $vid, $bundle) = entity_extract_ids($entity->epub_export_type, $entity);
+
+  $export = new EPUBExport($entity->epub_export_type, $id);
+
+  try {
+    $export->findAssets();
+    $export->parseAssets();
+    $export->rewriteResourceLinks();
+    $filepath = $export->bundleEPUB();
+    list($file, $field) = epub_export_attach_epub($entity, $filepath);
+
+    // Allow other modules to respond to adding the EPUB document.
+    module_invoke_all('epub_export_attach_epub', $entity, $file, $field);
+
+    epub_export_cleanup_files(array($filepath));
+  } catch (Exception $e) {
+    $message = t('Failed to bundle EPUB for @type(@id) with message "@message"', array(
+      '@type' => $entity->epub_export_type,
+      '@id' => $id,
+      '@message' => $e->getMessage(),
+    ));
+    watchdog('epub_export', $message, array(), WATCHDOG_ERROR);
+    // php 5.5 finally{} would be better for this
+    if (!empty($bundler)) {
+      $user = $original_user;
+      drupal_save_session($old_state);
+    }
+  }
+
+  // php 5.5 finally{} would be better for this
+  if (!empty($bundler)) {
+    $user = $original_user;
+    drupal_save_session($old_state);
+  }
+  return FALSE;
+}
+
+/**
+ * Implements hook_libraries_info().
+ */
+function epub_export_libraries_info() {
+  // Define funnymonky EPUB package to export to EPUB.
+  $libraries['FunnyMonkey-EPUB-Package'] = array(
+    'name' => 'FunnyMonkey EPUB Packager',
+    'vendor_url' => 'https://github.com/FunnyMonkey/FunnyMonkey-EPUB-Package/',
+    'download_url' => 'https://github.com/FunnyMonkey/FunnyMonkey-EPUB-Package/downloads',
+    'version arguments' => array(
+      'file' => 'FunnyMonkey/EPUB/EPUBPackage.php',
+      'pattern' => '/@version\s+version\s+([0-9]+\.[0-9]+)/',
+    ),
+    'files' => array(
+      'php' => array(
+        'FunnyMonkey/EPUB/EPUBPackage.php',
+      ),
+    ),
+  );
+
+  return $libraries;
+}
+
+
+
+/**
+ * Returns a set of entities matching the given field status for epub fields.
+ *
+ * @param array $states
+ *   An array field states for entities we want returned.
+ */
+function epub_export_get_entities_by_field_status($states = array(EPUB_EXPORT_STATUS_NOT_BUILT,
+  EPUB_EXPORT_STATUS_NEEDS_REBUILD)) {
+
+  $results = array();
+  $fields = field_read_fields(array('type' => 'epub_export_epub'));
+  foreach (array_keys($fields) as $field) {
+    $query = new EntityFieldQuery();
+    $query->fieldCondition($field, 'status', $states, 'IN');
+    $results = array_merge_recursive($results, $query->execute());
+  }
+  return $results;
+}
+
+/**
+ * Returns the set of referenced entities for a particular node.
+ */
+function epub_export_get_assets($node) {
+  $referenced = &drupal_static(__FUNCTION__);
+  if (!isset($referenced[$node->nid])) {
+    $query = db_select('epub_export')
+      ->fields(array('ref_entity_type', 'ref_entity_id'));
+    foreach ($query->execute as $row) {
+      $referenced[$node->nid] = $row;
+    }
+  }
+  return $referenced[$node->nid];
+}
+
+/**
+ * Gets the referenced entities for a given node.
+ */
+function epub_export_get_referenced_entities($node) {
+  $return = array();
+  $export = new EPUBExport('node', $node->nid);
+  if (!empty($export)) {
+    $export->findAssets();
+    $export->parseAssets();
+    foreach ($export->getAssets() as $uri => $asset) {
+      if (!empty($asset['ref_entity_type'])) {
+        $return[] = array(
+          'ref_entity_type' => $asset['ref_entity_type'],
+          'ref_entity_id' => $asset['ref_entity_id'],
+        );
+      }
+    }
+  }
+
+  return $return;
+}
+
+/**
+ * Determine if a given entity needs rebuild.
+ *
+ * @param string $entity_type
+ *   The entity type eg. node.
+ * @param int $entity_id
+ *   Tnhe entity_id for the given entity_type.
+ *
+ * @return bool
+ *   Indicating epub needs rebuild FALSE otherwise.
+ */
+function epub_export_needs_rebuild($entity_type, $entity_id) {
+  $states = array(
+    EPUB_EXPORT_STATUS_NOT_BUILT,
+    EPUB_EXPORT_STATUS_NEEDS_REBUILD,
+    EPUB_EXPORT_STATUS_ERRORS,
+  );
+  $needing_rebuild = epub_export_get_entities_by_field_status($states);
+  if (isset($needing_rebuild[$entity_type][$entity_id])) {
+    return TRUE;
+  }
+  else {
+    return FALSE;
+  }
+}
+
+/**
+ * Returns a set of supported entity types and their keys.
+ *
+ * @todo replace all calls to this with appropriate entity API calls.
+ */
+function epub_export_supported_types() {
+  $types = array('node', 'taxonomy_term');
+  drupal_alter('epub_export_supported_types', $types);
+  return $types;
+}
+
+/**
+ * Returns an array of navigational entity types.
+ */
+function epub_export_navigation_types() {
+  $types = array('node');
+  drupal_alter('epub_export_navigation_types', $types);
+  return $types;
+}
+
+/**
+ * Implements hook_theme().
+ */
+function epub_export_theme($existing, $type, $theme, $path) {
+  return array(
+    'epub_export' => array(
+      'variables' => array(
+        'language' => LANGUAGE_NONE,
+        'head' => NULL,
+        'head_title' => NULL,
+        'styles' => NULL,
+        'scripts' => NULL,
+        'attributes' => NULL,
+        'content' => NULL,
+        'page_bottom' => NULL,
+        'entity_type' => NULL,
+        'entity' => NULL,
+      ),
+      'template' => 'epub-export',
+    ),
+    'epub_export_toc' => array(
+      'variables' => array(
+        'language' => LANGUAGE_NONE,
+        'head' => NULL,
+        'head_title' => NULL,
+        'styles' => NULL,
+        'scripts' => NULL,
+        'attributes' => NULL,
+        'links_array' => array(),
+        'links' => NULL,
+        'page_bottom' => NULL,
+        'entity_type' => NULL,
+        'entity' => NULL,
+      ),
+      'template' => 'epub-export-toc',
+    ),
+  );
+}
+
+/**
+ * This function is not used; see the corresponding template file instead.
+ */
+function theme_epub_export($variables) {
+
+}
+
+/**
+ * This function is not used; see the corresponding template file instead.
+ */
+function theme_epub_export_toc($variables) {
+
+}
+
+/**
+* Implements hook_entity_load()
+*
+* @see http://drupal.org/node/1042822
+*/
+function epub_export_entity_load($entities, $entity_type) {
+  // For every entity, ensure that the 'entity_type' key is set so that we can
+  // always figure outwhat type of entity it is.
+  foreach ($entities as $entity) {
+    $entity->epub_export_type = $entity_type;
+  }
+}
+
+/**
+ * Used to attach a file to an epub export field.
+ */
+function epub_export_attach_epub($entity, $filename) {
+  list($id, $vid, $bundle) = entity_extract_ids($entity->epub_export_type, $entity);
+  $earray = (array) $entity;
+
+  // Dig through all fields on this entity and find any epub fields
+  foreach (element_children($earray) as $field) {
+    $info = field_info_field($field);
+
+    if (!empty($info) && $info['type'] == 'epub_export_epub') {
+      // see if this field has a status requiring a new EPUB.
+      if (epub_export_rebuild_needed($entity->{$field}[LANGUAGE_NONE][EPUB_EXPORT_DEFAULT_FILE_INDEX]['status'])) {
+        if (!empty($filename) && file_exists($filename)) {
+          $instance = field_info_instance($entity->epub_export_type, $field, $bundle);
+          epub_export_remove_existing_epub_file($entity, $field, $instance);
+          $file = epub_export_configure_file($filename, $entity, $info, $instance);
+
+          if (!empty($file->fid)) {
+            file_usage_add($file, 'epub_export', $entity->epub_export_type, $instance['id']);
+            $entity->{$field}[LANGUAGE_NONE][EPUB_EXPORT_DEFAULT_FILE_INDEX]['fid'] = $file->fid;
+            $entity->{$field}[LANGUAGE_NONE][EPUB_EXPORT_DEFAULT_FILE_INDEX]['status'] = EPUB_EXPORT_STATUS_READY;
+          }
+          else {
+            $entity->{$field}[LANGUAGE_NONE][EPUB_EXPORT_DEFAULT_FILE_INDEX]['status'] = EPUB_EXPORT_STATUS_ERRORS;
+          }
+        }
+
+        $entity->epub_export_in_progress = TRUE;
+        entity_save($entity->epub_export_type, $entity);
+        return array($file, $field);
+      }
+    }
+  }
+}
+
+/**
+ * Given a filename save it to the appropriate location.
+ * @param string $filename
+ *   The filename to save.
+ * @param object $entity
+ *   The entity we are saving the file on behalf of.
+ * @param array $info
+ *   Field array as returned from field_info_field().
+ * @param array $instance
+ *   An array as returned from field_info_instnance.
+ * @return mixed
+ *   A file object on success, FALSE otherwise. See file_copy().
+ */
+function epub_export_configure_file($filename, $entity, $info, $instance) {
+  $destination = epub_export_get_filename($entity, $info, $instance);
+  $file = new StdClass();
+  $file->uid = $entity->uid;
+  $file->uri = $filename;
+  $file->filemime = file_get_mimetype($file->uri);
+  $file->status = FILE_STATUS_PERMANENT;
+  return file_copy($file, $destination);
+
+}
+
+/**
+ * Given an EPUB field status determine if we need to rebuild.
+ *
+ * @param integer $status
+ *   An epub field status
+ * @return bool
+ *   TRUE indicating rebuild needed, FALSE otherwise.
+ */
+function epub_export_rebuild_needed($status) {
+  $rebuild_states = (EPUB_EXPORT_STATUS_NOT_BUILT |
+    EPUB_EXPORT_STATUS_NEEDS_REBUILD |
+    EPUB_EXPORT_STATUS_ERRORS);
+  if ($status & $rebuild_states) {
+    return TRUE;
+  }
+  return FALSE;
+}
+
+/**
+ * Remove an existing epub file on the given entity field instance.
+ *
+ * @param object $entity
+ *   An entity to remove existing epub files from.
+ *
+ * @param string $field
+ *   A field name to remove the field from.
+ * @param array $instance
+ *   An array as returned from field_info_instnance.
+ * @return bool
+ *   FALSE if it wasn't safe to remove the file or didn't exist or the value
+ *   from file_delete().
+ */
+function epub_export_remove_existing_epub_file($entity, $field, $instance) {
+  if (!empty($entity->{$field}[LANGUAGE_NONE][EPUB_EXPORT_DEFAULT_FILE_INDEX]['fid']) &&
+    $oldfile = file_load($entity->{$field}[LANGUAGE_NONE][EPUB_EXPORT_DEFAULT_FILE_INDEX]['fid'])) {
+
+    $file_usage = file_usage_list($oldfile);
+    if ($oldfile->status == 0 || !empty($file_usage['epub_export'])) {
+      file_usage_delete($oldfile, 'epub_export', $entity->epub_export_type, $instance['id'], 1);
+      return file_delete($oldfile);
+    }
+  }
+
+  return FALSE;
+}
+
+/**
+ * Implements hook_entity_info_alter()
+ */
+function epub_export_entity_info_alter(&$entity_info) {
+  $types = epub_export_supported_types();
+  foreach($types as $type) {
+    if (!empty($entity_info[$type])) {
+      $entity_info[$type]['view modes']['epub_export'] = array(
+        'label' => t('EPUB'),
+        'custom settings' => FALSE,
+      );
+    }
+  }
+}
+
+function template_preprocess_epub_export(&$vars) {
+  $vars['scripts'] = drupal_get_css();
+  $head = '<meta charset="utf-8" />';
+  $head .= '<meta name="viewport" content="width=device-width, initial-scale=1.0" />';
+  $vars['head'] = $head;
+
+  $args = epub_export_get_theme_suggestions_args($vars);
+  $vars['theme_hook_suggestions'] = theme_get_suggestions($args, 'epub_export');
+}
+
+function template_preprocess_epub_export_toc(&$vars) {
+  $vars['scripts'] = drupal_get_css();
+  $head = '<meta charset="utf-8" />';
+  $head .= '<meta name="viewport" content="width=device-width, initial-scale=1.0" />';
+  $vars['head'] = $head;
+  $vars['links'] = implode("\n", $vars['links_array']);
+
+  $args = epub_export_get_theme_suggestions_args($vars);
+  $vars['theme_hook_suggestions'] = theme_get_suggestions($args, 'epub_export_toc');
+}
+
+/**
+ *  Helper function to generate the theme suggestions passed to
+ *  theme_hook_suggestions() as the first '$args' parameter
+ *
+ * @param array $vars
+ *   Render array as passed to one of epub_exports' theme functions.
+ *
+ * @return array
+ *   String order in specificity for theme_suggestions.
+ */
+function epub_export_get_theme_suggestions_args($vars) {
+  list($id, $vid, $bundle) = entity_extract_ids($vars['entity_type'], $vars['entity']);
+  return array(
+    $vars['entity_type'],
+    $bundle,
+    $id,
+  );
+}
+
+/**
+ * Helper function to cleanup temporary working directories.
+ *
+ * Note that since this does recursive deletion of the passed paths, this has a
+ * safety check to ensure the path resides in the temp directory.
+ *
+ * @param array $paths
+ *   An array of paths and/or files to delete recursively.
+ */
+function epub_export_cleanup_files($paths) {
+  // Remove our extract directory
+  $tempdir = file_directory_temp();
+  foreach ($paths as $cleanup) {
+    // Safety check to ensure that the path is in temp dir.
+    if (strpos($cleanup, $tempdir) === 0) {
+      if (is_file($cleanup)) {
+        unlink($cleanup);
+      }
+      else {
+        // directory, use recursive delete.
+        foreach(new RecursiveIteratorIterator(new RecursiveDirectoryIterator($cleanup, FilesystemIterator::SKIP_DOTS), RecursiveIteratorIterator::CHILD_FIRST) as $path) {
+          $path->isFile() ? unlink($path) : rmdir($path);
+        }
+      }
+
+      // top-level directories will need to be cleared out after contents.
+      if (is_dir($cleanup)) {
+        rmdir($cleanup);
+      }
+    }
+  }
+}

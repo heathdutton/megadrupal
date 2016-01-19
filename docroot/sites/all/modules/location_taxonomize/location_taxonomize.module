@@ -1,0 +1,468 @@
+<?php
+
+/**
+ * @file
+ * A module which creates and maintains a Location Taxonomy
+ * which is synchronized with Data from the Location module
+ */
+
+require_once('location_taxonomize.inc');
+require_once('location_taxonomize.admin.inc');
+
+/**
+ * Implements hook_menu().
+ */
+function location_taxonomize_menu() {
+  $items = array();
+  // module configuration page
+  $items['admin/config/content/' . LT_MODULE_ID] = array(
+    'title' => 'Location Taxonomize',
+    'description' => 'Configuration for Location taxonomize module',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('location_taxonomize_form'),
+    'access callback' => 'location_taxonomize_access_admin',
+    'type' => MENU_NORMAL_ITEM,
+  );
+  return $items;
+}
+
+/**
+ * custom access callback for admin form
+ */
+function location_taxonomize_access_admin() {
+  $access_lt = user_access('administer location_taxonomize');
+  $access_admin = user_access('access administration pages');
+  return $access_lt && $access_admin;
+}
+
+/**
+ * Implements hook_permission().
+ */
+function location_taxonomize_permission() {
+  return array(
+    'administer location_taxonomize' => array(
+      'title' => t('Administer Location taxonomize'),
+    )
+  );
+}
+
+/**
+ * Implements hook_field_attach_form().
+ *   - hides the term reference field if necessary
+ */
+function location_taxonomize_field_attach_form($entity_type, $entity, &$form, &$form_state, $langcode) {
+  // get the fields on this form, or quit if there are none
+  if (isset($form_state['field'])) {
+    $fields = $form_state['field'];
+  }
+  else return;
+  // check if we are configured to hide the field
+  $settings = location_taxonomize_get_settings();
+  if ($settings['hide_terms_field']) {
+    // hide the term references field if it's there
+    $field_name = 'field_' . LT_TERM_ATTACH_FIELD;
+    if (in_array($field_name, array_keys($fields))) {
+      $form[$field_name]['#access'] = FALSE;
+    }
+  }
+}
+
+/**
+ * Submit callback for the initialization config form. Handles initialization of Location Taxonomy.
+ */
+function location_taxonomize_initialize($form, $form_state) {
+  $values_init = $form_state['values']['location_taxonomize_vocab'];
+  $method = $values_init['method'];
+  switch ($method) {
+    case 'new':
+      // create a new location vocabulary
+      taxonomy_vocabulary_save((object) array(
+        'name' => t('Location'),
+        'machine_name' => LT_VOCAB_NAME,
+        'description' => t('This vocabulary is synchronized with Location data automatically by the @name module', 
+                         array('@name' => LT_MODULE_NAME)),
+      ));
+      // save the vid of the newly created vocabulary
+      $vocab = taxonomy_vocabulary_machine_name_load(LT_VOCAB_NAME);
+      $vid = $vocab->vid;
+      variable_set('location_taxonomize_vid', $vid);
+      $msg = t('Successfully created the Location taxonomy (vid @vid)', 
+              array('@vid' => $vid));
+      break;
+    case 'existing':
+      // save the vid of the existing vocabulary
+      $vid = $values_init['possible_vid'];
+      variable_set('location_taxonomize_vid', $vid);
+      $msg = t('Successfully connected to the existing Location Vocabulary (vid @vid)',
+              array('@vid' => $vid));
+      break;
+  }
+  drupal_set_message($msg);
+  // Create the 'taxonomy_longname' field if it doesn't already exist.
+  if (!field_info_field('location_taxonomize_longname')) {
+    $field = array(
+      'field_name' => 'location_taxonomize_longname',
+      'type' => 'text',
+    );
+    field_create_field($field);
+  }
+  // Create the instance on the bundle.
+  if (!field_info_instance('taxonomy_term', 'location_taxonomize_longname', 'location_taxonomize')) {
+    $instance = array(
+      'field_name' => 'location_taxonomize_longname',
+      'label' => t('Long Name'),
+      'entity_type' => 'taxonomy_term',
+      'bundle' => 'location_taxonomize',
+    );
+    field_create_instance($instance);
+  }
+  // set defaults for longname fields
+  _location_taxonomize_init_var_longname();
+  // Allow modules to hook into the initialization process.
+  $settings = array(
+    'source' => $values_init['source'],
+    'method' => $values_init['method'],
+    'hierarchy' => $values_init['hierarchy'],
+  );
+  module_invoke_all('location_taxonomize_initialize', $settings);
+  drupal_set_message(t('Location Taxonomize initialized successfully'));
+}
+
+/**
+ * @param $items - an array of items ready to be taxonomized
+ */
+function location_taxonomize_taxonomize($items, $form, &$form_state) {
+  $saved = 0;
+  $tids = array();
+  foreach ($items as $item) {
+    $results = location_taxonomize_process_item($item);
+    $saved += $results['saved'];
+    $tids = array_merge($tids, $results['tids']);
+  }
+  if (!empty($tids)) {
+    if (location_taxonomize_term_attach_enabled()) {
+      location_taxonomize_term_attach($tids, $form, $form_state);
+    }
+  }
+  if (variable_get('location_taxonomize_show_messages', 1)) {
+    $msg = t('Location taxonomize: @num new terms saved', array('@num' => $saved));
+    drupal_set_message($msg);
+  }
+  return array("saved" => $saved, "tids" => $tids);
+}
+
+function location_taxonomize_taxonomize_bulk($items) {
+  $saved = 0;
+  foreach ($items as $nid => $items) {
+    $tids = array();
+    foreach ($items as $item) {
+      $results = location_taxonomize_process_item($item);
+      $saved += $results['saved'];
+      $tids = array_merge($tids, $results['tids']);
+    }
+    if (!empty($tids)) {
+      if (location_taxonomize_term_attach_enabled()) {
+        location_taxonomize_term_attach_bulk($tids, $nid);
+      }
+    }
+  }
+  return array("saved" => $saved);
+}
+
+/**
+ * Determines if a location needs to be taxonomized. 
+ * If so, it saves the appropriate terms
+ * Returns an array containing two items: the first is the number of new terms
+ * saved, and the second is an array of all the terms that correspond to this
+ * object, including ones that were added and ones that already existed
+ * @param $obj - a location object
+ */
+function location_taxonomize_process_item($obj) {
+  // make sure we are enabled
+  if (!location_taxonomize_enabled()) return NULL;
+  // get settings
+  $settings = variable_get('location_taxonomize_settings');
+  $vid = variable_get('location_taxonomize_vid');
+  $hierarchy = _location_taxonomize_get_hierarchy();
+  $longname_main = $settings['longname_enable'] && $settings['longname']['main'];
+  // holds the number of newly saved terms
+  $saved = 0;
+  $tids = array();
+  // this loops through hierarchy levels and saves terms if necessary
+  for ($hlevel = 0; $hlevel < count($hierarchy); $hlevel++) {
+    $hlevel_name = $hierarchy[$hlevel];
+    // set the term name
+    if ($longname_main) {
+      $name = location_taxonomize_make_longname($hlevel, $obj);
+      $longname = $name;
+    } else {
+      $name = _location_taxonomize_create_term_name($hlevel_name, $obj, $settings);
+    }
+    // find if the term exists already or not
+    if ($hlevel == 0) $parentid = -1;
+    else $parentid = $tids[$hlevel-1];
+    $findterm = _find_term($name, $hlevel, $parentid);
+    // save if necessary
+    if (!$findterm) {
+      $term = (object) array(
+        'name' => $name,
+        'vid' => $vid,
+      );
+      // add longname if necessary
+      if ($settings['longname_enable'] && !$longname_main) {
+          _location_taxonomy_add_longname($term, $hlevel, $obj);
+      }
+      // set term parent
+      if ($hlevel == 0) {
+        $term->parent = array(0);
+      }
+      else {
+        $term->parent = array($parentid);
+      }
+      taxonomy_term_save($term);
+      $tids[] = $term->tid;
+      $saved++;
+    }
+    elseif ($findterm->tid) $tids[] = $findterm->tid;
+  }
+  return array('saved' => $saved, 'tids' => $tids);
+}
+
+/**
+ * Given a name, hierarchy level, and parent id, this function returns the term
+ * if such a term exists, and FALSE if it doesn't.
+ * It returns TRUE if the term was not found but should not be saved
+ * NOTE: $parentid is only necessary if $hlevel > 0. Otherwise, set $parentid = -1
+ */
+function _find_term($name, $hlevel, $parentid) {
+  $terms = taxonomy_get_term_by_name($name, 'location_taxonomize');
+  // there are no terms that match
+  if (!$terms) return FALSE;
+  $withparent = array();
+  // look through matching terms and find the one(s) with the right parent
+  foreach ($terms as $term) {
+    $parents = taxonomy_get_parents($term->tid);
+    // for root-level terms:
+    if (empty($parents) && $parentid == -1) {
+      $withparent[] = $term;
+    }
+    // for all other terms (one parent is assumed):
+    elseif (array_pop($parents)->tid == $parentid) $withparent[] = $term;
+  }
+  // there is one term that matches exactly
+  if (count($withparent) == 1) {
+    return array_pop($withparent);
+  }
+  // there are no terms that match exactly
+  elseif (count($withparent) == 0) {
+    return FALSE;
+  }
+  // if we get here, there was more than one term that matched exactly
+  if (variable_get('location_taxonomize_show_messages', 1)) {
+    $msg = t("Location taxonomize couldn't save a term because its hierarchy
+          location was ambiguous.");
+    drupal_set_message($msg);
+  }
+  return TRUE;
+}
+
+/**
+ * Adds a longname field to a term
+ */
+function _location_taxonomy_add_longname(&$term, $hlevel, $location, $longname = NULL) {
+  if ($longname == NULL) {
+    $longname = location_taxonomize_make_longname($hlevel, $location);
+  }
+  // add the longname to the term
+  $term->location_taxonomize_longname['und'][0]['value'] = $longname;
+}
+
+function location_taxonomize_make_longname($hlevel, $location) {
+  // get settings
+  $settings = variable_get('location_taxonomize_settings');
+  $ln_settings = $settings['longname'];
+  $fields = $ln_settings['fields'];
+  $hierarchy = _location_taxonomize_get_hierarchy();
+  // the name of the hierarchy level of this term (i.e. 'city')
+  $term_hlevel_name = $hierarchy[$hlevel];
+  // translate the name into an internal field name if necessary
+  $term_hlevel_name_lt = location_taxonomize_convert_field_name($term_hlevel_name);
+  // no Long Name if this hlevel_name is not selected in config
+  if (!$fields[$term_hlevel_name]) return '';
+  $longname = array();
+  // collect parts of longname
+  for ($i = 0; $i <= $hlevel; $i++) {
+    $hlevel_name = $hierarchy[$i];
+    $hlevel_name_lt = location_taxonomize_convert_field_name($hlevel_name);
+    $include = $fields[$hlevel_name];
+    if ($include) {
+      switch ($hlevel_name_lt) {
+        case 'country':
+          if ($term_hlevel_name_lt == 'country' || $ln_settings['country_naming'] == 'name') {
+            if (isset($location[location_taxonomize_source_field_name('country_name')])) {
+              $longname[] = $location[location_taxonomize_source_field_name('country_name')];
+            }
+            else {
+              $longname[] = $location[location_taxonomize_source_field_name('country')];
+            }
+          }
+          elseif ($location[$hlevel_name] == 'us' && $ln_settings['usa']) $longname[] = 'USA';
+          else $longname[] = drupal_strtoupper($location[$hlevel_name]);
+          break;
+        case 'province':
+          if ($term_hlevel_name_lt == 'province' || $ln_settings['province_naming'] == 'name') {
+            if (isset($location[location_taxonomize_source_field_name('province_name')])) {
+              $longname[] = $location[location_taxonomize_source_field_name('province_name')];
+            }
+            else {
+              $longname[] = $location[location_taxonomize_source_field_name('province')];
+            }
+          }
+          else $longname[] = $location[$hlevel_name];
+          break;
+        default:
+          $longname[] = $location[$hlevel_name];
+          break;
+      }
+    }
+  }
+  // construct longname string from parts
+  $longname = array_reverse($longname);
+  $count = count($longname);
+  $longname_str = '';
+  for ($i = 0; $i<$count; $i++) {
+    $longname_str .= $longname[$i];
+    if ($i != $count-1) {
+      $longname_str .= check_plain($ln_settings['separator']) . ' ';
+    }
+  }
+  return $longname_str;
+}
+/**
+ * Helper function to create the name for a term to be saved, considering
+ * all the config options
+ */
+function _location_taxonomize_create_term_name($hlevel_name, &$location, &$settings) {
+  // convert this hlevel_name to an internal primary field name if necessary
+  $field_name = location_taxonomize_convert_field_name($hlevel_name);
+  switch ($field_name) {
+    case 'country':
+      if (empty($location[$hlevel_name])) {
+        $name = $settings['na_text'];
+      }
+      elseif ($settings['naming']['country'] == 'name') {
+        $name = $location[location_taxonomize_source_field_name('country_name')];
+      }
+      elseif ($location[$hlevel_name] == 'us' && $settings['naming']['usa']) {
+        $name = 'USA';
+      }
+      else $name = drupal_strtoupper($location[$hlevel_name]);
+      break;
+    case 'province':
+      $us_states = location_taxonomize_us_states();
+      if (empty($location[$hlevel_name])) {
+        $name = $settings['na_text'];
+      }
+      elseif ($settings['naming']['province'] == 'name') {
+        if (!empty($location[location_taxonomize_source_field_name('province_name')])) {
+          $name = $location[location_taxonomize_source_field_name('province_name')];
+        } else if (isset($us_states[strtoupper($location[$hlevel_name])])) {
+          $name = $us_states[strtoupper($location[$hlevel_name])];
+        }
+        else $name= $location[$hlevel_name];
+      }
+      else $name = $location[$hlevel_name];
+      break;
+    default:
+      if (empty($location[$hlevel_name])) $name = $settings['na_text'];
+      else $name = $location[$hlevel_name];
+      break;
+  }
+  return $name;
+}
+
+ /**
+  * Attaches the given tids to the node form given in form_state if they need to
+  * be attached
+  * Note that all it does is remove the old numbers and add the new ones. It's
+  * faster than checking which ones are missing and adding. Also ensures that 
+  * only the terms that are relevant are getting saved.
+  */
+function location_taxonomize_term_attach($tids, $form, &$form_state) {
+  $lang = 'und';
+  
+  // check that the field exists and is set up correctly
+  $field = location_taxonomize_term_attach_check_field($form);
+  if ($field == FALSE) {
+    drupal_set_message(t('Location Taxonomize could not attach the terms to the node because the Taxonomy Reference field is not set up correctly'), 'warning');
+    return;
+  }
+
+  // empty the currently set values
+  $form_state['values'][$field][$lang] = array();
+  
+  // Reverse the order to assign the lowest term in the hierarchy first
+  $tids = array_reverse($tids);
+  
+  // add the values
+  $tids = array_unique($tids);
+  foreach ($tids as $tid) {
+    $form_state['values'][$field][$lang][]['tid'] = $tid;
+  }
+}
+
+function location_taxonomize_term_attach_bulk($tids, $nid) {
+  $langcode = 'und';
+  // load the node
+  $node = node_load($nid);
+  if (!isset($node->field_location_taxonomize_terms)) return;
+  
+  // Reverse the order to assign the lowest term in the hierarchy first
+  $tids = array_reverse($tids);
+  
+  $tids = array_unique($tids);
+  $save = array();
+  foreach ($tids as $tid) {
+    $save[$langcode][]['tid'] = $tid;
+  }
+  $node->field_location_taxonomize_terms = $save;
+  node_save($node);
+}
+
+////////////////////////////////////////
+// Feature: Bulk taxonomize
+////////////////////////////////////////
+
+/**
+ * Calls the Batch API to run the bulk operation function
+ */
+function location_taxonomize_bulk_taxonomize($form, $form_state) {
+  $source = _location_taxonomize_get_source();
+  $batch_function = $source . '_bulk_taxonomize_op';
+  $batch = array(
+    'operations' => array(
+      array($batch_function, array($form_state)),
+    ),
+    'finished' => 'location_taxonomize_bulk_taxonomize_finished',
+    'title' => t('Taxonomizing Locations'),
+    'init_message' => t('Initializing...'),
+    'progress_message' => t('Processed @current out of @total.'),
+    'error_message' => t('Bulk Taxonomize encountered an error.'),
+  );
+  batch_set($batch);
+}
+
+/**
+ * Last function to run after bulk taxonomize operation
+ */
+function location_taxonomize_bulk_taxonomize_finished($success, $results, $operations) {
+  $success = t('Bulk Taxonomize completed successfully!');
+  $locs = t('Processed @num locations', array('@num' => $results['processed']));
+  $terms = t('Saved @num new terms to the Location Vocabulary',
+           array('@num' => $results['added']));
+  drupal_set_message($success);
+  drupal_set_message($locs);
+  drupal_set_message($terms);
+}
+
+

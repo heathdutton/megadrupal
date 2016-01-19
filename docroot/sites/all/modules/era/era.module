@@ -1,0 +1,310 @@
+<?php
+
+/**
+ * @file
+ * The Exchange Rates API functions used to make the module work.
+ */
+
+/**
+ * Implements hook_cron().
+ */
+function era_cron() {
+  era_update_openexchange_rates_cron();
+}
+
+/**
+ * Implements hook_permission().
+ */
+function era_permission() {
+  return array(
+    'administer era configuration' =>  array(
+      'title' => t('Administer Exchange Rates API configuration'),
+    ),
+  );
+}
+
+/**
+ * Implements hook_menu().
+ */
+function era_menu() {
+  $items['admin/config/services/era'] = array(
+    'title' => 'Exchange Rates API',
+    'page callback' => 'era_admin_page_content',
+    'access arguments' => array('administer era configuration'),
+    'file' => 'era.admin.inc',
+  );
+
+  return $items;
+}
+
+/**
+ * A function to calculate the rate to convert a currency to another.
+ * @param  string $from The currency from which the conversion is calculated.
+ * @param  string $to   The currency to which the conversion is calculated.
+ * @return float        The rate calculated. If a rate is not calculated, FALSE
+ * is returned.
+ */
+function era_rate($from, $to, $date = NULL) {
+  $date = era_get_date($date);
+
+  $rates = era_get_rates($date);
+
+  if (!empty($rates['rates'])) {
+    $from = strtoupper($from);
+    $to = strtoupper($to);
+
+    if (isset($rates['rates'][$from]) && isset($rates['rates'][$to])) {
+      $rate = $rates['rates'][$to] / $rates['rates'][$from];
+      drupal_alter('era_rate', $rate, $from, $to, $date);
+
+      return $rate;
+    }
+  }
+
+  return FALSE;
+}
+
+/**
+ * A function to convert an amount from one currency to another.
+ * @param  float  $amount The current rate.
+ * @param  string $from   The currency from which the conversion is calculated.
+ * @param  string $to     The currency to which the conversion is calculated.
+ * @return float          The conversion calculated. If a conversion is not
+ * calculated, FALSE is returned.
+ */
+function era_convert($amount, $from, $to, $date = NULL) {
+  $date = era_get_date($date);
+  if ($rate = era_rate($from, $to, $date)) {
+    return $amount * $rate;
+  }
+  return FALSE;
+}
+
+/**
+ * A helper function used by module's cron function to update (if needed) the
+ * rates and store them in cache.
+ */
+function era_update_openexchange_rates_cron() {
+  if (variable_get('era_cache_use_cron', 1) && variable_get('era_cache_expire', 3)) {
+    era_get_rates();
+  }
+}
+
+/**
+ * A function to get the currency rates. If they are not available on cache,
+ * they will be retrieved from the external service and stored in cache for
+ * future use.
+ * @return array An associative array containing 3 keys:
+ * - base: The base currency to which all the rates are converted.
+ * - rates: An associative array which keys are the ISO name of the currency and
+ * the values are the rate conversion to the base rate.
+ * - cache: Wheter the current rates where retrieved from cache or not.
+ */
+function era_get_rates($date = NULL) {
+  $date = era_get_date($date);
+  $rates = array();
+
+  if (
+    empty($date) ||
+    era_get_date($date) == era_get_date(REQUEST_TIME)
+  ) { // Requesting current rates
+    $cid = 'era:rates';
+    $bin = 'cache';
+
+    $expire = 60 * 60 * variable_get('era_cache_expire', 3);
+    $last_update = variable_get('era_openexchangerates_last_update', 0);
+
+    $cache = cache_get($cid, $bin);
+    if (empty($cache) || (($last_update + $expire) < REQUEST_TIME)) {
+      if ($data = era_get_openexchangerates_data()) {
+        $rates['base'] = $data['base'];
+        $rates['rates'] = $data['rates'];
+
+        if (!empty($expire)) {
+          cache_set($cid, $rates, $bin);
+          variable_set('era_openexchangerates_last_update', REQUEST_TIME);
+        }
+        $rates['cache'] = 0;
+      }
+      else {
+        if (!empty($cache->data)) {
+          $rates = $cache->data;
+          $rates['cache'] = 1;
+        }
+      }
+    }
+    else {
+      $rates = $cache->data;
+      $rates['cache'] = 1;
+    }
+
+    drupal_alter('era_rates', $rates, $date);
+  }
+  else { // Requesting rates of a specific date.
+    $query = db_select('era_historical_rates', 'ehr')
+    ->fields('ehr')
+    ->condition('era_date', $date)
+    ->range(0, 1);
+
+    $result = $query->execute()->fetchAssoc();
+
+    if (empty($result)) { // Historical rates not stored yet.
+      if ($data = era_get_openexchangerates_data($date)) {
+        $rates['base'] = $data['base'];
+        $rates['rates'] = $data['rates'];
+        $object = array(
+          'era_date' => $date,
+          'era_data' => $rates,
+        );
+        drupal_write_record('era_historical_rates', $object);
+        $rates['cache'] = 0;
+      }
+    }
+    else { // Historical rates already stored on the database.
+      $rates = unserialize($result['era_data']);
+      $rates['cache'] = 1;
+    }
+  }
+
+  return $rates;
+}
+
+/**
+ * A function to get the Exchange Rates directly from Open Exchange Rates
+ * service.
+ * @return array An associative array returned by Open Exchange Rates service.
+ */
+function era_get_openexchangerates_data($date = NULL) {
+  $date = era_get_date($date);
+  $data = FALSE;
+
+  if (empty($date)) {
+    $path = "https://openexchangerates.org/api/latest.json";
+  }
+  else {
+    $path = "https://openexchangerates.org/api/historical/$date.json";
+  }
+  $options = array(
+    'https' => TRUE,
+    'external' => TRUE,
+    'query' => array(
+      'app_id' => variable_get('era_openexchangerates_app_id', ''),
+    ),
+  );
+
+  $url = url($path, $options);
+
+  $request = drupal_http_request($url);
+
+  if (!empty($request->code) && $request->code == 200) {
+    $data = drupal_json_decode($request->data);
+    if (empty($date)) {
+      watchdog('era_rates', 'Rates where retrieved from Open Exchange Rates', array(), WATCHDOG_INFO);
+    }
+    else {
+      watchdog('era_rates', 'Historical rates (%date) where retrieved from Open Exchange Rates', array('%date' => $date), WATCHDOG_INFO);
+    }
+  }
+  else {
+    if (empty($date)) {
+      watchdog('era_rates', 'An error occured when trying to retrieve rates from Open Exchange Rates', array(), WATCHDOG_ERROR);
+    }
+    else {
+      watchdog('era_rates', 'An error occured when trying to retrieve historical rates (%date) from Open Exchange Rates', array('%date' => $date), WATCHDOG_ERROR);
+    }
+  }
+
+  return $data;
+}
+
+/**
+ * A function to get the list of available currencies. If they are not available
+ * on cache, they will be retrieved from the external service and stored in
+ * cache for at least 24 hours.
+ * @return array An associative array containing 2 keys:
+ * - currencies: An associative array which keys are the ISO name of the
+ * currency and the values are the currency name.
+ * - cache: Wheter the currencies where retrieved from cache or not.
+ */
+function era_get_currencies() {
+  $currencies = array();
+
+  $cid = 'era:currencies';
+  $bin = 'cache';
+
+  $expire = 60 * 60 * 24;
+  $last_update = variable_get('era_openexchangecurrencies_last_update', 0);
+
+  $cache = cache_get($cid, $bin);
+  if (empty($cache) || (($last_update + $expire) < REQUEST_TIME)) {
+    if ($data = era_get_openexchangecurrencies_data()) {
+      $currencies['currencies'] = $data;
+
+      if (!empty($expire)) {
+        cache_set($cid, $currencies, $bin);
+        variable_set('era_openexchangecurrencies_last_update', REQUEST_TIME);
+      }
+      $currencies['cache'] = 0;
+    }
+    else {
+      if (!empty($cache->data)) {
+        $currencies = $cache->data;
+        $currencies['cache'] = 1;
+      }
+    }
+  }
+  else {
+    $currencies = $cache->data;
+    $currencies['cache'] = 1;
+  }
+
+  drupal_alter('era_currencies', $currencies);
+
+  asort($currencies['currencies']);
+
+  return $currencies;
+}
+
+/**
+ * A function to get the Currencies list directly from Open Exchange Rates
+ * service.
+ * @return array An associative array returned by Open Exchange Rates service.
+ */
+function era_get_openexchangecurrencies_data() {
+  $data = FALSE;
+
+  $path = "https://openexchangerates.org/api/currencies.json";
+  $options = array(
+    'https' => TRUE,
+    'external' => TRUE,
+  );
+
+  $url = url($path, $options);
+
+  $request = drupal_http_request($url);
+
+  if (!empty($request->code) && $request->code == 200) {
+    $data = drupal_json_decode($request->data);
+    watchdog('era_currencies', 'Currencies where retrieved from Open Exchange Rates', array(), WATCHDOG_INFO);
+  }
+  else {
+    watchdog('era_currencies', 'An error occured when trying to retrieve currencies from Open Exchange Rates', array(), WATCHDOG_ERROR);
+  }
+
+  return $data;
+}
+
+/**
+ * Helper function to convert a timestamp (in seconds) to a date in the format
+ * needed by OpenExchangeRates.org API.
+ * @param  integer $timestamp The timestamp to get the date from.
+ * @return string             The formated date. If $timestamp is not a number,
+ * the same $timestamp received will be returned, because maybe it was already
+ * converted.
+ */
+function era_get_date($timestamp) {
+  if (!is_numeric($timestamp)) {
+    return $timestamp;
+  }
+  return date("Y-m-d", $timestamp);
+}

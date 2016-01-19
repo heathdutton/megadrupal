@@ -1,0 +1,1326 @@
+<?php
+/**
+ * @file
+ * Contains hook implementations and the other functions responsible for
+ * carrying out the module's purpose.
+ *
+ * @ingroup ercd
+ */
+
+/**
+ * Implements hook_menu().
+ */
+function ercd_menu() {
+  $items['admin/config/content/ercd'] = array(
+    'title' => 'Entity reference cascade delete settings',
+    'description' => 'Configure default settings for cascade deletion of referencing entities.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('ercd_admin_settings'),
+    'access arguments' => array('administer cascade delete'),
+    'file' => 'ercd.admin.inc',
+  );
+  $items['admin/config/content/ercd/defaults'] = array(
+    'title' => 'Default settings',
+    'type' => MENU_DEFAULT_LOCAL_TASK,
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_permission().
+ */
+function ercd_permission() {
+  $perms['administer cascade delete'] = array(
+    'title' => t('Administer cascade delete default settings'),
+    'restrict access' => TRUE,
+  );
+
+  $perms['perform cascade delete all'] = array(
+    'title' => t('Perform cascade delete on all entities'),
+    'restrict access' => TRUE,
+  );
+
+  $reference_direction = variable_get('ercd_reference_direction', NULL);
+
+  // Permissions for each entity reference.
+  $all_entities = field_info_bundles();
+  foreach ($all_entities as $type => $type_info) {
+    if (ercd_valid_entity($type)) {
+      $entity_info = entity_get_info($type);
+      foreach ($type_info as $bundle => $bundle_info) {
+        // Only display permissions for entities that have an entity reference.
+        $child_entities = ercd_get_child_entities($type, $bundle, $reference_direction, $all_entities);
+        if (count($child_entities)) {
+          foreach ($child_entities as $child_entity) {
+            $child_entity_info = entity_get_info($child_entity['type']);
+            $child_bundle_info = $child_entity_info['bundles'][$child_entity['bundle']];
+            $perms['perform cascade delete ' . $type . '-' . $bundle . '-' . $child_entity['type'] . '-' . $child_entity['bundle']] = array(
+              'title' => t('Perform cascade delete on entity <em>@child_type: @child_bundle</em> when deleting <em>@parent_type: @parent_bundle</em>', array(
+                '@child_type' => $child_entity_info['label'],
+                '@child_bundle' => $child_bundle_info['label'],
+                '@parent_type' => $entity_info['label'],
+                '@parent_bundle' => $bundle_info['label'],
+              )),
+              'description' => t('When deleting a <em>@parent_type: @parent_bundle</em>, users with this permission can optionally delete any and all <em>@child_type: @child_bundle</em> entities that reference it.', array(
+                '@parent_type' => $entity_info['label'],
+                '@parent_bundle' => $bundle_info['label'],
+                '@child_type' => $child_entity_info['label'],
+                '@child_bundle' => $child_bundle_info['label'],
+              )),
+            );
+          }
+        }
+      }
+    }
+  }
+
+  return $perms;
+}
+
+/**
+ * Implements hook_help().
+ */
+function ercd_help($path, $arg) {
+  switch ($path) {
+    case 'admin/help#ercd':
+      $output = file_get_contents(drupal_get_path('module', 'ercd') . '/README.txt');
+      return module_exists('markdown') ? filter_xss_admin(module_invoke('markdown', 'filter', 'process', 0, -1, $output)) : '<pre>' . check_plain($output) . '</pre>';
+  }
+}
+
+/**
+ * Implements hook_form_alter().
+ *
+ * Add options to users to override the default settings for cascade deletion.
+ */
+function ercd_form_alter(&$form, &$form_state, $form_id) {
+  $parent_type = NULL;
+
+  if (ercd_valid_form($form_state, $form_id, $parent_type)) {
+    $ercd_path = drupal_get_path('module', 'ercd');
+    drupal_add_css($ercd_path . '/ercd.css');
+    drupal_add_js($ercd_path . '/ercd.js');
+
+    $entity = $form_state['build_info']['args'][0];
+
+    $parent_bundle = ercd_extract_bundle_helper($parent_type, $entity);
+
+    $parent_entity_id = current(entity_extract_ids($parent_type, $entity));
+    $parent_entity_info = entity_get_info($parent_type);
+
+    // Explicitly defining weight so our options appear before the rest of
+    // the delete confirm form.
+    $start_weight = $weight = -1000;
+    if ($form_id == 'user_cancel_confirm_form') {
+      $start_weight = $weight = 2;
+    }
+    $parent_ids = array();
+    $all_child_entities = array();
+
+    $reference_direction = variable_get('ercd_reference_direction', NULL);
+
+    // Get all relevant child ids.
+    $id_tree = ercd_build_id_tree($parent_ids, $all_child_entities, $parent_type, $parent_bundle, $parent_entity_id, $reference_direction);
+
+    // Remove any branches from the tree that have references to other
+    // entities outside of the tree; otherwise, we will have broken
+    // references elsewhere.
+    ercd_prune_references_with_others($id_tree, $all_child_entities, $parent_type, $parent_bundle, $parent_entity_id);
+
+    // Build the options for the form.
+    $options = ercd_build_form_checkbox_tree($weight, $form_id, $id_tree, $parent_type, $parent_bundle);
+
+    // Only set this form if there were options to choose from.
+    if (!empty($options)) {
+      $style = array();
+      if ($form_id == 'user_cancel_confirm_form') {
+        $style[] = 'display: none;';
+      }
+      $form['ercd_main_wrapper'] = array(
+        '#type' => 'container',
+        '#weight' => $start_weight - 2,
+        '#attributes' => array(
+          'id' => array('ercd-delete-message'),
+          'style' => $style,
+        ),
+      );
+
+      // Message to user.
+      $form['ercd_main_wrapper']['ercd_preamble'] = array(
+        '#markup' => '<p>' . t('<strong class="ercd-alert">Please choose carefully!</strong>: In addition to deleting this <em>@parent_bundle</em>, all entities checked below that reference this <em>@parent_bundle</em> will also be deleted. If you would like to preserve individual entities, unselect them. Unselecting any entity will unselect any other descendents of that entity.', array('@parent_bundle' => $parent_entity_info['bundles'][$parent_bundle]['label'])) . '</p>',
+        '#weight' => $start_weight - 1,
+      );
+
+      // Add the options.
+      $form['ercd_main_wrapper']['options'] = $options;
+    }
+    $form['#submit'][] = 'ercd_delete_confirm_submit';
+  }
+}
+
+/**
+ * Builds a tree of child reference ids.
+ *
+ * This function will recursively build an array of child ids that have
+ * a common reference to the parent entity.
+ *
+ * @param array $parent_ids
+ *   An array to keep track of referenced entity ids from the top down.
+ * @param array $all_child_entities
+ *   A flat array of child entity types/bundles/ids.
+ * @param string $parent_type
+ *   A string with the machine name of an entity type being deleted.
+ * @param string $parent_bundle
+ *   A string with the machine name of the entity bundle being deleted.
+ * @param int $parent_entity_id
+ *   The id of the entity being deleted.
+ * @param string $reference_direction
+ *   A string container either 'desc' or 'asc', determining the
+ *   direction of our referential relationship.
+ * @param int $recursion_level
+ *   An integer to keep track of which level of recursion we are at.
+ *   This is important for knowing when to clear $parent_ids.
+ *
+ * @return array
+ *   A recursive array of child entity ids.
+ */
+function ercd_build_id_tree(&$parent_ids, &$all_child_entities, $parent_type, $parent_bundle, $parent_entity_id, $reference_direction, $recursion_level = 0) {
+  $id_tree = array();
+
+  $child_entities = ercd_get_child_entities($parent_type, $parent_bundle, $reference_direction);
+  if (count($child_entities)) {
+    $row_count = 0;
+
+    // Cycle through the referencing entities.
+    foreach ($child_entities as $child_entity) {
+      $child_count = 0;
+
+      // Check if this has been set up to be subject to cascade delete.
+      if (variable_get('ercd_' . $reference_direction . '_' . $parent_type . '__' . $parent_bundle . '__' . $child_entity['type'] . '__' . $child_entity['bundle'], FALSE) && (user_access('perform cascade delete all') || user_access('perform cascade delete ' . $parent_type . '-' . $parent_bundle . '-' . $child_entity['type'] . '-' . $child_entity['bundle']))) {
+
+        $child_entity_ids = ercd_get_child_ids($parent_entity_id, $parent_type, $parent_bundle, $child_entity, $reference_direction);
+
+        if ($recursion_level == 0) {
+          // Reset the referenced ids if this is a child of the parent
+          // entity.
+          $parent_ids = array();
+        }
+        else {
+          foreach ($child_entity_ids as $id => $child_entity_id) {
+            // Remove any entity ids that have already been referenced,
+            // otherwise we will get an infinite loop.
+            if (in_array($child_entity['type'] . '-' . $child_entity_id, $parent_ids)) {
+              unset($child_entity_ids[$id]);
+            }
+          }
+        }
+
+        if (!empty($child_entity_ids)) {
+          $id_tree[$row_count] = array(
+            'type' => $child_entity['type'],
+            'bundle' => $child_entity['bundle'],
+            'entities' => array(),
+          );
+
+          // Show the entity label so we can select individual entities.
+          foreach ($child_entity_ids as $child_entity_id) {
+            $parent_ids[] = $parent_type . '-' . $parent_entity_id;
+
+            // Add child entity information to the array.
+            $child_entity_array = array();
+            $child_entity_array['type'] = $child_entity['type'];
+            $child_entity_array['bundle'] = $child_entity['bundle'];
+            $child_entity_array['id'] = $child_entity_id;
+            $all_child_entities[] = $child_entity_array;
+
+            // Load the entity and get the label.
+            $child_entity_object = current(entity_load($child_entity['type'], array($child_entity_id)));
+            $entity_label = entity_label($child_entity['type'], $child_entity_object);
+
+            $id_tree[$row_count]['entities'][$child_count]['id'] = $child_entity_id;
+
+            $id_tree[$row_count]['entities'][$child_count]['children'] = ercd_build_id_tree($parent_ids, $all_child_entities, $child_entity['type'], $child_entity['bundle'], $child_entity_id, $reference_direction, $recursion_level + 1);
+
+            $child_count += 1;
+          }
+
+          $row_count += 1;
+        }
+      }
+    }
+  }
+
+  return $id_tree;
+}
+
+/**
+ * Removes entities with other references outside the id tree.
+ *
+ * This function recursively goes through an id tree and checks for
+ * references that are outside of the tree and then removes them to
+ * avoid broken references else where in the system.
+ *
+ * @param array $id_tree
+ *   A recursive array of child entity ids.
+ * @param array $all_child_entities
+ *   A flattened version of the id tree.
+ * @param string $parent_type
+ *   A string with the machine name of an entity type being deleted.
+ * @param string $parent_bundle
+ *   A string with the machine name of the entity bundle being deleted.
+ * @param int $parent_id
+ *   The id of the entity being deleted.
+ */
+function ercd_prune_references_with_others(&$id_tree, $all_child_entities, $parent_type, $parent_bundle, $parent_id) {
+  foreach ($id_tree as $id => $child_entity) {
+    foreach ($child_entity['entities'] as $child_id => $child_entity_entities) {
+      $external_reference = FALSE;
+
+      // Check if this entity is referenced by an entity outside of the tree.
+      $parent_field_name = ercd_get_reference_field_name($child_entity['type'], $child_entity['bundle'], $parent_type, $parent_bundle);
+
+      if ($parent_field_name != NULL) {
+        if ($parent_field_name !== NULL) {
+          $escaped_table = db_escape_table('field_data_' . $parent_field_name);
+          $escaped_field = db_escape_field($parent_field_name . "_target_id");
+
+          // Query the database for referencing ids.
+          if (db_table_exists($escaped_table) && db_field_exists($escaped_table, $escaped_field)) {
+            $result = db_query("SELECT entity_type AS type, bundle, entity_id AS id FROM {" . $escaped_table . "} WHERE " . $escaped_field . " = :entityId", array(':entityId' => $child_entity_entities['id']));
+
+            foreach ($result as $entity) {
+              $parent_entity_array = (array) $entity;
+              if ($entity->id != $parent_id && !in_array($parent_entity_array, $all_child_entities)) {
+                $external_reference = TRUE;
+                break;
+              }
+            }
+          }
+          else {
+            // Shouldn't ever happen, but just in case...no table or column
+            // found.
+            drupal_set_message(t('Module Cascade Delete: The referencing table <em>@table</em> and/or column <em>@field</em> is missing. Referencing entities <em>@child_type @child_bundle</em> were not deleted.', array(
+              '@table' => $escaped_table,
+              '@field' => $escaped_field,
+              '@child_type' => $child_entity['type'],
+              '@child_bundle' => $child_entity['bundle'],
+            )), 'warning');
+          }
+        }
+      }
+
+      // Check if this entity is referencing any entity outside of the tree.
+      if (!$external_reference) {
+        // Load entity object.
+        $entity = current(entity_load($child_entity['type'], array($child_entity_entities['id'])));
+
+        // Get entity references so we can check the entity reference
+        // fields in the entity object.
+        $reference_entities = ercd_get_referenced_child_entities($child_entity['type'], $child_entity['bundle']);
+
+        // Get the field names to check.
+        $child_fields = array();
+        foreach ($reference_entities as $reference_entity) {
+          $array = array(
+            'entity' => $reference_entity,
+            'field_name' => ercd_get_reference_field_name($reference_entity['type'], $reference_entity['bundle'], $child_entity['type'], $child_entity['bundle']),
+          );
+          $child_fields[] = $array;
+        }
+
+        foreach ($child_fields as $child_field) {
+          if ($child_field['field_name'] != NULL) {
+            if (isset($entity->{$child_field['field_name']}[LANGUAGE_NONE])) {
+              foreach ($entity->{$child_field['field_name']}[LANGUAGE_NONE] as $field_value) {
+                $child_entity_array = array(
+                  'type' => $child_field['entity']['type'],
+                  'bundle' => $child_field['entity']['bundle'],
+                  'id' => $field_value['target_id'],
+                );
+                if ($field_value['target_id'] != $parent_id && !in_array($child_entity_array, $all_child_entities)) {
+                  $external_reference = TRUE;
+                  break;
+                }
+              }
+            }
+          }
+        }
+      }
+
+      // Remove child entity if there's an external reference.
+      if ($external_reference) {
+        unset($id_tree[$id]['entities'][$child_id]);
+
+        // If no child entities remain, remove the whole branch.
+        if (empty($id_tree[$id]['entities'])) {
+          unset($id_tree[$id]);
+        }
+      }
+      // Begin recursion.
+      elseif (!empty($child_entity_entities['children'])) {
+        ercd_prune_references_with_others($id_tree[$id]['entities'][$child_id]['children'], $all_child_entities, $parent_type, $parent_bundle, $parent_id);
+      }
+    }
+  }
+}
+
+/**
+ * A recursive function for developing a tree of checkbox options.
+ *
+ * Essentially, this should develop a tree of checkbox options that
+ * drill down from a top-level entity down to children, grandchildren, etc.
+ *
+ * @param int $weight
+ *   An integer that increases with each form element
+ * @param string $form_id
+ *   The id of the form we are working with
+ * @param array $id_tree
+ *   A recursive array of child entity ids.
+ * @param string $parent_type
+ *   A string with the machine name of an entity type being deleted.
+ * @param string $parent_bundle
+ *   A string with the machine name of the entity bundle being deleted.
+ *
+ * @return array
+ *   An array of form elements.
+ */
+function ercd_build_form_checkbox_tree(&$weight, $form_id, $id_tree, $parent_type, $parent_bundle) {
+  $options = array();
+
+  // We'll use this below if we get options.
+  $start_weight = $weight;
+
+  foreach ($id_tree as $id => $child_entity) {
+    $child_entity_info = entity_get_info($child_entity['type']);
+
+    // Add row.
+    $weight += 1;
+
+    // Set row display setting.
+    $odd_even = 'even';
+    if ($id % 2 == 0) {
+      $odd_even = 'odd';
+    }
+    $options['ercd_row_' . $id] = array(
+      '#type' => 'container',
+      '#attributes' => array('class' => array('ercd-row ' . $odd_even)),
+      '#weight' => $weight,
+    );
+
+    // Add child entity checkbox.
+    $weight += 1;
+
+    // User delete confirm is a little different since there are several
+    // options, so handle that here since we don't want to display the ercd
+    // options by default for the user delete confirm form.
+    $default_check_value = 1;
+    if ($form_id == 'user_cancel_confirm_form') {
+      $default_check_value = 0;
+    }
+    $options['ercd_row_' . $id]['ercd_' . (-$weight)] = array(
+      '#type' => 'checkbox',
+      '#title' => '<strong>' . t('@child_type: @child_bundle', array(
+        '@child_type' => $child_entity_info['label'],
+        '@child_bundle' => $child_entity_info['bundles'][$child_entity['bundle']]['label'],
+      )) . '</strong>',
+      '#default_value' => $default_check_value,
+      '#attributes' => array(
+        'class' => array(
+          'ercd-trigger',
+          'ercd-option',
+        )),
+      '#weight' => $weight,
+    );
+
+    // A child container.
+    $weight += 1;
+
+    // Style settings specific to the user delete confirm form.
+    $style = array();
+    if ($form_id == 'user_cancel_confirm_form') {
+      $style[] = 'display: none;';
+    }
+
+    // Since we're using $weight as an identifier, we don't want
+    // it to change as we're adding child elements.
+    $child_weight = $weight;
+    $options['ercd_row_' . $id]['ercd_child_' . (-$child_weight)] = array(
+      '#type' => 'container',
+      '#attributes' => array(
+        'class' => array('ercd-child'),
+        'style' => $style,
+      ),
+      '#weight' => $weight,
+    );
+
+    // Add fieldset to hold child entity checkboxes.
+    $weight += 1;
+
+    $options['ercd_row_' . $id]['ercd_child_' . (-$child_weight)]['ercd_' . $child_entity['type'] . '_' . $child_entity['bundle'] . '_fieldset'] = array(
+      '#type' => 'fieldset',
+      '#title' => t('Select Individual Referencing Entities for @child_type: @child_bundle', array(
+        '@child_type' => $child_entity_info['label'],
+        '@child_bundle' => $child_entity_info['bundles'][$child_entity['bundle']]['label'],
+      )),
+      '#collapsible' => TRUE,
+      '#collapsed' => TRUE,
+      '#weight' => $weight,
+      '#attributes' => array('class' => array('ercd-fieldset')),
+    );
+
+    // Add child entity id checkboxes.
+    foreach ($child_entity['entities'] as $child_id => $child_entity_entities) {
+      // Load the entity and get the label.
+      $child_entity_object = current(entity_load($child_entity['type'], array($child_entity_entities['id'])));
+      $entity_label = entity_label($child_entity['type'], $child_entity_object);
+
+      $weight += 1;
+      $default_check_value = $parent_type . '__' . $parent_bundle . '__' . $child_entity['type'] . '__' . $child_entity['bundle'] . '__' . $child_entity_entities['id'];
+      if ($form_id == 'user_cancel_confirm_form') {
+        $default_check_value = 0;
+      }
+
+      // Referencing entity checkbox.
+      $options['ercd_row_' . $id]['ercd_child_' . (-$child_weight)]['ercd_' . $child_entity['type'] . '_' . $child_entity['bundle'] . '_fieldset']['ercd_option_' . (-$weight) . '_' . $child_entity['type'] . '__' . $child_entity_entities['id']] = array(
+        '#type' => 'checkbox',
+        '#title' => '<strong>' . t('@entity_type', array('@entity_type' => $entity_label)) . '</strong>',
+        '#default_value' => $default_check_value,
+        '#return_value' => $parent_type . '__' . $parent_bundle . '__' . $child_entity['type'] . '__' . $child_entity['bundle'] . '__' . $child_entity_entities['id'],
+        '#attributes' => array(
+          'class' => array(
+            'ercd-trigger',
+            'ercd-option',
+          )),
+        '#weight' => $weight,
+      );
+
+      // Start the recursion.
+      if (!empty($child_entity_entities['children'])) {
+        $options['ercd_row_' . $id]['ercd_child_' . (-$child_weight)]['ercd_' . $child_entity['type'] . '_' . $child_entity['bundle'] . '_fieldset']['options_' . $child_entity_entities['id']] = ercd_build_form_checkbox_tree($weight, $form_id, $id_tree[$id]['entities'][$child_id]['children'], $parent_type, $parent_bundle);
+      }
+    }
+
+    // Add buttons for un/selecting all.
+    $weight += 1;
+
+    // Since we're using $weight as an identifier, we don't want
+    // it to change as we're adding child elements.
+    $button_weight = $weight;
+
+    // Button container.
+    $options['ercd_row_' . $id]['ercd_child_' . (-$child_weight)]['ercd_' . $child_entity['type'] . '_' . $child_entity['bundle'] . '_fieldset']['ercd_buttons_' . $button_weight] = array(
+      '#type' => 'container',
+      '#attributes' => array('class' => array('ercd-select-all-buttons')),
+      '#weight' => $weight,
+    );
+
+    $weight += 1;
+
+    // Select all button.
+    $options['ercd_row_' . $id]['ercd_child_' . (-$child_weight)]['ercd_' . $child_entity['type'] . '_' . $child_entity['bundle'] . '_fieldset']['ercd_buttons_' . $button_weight]['ercd_' . $child_entity['type'] . '_' . $child_entity['bundle'] . '_fieldset_select_all'] = array(
+      '#markup' => '<input type="button" class="ercd-select-all form-submit" value="Select all" />',
+      '#weight' => $weight,
+    );
+
+    $weight += 1;
+
+    // Unselect all button.
+    $options['ercd_row_' . $id]['ercd_child_' . (-$child_weight)]['ercd_' . $child_entity['type'] . '_' . $child_entity['bundle'] . '_fieldset']['ercd_buttons_' . $button_weight]['ercd_' . $child_entity['type'] . '_' . $child_entity['bundle'] . '_fieldset_unselect_all'] = array(
+      '#markup' => '<input type="button" class="ercd-unselect-all form-submit" value="Unselect all" />',
+      '#weight' => $weight,
+    );
+  }
+
+  // Wrapper if we actually got any options.
+  if (!empty($options)) {
+    $options_holder = $options;
+    // Reset array and add options.
+    $options = array();
+    $options['ercd_child_' . (-$weight)] = array(
+      '#type' => 'container',
+      '#attributes' => array('class' => array('ercd-wrapper ercd-child')),
+      '#weight' => $start_weight,
+    );
+    $options['ercd_child_' . (-$weight)]['options'] = $options_holder;
+
+    $weight += 1;
+    $options['#weight'] = $weight;
+  }
+
+  return $options;
+}
+
+/**
+ * Submit handler for ercd_form_alter().
+ *
+ * This will retrieve the filtered ids to be deleted and then delete them.
+ */
+function ercd_delete_confirm_submit($form, &$form_state) {
+  $selections = ercd_filter_submitted_ids($form_state['values']);
+
+  // Cycle through and delete.
+  foreach ($selections as $selection) {
+    if (user_access('perform cascade delete all') || user_access('perform cascade delete ' . $selection['parent_type'] . '-' . $selection['parent_bundle'] . '-' . $selection['child_type'] . '-' . $selection['child_bundle'])) {
+
+      // Load the entity and get the label.
+      $child_entity = current(entity_load($selection['child_type'], array($selection['entity_id'])));
+      $entity_label = entity_label($selection['child_type'], $child_entity);
+
+      // Load entity info to get the bundle label.
+      $entity_info = entity_get_info($selection['child_type']);
+      $bundle_label = $entity_info['bundles'][$selection['child_bundle']]['label'];
+
+      // DELETE ENTITY: entity_delete() doesn't return TRUE if successful, so
+      // test against an error occurring and then set message.
+      if (entity_delete($selection['child_type'], $selection['entity_id']) !== FALSE) {
+        drupal_set_message(t('@bundle <em>@type</em> has been deleted.', array(
+          '@bundle' => $bundle_label,
+          '@type' => $entity_label,
+        )));
+      }
+    }
+  }
+}
+
+/**
+ * Filters ids submitted on the delete confirm form.
+ *
+ * This will be used to to set an array of valid selections. If there is a
+ * conflict where an entity is selected for deletion in one reference branch but
+ * unselected in another, it will become immune to deletion but the rest of the
+ * selected branch entities will continue to be deleted, even those that are
+ * descendants of the immune entity.
+ *
+ * The ids of the values we're interested in are in the format of:
+ * ercd_selection_[weight]_[entity_type]__[entity_id]...this will be
+ * exploded in the case of being UNSELECTED and used as data.
+ * Likewise, the values are in the format of:
+ * [parent_type]__[parent_bundle]__[child_type]__
+ * [child_bundle]__[child_entity_id]
+ * This will also be exploded in the case of being SELECTED and used as data.
+ *
+ * @param array $submitted_values
+ *   Array of submitted form values.
+ *
+ * @return array
+ *   An array of entity id numbers.
+ */
+function ercd_filter_submitted_ids($submitted_values) {
+  $selections = array();
+
+  // Elements that are immune will either not be added to selections or
+  // removed if they are there AND also immune.
+  $immunities = array();
+
+  // Cycle through and divide.
+  foreach ($submitted_values as $id => $value) {
+    if (substr($id, 0, 12) === 'ercd_option_') {
+      if (!$value) {
+        // Explode the id to get the entity type and id.
+        $bits = explode('__', $id);
+        $microbits = explode('_', $bits[0]);
+
+        // Rebuild type id if underscores are in the id.
+        $type = '';
+        foreach ($microbits as $bit) {
+          // Weed out our prefixes of ercd_option_[weight].
+          if ($bit != 'ercd' && $bit != 'option' && !is_numeric($bit)) {
+            if (!empty($type)) {
+              $type .= '_';
+            }
+            $type .= $bit;
+          }
+        }
+
+        // Add immunity.
+        if (count($bits) == 2 && is_numeric($bits[1])) {
+          $immunity = array(
+            'child_type' => $type,
+            'entity_id' => $bits[1],
+          );
+
+          $immunities[] = $immunity;
+
+          // Remove from selections if already added.
+          foreach ($selections as $id => $selection) {
+            if ($selection['child_type'] == $immunity['child_type'] && $selection['entity_id'] == $immunity['entity_id']) {
+              unset($selections[$id]);
+            }
+          }
+        }
+      }
+      else {
+        $bits = explode('__', $value);
+
+        // Use only the individual entity values, not the entity type/bundles
+        // selections (ie. not count($bits)==4).
+        if (count($bits) == 5) {
+          $selection = array(
+            'parent_type' => $bits[0],
+            'parent_bundle' => $bits[1],
+            'child_type' => $bits[2],
+            'child_bundle' => $bits[3],
+            'entity_id' => $bits[4],
+          );
+
+          // Only add if not in immunities And not already in the selections.
+          if (!ercd_in_immunities($selection, $immunities) && !ercd_in_selections($selection, $selections)) {
+            $selections[] = $selection;
+          }
+        }
+      }
+    }
+  }
+
+  return $selections;
+}
+
+/**
+ * Get the ids of entities that have a reference to/from a given entity.
+ *
+ * This function retrieves the ids of direct descendants or ascendents of
+ * an entity and returns them in an array. The reference direction determines
+ * which entities we choose.
+ *
+ * @param int $parent_entity_id
+ *   The id of the entity
+ * @param string $parent_type
+ *   The type of the entity
+ * @param string $parent_bundle
+ *   The bundle of the entity
+ * @param string $child_entity
+ *   An associative array containing an entity type and bundle
+ * @param string $reference_direction
+ *   A string container either 'desc' or 'asc', determining the
+ *   direction of our referential relationship.
+ *
+ * @return array
+ *   An array of entity ids
+ */
+function ercd_get_child_ids($parent_entity_id, $parent_type, $parent_bundle, $child_entity, $reference_direction) {
+  $child_ids = array();
+
+  if ($reference_direction == 'desc') {
+    $child_ids = ercd_get_referenced_child_ids($parent_entity_id, $parent_type, $parent_bundle, $child_entity);
+  }
+  elseif ($reference_direction == 'asc') {
+    $child_ids = ercd_get_referencing_child_ids($parent_entity_id, $parent_type, $parent_bundle, $child_entity);
+  }
+  else {
+    return $child_ids;
+  }
+
+  return $child_ids;
+}
+
+/**
+ * Get the ids of entities referenced by a given entity.
+ *
+ * This function retrieves the ids of direct ascendants of an entity and
+ * returns them in an array.
+ *
+ * @param int $parent_entity_id
+ *   The id of the entity
+ * @param string $parent_type
+ *   The type of the entity
+ * @param string $parent_bundle
+ *   The bundle of the entity
+ * @param string $child_entity
+ *   An associative array containing an entity type and bundle
+ *
+ * @return array
+ *   An array of entity ids
+ */
+function ercd_get_referenced_child_ids($parent_entity_id, $parent_type, $parent_bundle, $child_entity) {
+  $child_ids = array();
+
+  $parent_entity = current(entity_load($parent_type, array($parent_entity_id)));
+
+  // Get valid referencing fields for the parent entity.
+  $bundle_fields = field_info_instances($parent_type, $parent_bundle);
+
+  // Cycle through and find the fields that reference an entity.
+  foreach ($bundle_fields as $field_name => $field) {
+    $field_info = field_info_field($field_name);
+
+    // Make sure the bundle is set.
+    ercd_ensure_entity_bundle_set($field_info, $parent_type);
+
+    // Add id if this is a valid entity type.
+    if (isset($parent_entity->{$field_name}[LANGUAGE_NONE]) && isset($field_info['settings']['target_type']) && ercd_valid_entity($field_info['settings']['target_type']) && $field_info['settings']['target_type'] == $child_entity['type'] && in_array($child_entity['bundle'], $field_info['settings']['handler_settings']['target_bundles'])) {
+
+      // Load the safe user roles if this is the user entity.
+      if ($field_info['settings']['target_type'] == 'user') {
+        $immune_roles = ercd_get_immune_user_roles($parent_type, $parent_bundle, $child_entity['type'], $child_entity['bundle'], 'desc');
+      }
+
+      foreach ($parent_entity->{$field_name}[LANGUAGE_NONE] as $child_id) {
+
+        // Load child entity to check for its bundle.
+        $child_entity_object = current(entity_load($child_entity['type'], array($child_id['target_id'])));
+
+        // Not an ideal situation, but comments are no quite full-fledged
+        // entities yet.
+        $bundle = ercd_extract_bundle_helper($child_entity['type'], $child_entity_object);
+
+        // Make sure this is the correct bundle in cases where an entity
+        // reference field allows multiple bundles of the same entity type.
+        if ($bundle == $child_entity['bundle']) {
+          // No reason to add the id of the entity that we are already
+          // deleting.
+          if ($child_id['target_id'] != $parent_entity_id) {
+            // A flag to determine if we add this id or not.
+            $skip_id = FALSE;
+
+            // Check if these are user ids and filter out the safe roles.
+            if ($field_info['settings']['target_type'] == 'user') {
+              $skip_id = ercd_skip_user_id($child_id['target_id'], $immune_roles);
+            }
+
+            if (!$skip_id) {
+              $child_ids[] = $child_id['target_id'];
+            }
+          }
+        }
+      }
+    }
+  }
+
+  return $child_ids;
+}
+
+/**
+ * Get the ids of entities referencing a given entity.
+ *
+ * This function retrieves the ids of direct descendants of and entity and
+ * return them in an array.
+ *
+ * @param int $parent_entity_id
+ *   The id of the entity
+ * @param string $parent_type
+ *   The type of the entity
+ * @param string $parent_bundle
+ *   The bundle of the entity
+ * @param string $child_entity
+ *   An associative array containing an entity type and bundle
+ *
+ * @return array
+ *   An array of entity ids
+ */
+function ercd_get_referencing_child_ids($parent_entity_id, $parent_type, $parent_bundle, $child_entity) {
+  $child_ids = array();
+
+  $child_field_name = ercd_get_reference_field_name($parent_type, $parent_bundle, $child_entity['type'], $child_entity['bundle']);
+
+  if ($child_field_name !== NULL) {
+    $escaped_table = db_escape_table('field_data_' . $child_field_name);
+    $escaped_field = db_escape_field($child_field_name . "_target_id");
+
+    // Query the database for referencing ids.
+    if (db_table_exists($escaped_table) && db_field_exists($escaped_table, $escaped_field)) {
+      $result = db_query("SELECT entity_id FROM {" . $escaped_table . "} WHERE entity_type = :entityType AND bundle = :bundle AND " . $escaped_field . " = :entityId", array(
+        ':entityType' => $child_entity['type'],
+        ':bundle' => $child_entity['bundle'],
+        ':entityId' => $parent_entity_id,
+      ));
+
+      // Load the safe user roles if this is the user entity.
+      if ($child_entity['type'] == 'user') {
+        $immune_roles = ercd_get_immune_user_roles($parent_type, $parent_bundle, $child_entity['type'], $child_entity['bundle'], 'asc');
+      }
+
+      foreach ($result as $entity) {
+        // No reason to add the id of the entity that we are already
+        // deleting.
+        if ($entity->entity_id != $parent_entity_id) {
+          // A flag to determine if we add this id or not.
+          $skip_id = FALSE;
+
+          // Check if these are user ids and filter out the safe roles.
+          if ($child_entity['type'] == 'user') {
+            $skip_id = ercd_skip_user_id($entity->entity_id, $immune_roles);
+          }
+
+          if (!$skip_id) {
+            $child_ids[] = $entity->entity_id;
+          }
+        }
+      }
+    }
+    else {
+      // Shouldn't ever happen, but just in case...no table or column found.
+      drupal_set_message(t('Module Cascade Delete: The referencing table <em>@table</em> and/or column <em>@field</em> is missing. Referencing entities <em>@child_type @child_bundle</em> were not deleted.', array(
+        '@table' => $escaped_table,
+        '@field' => $escaped_field,
+        '@child_type' => $child_entity['type'],
+        '@child_bundle' => $child_entity['bundle'],
+      )), 'warning');
+    }
+  }
+
+  return $child_ids;
+}
+
+/**
+ * Get all possible reference entities for a given entity.
+ *
+ * This function searches for any child entities that have a referential
+ * relationship with the parent entity given. The reference direction will
+ * determine if the children reference the parent or the parent references
+ * the children. All matches are returned in an array.
+ *
+ * @param string $parent_type
+ *   The type of the parent entity.
+ * @param string $parent_bundle
+ *   The bundle of the parent entity.
+ * @param string $reference_direction
+ *   A string container either 'desc' or 'asc', determining the
+ *   direction of our referential relationship.
+ * @param array $all_entities
+ *   (optional) An array of all existing bundles, keyed by entity type.
+ *
+ * @return array
+ *   An array of associative arrays containing valid children entity types
+ *   and bundles.
+ *
+ * @todo We may want to limit this to only required fields to limit losses.
+ *       Would probably need to set up a place to select that option in the
+ *       settings form.
+ */
+function ercd_get_child_entities($parent_type, $parent_bundle, $reference_direction, $all_entities = NULL) {
+  if ($all_entities == NULL) {
+    // Get all entities.
+    $all_entities = field_info_bundles();
+  }
+
+  $child_entities = array();
+
+  if ($reference_direction == 'desc') {
+    $child_entities = ercd_get_referenced_child_entities($parent_type, $parent_bundle);
+  }
+  elseif ($reference_direction == 'asc') {
+    $child_entities = ercd_get_referencing_child_entities($parent_type, $parent_bundle, $all_entities);
+  }
+  else {
+    return $child_entities;
+  }
+
+  return $child_entities;
+}
+
+/**
+ * Get all entities that are referenced by a given entity.
+ *
+ * This function searches for any entity types/bundles that are referenced
+ * by another entity type/bundle and returns an array of matches.
+ *
+ * @param string $parent_type
+ *   The type of the parent entity.
+ * @param string $parent_bundle
+ *   The bundle of the parent entity.
+ *
+ * @return array
+ *   An array of associative arrays containing valid children entity types
+ *   and bundles.
+ */
+function ercd_get_referenced_child_entities($parent_type, $parent_bundle) {
+  $child_entities = array();
+
+  // Get the basic field information for the parent entity.
+  $fields = field_info_instances($parent_type, $parent_bundle);
+
+  // Cycle through and find valid references.
+  foreach ($fields as $field_name => $field) {
+
+    // Get more specific field information to see if this field targets an
+    // entity.
+    $field_info = field_info_field($field_name);
+
+    // Make sure this field is actually an entity reference.
+    if (isset($field_info['settings']['target_type'])) {
+
+      // Get the referenced entity type.
+      $child_type = $field_info['settings']['target_type'];
+
+      // Make sure it is valid.
+      if (ercd_valid_entity($child_type)) {
+
+        // Make sure the bundle is set.
+        ercd_ensure_entity_bundle_set($field_info, $child_type);
+
+        // Check if this field target the referenced bundle, if one exists.
+        if (isset($field_info['settings']['handler_settings']['target_bundles'])) {
+          foreach ($field_info['settings']['handler_settings']['target_bundles'] as $child_bundle) {
+            $child_entities[] = array(
+              'type' => $child_type,
+              'bundle' => $child_bundle,
+            );
+          }
+        }
+      }
+    }
+  }
+
+  return $child_entities;
+}
+
+/**
+ * Get all entities that reference a given entity.
+ *
+ * This function searches for any entity types/bundles that reference
+ * another entity type/bundle and returns an array of matches.
+ *
+ * @param string $parent_type
+ *   The type of the parent entity.
+ * @param string $parent_bundle
+ *   The bundle of the parent entity.
+ * @param array $all_entities
+ *   (optional) An array of all existing bundles, keyed by entity type.
+ *
+ * @return array
+ *   An array of associative arrays containing valid children entity types
+ *   and bundles.
+ */
+function ercd_get_referencing_child_entities($parent_type, $parent_bundle, $all_entities = NULL) {
+  $child_entities = array();
+
+  // Get all child entity bundles for each parent entity.
+  foreach ($all_entities as $child_type => $type_info) {
+    if (ercd_valid_entity($child_type)) {
+      foreach ($type_info as $child_bundle => $bundle_info) {
+
+        // Get the basic field information for the referencing entity.
+        $fields = field_info_instances($child_type, $child_bundle);
+        foreach ($fields as $field_name => $field) {
+
+          // Get more specific field information to see if this field targets an
+          // entity.
+          $field_info = field_info_field($field_name);
+
+          // Check if this field targets the parent entity.
+          if (isset($field_info['settings']['target_type']) && $field_info['settings']['target_type'] == $parent_type) {
+
+            // Make sure the bundle is set.
+            ercd_ensure_entity_bundle_set($field_info, $parent_type);
+
+            // Check if this field target the referenced bundle, if one exists.
+            if (isset($field_info['settings']['handler_settings']['target_bundles']) && in_array($parent_bundle, $field_info['settings']['handler_settings']['target_bundles'])) {
+              $child_entities[] = array(
+                'type' => $child_type,
+                'bundle' => $child_bundle,
+              );
+            }
+          }
+        }
+      }
+    }
+  }
+
+  return $child_entities;
+}
+
+/**
+ * Creates an array of safe user roles.
+ *
+ * This function takes the default safe roles (anon and admin) and
+ * then adds other roles that have not been selected for cascade
+ * deletion. The combined array is then returned to the receiving function.
+ *
+ * @param string $parent_type
+ *   The type of the parent entity
+ * @param string $parent_bundle
+ *   The bundle of the parent entity
+ * @param string $child_type
+ *   The type of the child entity
+ * @param string $child_bundle
+ *   The bundle of the child entity
+ * @param string $reference_direction
+ *   A string container either 'desc' or 'asc', determining the
+ *   direction of our referential relationship.
+ *
+ * @return array
+ *   An array of immune user roles
+ */
+function ercd_get_immune_user_roles($parent_type, $parent_bundle, $child_type, $child_bundle, $reference_direction) {
+  $immune_roles = variable_get('ercd_immune_roles', array());
+  $valid_user_role_rids = variable_get('ercd_' . $reference_direction . '_roles_' . $parent_type . '__' . $parent_bundle . '__' . $child_type . '__' . $child_bundle, array());
+  foreach ($valid_user_role_rids as $rid => $valid_user_role_rid) {
+    if (!$valid_user_role_rid) {
+      $immune_roles[$rid] = $rid;
+    }
+  }
+
+  return $immune_roles;
+}
+
+/**
+ * Checks if a user's role is immune from deletion.
+ *
+ * This function loads a user based on their id and then checks
+ * if any of their roles are in the immune_roles array. If so,
+ * the function returns a boolean flag indicating the user is safe
+ * from being deleted.
+ *
+ * @param int $uid
+ *   A user id.
+ * @param array $immune_roles
+ *   An array of safe user roles.
+ *
+ * @return bool
+ *   Used as a flag to the receiving function.
+ */
+function ercd_skip_user_id($uid, $immune_roles) {
+  $ercd_user = user_load($uid);
+  $keys = array_keys($ercd_user->roles);
+
+  // Filter the immune roles.
+  foreach ($immune_roles as $immune_role) {
+    // Make sure we do delete user id 1
+    if ($ercd_user->uid == 1) {
+      return TRUE;
+    }
+
+    // This user is an authenticated user only with no other roles
+    // assigned.
+    if (count($keys) == 1 && $keys[0] == 2 && in_array($immune_role, $keys)) {
+      return TRUE;
+    }
+
+    // This user has other roles or is anonymous so filter out
+    // authenticated user rid.
+    if ($immune_role != 2 && in_array($immune_role, $keys)) {
+      return TRUE;
+    }
+  }
+
+  return FALSE;
+}
+
+/**
+ * Checks if an entity is valid based on an array of invalid entities.
+ *
+ * @param string $entity_type
+ *   The entity type to be validated.
+ *
+ * @return bool
+ *   Valid of invalid.
+ */
+function ercd_valid_entity($entity_type) {
+  $valid = FALSE;
+
+  if (!in_array($entity_type, variable_get('ercd_entities_to_skip'))) {
+    $valid = TRUE;
+  }
+
+  return $valid;
+}
+
+/**
+ * Checks to see if a form is a confirm delete form.
+ *
+ * Based on the entities we can currently test for, we will check the form id to
+ * see if this is one of the forms we want to alter and then return the entity
+ * type associated with that form.
+ *
+ * @param array $form_state
+ *   An associative array of form state values.
+ * @param string $form_id
+ *   A form id.
+ * @param string $type
+ *   The machine name of the entity type to be deleted.
+ *
+ * @return bool
+ *   A boolean value
+ */
+function ercd_valid_form($form_state, $form_id, &$type = NULL) {
+  $valid_form = FALSE;
+  switch ($form_id) {
+    case 'node_delete_confirm':
+      $valid_form = TRUE;
+      $type = 'node';
+      break;
+
+    case 'taxonomy_form_vocabulary':
+      if (isset($form_state['confirm_delete']) && isset($form_state['values']['vid'])) {
+        $valid_form = TRUE;
+        $type = 'taxonomy_vocabulary';
+      }
+      break;
+
+    case 'taxonomy_form_term':
+      if (isset($form_state['confirm_delete'])) {
+        $valid_form = TRUE;
+        $type = 'taxonomy_term';
+      }
+      break;
+
+    case 'rules_ui_form_rules_config_confirm_op':
+      if ($form_state['op'] == 'delete') {
+        $valid_form = TRUE;
+        $type = 'rules_config';
+      }
+      break;
+
+    case 'user_cancel_confirm_form':
+      $valid_form = TRUE;
+      $type = 'user';
+      break;
+
+    case 'comment_confirm_delete':
+      $valid_form = TRUE;
+      $type = 'comment';
+      break;
+  }
+
+  return $valid_form;
+}
+
+/**
+ * Check an entity selection for immunity.
+ *
+ * Cycles through an array of immune entities and returns an
+ * appropriate boolean value if found or not found.
+ *
+ * @param array $selection
+ *   An associative array of values for a referenced entity
+ *   and a referencing entity, including the referencing
+ *   entities id.
+ * @param array $immunities
+ *   An array of selections that are immune from deletion.
+ *
+ * @return bool
+ *   A boolean value for whether a match is found or not.
+ */
+function ercd_in_immunities($selection, $immunities) {
+  $match = FALSE;
+
+  foreach ($immunities as $id => $immunity) {
+    if ($selection['child_type'] == $immunity['child_type'] && $selection['entity_id'] == $immunity['entity_id']) {
+      $match = TRUE;
+    }
+  }
+
+  return $match;
+}
+
+/**
+ * Check if an entity selection is already set.
+ *
+ * Cycles through an array of selected entities and returns an
+ * appropriate boolean value if found or not found.
+ *
+ * @param array $selection
+ *   An associative array of values for a referenced entity
+ *   and a referencing entity, including the referencing
+ *   entities id.
+ * @param array $selections
+ *   An array of selections that have been selected for deletion.
+ *
+ * @return bool
+ *   A boolean value for whether a match is found or not.
+ */
+function ercd_in_selections($selection, $selections) {
+  $match = FALSE;
+
+  foreach ($selections as $selected) {
+    if ($selection['child_type'] == $selected['child_type'] && $selection['entity_id'] == $selected['entity_id']) {
+      $match = TRUE;
+    }
+  }
+
+  return $match;
+}
+
+/**
+ * Get an entity reference field name of a referencing entity.
+ *
+ * Checks if there is a matching field name that references the referenced
+ * type and bundle provided.
+ *
+ * @param string $referenced_type
+ *   The type of the referenced entity.
+ * @param string $referenced_bundle
+ *   The bundle of the referenced entity.
+ * @param string $referencing_type
+ *   The type of the referencing entity.
+ * @param string $referencing_bundle
+ *   The bundle of the referencing entity.
+ *
+ * @return string
+ *   The field name of the referencing entity.
+ */
+function ercd_get_reference_field_name($referenced_type, $referenced_bundle, $referencing_type, $referencing_bundle) {
+  $reference_field_name = NULL;
+
+  // Get the field info for the referencing entity.
+  $bundle_fields = field_info_instances($referencing_type, $referencing_bundle);
+
+  // Cycle through and find the field that references the referenced entity.
+  foreach ($bundle_fields as $field_name => $field) {
+    $field_info = field_info_field($field_name);
+
+    // Find a match.
+    if (isset($field_info['settings']['target_type']) && $field_info['settings']['target_type'] == $referenced_type && isset($field_info['settings']['handler_settings']['target_bundles']) && is_array($field_info['settings']['handler_settings']['target_bundles']) && in_array($referenced_bundle, $field_info['settings']['handler_settings']['target_bundles'])) {
+      $reference_field_name = $field_name;
+      break;
+    }
+  }
+
+  return $reference_field_name;
+}
+
+/**
+ * Sets the a bundle name for entity types where a bundle is not specified.
+ *
+ * Check the field info array and sets a bundle name to a given entity
+ * type.
+ *
+ * @param array $field_info
+ *   A field info array as retrieved by field_info_field().
+ * @param string $entity_type
+ *   An machine name for an entity type.
+ */
+function ercd_ensure_entity_bundle_set(&$field_info, $entity_type) {
+  // Some entity references don't set the target bundle, so we'll set it here
+  // to be the same as the entity type.
+  if (empty($field_info['settings']['handler_settings']['target_bundles'])) {
+    $field_info['settings']['handler_settings']['target_bundles'][] = $entity_type;
+  }
+}
+
+/**
+ * Helps to get a bundle name for non-standard entities.
+ *
+ * This function will get the bundle name using core's built-in
+ * function field_extract_bundle(), but will set the bundle name
+ * manually for those entities without explicit bundles.
+ *
+ * @param string $type
+ *   An entity type.
+ * @param object $entity
+ *   An entity object.
+ *
+ * @return string
+ *   An entity bundle.
+ */
+function ercd_extract_bundle_helper($type, $entity) {
+  $bundle = field_extract_bundle($type, $entity);
+
+  if (empty($bundle)) {
+    switch ($type) {
+      case 'taxonomy_term':
+        $bundle = $entity->vocabulary_machine_name;
+        break;
+
+      case 'comment':
+        $bundle = $entity->node_type;
+        break;
+
+      default:
+        $bundle = $parent_type;
+    }
+  }
+
+  return $bundle;
+}

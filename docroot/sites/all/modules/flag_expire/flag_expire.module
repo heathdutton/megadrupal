@@ -1,0 +1,305 @@
+<?php
+/**
+ * @file flag_expire.module
+ * Allows flaggings to expire on a set date or after a set duration.
+ */
+
+/**
+ * Implements hook_flag_options_alter().
+ */
+function flag_expire_flag_options_alter(&$options, $flag) {
+  // Define the defaults for our options.
+  $options['expire_type'] = 'none';
+  $options['expire_period'] = 0;
+  $options['expire_date'] = NULL;
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter(): flag_form
+ */
+function flag_expire_form_flag_form_alter(&$form, &$form_state, $form_id) {
+  if (!isset($form['#flag'])) {
+    // Bail for broken flag handler forms.
+    return;
+  }
+
+  $flag = $form['#flag'];
+
+  $form['expire'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Expiry'),
+  );
+  $form['expire']['expire_type'] = array(
+    '#type' => 'radios',
+    '#title' => t('Expiry behaviour'),
+    '#options' => array(
+      'none' => t('None: this flag does not expire.'),
+      'flag_date' => t('Flag date: All flaggings expire on a particular date.'),
+      'flagging_date' => t('Flagging date: Each flagging expires on a date set per flagging.'),
+      'flag_period' => t('Flag period: All flaggings expire after the same set duration.'),
+      /*
+      // @todo: this expiry type is postponed, as the querying required on
+      // cron is going to be really awkward.
+      'flagging_period' => t('Flagging period: Each flagging expires after a duration set per flagging.'),
+      */
+    ),
+    '#default_value' => $flag->expire_type,
+  );
+
+  if (module_exists('date_api')) {
+    // @todo: validate this is not in the past.
+    $form['expire']['expire_date'] = array(
+      '#type' => module_exists('date_popup') ? 'date_popup' : 'date_select',
+      '#title' => t('Expiry date'),
+      '#description' => t("Enter a date and time for this flag's expiry. Objects flagged with this flag will revert to being unflagged at this time."),
+      '#default_value' => $flag->expire_date,
+      '#states' => array(
+        'visible' => array(
+          ':input[name="expire_type"]' => array('value' => 'flag_date'),
+        ),
+      ),
+    );
+  }
+  else {
+    // Disable the expiry type options that require this module.
+    $form['expire']['expire_type']['flag_date']['#disabled'] = TRUE;
+    $form['expire']['expire_type']['flag_date']['#description'] = t('This option requires <a href="!url">Date API module</a>.', array(
+      '!url' => 'http://drupal.org/project/date',
+    ));
+  }
+  // The flagging date option needs date fields in addition to Date API.
+  if (!module_exists('date')) {
+    $form['expire']['expire_type']['flagging_date']['#disabled'] = TRUE;
+    $form['expire']['expire_type']['flagging_date']['#description'] = t('This option requires <a href="!url">Date module</a>.', array(
+      '!url' => 'http://drupal.org/project/date',
+    ));
+  }
+
+  if (module_exists('timeperiod')) {
+    $units = array(
+      // Weeks: needs patch at http://drupal.org/node/1700422.
+      // '604800' => array('max' => 52, 'step size' => 1, 'suffix' => t('weeks')),
+      '86400' => array('max' => 180, 'step size' => 1),
+      '3600'  => array('max' => 23, 'step size' => 1),
+      '60'    => array('max' => 55, 'step size' => 1),
+    );
+    $form['expire']['expire_period'] = array(
+      '#type' => 'timeperiod_select',
+      '#title' => t('Expiry period'),
+      '#description' => t("Enter a time period for this flag's expiry. Objects flagged with this flag will revert to being unflagged after this duration."),
+      '#units' => $units,
+      '#default_value' => $flag->expire_period,
+      // Bug in timeperiod here.
+      // See http://drupal.org/node/1702540.
+      '#states' => array(
+        'visible' => array(
+          ':input[name="expire_type"]' => array('value' => 'flag_period'),
+        ),
+      ),
+    );
+  }
+  else {
+    // Disable the expiry type options that require this module.
+    $form['expire']['expire_type']['flag_period']['#disabled'] = TRUE;
+    //$form['expire']['expire_type']['flagging_period']['#disabled'] = TRUE;
+    $form['expire']['expire_type']['flag_period']['#description'] = t('Time period options require <a href="!url">Time Period module</a>.', array(
+      '!url' => 'http://drupal.org/project/timeperiod',
+    ));
+  }
+
+  // Warn about changing away from a flagging_* expiry type.
+  if (substr($flag->expire_type, 0, 8) == 'flagging') {
+    $form['expire']['expire_type'][$flag->expire_type]['#description'] = t('<span class="warning">Warning:</span> deselecting this option will delete the expiry field on the flagging entity and all its data.');
+  }
+  // Stash the current expiry type so we can act on it to delete the instance.
+  $form['expire']['expire_type_current'] = array(
+    '#type' => 'value',
+    '#value' => $flag->expire_type,
+  );
+
+  // Don't allow the default radio to be one that's disabled.
+  if (!empty($form['expire']['expire_type'][$form['expire']['expire_type']['#default_value']]['#disabled'])) {
+    $form['expire']['expire_type']['#default_value'] = 'none';
+  }
+  $form['#validate'][] = 'flag_expire_form_flag_form_expiry_validate';
+  $form['#submit'][] = 'flag_expire_form_flag_form_expiry_submit';
+}
+
+/**
+ * Custom validate handler for the flag edit form.
+ *
+ * Check the options all make sense together.
+ */
+function flag_expire_form_flag_form_expiry_validate($form, &$form_state) {
+  // Check that the link type allows the user to set an expiry on the flagging.
+  if (substr($form_state['values']['expire_type'], 0, 8) == 'flagging') {
+    $link_types = flag_get_link_types();
+    $link_type_info = $link_types[$form_state['values']['link_type']];
+    if (empty($link_type_info['provides form'])) {
+      // Build up a list of the link types that are suitable.
+      $possible_types = array();
+      foreach ($link_types as $link_type) {
+        if ($link_type['provides form'])
+        $possible_types[] = $link_type['title'];
+      }
+      // Errors on radios don't show.
+      // Drupal core bug. See http://drupal.org/node/222380.
+      form_set_error('display][link_type', t("Expiry types that are per-flagging require a flag link type that exposes a flagging form to the user. Please select one of: %types.", array(
+        '%types' => implode(', ', $possible_types),
+      )));
+    }
+  }
+}
+
+/**
+ * Custom submit handler for the flag edit form.
+ *
+ * Create fields and instances for per-flagging expire options if required.
+ */
+function flag_expire_form_flag_form_expiry_submit($form, &$form_state) {
+  $flag = $form['#flag'];
+  // Build a field and instance definition if required.
+  switch ($form_state['values']['expire_type']) {
+    case 'flagging_date':
+      if (!field_info_field('flag_expire_date')) {
+        $field_flagging_date = array(
+          'field_name' => 'flag_expire_date',
+          'type'        => 'datestamp',
+          'cardinality' => 1,
+          'settings'    => array(
+            'granularity' => date_granularity_array_from_precision('second'),
+            'todate' => '',
+          ),
+        );
+        field_create_field($field_flagging_date);
+      }
+      // The flag name is the flagging bundle.
+      if (!field_info_instance('flagging', 'flag_expire_date', $flag->name)) {
+        $instance_flagging_date = array(
+          'field_name' => 'flag_expire_date',
+          'entity_type' => 'flagging',
+          'bundle' => $flag->name,
+          'label' => t('Flagging expiry date'),
+          'description' => t('The date on which this flagging should expire.'),
+          'widget' => array(
+            'type' => module_exists('date_popup') ? 'date_popup' : 'date_select',
+          ),
+        );
+        field_create_instance($instance_flagging_date);
+        drupal_set_message(t('The field %fieldname has been added to this flag. You may set the default expiry date in its <a href="!url">settings</a>.', array(
+          '%fieldname' => $instance_flagging_date['label'],
+          '!url' => url('admin/structure/flags/manage/' . $flag->name . '/fields/flag_expire_date'),
+        )));
+      }
+      break;
+    case 'flagging_period':
+      // TODO.
+  }
+
+  // If the expiry type has changed, remove the flagging field instance.
+  if ($form_state['values']['expire_type'] != $form_state['values']['expire_type_current']) {
+    switch ($form_state['values']['expire_type_current']) {
+      case 'flagging_date':
+        $instance = field_info_instance('flagging', 'flag_expire_date', $flag->name);
+        field_delete_instance($instance);
+        drupal_set_message(t('The expiry date field has been removed from this flag.'));
+        break;
+      case 'flagging_period':
+        // TODO.
+    }
+  }
+}
+
+/**
+ * Implements hook_cron_queue_info().
+ */
+function flag_expire_cron_queue_info() {
+  return array(
+    'flag_expire_flags' => array(
+      'worker callback' => 'flag_expire_flags',
+      'time' => 60,
+    ),
+  );
+}
+
+/**
+ * Implements hook_cron().
+ */
+function flag_expire_cron() {
+  // Get all flags and run each one through the Cron Queue.
+  $queue = DrupalQueue::get('flag_expire_flags');
+  $flags = flag_get_flags();
+  foreach ($flags as $flag) {
+    $queue->createItem($flag);
+  }
+}
+
+/**
+ * Cron queue worker callback.
+ *
+ * Checks if a flag should expire.
+ *
+ * @param $flag
+ *  A flag object.
+ *
+ * @see flag_expire_cron_queue_info()
+ * @see flag_expire_cron()
+ */
+function flag_expire_flags(flag_flag $flag) {
+  // Switch for each expiry type.
+  switch ($flag->expire_type) {
+    case 'flag_date':
+      if ((REQUEST_TIME > strtotime($flag->expire_date))) {
+        // Clear all flaggings for this flag.
+        flag_reset_flag($flag);
+      }
+      break;
+    case 'flag_period':
+      // Get the flaggings that are due to expire.
+      $result = db_select('flagging', 'fc')
+        ->fields('fc', array('entity_id', 'uid'))
+        ->condition('fid', $flag->fid, '=')
+        // Equivalent to if flagging timestamp + duration >= REQUEST_TIME,
+        ->condition('timestamp', REQUEST_TIME - $flag->expire_period, '<=')
+        ->execute();
+
+      foreach ($result as $flagging_data) {
+        if ($flagging_data->uid) {
+          $account = user_load($flagging_data->uid);
+        }
+        else {
+          $account = NULL;
+        }
+        // Set $skip_permission_check to TRUE in case the original flagging user
+        // has since had permissions revoked.
+        $flag->flag('unflag', $flagging_data->entity_id, $account, TRUE);
+      }
+      break;
+    case 'flagging_date':
+      // Get all flaggings that are due to expire.
+      $query = new EntityFieldQuery();
+      $query->entityCondition('entity_type', 'flagging');
+      $query->entityCondition('bundle', $flag->name);
+      $query->fieldCondition('flag_expire_date', 'value', REQUEST_TIME, '<=');
+      $result = $query->execute();
+      if (!empty($result['flagging'])) {
+        // We might as well load all the flagging entities now, as the flag
+        // class's unflagging will do that anyway.
+        $flaggings = entity_load('flagging', array_keys($result['flagging']));
+        foreach ($flaggings as $flagging) {
+          if ($flagging->uid) {
+            $account = user_load($flagging->uid);
+          }
+          else {
+            $account = NULL;
+          }
+          // Set $skip_permission_check to TRUE in case the original flagging
+          // user has since had permissions revoked.
+          $flag->flag('unflag', $flagging->entity_id, $account, TRUE);
+        }
+      }
+      break;
+    case 'flagging_period':
+      // TODO.
+  }
+}

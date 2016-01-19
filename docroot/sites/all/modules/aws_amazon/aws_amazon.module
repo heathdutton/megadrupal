@@ -1,0 +1,806 @@
+<?php
+
+include_once __DIR__ . '/aws_amazon.field.inc';
+
+/**
+ * Implements hook_permission().
+ */
+function aws_amazon_permission() {
+  $direct_uploads = explode("\n", variable_get('aws_amazon_direct_upload', ''));
+  $perm = array();
+  foreach ($direct_uploads as $bucket) {
+    $item = trim($bucket);
+    if (!empty($item)) {
+      $perm['direct s3 upload ' . $item] = array('title' => t('Upload to S3 Bucket %bucket', array('%bucket' => $item)));
+    }
+  }
+  return $perm;
+}
+ 
+/**
+ * Implements hook_menu().
+ */
+function aws_amazon_menu() {
+  $items['admin/config/system/aws-amazon'] = array(
+    'title' => 'Amazon AWS Configuration',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('aws_amazon_admin_settings_form'),
+    'access arguments' => array('access administration pages'),
+    'file' => 'aws_amazon.admin.inc',
+  );
+  
+  $items['admin/config/system/aws-amazon/settings'] = array(
+    'type' => MENU_DEFAULT_LOCAL_TASK,
+    'title' => 'Settings',
+    'weight' => -10,
+  );
+  
+  $items['admin/config/system/aws-amazon/browse'] = array(
+    'title' => 'Browse Backup',
+    'page callback' => 'aws_amazon_backup_browser',
+    'page arguments' => array(5, 6),
+    'access arguments' => array('access administration pages'),
+    'file' => 'aws_amazon.admin.inc',
+    'type' => MENU_LOCAL_TASK
+  );
+  $items['admin/config/system/aws-amazon/bucket-browse'] = array(
+    'title' => 'Browse Bucket',
+    'page callback' => 'aws_amazon_bucket_browser',
+    'page arguments' => array(5, 6),
+    'access arguments' => array('access administration pages'),
+    'file' => 'aws_amazon.admin.inc',
+    'type' => MENU_LOCAL_TASK
+  );
+  $items['admin/config/system/aws-amazon/download/%/%'] = array(
+    'title' => 'S3 Download',
+    'page callback' => 'aws_amazon_bucket_browser_download',
+    'page arguments' => array(5, 6),
+    'access arguments' => array('access administration pages'),
+    'file' => 'aws_amazon.admin.inc',
+    'type' => MENU_CALLBACK,
+  );
+  $items['admin/config/system/aws-amazon/restore/%'] = array(
+    'title' => 'Restore',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('aws_amazon_bucket_browser_restore_form', 5, 6),
+    'access arguments' => array('access administration pages'),
+    'file' => 'aws_amazon.admin.inc',
+    'type' => MENU_CALLBACK,
+  );
+  $items['aws-amazon/%/download/%/%'] = array(
+    'title' => 'Download',
+    'page callback' => 'aws_amazon_download_file',
+    'page arguments' => array(1, 3, 4),
+    'access arguments' => array(1, 3, 4),
+    'access callback' => 'aws_amazon_download_file_access',
+    'type' => MENU_CALLBACK,
+  );
+  global $base_url;
+   
+  //generate a unique URL per site that cannot be faked.
+  $token = hash('sha1', $base_url . drupal_get_hash_salt() . variable_get('aws_amazon_access_key', drupal_get_hash_salt()));
+  
+  $items['aws-amazon-cron/' . $token] = array(
+    'type' => MENU_CALLBACK,
+    'title' => 'Amazon Run Backup',
+    'page callback' => 'aws_amazon_backup_and_cleanup',
+    'access callback' => TRUE,
+  );
+  
+  //generate direct upload menus
+  $direct_uploads = explode("\n", variable_get('aws_amazon_direct_upload', ''));
+  foreach ($direct_uploads as $item) {
+    $bucket = trim($item);
+    if (!empty($bucket)) {
+      $items['aws-amazon/upload/' . $bucket] = array(
+        'type' => MENU_NORMAL_ITEM,
+        'title' => 'Upload to bucket ' . $bucket,
+        'page callback' => 'aws_amazon_upload_s3',
+        'page arguments' => array(2),
+        'access arguments' => array('direct s3 upload ' . $bucket),
+      );
+    }
+  }
+  return $items;
+}
+
+/**
+ * Validate if the entered value is numeric
+ */
+function aws_amazon_element_validate_numeric($element, &$form_state, $form) {
+  if (!empty($element['#value']) && !is_numeric($element['#value'])) {
+    form_error($element, t('!title must be numeric.', array('!title' => $element['#title'])));
+  }
+}
+
+/**
+ * Implements hook_cron().
+ */
+function aws_amazon_cron() {
+  $enabled = variable_get('aws_amazon_enable_backup', 0);
+  if ($enabled) {
+    if ($type = variable_get('aws_amazon_backup_cron', 0)) {
+      if ($type == 1) {
+        //on each cron run
+        aws_amazon_backup_and_cleanup();
+      }
+      else {
+        //once a day
+        $next_run = variable_get('aws_amazon_backup_next', 0);
+        if (empty($next_run) || $next_run < time()) {
+          variable_set('aws_amazon_backup_next', strtotime('tomorrow')); //any time after today.
+          aws_amazon_backup_and_cleanup();
+        }
+      }
+    }
+    aws_amazon_s3_backup_and_cleanup(); //s3 runs in cron only
+  }
+  else {
+    watchdog('aws_amazon-cron', t('In test mode. Backup / clean up not done. To run backup / configure disable "Test Run Only" in Configuration.'), array(), WATCHDOG_INFO);
+  }
+  //fields with files in s3
+  //upload new files
+  _aws_amazon_move_files_to_s3();
+}
+
+/**
+ * Perform backup & cleanup
+ */
+function aws_amazon_backup_and_cleanup() {
+  $regions = variable_get('aws_amazon_regions', array());
+  if (!empty($regions)) {
+    foreach ($regions as $endpoint) {
+      aws_amazon_backup($endpoint);
+      aws_amazon_cleanup($endpoint);
+    }
+  } 
+  else {
+    aws_amazon_backup();
+    aws_amazon_cleanup();
+  }
+  return t('Backup and clean up performed');
+}
+ 
+/**
+ * perform backups
+ */ 
+function aws_amazon_backup($endpoint = '') {
+  $enabled = variable_get('aws_amazon_enable_backup', 0);
+  if ($type = variable_get('aws_amazon_backup_allow', 1)) {
+    $log = variable_get('aws_amazon_log', 0);
+    aws_amazon_set_credentials();
+    $volumes = _aws_amazon_get_volumes($endpoint);
+    $ec2 = new AmazonEC2();
+    if (!empty($endpoint)) {
+      $ec2->set_hostname($endpoint);
+    }
+    foreach ($volumes as $volume_id) {
+      $volume_id = trim($volume_id);
+      if (!empty($volume_id)) {
+        if ($enabled) {
+          $response = $ec2->create_snapshot($volume_id, array('Description' => $volume_id));
+          if (!$response->isOK()) {
+            $data = _aws_amazon_get_response_as_json($response);
+            watchdog('aws_amazon-backup', 'Backup for !volume failed: !data', array('!volume' => $volume_id, '!data' => var_export( $data, TRUE)), WATCHDOG_CRITICAL);
+          }
+          elseif($log) {
+            watchdog('aws_amazon-backup', 'Backup for !volume succeeded', array('!volume' => $volume_id), WATCHDOG_NOTICE);
+          }
+        }
+        else {
+          watchdog('aws_amazon-backup', 'Test Run: Backup for !volume', array('!volume' => $volume_id), WATCHDOG_NOTICE);
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Delete backups based on rule provided
+ */
+function aws_amazon_cleanup($endpoint = '') {
+  $enabled = variable_get('aws_amazon_enable_backup', 0);
+  if ($type = variable_get('aws_amazon_backup_type', 0)) {
+    aws_amazon_set_credentials();
+    $log = variable_get('aws_amazon_log', 0);
+    $ec2 = new AmazonEC2();
+    if (!empty($endpoint)) {
+      $ec2->set_hostname($endpoint);
+    }
+    $volumes = _aws_amazon_get_volumes($endpoint);
+    $opt = array(
+      'Owner' => 'self',
+      'Filter' => array(
+        array('Name' => 'status', 'Value' => 'completed'),
+      )
+    );
+    $response = $ec2->describe_snapshots($opt);
+    $result = _aws_amazon_get_response_as_json($response);
+    $snapshots = array();
+    if (isset($result['snapshotSet']['item'])) {
+      foreach($result['snapshotSet']['item'] as $item) {
+        $snapshots[$item['volumeId']][] = $item; //index item on their volumen ids
+      }
+    }
+    $number_of_snapshots = variable_get('aws_amazon_backup_no', 0);
+    foreach ($volumes as  $volumeId) {
+      $volumeId = trim($volumeId);
+      if (!empty($volumeId)) {
+        if (isset($snapshots[$volumeId]) && count($snapshots[$volumeId]) > 1) {//retain atleast one snapshot
+          $snapshot_count = count($snapshots[$volumeId]);
+          if ($type == 2) {
+            //number of snapshots
+            if ($snapshot_count > $number_of_snapshots) {
+              //delete the excess.
+              $to_delete = $snapshot_count - $number_of_snapshots;
+              for ($cnt = 0; $cnt < $to_delete; $cnt++) {
+                //delete the oldest. we depend on aws to return it in order of creation.
+                if ($enabled) {
+                  $response = $ec2->delete_snapshot($snapshots[$volumeId][$cnt]['snapshotId']);
+                  if (isset($response) && !$response->isOK()) {
+                    $data = _aws_amazon_get_response_as_json($response);
+                    watchdog('aws_amazon-delete', 'Snapshot Delete Failed: !data', array('!data' => var_export( $data, TRUE)), WATCHDOG_CRITICAL);
+                  }
+                  elseif($log) {
+                    watchdog('aws_amazon-delete', 'Snapshot Deleted: Time of snapshot !data', array('!data' => $snapshots[$volumeId][$cnt]['startTime']), WATCHDOG_NOTICE);
+                  }
+                }
+                else {
+                  watchdog('aws_amazon-delete', 'Test Run: Snapshot Deleted: Time of snapshot !data', array('!data' => $snapshots[$volumeId][$cnt]['startTime']), WATCHDOG_NOTICE);
+                }
+              }
+            }
+          }
+          else {
+            //number of days
+            $older_than = strtotime("-$number_of_snapshots day");
+            //start in reverse chronological order to ensure that atleast one will be retained.
+            for($cnt = $snapshot_count - 1; $cnt >=0; $cnt--) {
+              $created = strtotime($snapshots[$volumeId][$cnt]['startTime']);
+              if ($created < $older_than && ($cnt + 1 != $snapshot_count)) {
+                if ($enabled) {
+                  $response = $ec2->delete_snapshot($snapshots[$volumeId][$cnt]['snapshotId']);
+                  if (isset($response) && !$response->isOK()) {
+                    $data = _aws_amazon_get_response_as_json($response);
+                    watchdog('aws_amazon-delete', 'Snapshot Delete Failed: !data', array('!data' => var_export( $data, TRUE)), WATCHDOG_CRITICAL);
+                  }
+                  elseif($log) {
+                    watchdog('aws_amazon-delete', 'Snapshot Deleted: Time of snapshot !data', array('!data' => $snapshots[$volumeId][$cnt]['startTime']), WATCHDOG_NOTICE);
+                  }
+                }
+                else {
+                  watchdog('aws_amazon-delete', 'Test Run: Snapshot Deleted: Time of snapshot !data', array('!data' => $snapshots[$volumeId][$cnt]['startTime']), WATCHDOG_NOTICE);
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    
+  }
+}
+
+function _aws_amazon_get_response_as_json($response) {
+  return drupal_json_decode($response->body->to_json());
+}
+
+/**
+ * get credentials
+ */
+function aws_amazon_set_credentials() {
+  require_once 'sites/all/libraries/AWSSDKforPHP/sdk.class.php';
+  
+  CFCredentials::set(array(
+    '@default' => array(
+      'key' => variable_get('aws_amazon_access_key', ''),
+      'secret' => variable_get('aws_amazon_secret_key', ''),
+      'default_cache_config' => 'apc',
+      'certificate_authority' => false
+    )
+  ));
+}
+
+/**
+ * perform an S3 operation
+ * Supported operations
+ * list: $file -> prefix in s3
+ */
+function aws_amazon_get_list($bucket, $file) {
+  aws_amazon_set_credentials();
+  $s3 = new AmazonS3();
+  $output = FALSE;
+  try {
+    $output = $s3->get_object_list($bucket, array('prefix' => $file));      
+  }
+  catch (Exception $ex) {
+    watchdog('s3-access', $ex->getMessage(), array(), WATCHDOG_ERROR);
+  }
+  return $output;
+}
+
+/**
+ * link: $file -> file path in s3, $arg3 -> timestamp, validity of link. defaults to 1 hour
+ */
+function aws_amazon_get_link($bucket, $file, $timeout) {
+  aws_amazon_set_credentials();
+  $s3 = new AmazonS3();
+  $output = FALSE;
+  try {
+    if($s3->if_object_exists($bucket, $file)) {
+      if (empty($timeout)) {
+        $timeout = strtotime('+1 hour');
+      }
+      $output = $s3->get_object_url($bucket, $file, $timeout);
+    }
+  }
+  catch (Exception $ex) {
+    watchdog('s3-access', $ex->getMessage(), array(), WATCHDOG_ERROR);
+  }
+  return $output;
+}
+
+/**
+ * put: $file -> Path to file on server, $s3_path -> target path on S3
+ * upload a file
+ */
+function aws_amazon_put_file($bucket, $file, $s3_path) {
+  aws_amazon_set_credentials();
+  $s3 = new AmazonS3();
+  $output = FALSE;
+  try {
+    if (file_exists($file)) {
+      $result = $s3->create_object($bucket, $s3_path, array('fileUpload' => $file, 'acl' => AmazonS3::ACL_PRIVATE));
+      $output = $result->isOK();
+    }
+  }
+  catch (Exception $ex) {
+    watchdog('s3-access', $ex->getMessage(), array(), WATCHDOG_ERROR);
+  }
+  return $output;
+}
+
+/**
+ * download a file
+ */
+function aws_amazon_get_file($bucket, $file, $download_path) {
+  aws_amazon_set_credentials();
+  $s3 = new AmazonS3();
+  $output = FALSE;
+  try {
+    if ($s3->if_object_exists($bucket, $file)) {
+      $result = $s3->get_object($bucket, $file, array('fileDownload' => $download_path));
+      $output = $result->isOK();
+    }
+  }
+  catch (Exception $ex) {
+    watchdog('s3-access', $ex->getMessage(), array(), WATCHDOG_ERROR);
+  }
+  return $output;
+}
+
+/**
+ * metadata: $file -> path on S3
+ */
+function aws_amazon_get_metadata($bucket, $file) {
+  aws_amazon_set_credentials();
+  $s3 = new AmazonS3();
+  $output = FALSE;
+  try {
+    if ($s3->if_object_exists($bucket, $file)) {
+      $output = $s3->get_object_metadata($bucket, $file);
+    }
+  }
+  catch (Exception $ex) {
+    watchdog('s3-access', $ex->getMessage(), array(), WATCHDOG_ERROR);
+  }
+  return $output;
+}
+
+/**
+ * delete file
+ */
+function aws_amazon_delete_file($bucket, $file) {
+  aws_amazon_set_credentials();
+  $s3 = new AmazonS3();
+  $output = FALSE;
+  try {
+    if ($s3->if_object_exists($bucket, $file)) {
+      $result = $s3->delete_object($bucket, $file);
+      $output = $result->isOK();
+    }
+  }
+  catch (Exception $ex) {
+    watchdog('s3-access', $ex->getMessage(), array(), WATCHDOG_ERROR);
+  }
+  return $output;
+}
+
+/**
+ * move or rename file
+ */
+function aws_amazon_move_file($bucket, $file, $new_path) {
+  aws_amazon_set_credentials();
+  $s3 = new AmazonS3();
+  $output = FALSE;
+  try {
+        if (!empty($new_path)) {
+          if ($s3->if_object_exists($bucket, $file)) {
+            $result = $s3->copy_object(
+              array('bucket' => $bucket, 'filename' => $file),
+              array('bucket' => $bucket, 'filename' => $new_path)
+            );
+            if ($result->isOK()) {
+              $result = $s3->delete_object($bucket, $file);
+            }
+            $output = $result->isOK();
+          }
+        }
+  }
+  catch (Exception $ex) {
+    watchdog('s3-access', $ex->getMessage(), array(), WATCHDOG_ERROR);
+  }
+  return $output;
+}
+
+/**
+ * move or rename file
+ */
+function aws_amazon_copy_file($bucket, $file, $new_bucket, $new_path) {
+  aws_amazon_set_credentials();
+  $s3 = new AmazonS3();
+  $output = FALSE;
+  try {
+        if (!empty($new_path)) {
+          if ($s3->if_object_exists($bucket, $file)) {
+            $result = $s3->copy_object(
+              array('bucket' => $bucket, 'filename' => $file),
+              array('bucket' => $new_bucket, 'filename' => $new_path)
+            );
+            $output = $result->isOK();
+          }
+        }
+  }
+  catch (Exception $ex) {
+    watchdog('s3-access', $ex->getMessage(), array(), WATCHDOG_ERROR);
+  }
+  return $output;
+}
+
+/**
+ * get amazon regions
+ */
+function _aws_amazon_get_regions() {
+  $output = array();
+  aws_amazon_set_credentials();
+  $ec2 = new AmazonEC2;
+  $response = $ec2->describe_regions();
+  $data = _aws_amazon_get_response_as_json($response);
+  if ($response->isOK()) {
+    foreach ($data['regionInfo']['item'] as $item) {
+      $output[$item['regionEndpoint']] = $item['regionName'];
+    }
+  }
+  else {
+    drupal_set_message(t('Error occured: !error', array('!error' => $data['Errors']['Error']['Message'])), 'error');
+  }
+  return $output;
+}
+
+/**
+ * get volumes
+ */
+function _aws_amazon_get_volumes($endpoint = '') {
+  $output  = array();
+  $volumes = explode("\n", variable_get('aws_amazon_backup_vols', ''));
+  $regions = array();
+  foreach ($volumes as $vol) {
+    if (strpos($vol, '|') !== FALSE) {
+      if (empty($regions)) {
+        $regions = _aws_amazon_get_regions();
+        $regions = array_flip($regions); //index on region to get endpoints
+      }
+      $token = explode('|', $vol);
+      if ($regions[trim($token[0])] === $endpoint) {
+        $output[] = trim($token[1]);
+      }
+    }
+    else {
+      $output[] = trim($vol);
+    }
+  }
+  return $output;
+}
+
+/**
+ * Perform backup & cleanup
+ */
+function aws_amazon_s3_backup_and_cleanup() {
+  //run only once a day.
+  $next_run = variable_get('aws_amazon_backup_s3_next', 0);
+  if (empty($next_run) || $next_run < time()) {
+    $enabled = variable_get('aws_amazon_enable_backup', 0);
+    if ($enabled) {
+      variable_set('aws_amazon_backup_s3_next', strtotime('+23 hour 50 minute'));
+      aws_amazon_backup_s3();
+      aws_amazon_cleanup_s3();
+    }
+  }
+}
+
+/**
+ * backup s3 buckets
+ */
+function aws_amazon_backup_s3() {
+  $enabled = variable_get('aws_amazon_enable_backup', 0);
+  $buckets = explode("\n", variable_get('aws_amazon_s3_buckets', ''));
+  if (empty($buckets)) {
+    return;
+  }
+  aws_amazon_set_credentials();
+  $s3 = new AmazonS3;
+  //check if backup bucket exists. if not create it.
+  $backup_bucket = variable_get('aws_amazon_s3_backup_bucket', '');
+  if (!$s3->if_bucket_exists($backup_bucket)) {
+    watchdog('aws-amazon-s3', 'Backup Bucket !bucket not found.', array('!bucket' => $backup_bucket), WATCHDOG_CRITICAL);
+    return;    
+  }
+  $log = variable_get('aws_amazon_log', 0);
+  
+  $folder = date('Y-m-dTH:i');
+  foreach ($buckets as $key => $value) {
+    $bucket = trim($value);
+    $list = aws_amazon_get_list($bucket, '');
+    if ($enabled) {
+      $source['bucket'] = $bucket;
+      $dest['bucket'] = $backup_bucket;
+      foreach ($list as $item) {
+        $source['filename'] = $item;
+        $dest['filename'] = $bucket . '/' . $folder . '/' . $item;
+        $response = $s3->copy_object($source, $dest);
+        if (!$response->isOK()) {
+          watchdog('aws-amazon-s3backup', 'Failed to backup !file', array('!file' => $item), WATCHDOG_CRITICAL);
+        }
+      }
+      if($log) {
+        watchdog('aws-amazon-s3backup', 'Bucket !bucket backedup.', array('!bucket' => $bucket), WATCHDOG_INFO);
+      }
+    }
+    else {
+      watchdog('aws-amazon-s3backup', 'Test Run: Following files backed up. !files', array('!files' => implode(', ', $list)), WATCHDOG_INFO);
+    }
+  }
+}
+
+/**
+ * find the buckets whose backup needs to be deleted and delete them according to rules
+ */
+function aws_amazon_cleanup_s3() {
+  $bucket = variable_get('aws_amazon_s3_backup_bucket', '');
+  if (empty($bucket)) {
+    return;
+  }
+  $no_backups = variable_get('aws_amazon_s3_backup_days', 0);
+  if (empty($no_backups)) {
+    return; //retail all backups
+  }
+  $log = variable_get('aws_amazon_log', 0);
+  $enabled = variable_get('aws_amazon_enable_backup', 0);
+  aws_amazon_set_credentials(); 
+  $s3 = new AmazonS3();
+  $opts = array('delimiter' => '/');
+  $response = $s3->list_objects($bucket, $opts);
+  $data = _aws_amazon_get_response_as_json($response);
+  $items = array();
+  if (isset($data['CommonPrefixes'])) {
+    if (isset($data['CommonPrefixes']['Prefix'])) {
+      //single item
+      $item = $data['CommonPrefixes'];
+      _aws_amazon_cleanup_s3($bucket, $item['Prefix'], $s3, $no_backups, $enabled, $log);
+    }
+    else {
+      foreach ($data['CommonPrefixes'] as $item) {
+        _aws_amazon_cleanup_s3($bucket, $item['Prefix'], $s3, $no_backups, $enabled, $log);
+      }
+    }
+  }
+}
+
+/**
+ * delete backups of a given bucket. 
+ */
+function _aws_amazon_cleanup_s3($bucket, $backedup_bucket, $s3, $no_backups, $enabled, $log) {
+  //get the backups
+  $opts = array('delimiter' => '/', 'prefix' => $backedup_bucket);
+  $response = $s3->list_objects($bucket, $opts);
+  $data = _aws_amazon_get_response_as_json($response);
+  $items = array();
+  $backedup_bucket_name = str_replace('/', '', $backedup_bucket);
+  if (isset($data['CommonPrefixes'])) {
+    if (!isset($data['CommonPrefixes']['Prefix'])) { //retain atleast one backup. if prefix is directly set then there is only one folder
+      $items = $data['CommonPrefixes'];
+    }
+  }
+  $max_backup = strtotime("-$no_backups day");
+  $cnt = 0;
+  if (!empty($items) && ($cnt = count($items)) > 1) {
+    foreach ($items as $item) {
+      $name = str_replace($backedup_bucket, '', $item['Prefix']);
+      $name = str_replace('/', '', $name); //remove the training '/'
+      $backuptime = strtotime($name);
+      if ($backuptime < $max_backup) {
+        $cnt--;
+        if ($cnt) {//at least 1 backup is maintained all the time.
+          if ($enabled) {
+            $list = aws_amazon_get_list($bucket, $item['Prefix']);
+            //delete bottom up. children must be delte
+            for($itemcnt = count($list) - 1; $itemcnt >= 0; $itemcnt--) {
+              $response = $s3->delete_object($bucket, $list[$itemcnt]);
+              if (!$response->isOK()) {
+                watchdog('aws_amazon-s3cleanup', 'Failed to delete backup !backup of bucket !bucket', array('!bucket' => $backedup_bucket_name, '!backup' => $name), WATCHDOG_ERROR);
+              }
+            }
+            if ($log) {
+              watchdog('aws_amazon-s3cleanup', 'Backup !backup of bucket !bucket deleted', array('!bucket' => $backedup_bucket_name, '!backup' => $name), WATCHDOG_INFO);
+            }
+          }
+          else {
+            watchdog('aws-amazon-s3cleanup', 'Test Run: Backup !backup of bucket !bucket deleted.', array('!bucket' => $backedup_bucket_name, '!backup' => $name), WATCHDOG_INFO);
+          }
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_theme().
+ */
+function aws_amazon_theme() {
+  return array(
+    'aws_amazon_s3_file' => array(
+      'variables' => array('file' => NULL, 'entity' => NULL, 'entity_type' => NULL,),
+      'file' => 'aws_amazon.field.inc',
+    ),
+    'aws_amazon_s3_upload' => array(
+      'variables' => array('bucket' => ''),
+      'template' => 'aws-amazon-s3-upload',
+    )
+  );
+}
+
+/**
+ * File download access
+ */
+function aws_amazon_download_file_access($fid, $entity_type, $entity_id) {
+  $entity = entity_load($entity_type, array($entity_id));
+  return entity_access('view', $entity_type, $entity);
+}
+
+/**
+ * download the file
+ */
+function aws_amazon_download_file($fid, $entity_type, $entity_id) {
+  $file = file_load($fid); 
+  $uri = isset($file->aws_uri)? $file->aws_uri : $file->uri;
+  $bucket = variable_get('aws_amazon_field_bucket', '');
+  if (strpos($uri, 'aws://') !== FALSE) {
+    $timeout = strtotime(variable_get('aws_amazon_field_timeout', '+1 hour'));
+    $url = aws_amazon_get_link($bucket, str_replace('aws://', '', $uri), $timeout);
+  }
+  else {
+    $url = file_create_url($uri);
+  }
+  drupal_goto($url);
+}
+
+/**
+ * move files to S3 for specified fields
+ */
+function _aws_amazon_move_files_to_s3() {
+  $query = db_select('aws_amazon_files', 'afs')->fields('afs');
+  $query->innerJoin('file_managed', 'fm', 'fm.fid = afs.fid');
+  $result = $query->condition('afs.status', 0)
+    ->condition('fm.status', FILE_STATUS_PERMANENT) //if a file has been removed in mean time. don't upload them.
+    ->execute();
+  foreach ($result as $row) {
+    //ensure a unique path on s3
+    $s3_path = $row->entity_type . '/' . $row->entity_id . '/' . basename($row->uri);
+    $file = drupal_realpath($row->uri);
+    if (aws_amazon_put_file($row->bucket, $file, $s3_path)) {
+      //update our table that we have uploaded the file.
+      db_update('aws_amazon_files')->fields(array('uri' => 'aws://' . $s3_path, 'status' => 1))
+        ->condition('fid', $row->fid)->execute();
+      //now delete the file from file system
+      file_unmanaged_delete($file);
+      //clear cache
+      cache_clear_all('field:' . $row->entity_type . ':' . $row->entity_id, 'cache_field');
+    }
+  }
+}
+
+/**
+ * Implements hook_file_delete().
+ */
+function aws_amazon_file_delete($file) {
+  //check if this is an s3 file. if yes delete it.
+  if (isset($file->aws_uri) && strpos($file->aws_uri, 'aws://') !== FALSE) {
+    $data = db_select('aws_amazon_files', 'aw')->fields('aw', array('bucket'))->condition('fid', $file->fid)
+      ->execute()->fetchObject();
+    if (aws_amazon_delete_file($data->bucket, str_replace('aws://', '', $file->aws_uri))) {
+      db_delete('aws_amazon_files')->condition('fid', $file->fid)->execute();
+    }
+  }
+}
+
+/**
+ * Implements hook_disable().
+ * restore files that were upload
+ */
+function aws_amazon_disable() {
+  //if files were uploaded to s3, restore them back on file system
+  $query = db_select('aws_amazon_files', 'afs')->fields('afs');
+  $query->innerJoin('file_managed', 'fm', 'fm.fid = afs.fid');
+  $query->addField('fm', 'uri', 'orig_uri');
+  $result = $query->condition('afs.status', 1) //only uploaded files
+    ->condition('fm.status', FILE_STATUS_PERMANENT) //only permanent files
+    ->execute();
+  foreach ($result as $row) {
+    //get original upload path of the file. we need to ensure public:// and private:// path
+    $file = drupal_realpath($row->orig_uri);
+    $s3_path = str_replace('aws://', '', $row->uri);
+    if (aws_amazon_get_file($row->bucket, $s3_path, $file)) {
+      aws_amazon_delete_file($row->bucket, $s3_path);
+      //reset the status so that if the module is enabled we reupload it.
+      db_update('aws_amazon_files')->fields(array('status' => 0))->condition('fid', $row->fid)->execute();
+    }
+  }
+}
+
+/**
+ * Implements hook_file_load().
+ */
+function aws_amazon_file_load($files) {
+  $result = db_select('aws_amazon_files', 'aw')->fields('aw', array('fid', 'uri'))
+    ->condition('fid', array_keys($files))->execute();
+  foreach ($result as $row) {
+    $files[$row->fid]->aws_uri = $row->uri;
+  }
+}
+
+/**
+ * upload form to s3
+ */
+function aws_amazon_upload_s3($bucket) {
+  return theme('aws_amazon_s3_upload', compact('bucket'));
+}
+
+/**
+ * $s3path: object path in S3
+ * $timeout: epoch time e.g. strtotime('+1 day')
+ */
+function aws_amazon_cf_url($s3path, $timeout) {
+  require_once 'sites/all/libraries/AWSSDKforPHP/sdk.class.php';
+  $url = '';
+  $cf = new AmazonCloudFront(array(
+    'key' => variable_get('aws_amazon_access_key', ''),
+    'secret' => variable_get('aws_amazon_secret_key', ''),
+  ));
+  $path = variable_get('aws_amazon_cloudfront_pk', '');
+  try {
+    if (!empty($path)) {
+      $fp=fopen($path,"r"); 
+      $priv_key=fread($fp,8192); 
+      fclose($fp);
+      $cf->set_private_key($priv_key);
+
+      $cf->set_keypair_id(variable_get('aws_amazon_cloudfront_kpid', ''));
+
+      $url = $cf->get_private_object_url(variable_get('aws_amazon_cloudfront_dh', ''), $s3path, $timeout);
+    }
+  }
+  catch(Exception $ex) {
+    watchdog_exception('php', $ex);
+  }
+  return $url;
+}

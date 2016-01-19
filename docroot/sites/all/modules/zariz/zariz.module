@@ -1,0 +1,1716 @@
+<?php
+
+/**
+ * @file
+ * Content Revision Control.
+ */
+
+/**
+ * Indicate a branch can be merged.
+ */
+define('ZARIZ_BRANCH_IS_MERGABLE', 0);
+
+/**
+ * Indicate branch has no content in it.
+ */
+define('ZARIZ_BRANCH_HAS_NO_CONTENT', 1);
+
+/**
+ * Indicate a branch can not be merged due to conflicts with newer content.
+ */
+define('ZARIZ_BRANCH_HAS_CONFLICTS', 2);
+
+/**
+ * Indicate a branch was already merged.
+ */
+define('ZARIZ_BRANCH_IS_MERGED', 3);
+
+/**
+ * Indicate a branch can not be merged as it is the "master" branch.
+ */
+define('ZARIZ_BRANCH_IS_MASTER', 4);
+
+/**
+ * Implements hook_entity_info().
+ */
+function zariz_entity_info() {
+  $items['snapshot'] = array(
+    'label' => t('Snapshot'),
+    'controller class' => 'EntityAPIController',
+    'entity class' => 'Snapshot',
+    'base table' => 'zariz_snapshot',
+    'fieldable' => TRUE,
+    'entity keys' => array(
+      'id' => 'sid',
+    ),
+    'bundles' => array(
+      'snapshot' => array(
+        'label' => t('Snapshot'),
+      ),
+    ),
+    'view modes' => array(
+      'full' => array(
+        'label' => t('Full'),
+        'custom settings' => FALSE,
+      ),
+    ),
+    'module' => 'zariz',
+    'metadata controller class' => 'EntityDefaultMetadataController',
+  );
+  return $items;
+}
+
+/**
+ * Implements hook_entity_info_alter().
+ *
+ * Add "last id field name" property to determine which entities should be
+ * tracked by the Snapshot entity.
+ */
+function zariz_entity_info_alter(&$entity_info) {
+  $entity_info['node']['zariz'] = array(
+    'last id field name' => 'field_last_node',
+  );
+}
+
+
+
+/**
+ * Merge the content of a snapshot into another branch.
+ *
+ * We iterate over the content in the "merge from" branch, and clone it into the
+ * the "merge to" branch. Like this we confirm that the new content has higher
+ * entity ID.
+ *
+ * @param $from_branch_id
+ *   The branch node ID.
+ * @param $to_branch_id
+ *   Optional; The other branch node ID to merge to. If empty, the parent
+ *   branch would be used. Defaults to NULL.
+ *
+ * @todo: What to do if there is no content to merge?
+ *
+ * @return Snapshot
+ *   The snapshot entity created in the other branch, or FALSE if there was no
+ *   content to merge.
+ *
+ * @throw Exception
+ *   Throws exception if entity did not replicate.
+ *
+ */
+function zariz_merge_branch($from_branch_id, $to_branch_id = NULL) {
+  $master_nid = variable_get('zariz_master_branch');
+  if (!$to_branch_id && $from_branch_id == $master_nid) {
+    throw new Exception('The master branch has no parent branch to merge into.');
+  }
+
+  $params = array(
+    '@from-id' => $from_branch_id,
+    '@to-id' => $to_branch_id,
+  );
+
+  if (zariz_get_merge_conflicts($from_branch_id, $to_branch_id)) {
+    throw new Exception(format_string('Cannot merge branch @from-id to @to-id as they are conflicting branches.', $params));
+  }
+
+  $wrapper = entity_metadata_wrapper('node', $from_branch_id);
+  if ($wrapper->field_branch_merged->value()) {
+    throw new Exception(format_string('Branch @from-id is already marked as merged.', $params));
+  }
+
+  $to_branch_id = $to_branch_id ? $to_branch_id : $wrapper->field_parent_branch->getIdentifier();
+
+  // Lock the existing snapshots in both branches.
+  $from_snapshot = zariz_get_snapshot_from_branch($from_branch_id);
+  $from_snapshot->lock();
+
+  $to_snapshot = zariz_get_snapshot_from_branch($to_branch_id);
+  $to_snapshot->lock();
+
+  foreach (array_keys(zariz_get_tracked_entity_types()) as $entity_type) {
+    $entity_info = entity_get_info($entity_type);
+    $id_key = $entity_info['entity keys']['id'];
+
+    // Clone content from "merge from" to "merge to" branch.
+    $query = new EntityFieldQuery();
+    $result = $query
+      ->entityCondition('entity_type', $entity_type)
+      ->entityCondition('bundle', array_keys(zariz_get_group_content_bundles($entity_type)))
+      ->fieldCondition('field_branch', 'target_id', $from_branch_id)
+      ->propertyOrderBy($id_key)
+      ->execute();
+
+    if (empty($result[$entity_type])) {
+      // No content to merge.
+      continue;
+    }
+
+    $ids = array_keys($result[$entity_type]);
+
+    $entity_items = entity_load($entity_type, $ids);
+    foreach ($entity_items as $entity_item) {
+      // Replicate the entity, only after we changed the branch it belongs to.
+      $wrapper_item = entity_metadata_wrapper($entity_type, $entity_item);
+      $wrapper_item->field_branch->set($to_branch_id);
+      if (!$new_id = replicate_entity($entity_type, $entity_item)) {
+        $params = array(
+          '@type' => $entity_type,
+          '@id' => $wrapper_item->getIdentifier(),
+          '@branch_id' => $to_branch_id,
+        );
+        throw new Exception(format_string('Could not merge @type with ID @id into branch ID @branch_id', $params));
+      }
+    }
+  }
+
+  // Mark "from branch" as merged.
+  $wrapper->field_branch_merged->set(TRUE);
+  $wrapper->save();
+
+  // Lock and return the newely created snapshot.
+  $snapshot = zariz_get_snapshot_from_branch($to_branch_id);
+  $snapshot->lock();
+  return $snapshot;
+}
+
+/**
+ * Get entities that have a merge conflict.
+ *
+ * A merge conflict can happen when content with same UUID on the "to branch"
+ * was already updated, and the entity ID is higher than the one in the "from
+ * branch".
+ *
+ * @param $from_branch_id
+ *   The branch node ID.
+ * @param $to_branch_id
+ *   Optional; The other branch node ID to merge to. If empty, the parent
+ *   branch would be used. Defaults to NULL.
+ * @param $entity_types
+ *   (optional) Array of entity types to check for merge conflicts. If empty,
+ *   all entities that are registered to be tracked by Zariz will be checked.
+ *
+ * @return
+ *   Array keyed by the enity type and UUID, ans as values the entity ID from
+ *   the "from branch" and the entity ID from the "to branch" as the value.
+ */
+function zariz_get_merge_conflicts($from_branch_id, $to_branch_id = NULL, $entity_types = array()) {
+  $from_branch_wrapper = entity_metadata_wrapper('node', $from_branch_id);
+  $to_branch_id = $to_branch_id ? $to_branch_id : $from_branch_wrapper->field_parent_branch->getIdentifier();
+
+  $entity_types = $entity_types ? $entity_types : array_keys(zariz_get_tracked_entity_types());
+  $found_conflicts = FALSE;
+
+  $values = array();
+
+  foreach ($entity_types as $entity_type) {
+
+    $entity_info = entity_get_info($entity_type);
+    $id_key = $entity_info['entity keys']['id'];
+
+    $query = new EntityFieldQuery();
+    $result = $query
+      ->entityCondition('entity_type', $entity_type)
+      ->entityCondition('bundle', array_keys(zariz_get_group_content_bundles($entity_type)))
+      ->fieldCondition('field_branch', 'target_id', $from_branch_id)
+      ->range(0, 1)
+      ->propertyOrderBy($id_key)
+      ->execute();
+
+    if (empty($result[$entity_type])) {
+      // Nothing to merge.
+      continue;
+    }
+
+    $first_from_id = key($result[$entity_type]);
+
+    $query = new EntityFieldQuery();
+    $result = $query
+      ->entityCondition('entity_type', $entity_type)
+      ->entityCondition('bundle', array_keys(zariz_get_group_content_bundles($entity_type)))
+      ->fieldCondition('field_branch', 'target_id', $to_branch_id)
+      ->range(0, 1)
+      ->propertyOrderBy($id_key, 'DESC')
+      ->execute();
+
+    if (empty($result[$entity_type])) {
+      // No content in the "to branch".
+      continue;
+    }
+
+    $last_to_id = key($result[$entity_type]);
+
+    if ($last_to_id < $first_from_id) {
+      // The last entity ID of the "to branch" is lower than the first one in
+      // the "from branch", so no conflict.
+      continue;
+    }
+
+    // Get all the UUID from the "from branch".
+    $query = new EntityFieldQuery();
+    $result = $query
+      ->entityCondition('entity_type', $entity_type)
+      ->entityCondition('bundle', array_keys(zariz_get_group_content_bundles($entity_type)))
+      ->fieldCondition('field_branch', 'target_id', $from_branch_id)
+      ->execute();
+
+    $ids = array_keys($result[$entity_type]);
+    foreach (entity_load($entity_type, $ids) as $entity) {
+      $wrapper = entity_metadata_wrapper($entity_type, $entity);
+      $uuid = $wrapper->field_uuid->value();
+      $values[$entity_type][$uuid]['from'] = $wrapper->getIdentifier();
+    }
+
+    // Get the UUID values of the content from the "to branch" with higher entity
+    // ID then the first content from the "from branch."
+    $all_uuids = array_keys($values[$entity_type]);
+    $query = new EntityFieldQuery();
+    $result = $query
+      ->entityCondition('entity_type', $entity_type)
+      ->entityCondition('bundle', array_keys(zariz_get_group_content_bundles($entity_type)))
+      ->fieldCondition('field_branch', 'target_id', $to_branch_id)
+      ->fieldCondition('field_uuid', 'value', $all_uuids, 'IN')
+      ->propertyCondition($id_key, $first_from_id, '>')
+      ->propertyOrderBy($id_key)
+      ->execute();
+
+    if (empty($result[$entity_type])) {
+      // No matching UUIDs found.
+      continue;
+    }
+
+    $ids = array_keys($result[$entity_type]);
+    foreach (entity_load($entity_type, $ids) as $entity) {
+      $wrapper = entity_metadata_wrapper($entity_type, $entity);
+      $uuid = $wrapper->field_uuid->value();
+      $id = $wrapper->getIdentifier();
+
+      if ($id > $values[$entity_type][$uuid]['from']) {
+        $values[$entity_type][$uuid]['to'] = $id;
+        $found_conflicts = TRUE;
+      }
+    }
+  }
+
+
+  return $found_conflicts ? $values : NULL;
+}
+
+/**
+ * Determines if a branch can be merged.
+ *
+ * @param $branch_id
+ *   The node ID or object of the branch.
+ *
+ * @return
+ *   TRUE if branch can be merged.
+ */
+function zariz_is_mergable($branch_id) {
+  return zariz_get_merge_status($branch_id) == ZARIZ_BRANCH_IS_MERGABLE;
+}
+
+/**
+ * Determines if a branch is the "master" branch.
+ *
+ * @param $branch_id
+ *   The node ID of the branch.
+ *
+ * @return
+ *   TRUE if a branch is the "master" branch.
+ */
+function zariz_is_master_branch($branch_id) {
+  $master_nid = variable_get('zariz_master_branch');
+  return $branch_id == $master_nid;
+}
+/**
+ * Return the merge status of a branch.
+ *
+ * @param $branch_id
+ *   The node ID or object of the branch.
+ *
+ */
+function zariz_get_merge_status($branch_id) {
+  if (zariz_is_master_branch($branch_id)) {
+    return ZARIZ_BRANCH_IS_MASTER;
+  }
+
+  $wrapper = entity_metadata_wrapper('node', $branch_id);
+  if ($wrapper->field_branch_merged->value()) {
+    return ZARIZ_BRANCH_IS_MERGED;
+  }
+
+  if (zariz_get_merge_conflicts($branch_id)) {
+    return ZARIZ_BRANCH_HAS_CONFLICTS;
+  }
+
+  // Check there's content in the branch.
+  $query = new EntityFieldQuery();
+  $result = $query
+    ->entityCondition('entity_type', 'og_membership')
+    ->propertyCondition('gid', $branch_id)
+    ->propertyCondition('entity_type', 'user', '<>')
+    ->count()
+    ->execute();
+
+  if (!$result) {
+    return ZARIZ_BRANCH_HAS_NO_CONTENT;
+  }
+
+  return ZARIZ_BRANCH_IS_MERGABLE;
+}
+
+/**
+ * Get the node IDs of the parents of the branch, including the node itself.
+ *
+ * @param $branch_nid
+ *   The branch ID or node.
+ * @param $include
+ *   Determines if to include the given branch ID. Defaults to TRUE.
+ * @param $ids
+ *   Internal use; Array of the parent IDs, used in this recursive function.
+ *
+ * @return
+ *   Array with the branch node ID, and it's parents. The top most parent is the
+ *   last element in the array.
+ */
+function zariz_get_branch_parents_ids($branch_nid, $include = TRUE, $ids = array()) {
+  $wrapper = entity_metadata_wrapper('node', $branch_nid);
+
+  $branch_node = $wrapper->value();
+  if ($include) {
+    $ids[] = $branch_node->nid;
+  }
+
+
+  if (!$parent_node = $wrapper->field_parent_branch->value()) {
+    // We reached the top most parent.
+    return $ids;
+  }
+
+  // Call function, with the parent node.
+  $ids = zariz_get_branch_parents_ids($parent_node, TRUE, $ids);
+  return $ids;
+}
+
+/**
+ * Get the snapshot IDs of the parents of the snapshot, including the snapshot itself.
+ *
+ * @param $snapshot_id
+ *   The branch ID or node.
+ * @param $strict_snapshot
+ *   Determines if the parent snapshot should be the real parent snapshot, or
+ *   the last snapshot the exists in the Branch. If using the last snapshot then
+ *   the returned values will include content that was inserted or deleted after
+ *   the branch was created. If TRUE, then only the content that was created
+ *   exactly when the branch was created will be show. Defaults to FALSE.
+ *
+ * @return
+ *   array with the snapshot ID, and it's parents. The top most parent is the
+ *   last element in the array.
+ */
+function zariz_get_snapshot_parents_ids($snapshot_id, $strict_snapshot = FALSE) {
+  if ($strict_snapshot) {
+    return zariz_get_snapshot_parents_ids_strict($snapshot_id);
+  }
+
+  return zariz_get_snapshot_parents_ids_not_strict($snapshot_id);
+}
+
+
+/**
+ * Helper function; Return the snapshot parents in strict mode.
+ *
+ * @param $snapshot_id
+ *   The branch ID or node.
+ * @param $ids
+ *   Internal use. Array of the parent IDs, used in this recursive function.
+ *
+ * @return
+ *   array with the snapshot ID, and it's parents. The top most parent is the
+ *   last element in the array.
+ *
+ * @see zariz_get_snapshot_parents_ids().
+ */
+function zariz_get_snapshot_parents_ids_strict($snapshot_id, $ids = array()) {
+  $wrapper = entity_metadata_wrapper('snapshot', $snapshot_id);
+  $ids[] = $snapshot_id;
+
+  if (!$parent_snapshot = $wrapper->field_snapshot->value()) {
+    // We reached the top most parent.
+    return $ids;
+  }
+
+  // Call function, with the parent snapshot.
+  $ids = zariz_get_snapshot_parents_ids($parent_snapshot, $ids);
+  return $ids;
+}
+
+/**
+ * Helper function; Return the snapshot parents in a non-strict mode.
+ *
+ * @param $snapshot_id
+ *   The branch ID or node.
+ * @param $ids
+ *   Internal use. Array of the parent IDs, used in this recursive function.
+ *
+ * @return
+ *   array with the snapshot ID, and it's parents. The top most parent is the
+ *   last element in the array.
+ *
+ * @see zariz_get_snapshot_parents_ids().
+ */
+function zariz_get_snapshot_parents_ids_not_strict($snapshot_id, $ids = array()) {
+  // Get all the parent branches.
+  $ids = array($snapshot_id);
+  $snapshot = entity_load_single('snapshot', $snapshot_id);
+  $branch_ids = zariz_get_branch_parents_ids($snapshot->nid);
+
+  foreach ($branch_ids as $branch_id) {
+    $snapshot = zariz_get_snapshot_from_branch($branch_id);
+    $ids[] = $snapshot->sid;
+  }
+
+  return $ids;
+}
+
+/**
+ * Return array with the last entity IDs per branch, and the deleted entity IDs.
+ *
+ * @param $snapshot_id
+ *   The snapshot ID.
+ * @param $entity_types
+ *   Array of the entity type of the last ID that should be returned. If empty
+ *   array, all entity types tracked by Zariz will be used.
+ * @param $deleted_ids_field_name
+ *   The name of the field that holds the the "deleted" entity ID. Defaults to
+ *   "field_deleted_nodes".
+ * @param $strict_snapshot
+ *   Determines if the parent snapshot should be the real parent snapshot, or
+ *   the last snapshot the exists in the Branch. If using the last snapshot then
+ *   the returned values will include content that was inserted or deleted after
+ *   the branch was created. If TRUE, then only the content that was created
+ *   exactly when the branch was created will be show. Defaults to FALSE.
+ *
+ * @return
+ *   Array keyed with:
+ *   - last_ids: array keyed by the branch node ID and the entity type. The
+ *     last entity ID as value.
+ *   - @todo: deleted_ids: array of entity IDs.
+ */
+function zariz_get_last_entity_ids_by_snapshot($snapshot_id, $entity_types = array(), $strict_snapshot = FALSE) {
+  $sids = zariz_get_snapshot_parents_ids($snapshot_id, $strict_snapshot);
+
+  $snapshots = entity_load('snapshot', $sids);
+
+  $entity_types = $entity_types ? $entity_types : array_keys(zariz_get_tracked_entity_types());
+
+  $return = array('last_ids' => array(), 'deleted_ids' => array());
+  foreach ($snapshots as $snapshot) {
+    $wrapper = entity_metadata_wrapper('snapshot', $snapshot);
+    $branch_id = $snapshot->nid;
+    foreach ($entity_types as $entity_type) {
+      $field_name = zariz_get_last_id_field_name($entity_type);
+      $return['last_ids'][$branch_id][$entity_type] = $wrapper->{$field_name}->getIdentifier();
+    }
+
+
+    // @todo: Return deleted items.
+  }
+
+  return $return;
+}
+
+/**
+ * Return array of all group content that has "field_branch" field.
+ *
+ * @param $entity_type
+ *   The entity type. Defaults to "node".
+ *
+ * @return
+ *   Array keyed by the bundle name, and the bundle label as value. Empty array
+ *   if no bundles exist for the entity type.
+ */
+function zariz_get_group_content_bundles($entity_type = 'node') {
+  $field = field_info_field('field_branch');
+  if (empty($field['bundles'][$entity_type])) {
+    return array();
+  }
+
+  $entity_info = entity_get_info($entity_type);
+  if (empty($entity_info['bundles'])) {
+    return array();
+  }
+
+  $return = array();
+  foreach ($field['bundles'][$entity_type] as $bundle) {
+    $return[$bundle] = $entity_info['bundles'][$bundle]['label'];
+  }
+
+  return $return;
+}
+
+/**
+ * Return an array of entity types that are registered to tracked by Zariz.
+ *
+ * @return
+ *   Array keyed by the entity type name, and the Zariz properties array as
+ *   value.
+ */
+function zariz_get_tracked_entity_types() {
+  $return = array();
+  foreach (entity_get_info() as $entity_type => $info) {
+    if (empty($info['zariz'])) {
+      continue;
+    }
+
+    $return[$entity_type] = $info['zariz'];
+  }
+
+  return $return;
+}
+
+
+/**
+ * Determines if a bundle is tracked by Zariz.
+ *
+ * @param $entity_type
+ *   The entity type name.
+ * @param $bundle
+ *   The bundle na,e.
+ *
+ * @return bool
+ *   TRUE if the bundle is tracked by Zariz.
+ */
+function zariz_is_bundle_tracked($entity_type, $bundle) {
+  if (!in_array($entity_type, array_keys(zariz_get_tracked_entity_types()))) {
+    return;
+  }
+
+  return og_is_group_content_type($entity_type, $bundle);
+}
+
+/**
+ * Get the name of the "last id field name" by entity type.
+ *
+ * @param $entity_type
+ *   The entity type.
+ *
+ * @return string
+ *   The field name if exists, or NULL.
+ */
+function zariz_get_last_id_field_name($entity_type) {
+  $entity_info = entity_get_info($entity_type);
+  if (empty($entity_info['zariz'])) {
+    return;
+  }
+
+  return $entity_info['zariz']['last id field name'];
+}
+
+/**
+ * Get the node IDs of "deleted" nodes, that should be excluded.
+ *
+ * @param $branch_nid
+ *   The branch node.
+ * @return
+ *   array with the node IDs.
+ */
+function zariz_get_deleted_node_ids($branch_nid) {
+  $branch_ids = zariz_get_branch_parents_ids($branch_nid);
+
+  // Get all the deleted node IDs in the branches.
+  $query = new EntityFieldQuery();
+  $result = $query
+    ->entityCondition('entity_type', 'node')
+    ->entityCondition('bundle', array_keys(zariz_get_group_content_bundles()))
+    ->fieldCondition('field_deleted', 'value', TRUE)
+    ->fieldCondition(field_branch, 'target_id', $branch_ids, 'IN')
+    ->execute();
+
+  if (empty($result['node'])) {
+    return array();
+  }
+
+  // Load all the deleted nodes, to get their UUID, so we can exclude also their
+  // non-deleted version.
+  $uuids = array();
+  foreach (node_load_multiple(array_keys($result['node'])) as $node) {
+    $wrapper = entity_metadata_wrapper('node', $node);
+    $uuid = $wrapper->field_uuid->value();
+    $uuids[$uuid] = TRUE;
+  }
+
+  // Query for the nodes, based on the UUID in the parent branches.
+  $query = new EntityFieldQuery();
+  $result = $query
+    ->entityCondition('entity_type', 'node')
+    ->entityCondition('bundle', array_keys(zariz_get_group_content_bundles()))
+    ->fieldCondition('field_branch', 'target_id', $branch_ids, 'IN')
+    ->fieldCondition('field_uuid', 'value', array_keys($uuids), 'IN')
+    ->execute();
+
+  return array_keys($result['node']);
+}
+
+/**
+ * Implements hook_field_access().
+ */
+function zariz_field_access($op, $field, $entity_type, $entity, $account) {
+  $field_names = array(
+    'field_branch_merged',
+    'field_deleted_snapshots',
+    'field_is_updated',
+    'field_uuid',
+  );
+  if ($op == 'edit' && in_array($field['field_name'], $field_names)) {
+    return FALSE;
+  }
+}
+
+
+/**
+ * Utility function; Create a new branch form an existing one.
+ *
+ * @param $branch_name
+ *   The branch name.
+ * @param $parent_branch
+ *   Optional; The node object of the parent branch.
+ * @param $account
+ *   Optional; The user object to use as the node author.
+ *
+ * @return
+ *   The branch node object.
+ */
+function zariz_create_branch($branch_name, $parent_branch = NULL, $account = NULL) {
+  global $user;
+
+  $values = array(
+    'type' => 'branch',
+    'title' => $branch_name,
+    'uid' => !empty($account) ? $account->uid : $user->uid,
+  );
+  $node = entity_create('node', $values);
+
+  $wrapper = entity_metadata_wrapper('node', $node);
+  $wrapper->{OG_GROUP_FIELD}->set(TRUE);
+
+  if ($parent_branch) {
+    $wrapper->field_parent_branch->set($parent_branch);
+  }
+
+  $wrapper->save();
+
+  return $node;
+}
+
+/**
+ * Implements hook_entity_presave().
+ *
+ * Populate a unique ID value.
+ */
+function zariz_entity_presave($entity, $entity_type) {
+  if (!empty($entity->nid)) {
+    return;
+  }
+
+  $wrapper = entity_metadata_wrapper($entity_type, $entity);
+  $bundle = $wrapper->getBundle();
+  if ($entity_type == 'node' && $bundle == 'branch') {
+    _zariz_validate_branch_presave($entity);
+
+    // Explicitly set the "field_branch_merged" to FALSE is it is NULL, to allow
+    // easier use of EntityFieldQuery that doesn't support querying over NULL
+    // values.
+    if (!$wrapper->field_branch_merged->value()) {
+      $wrapper->field_branch_merged->set(FALSE);
+    }
+
+  }
+
+  if (!zariz_is_bundle_tracked($entity_type, $bundle)) {
+    return;
+  }
+
+  _zariz_validate_group_content_presave($entity_type, $entity);
+
+  if (!$uuid = $wrapper->field_uuid->value()) {
+    // UUID doesn't exist.
+    $uuid = md5(rand());
+    $wrapper->field_uuid->set($uuid);
+  }
+
+  // Check if the UUID already exists.
+  $query = new EntityFieldQuery();
+  $result = $query
+    ->entityCondition('entity_type', $entity_type)
+    ->entityCondition('bundle', array_keys(zariz_get_group_content_bundles($entity_type)))
+    ->fieldCondition('field_uuid', 'value', $uuid)
+    ->range(0, 1)
+    ->execute();
+
+  if (empty($result[$entity_type])) {
+    return;
+  }
+
+  // Set the "Is updated" field to TRUE, and keep the same "created" date of the
+  // content. Like this, even if the entity IDs are changing, we can still query
+  // by the entity create date.
+  $wrapper->field_is_updated->set(TRUE);
+  $id = key($result[$entity_type]);
+  $previous_entity = entity_load_single($entity_type, $id);
+
+  $entity->created = $previous_entity->created;
+  $entity->changed = $previous_entity->changed;
+}
+
+/**
+ * Helper function; Validate a branch can be created.
+ *
+ * @param $node
+ *   The node object.
+ *
+ * @throws Exception
+ *
+ * @see zariz_node_presave()
+ */
+function _zariz_validate_branch_presave($node) {
+  if ($master_nid = variable_get('zariz_master_branch')) {
+    // There can be only a single "master" branch.
+    $wrapper = entity_metadata_wrapper('node', $node);
+    if (!$wrapper->field_parent_branch->value()) {
+      $master_node = node_load($master_nid);
+      $params = array(
+        '@title' => $node->title,
+        '@master' => $master_node->title,
+      );
+      throw new Exception(format_string('Branch @title cannot be a "master" branch, as @master already exists.', $params));
+    }
+  }
+
+  // Check branch doesn't exist already.
+  $query = new EntityFieldQuery();
+  $result = $query
+    ->entityCondition('entity_type', 'node')
+    ->entityCondition('bundle', 'branch')
+    ->propertyCondition('title', $node->title)
+    ->count()
+    ->execute();
+
+  if ($result) {
+    throw new Exception(format_string('Branch @name already exists.', array('@name' => $node->title)));
+  }
+}
+
+/**
+ * Helper function; Validate a group content can be created or updated.
+ *
+ * Group content cannot be changed if it belongs to a locked snapshot.
+ *
+ * @param $entity_type
+ *   The entity type.
+ * @param $entity
+ *   The entity object.
+ *
+ * @throws Exception
+ *
+ * @see zariz_node_presave()
+ */
+function _zariz_validate_group_content_presave($entity_type, $entity) {
+  list($id) = entity_extract_ids($entity_type, $entity);
+  if (empty($id)) {
+    return;
+  }
+
+  $wrapper = entity_metadata_wrapper($entity_type, $entity);
+  $branch_id = $wrapper->field_branch->getIdentifier();
+
+  $snapshot = zariz_get_snapshot_from_branch($branch_id);
+  if ($snapshot->isLocked()) {
+    $params = array(
+      '@type' => $entity_type,
+      '@id' => $id,
+    );
+    throw new Exception(format_string('Entity @type with ID @id cannot be saved, as it belongs to a locked snapshot.', $params));
+  }
+}
+
+/**
+ * Implements hook_node_insert().
+ */
+function zariz_node_insert($node) {
+  if ($node->type != 'branch') {
+    return;
+  }
+  if (!variable_get('zariz_master_branch')) {
+    // Set the branch as the "master" branch.
+    variable_set('zariz_master_branch', $node->nid);
+  }
+
+  $wrapper = entity_metadata_wrapper('node', $node);
+  $parent_branch = $wrapper->field_parent_branch->value();
+  $parent_snapshot = $parent_branch ? zariz_get_snapshot_from_branch($parent_branch->nid) : NULL;
+
+  // Create a new Snapshot.
+  $snapshot = zariz_get_snapshot_from_branch($node->nid, TRUE, 0, $parent_snapshot);
+  $snapshot->save();
+}
+
+/**
+ * Implements hook_og_membership_insert().
+ */
+function zariz_og_membership_insert(OgMembership $og_membership) {
+  if (!empty($og_membership->_skip_zariz_snapshot)) {
+    // Entity explicitly set to skip snapshot creation. This can be used by
+    // implementing modules that want for example to create several entities and
+    // only then create a snapshot for them.
+    return;
+  }
+
+  $entity_type = $og_membership->entity_type;
+  $id = $og_membership->etid;
+  $wrapper = entity_metadata_wrapper($entity_type, $id);
+  $bundle = $wrapper->getBundle();
+  if (!zariz_is_bundle_tracked($entity_type, $bundle)) {
+    return;
+  }
+
+  $branch_id = $og_membership->gid;
+
+  // Add entity to snapshot.
+  zariz_snapshot_set_last_entity_id($branch_id, $entity_type, $id);
+}
+
+/**
+ * Set the last entity ID of a snapshot.
+ *
+ * @param $branch_id
+ *   The branch ID.
+ * @parm $id
+ *   The entity ID to set as last.
+ * @param $entity_type
+ *   The entity type of the last ID that should be registered.
+ * @param Snapshot $snapshot
+ *   Optional; The snapshot to set. If NULL, the latest snapshot or a new one
+ *   if none found, will be used.
+ *
+ * @return
+ *   The saved Snapshot entity.
+ */
+function zariz_snapshot_set_last_entity_id($branch_id, $entity_type, $id, Snapshot $snapshot = NULL) {
+  $field_name = zariz_get_last_id_field_name($entity_type);
+  $snapshot = $snapshot ? $snapshot : zariz_get_snapshot_from_branch($branch_id, TRUE);
+
+  $snapshot_wrapper = entity_metadata_wrapper('snapshot', $snapshot);
+  $snapshot_wrapper->{$field_name}->set($id);
+  $snapshot_wrapper->save();
+  return $snapshot;
+}
+
+/**
+ * Returns the latest snapshot object of a branch.
+ *
+ * @param $branch_id
+ *   The branch ID.
+ * @param $create
+ *   Determine if a new Snapshot should be created if none exists. $offset
+ *   should be set to 0. Defaults to FALSE.
+ * @param $offset
+ *   The offest from the latest snapshot. Defaults to 0, which is the latest
+ *   snapshot created.
+ *  * @param $parent_snapshot
+ *   Optioanl; The parent snapshot object. If not set, function will try to get
+ *   a previous parent from same branch.
+ *
+ * @return Snapshot
+ *   The Snapshot entity object if found, or un-unsaved Snapshot entity if non
+ *   found and $create set to TRUE, or NULL.
+ *
+ */
+function zariz_get_snapshot_from_branch($branch_id, $create = FALSE, $offset = 0, $parent_snapshot = NULL) {
+  $query = new EntityFieldQuery();
+  $query
+    ->entityCondition('entity_type', 'snapshot')
+    ->propertyCondition('nid', $branch_id)
+    ->range($offset, $offset + 1)
+    ->propertyOrderBy('sid', 'DESC');
+
+  if ($create) {
+    // If we need to create a snapshot, make sure we are not returning an
+    // existing yet locked one.
+    $query->propertyCondition('locked', TRUE, '<>');
+  }
+
+  $result = $query->execute();
+
+  if (empty($result['snapshot'])) {
+    if (!$create) {
+      return;
+    }
+
+    if ($offset) {
+      throw new Exception('Offset value should be 0, when calling zariz_get_snapshot_from_branch() with $create set to TRUE.');
+    }
+
+    $parent_snapshot = $parent_snapshot ? $parent_snapshot : zariz_get_snapshot_from_branch($branch_id, FALSE);
+
+    $values = array(
+      'nid' => $branch_id,
+      'parent_sid' => !empty($parent_snapshot) ? $parent_snapshot->sid : NULL,
+      'created' => time(),
+    );
+    $snapshot = entity_create('snapshot', $values);
+
+    if ($parent_snapshot) {
+      // Copy the last entity ID fields from the parent.
+      foreach (zariz_get_tracked_entity_types() as $info) {
+        $field_name = $info['last id field name'];
+        $snapshot->{$field_name} = $parent_snapshot->{$field_name};
+      }
+    }
+
+    return $snapshot;
+  }
+
+  $sid = key($result['snapshot']);
+  return entity_load_single('snapshot', $sid);
+}
+
+/**
+ * Get the Snapshot an entity belongs to.
+ *
+ * @param $entity_type
+ *   The entity type.
+ * @param $entity
+ *   The entity object.
+ *
+ * @return Snapshot
+ *   The Snapshot object, or NULL if not found.
+ */
+function zariz_get_snapshot_from_content($entity_type, $entity) {
+  list($id,, $bundle) = entity_extract_ids($entity_type, $entity);
+  if (!zariz_is_bundle_tracked($entity_type, $bundle)) {
+    // Bundle isn't tracked by Zariz.
+    return;
+  }
+
+  $wrapper = entity_metadata_wrapper($entity_type, $entity);
+  $branch_id = $wrapper->field_branch->getIdentifier();
+
+  $field_name = zariz_get_last_id_field_name($entity_type);
+
+  $query = new EntityFieldQuery();
+  $result = $query
+    ->entityCondition('entity_type', 'snapshot')
+    ->fieldCondition($field_name, 'target_id', $id, '>=')
+    ->propertyCondition('nid', $branch_id)
+    ->range(0, 1)
+    ->propertyOrderBy('sid')
+    ->execute();
+
+  if (empty($result['snapshot'])) {
+    return;
+  }
+
+  $sid = key($result['snapshot']);
+  return entity_load_single('snapshot', $sid);
+}
+
+/**
+ * Implements hook_entity_delete().
+ *
+ * Safe guard against deleting any entity tracked by Zariz, unless explicitly
+ * allowed by setting the property "zariz_allow_delete".
+ */
+function zariz_entity_delete($entity, $entity_type) {
+  list(,, $bundle) = entity_extract_ids($entity_type, $entity);
+  if (!zariz_is_bundle_tracked($entity_type, $bundle)) {
+    // Bundle isn't tracked by Zariz.
+    return;
+  }
+
+  if (!empty($entity->zariz_allow_delete)) {
+    // Explicitly allow delete.
+    return;
+  }
+
+  throw new Exception('It is illegal to delete an entity tracked by Zariz.');
+}
+
+/**
+ * Implements hook_clone_node_alter().
+ *
+ * Preserve the original node title on clone, and set the branch by context.
+ */
+function zariz_clone_node_alter($node, $context) {
+  if ($context['method'] != 'prepopulate') {
+    return;
+  }
+
+  $og_context = og_context();
+  // Use the original node title.
+  $node->title = $context['original_node']->title;
+
+  // Check the context is a child of the existing branch.
+  $wrapper = entity_metadata_wrapper('node', $node);
+
+  $branch_id = $wrapper->field_branch->getIdentifier();
+
+  if ($branch_id == $og_context['gid']) {
+    // We are cloning inside the same branch, which is the only way to update
+    // an existing node.
+    return;
+  }
+
+  $branch_ids = zariz_get_branch_parents_ids($branch_id);
+
+  if (!in_array($branch_id, $branch_ids)) {
+    $new_branch = node_load($og_context['gid']);
+    $params = array(
+      '@origin' => $wrapper->field_branch->label(),
+      '@destination' => $new_branch->title,
+    );
+    throw new Exception(format_string('Cannot clone content from branch @origin to @destination as it was not branched from it.', $params));
+  }
+
+  // Set the group audience field according to the existing context.
+  $wrapper->field_branch->set($og_context['gid']);
+}
+
+/**
+ * Implements hook_query_branch_context_alter().
+ *
+ * @see \SelectQuery::__toString
+ */
+function zariz_query_zariz_alter(QueryAlterableInterface $query) {
+  if (!$query->hasTag('zariz')) {
+    return;
+  }
+
+  $branch_id = FALSE;
+
+  if ($zariz = $query->getMetaData('zariz')) {
+    // Get branch ID from query metadata.
+    $branch_id = $zariz['branch_id'];
+  }
+  elseif (module_exists('og_context') && $og_context = og_context()) {
+    if ($og_context['group_type'] != 'node') {
+      return;
+    }
+    // Get branch ID from context.
+    $branch_id = $og_context['gid'];
+  }
+
+  if (!$branch_id) {
+    // No branch ID found.
+    return;
+  }
+
+  $snapshot = zariz_get_snapshot_from_branch($branch_id);
+
+  $node_alias = FALSE;
+  $tables = &$query->getTables();
+  foreach ($tables as $alias => $info) {
+    if ($info['table'] == 'node') {
+      $node_alias = $alias;
+      break;
+    }
+  }
+
+  if (!$node_alias) {
+    return;
+  }
+
+  // Get the content up to the last entity ID of that branch.
+  $query->innerJoin('og_membership', 'ogm', "ogm.etid = $node_alias.nid");
+
+  // @todo: Remove entit type hardcoding.
+  $entity_type = 'node';
+  $nids = zariz_get_last_entity_ids_by_snapshot($snapshot->sid, array($entity_type));
+
+  // WHERE (ogm.gid = :gid1 AND n.last_node = :nid1) OR (ogm.gid = :gid2 AND n.last_node = :nid2)
+  $db_or = db_or();
+  foreach ($nids['last_ids'] as $gid => $last_id) {
+    $db_and = db_and();
+    $db_and->condition('ogm.gid', $gid);
+    $db_and->condition("$node_alias.nid", $last_id[$entity_type], '<=');
+    $db_or->condition($db_and);
+  }
+
+  $query->condition($db_or);
+
+  // The latest version of an edited content should be selected.
+  // This is done by getting the MAX() value of the entity ID.
+  $branch_ids = zariz_get_branch_parents_ids($branch_id);
+  $inner_query = db_select('node', $node_alias);
+
+  $field = field_info_field('field_uuid');
+  $table_name = _field_sql_storage_tablename($field);
+
+  $inner_query->innerJoin($table_name, 'field_uuid', "field_uuid.entity_id = $node_alias.nid");
+  $inner_query->innerJoin('og_membership', 'ogm', "ogm.etid = $node_alias.nid");
+  $inner_query
+    ->fields('field_uuid', array('field_uuid_value'))
+    ->condition('field_uuid.entity_type', 'node')
+    ->condition('ogm.gid', $branch_ids, 'IN')
+    ->groupBy('field_uuid.field_uuid_value');
+
+  $inner_query->addExpression("MAX($node_alias.nid)", 'nid');
+
+  $query->innerJoin($inner_query, 'max_nid', "max_nid.nid = $node_alias.nid");
+
+  // Inserted content should appear before edited content.
+  // @todo: Change to field_is_content_updated
+  $field = field_info_field('field_is_updated');
+  $table_name = _field_sql_storage_tablename($field);
+
+  $query->leftJoin($table_name, 'field_is_updated', "field_is_updated.entity_id = $node_alias.nid");
+  $query->fields('field_is_updated', array('field_is_updated_value'));
+
+  $query->orderBy('field_is_updated.field_is_updated_value', 'DESC');
+
+  if (count($branch_ids) > 1) {
+    // Order by group IDs, where the current branch is the first one, and the
+    // parent(s) are by order.
+    $query->addExpression('FIELD (ogm.gid, :args)', 'order_by_gid', array(':args' => $branch_ids));
+    $query->orderBy('order_by_gid');
+  }
+
+  // Group by entity ID to prevent duplication.
+  $query->groupBy("$node_alias.nid");
+}
+
+/**
+ * Implements hook_menu_alter().
+ */
+function zariz_menu_alter(&$items) {
+  $items['node/%node/edit']['access callback'] = 'zariz_node_access_by_snapshot_state';
+}
+
+/**
+ * Menu access; Determine if user can update a node.
+ *
+ * @todo: Support delete.
+ *
+ * @param $op
+ *   The operation to preform. Possible values are "update" and "delete".
+ * @param $node
+ *   The node object.
+ * @param $branch_id
+ *   The branch ID of the current context. If empty the OG-context would be
+ *   used.
+ *
+ * @return
+ *   TRUE if the operation may be performed, FALSE otherwise.
+ */
+function zariz_node_access_by_snapshot_state($op, $node, $branch_id = NULL) {
+  if (!node_access($op, $node)) {
+    return;
+  }
+
+  $bundles = array_keys(zariz_get_group_content_bundles());
+  if (!in_array($node->type, $bundles)) {
+    return TRUE;
+  }
+
+  $snapshot = zariz_get_snapshot_from_content('node', $node);
+
+  if (empty($branch_id)) {
+    // Get branch ID from context.
+    if (!$og_context = og_context()) {
+      // If we still doesn't have context, we don't deny access, as otherwise,
+      // it will fail og_context(). Returning TRUE gere means this function we
+      // be re-called later to determine the actual access.
+      return TRUE;
+    }
+    $branch_id = $og_context['gid'];
+  }
+
+  if (zariz_is_master_branch($branch_id)) {
+    // Always deny access on the "master" branch.
+    return;
+  }
+
+  if ($snapshot->nid != $branch_id) {
+    // The snapshot is not from the current branch, it means it is  not locked
+    // in the current context.
+    return TRUE;
+  }
+
+  return !$snapshot->isLocked();
+}
+
+/**
+ * Implements hook_node_info().
+ *
+ * Declare the Branch content type.
+ */
+function zariz_node_info() {
+  return array(
+    'branch' => array(
+      'name' => t('Branch'),
+      'description' => t('Branch with content.'),
+      'base' => 'node_content',
+      'title_label' => t('Name'),
+      'has_title' => TRUE,
+      'locked' => TRUE,
+    ),
+  );
+}
+
+/**
+ * Implements hook_field_create_instance().
+ *
+ * Add Zariz related fields to group content.
+ */
+function zariz_field_create_instance($instance) {
+  if (!og_is_group_audience_field($instance['field_name'])) {
+    // Bundle is not a group content.
+    return;
+  }
+
+  $entity_type = $instance['entity_type'];
+  $bundle = $instance['bundle'];
+
+  // We don't use zariz_is_bundle_tracked() as the bundle has just been attached
+  // with the group audience field.
+  if (!in_array($entity_type, array_keys(zariz_get_tracked_entity_types()))) {
+    return;
+  }
+
+  // CTools doesn't load all the plugins correctly upon installation, so we reset
+  // the plugins cache, so our Entity reference behaviors will be used.
+  // Apart of Calling ctools_get_plugins_reset() we also get all the entity
+  // reference "behavior" plugins and load the class ourself.
+  // This issue can be seen when executing simpleTests or enabling the module
+  // via Drush.
+  ctools_include('plugins');
+  ctools_get_plugins_reset();
+  module_load_include('php', 'zariz', 'entityreference/behavior/ZarizEntityReferenceBehavior.class');
+  ctools_get_plugins('entityreference', 'behavior');
+
+  // Add "Original branch" field.
+  // @todo: Target bundle to "Branch".
+  $og_field = og_fields_info(OG_AUDIENCE_FIELD);
+  $og_field['field']['cardinality'] = 1;
+  $og_field['instance']['default_value_function'] = 'entityreference_prepopulate_field_default_value';
+  $og_field['instance']['label'] = 'Branch';
+  $og_field['instance']['required'] = TRUE;
+  // Add entity reference prepopulate.
+  $og_field['instance']['settings']['behaviors']['prepopulate'] = array(
+    'action' => 'hide',
+    'fallback' => 'redirect',
+    'action_on_edit' => TRUE,
+    'status' => TRUE,
+    'providers' => array(
+      'og_context' => TRUE,
+    ),
+  );
+
+  og_create_field('field_branch', $entity_type, $bundle, $og_field);
+
+  // Add "UUID" field.
+  $field_name = 'field_uuid';
+
+  if (!field_info_field($field_name)) {
+    $field = array(
+      'cardinality' => 1,
+      'entity_types' => array(),
+      'field_name' => $field_name,
+      'module' => 'text',
+      'type' => 'text',
+    );
+    field_create_field($field);
+  }
+
+  if (!field_info_instance($entity_type, $field_name, $bundle)) {
+    $instance = array(
+      'entity_type' => $entity_type,
+      'field_name' => $field_name,
+      'bundle' => $bundle,
+      'label' => 'UUID',
+      'description' => 'Unique ID.',
+      'widget' => array(
+        'active' => 1,
+        'module' => 'text',
+        'type' => 'text',
+      ),
+    );
+    field_create_instance($instance);
+  }
+
+  // Add "Deleted snapshot" field.
+  $field_name = 'field_deleted_snapshots';
+  if (!field_info_field($field_name)) {
+    $field = array(
+      'entity_types' => array(),
+      'settings' => array(
+        'handler' => 'base',
+        'target_type' => 'snapshot',
+        'handler_settings' => array(
+          'target_bundles' => array(),
+        ),
+      ),
+      'field_name' => $field_name,
+      'type' => 'entityreference',
+      'cardinality' => FIELD_CARDINALITY_UNLIMITED,
+    );
+    field_create_field($field);
+  }
+
+  if (!field_info_instance($entity_type, $field_name, $bundle)) {
+    $instance = array(
+      'entity_type' => $entity_type,
+      'field_name' => $field_name,
+      'bundle' => $bundle,
+      'label' => 'Deleted snapshots',
+    );
+    field_create_instance($instance);
+  }
+
+  // "Is updated" field, to indicate a content is an edit of an existing content.
+  $field_name = 'field_is_updated';
+  if (!field_info_field($field_name)) {
+    $field = array(
+      'field_name' => $field_name,
+      'type' => 'list_boolean',
+      'cardinality' => 1,
+    );
+    field_create_field($field);
+  }
+
+  if (!field_info_instance($entity_type, $field_name, $bundle)) {
+    $instance = array(
+      'entity_type' => $entity_type,
+      'field_name' => $field_name,
+      'bundle' => $bundle,
+      'label' => t('Is updated'),
+      'description' => t('Indicates a content is an edit of an existing content.'),
+      'widget' => array(
+        'module' => 'options',
+        'settings' => array(
+          'display_label' => TRUE,
+        ),
+        'type' => 'options_onoff',
+      ),
+    );
+    field_create_instance($instance);
+  }
+
+  if ($entity_type == 'node') {
+    // @todo: Add option to add this field, as it is not mandatory?
+    // Add "Content" - a node reference field.
+    // We prefix the field name with "zariz" to indicate its a reference field
+    // that is aware to the context.
+    $field_name = 'field_zariz_node';
+    if (!field_info_field($field_name)) {
+      $field = array(
+        'entity_types' => array(),
+        'settings' => array(
+          // The handler is "zariz".
+          'handler' => 'zariz',
+          'target_type' => 'node',
+          'handler_settings' => array(
+            'target_bundles' => array(),
+            'behaviors' => array(
+              'zariz' => array(
+                'status' => TRUE,
+              ),
+            ),
+          ),
+        ),
+        'field_name' => $field_name,
+        'type' => 'entityreference',
+        'cardinality' => FIELD_CARDINALITY_UNLIMITED,
+      );
+      field_create_field($field);
+    }
+
+    if (!field_info_instance($entity_type, $field_name, $bundle)) {
+      $instance = array(
+        'entity_type' => $entity_type,
+        'field_name' => $field_name,
+        'bundle' => $bundle,
+        'label' => 'Content',
+        'widget' => array(
+          'module' => 'options',
+          'type' => 'options_select',
+        ),
+        'display' => array(
+          'default' => array(
+            'settings' => array(
+              'link' => TRUE,
+            ),
+          ),
+        ),
+      );
+      field_create_instance($instance);
+    }
+  }
+}
+
+/**
+ * Implements hook_modules_enabled().
+ *
+ * Make "Article" content type a group content.
+ */
+function zariz_modules_enabled($modules) {
+  if (in_array('zariz', $modules)) {
+    $og_field = og_fields_info(OG_AUDIENCE_FIELD);
+    $og_field['field']['cardinality'] = 1;
+    $og_field['field']['settings']['handler'] = 'og';
+    $og_field['instance']['default_value_function'] = 'entityreference_prepopulate_field_default_value';
+    $og_field['instance']['label'] = 'Branch';
+    $og_field['instance']['required'] = TRUE;
+    // Add entity reference prepopulate.
+    $og_field['instance']['settings']['behaviors']['prepopulate'] = array(
+      'action' => 'hide',
+      'fallback' => 'redirect',
+      'action_on_edit' => TRUE,
+      'status' => TRUE,
+      'providers' => array(
+        'og_context' => TRUE,
+      ),
+    );
+
+
+    og_create_field('field_branch', 'node', 'article', $og_field);
+  }
+}
+
+/**
+ * Implements hook_views_api().
+ */
+function zariz_views_api($module, $api) {
+  if ($module == 'views' && $api == 'views_default') {
+    return array('version' => 2);
+  }
+}
+
+
+/**
+ * Implements hook_ctools_plugin_directory().
+ */
+function zariz_ctools_plugin_directory($module, $plugin) {
+  if ($module == 'entityreference') {
+    return $module . '/' . $plugin;
+  }
+}
+
+
+/**
+ * Implements hook_entity_prepare_view().
+ */
+function zariz_entity_prepare_view($entities, $type, $langcode) {
+  foreach ($entities as &$entity) {
+    zariz_adjust_entity_reference_fields($type, $entity, $langcode);
+  }
+
+}
+
+
+/**
+ * Change entity reference according to the context.
+ *
+ * @param $entity_type
+ *   The entity type.
+ * @param $entity
+ *   The entity object passed by reference.
+ * @param $langcode
+ *   The language code of the field.
+ * @param $branch_id
+ *   (optional) The branch ID. If NULL the current context
+ *   will be used.
+ */
+function zariz_adjust_entity_reference_fields($entity_type, $entity, $langcode = NULL, $branch_id = NULL) {
+  if (!empty($entity->zariz_adjust_refernce_fields)) {
+    // Entity was already adjusted.
+    return $entity;
+  }
+
+  $entity->zariz_adjust_refernce_fields = TRUE;
+  $entity_info = entity_get_info($entity_type);
+  if (empty($entity_info['zariz'])) {
+    return;
+  }
+
+  list(,, $bundle) = entity_extract_ids($entity_type, $entity);
+
+  if (!zariz_is_bundle_tracked($entity_type, $bundle)) {
+    // Not a group content.
+    return;
+  }
+
+  if (!$branch_id) {
+    if (!$og_context = og_context()) {
+      return;
+    }
+    $branch_id = $og_context['gid'];
+  }
+
+  $field_names = array();
+
+  foreach (field_info_instances($entity_type, $bundle) as $field_name => $instance) {
+    $field = field_info_field($field_name);
+    if ($field['type'] != 'entityreference') {
+      // Field is not entity reference
+      continue;
+    }
+
+    if ($field['settings']['handler'] != 'zariz' && strpos($field['settings']['handler'], 'zariz_') !== 0) {
+      continue;
+    }
+
+    $field_names[$field_name] = $field;
+  }
+
+  if (!$field_names) {
+    // No fields found.
+    return;
+  }
+
+  $wrapper = entity_metadata_wrapper($entity_type, $entity);
+
+  foreach ($field_names as $field_name => $field) {
+    $uuids = array();
+    $cardinality = $field['cardinality'];
+    if ($cardinality == 1) {
+      if ($id = $wrapper->{$field_name}->getIdentifier()) {
+        $uuids[$id] = $wrapper->{$field_name}->field_uuid->value();
+      }
+    }
+    else {
+      foreach ($wrapper->{$field_name} as $sub_wrapper) {
+        $id = $sub_wrapper->getIdentifier();
+        $uuids[$id] = $sub_wrapper->field_uuid->value();
+      }
+    }
+
+    if (!$uuids) {
+      // No values in the field.
+      continue;
+    }
+
+    $target_type = $field['settings']['target_type'];
+    $target_entity_info = entity_get_info($target_type);
+    $id_key = $target_entity_info['entity keys']['id'];
+
+    $query = new EntityFieldQuery();
+    $result = $query
+      ->entityCondition('entity_type', $target_type)
+      ->entityCondition('bundle', array_keys(zariz_get_group_content_bundles($target_type)))
+      ->addTag('zariz')
+      // Set explicitly the Branch ID.
+      ->addMetaData('zariz', array('branch_id' => $branch_id))
+      ->fieldCondition('field_uuid', 'value', $uuids, 'IN')
+      ->propertyOrderBy($id_key)
+      ->execute();
+
+    foreach (entity_load($target_type, array_keys($result[$target_type])) as $entity_item) {
+      $item_wrapper = entity_metadata_wrapper($target_type, $entity_item);
+      $uuid = $item_wrapper->field_uuid->value();
+
+      // Re-add the "access" and "entity" properties that were added in
+      // entityreference_field_formatter_prepare_view(), which was executed
+      // before this function.
+      $new_ids[$uuid] = array(
+        'target_id' => $item_wrapper->getIdentifier(),
+        'entity' => $entity_item,
+        'access' => entity_access('view', $target_type, $entity_item),
+        // Since we already have the UUID, we add it here, so other may use it
+        // for example in a custom formatter.
+        'uuid' => $uuid,
+      );
+    }
+
+    // Sort the new IDs by the old IDs.
+    $new_values = array();
+    foreach ($uuids as $uuid) {
+      $new_values[] = $new_ids[$uuid];
+    }
+
+    // @todo: Use the $langcode?
+    $entity->{$field_name}[LANGUAGE_NONE] = $new_values;
+  }
+}
+
+/**
+ * Implements hook_field_widget_form_alter().
+ *
+ * Re-set the #default_value property based on the UUID.
+ *
+ * @todo: Currently supports only the select list widget.
+ */
+function zariz_field_widget_form_alter(&$element, &$form_state, $context) {
+  $field = $context['field'];
+  if ($field['type'] != 'entityreference') {
+    // Field is not entity reference
+    return;
+  }
+
+  if ($field['settings']['handler'] != 'zariz' && strpos($field['settings']['handler'], 'zariz_') !== 0) {
+    return;
+  }
+
+  $instance = $context['instance'];
+
+  if (!in_array($instance['widget']['type'], array('options_select'))) {
+    return;
+  }
+
+  if (!$items = $context['items']) {
+    // No existing items in the field.
+    return;
+  }
+
+  if (!$og_context = og_context()) {
+    // No branch context.
+    return;
+  }
+  $branch_id = $og_context['gid'];
+
+  $uuids = array();
+  foreach ($items as $item) {
+    $uuids[] = $item['uuid'];
+  }
+
+  $target_type = $field['settings']['target_type'];
+  $query = new EntityFieldQuery();
+  $result = $query
+    ->entityCondition('entity_type', $target_type)
+    ->entityCondition('bundle', array_keys(zariz_get_group_content_bundles($target_type)))
+    ->addTag('zariz')
+    // Set explicitly the Branch ID.
+    ->addMetaData('zariz', array('branch_id' => $branch_id))
+    ->fieldCondition('field_uuid', 'value', $uuids, 'IN')
+    ->execute();
+
+  $element['#default_value'] = array_keys($result[$target_type]);
+}
+
+/**
+ * Implements hook_ctools_plugin_pre_alter().
+ */
+function zariz_ctools_plugin_pre_alter(&$plugin, &$info) {
+  if (empty($plugin['context']) || $plugin['context'] != 'ctools_context_create_entity') {
+    return;
+  }
+
+  $plugin['context'] = 'zariz_ctools_context_create_entity';
+}
+
+/**
+ * Adjust the loaded entity of a CTools context.
+ *
+ * @see tools_context_create_entity().
+ */
+function zariz_ctools_context_create_entity($empty, $data = NULL, $conf = FALSE, $plugin) {
+  $context = ctools_context_create_entity($empty, $data, $conf, $plugin);
+  if (empty($context->data)) {
+    // No entity exists.
+    return $context;
+  }
+
+  $entity_type = $context->type[2];
+  $entity = &$context->data;
+  zariz_adjust_entity_reference_fields($entity_type, $entity);
+
+  return $context;
+}

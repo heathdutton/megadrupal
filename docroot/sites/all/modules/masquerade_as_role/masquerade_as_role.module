@@ -1,0 +1,167 @@
+<?php
+
+
+/**
+ * Implements hook_permission.
+ */
+function masquerade_as_role_permission() {
+  return array(
+    'masquerade as role' => array(
+      'title' => t('Masquerade as role'),
+      'description' => drupal_placeholder(t('Note: Permission "Masquerade as admin" is required to masquerade as admin roles.')),
+    ),
+  );
+}
+
+/**
+ * Implements hook_cron().
+ *
+ * Clean up temporary users with invalid sessions, i.e. when people didn't use
+ * the switch back link that would have cleanly removed the temporary user.
+ */
+function masquerade_as_role_cron() {
+  // Watch http://drupal.org/node/268487 before modifying this query.
+  $subquery = db_select('sessions', 's');
+  $subquery->addField('s', 'uid');
+
+  $query = db_delete('users');
+  $query->condition('data', serialize(array('masquerade_as_role' => TRUE)));
+  $query->condition('uid',  $subquery, 'NOT IN');
+  $query->execute();
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function masquerade_as_role_form_masquerade_block_1_alter(&$form, &$form_alter, $form_id) {
+  if (user_access('masquerade as role') && !isset($_SESSION['masquerading'])) {
+    // Rearrange fields from masquerade.module.
+    $form['masquerade_user_field']['#description'] = $form['masquerade_desc']['#markup'];
+    $form['masquerade_user_field']['#required'] = FALSE;
+    unset($form['masquerade_desc']);
+    unset($form['masquerade_user_field']['#prefix']);
+    unset($form['submit']['#suffix']);
+    // Add our custom field. Do not allow admin roles if perm not granted.
+    $roles = user_roles();
+    if (!user_access('masquerade as admin')) {
+      $roles = array_diff_key($roles, array_filter(variable_get('masquerade_admin_roles', array())));
+    }
+    $form['masquerade_role_field'] = array(
+      '#type' => 'select',
+      '#options' => $roles,
+      '#description' => t('Alternatively, select one or several role(s) to masquerade as.'),
+      '#multiple' => TRUE,
+    );
+    // Set appropriate weights.
+    $form['masquerade_user_field']['#weight'] = 1;
+    $form['masquerade_role_field']['#weight'] = 2;
+    $form['submit']['#weight'] = 3;
+    // Add custom JS.
+    $form['#attached']['js'] = array(
+      drupal_get_path('module', 'masquerade_as_role') . '/js/masquerade_as_role.js',
+    );
+    // Set custom handlers.
+    $form['#validate'] = array('masquerade_as_role_form_masquerade_block_1_validate');
+    $form['#submit']   = array('masquerade_as_role_form_masquerade_block_1_submit');
+  }
+}
+
+/** 
+ * Masquerade block custom form validation.
+ */
+function masquerade_as_role_form_masquerade_block_1_validate($form, &$form_state) {
+  $rids = $form_state['values']['masquerade_role_field'];
+  if (empty($rids)) {
+    $name = $form_state['values']['masquerade_user_field'];
+    if (empty($name)) {
+      form_set_error('masquerade_user_field', t('Please either enter a username or select a role to masquerade as.'));
+    }
+    else {
+      masquerade_block_1_validate($form, $form_state);
+    }
+  }
+  else {
+    if (isset($_SESSION['masquerading'])) {
+      form_set_error('masquerade_role_field', t('You are already masquerading. Please <a href="@unswitch">switch back</a> to your account to masquerade as another role.', array('@unswitch' => url('masquerade/unswitch', array('query' => array('token' => drupal_get_token('masquerade/unswitch')))))));
+    }
+    $form_state['values']['masquerade_role_field'] = array_map('user_role_load', $rids);
+  }
+}
+
+/** 
+ * Masquerade block custom form submission.
+ */
+function masquerade_as_role_form_masquerade_block_1_submit($form, &$form_state) {
+  $roles = $form_state['values']['masquerade_role_field'];
+  if (!empty($roles)) {
+    // List role names.
+    $roles_name = array();
+    foreach ($roles as $role) {
+      $roles_name[] = $role->name;
+    }
+    // Create temporary user.
+    $edit = array();
+    $edit['name']  = substr(md5(microtime()), rand(0,26), 8);
+    $edit['mail']  = $edit['name'] . '@example.com'; 
+    $edit['pass']  = user_password();
+    $edit['data']  = array('masquerade_as_role' => TRUE);
+    $edit['roles'] = drupal_map_assoc(array_keys($roles));
+    $edit['status'] = 1;
+    $account = user_save(drupal_anonymous_user(), $edit);
+    if (empty($account->uid)) {
+      drupal_set_message(t('Could not create a temporary user with roles %roles.', array('%roles' => drupal_implode_tags($roles_name))), 'error');
+    }
+    else {
+      drupal_set_message(t('Created temporary user !user with roles %roles.', array('!user' => theme('username', array('account' => $account)), '%roles' => drupal_implode_tags($roles_name))));
+    }
+    // Assign user to form values.
+    $form_state['values']['masquerade_user_field'] = $edit['name'];
+  }
+  masquerade_block_1_submit($form, $form_state);
+}
+
+/**
+ * Implements hook_menu_alter().
+ */
+function masquerade_as_role_menu_alter(&$items) {
+  // Set our custom callback page.
+  $items['masquerade/unswitch']['page callback'] = 'masquerade_as_role_switch_back_page';
+}
+
+/**
+ * Implements hook_translated_menu_link_alter().
+ *
+ * Dynamically add the CSRF protection token to our custom callback page.
+ */
+function masquerade_as_role_translated_menu_link_alter(&$item, $map) {
+  if (isset($item['page_callback'])) {
+    if ($item['page_callback'] == 'masquerade_as_role_switch_back_page') {
+      $item['localized_options']['query']['token'] = drupal_get_token('masquerade/unswitch');
+    }
+  }
+}
+
+/**
+ * Callback page to handle switching back to regular user.
+ *
+ * Delete temporary user when switching back.
+ */
+function masquerade_as_role_switch_back_page() {
+  global $user;
+  if (!isset($user->data['masquerade_as_role'])) {
+    masquerade_switch_back_page();
+  }
+  else {
+    if (isset($_GET['token']) && drupal_valid_token($_GET['token'], 'masquerade/unswitch')) {
+      $olduser = $user;
+      masquerade_switch_back();
+      drupal_set_message(t('You are no longer masquerading as !masq_as and are now logged in as !user.', array('!user' => theme('username', array('account' => $user)), '!masq_as' => theme('username', array('account' => $olduser)))));
+      user_delete($olduser->uid);
+      drupal_set_message(t('Deleted temporary user !masq_as.', array('!masq_as' => theme('username', array('account' => $olduser)))));
+      drupal_goto($_SERVER['HTTP_REFERER']);
+    }
+    else {
+      drupal_access_denied();
+    }
+  }
+}

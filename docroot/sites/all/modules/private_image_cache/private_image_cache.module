@@ -1,0 +1,216 @@
+<?php
+
+/**
+ * Implements hook_module_implements_alter().
+ */
+function private_image_cache_module_implements_alter(&$implementations, $hook) {
+  if ($hook == 'file_download') {
+    unset($implementations['file']);
+    unset($implementations['image']);
+  }
+}
+
+/**
+ * Implements hook_file_download().
+ */
+function private_image_cache_file_download($uri) {
+  $headers = array();
+
+  foreach (array('private_image_cache_file_file_download', 'private_image_cache_image_file_download') as $function) {
+    $result = $function($uri);
+    if ($result == -1) {
+      // Throw away the headers received so far.
+      return -1;
+    }
+    if (isset($result) && is_array($result)) {
+      $headers = array_merge($headers, $result);
+    }
+  }
+
+  return $headers;
+}
+
+/**
+ * Override of file_file_download().
+ *
+ * This function takes an extra parameter $field_type so that it may
+ * be re-used by other File-like modules, such as Image.
+ */
+function private_image_cache_file_file_download($uri, $field_type = 'file') {
+  global $user;
+
+  // Get the file record based on the URI. If not in the database just return.
+  $files = file_load_multiple(array(), array('uri' => $uri));
+  if (count($files)) {
+    foreach ($files as $item) {
+      // Since some database servers sometimes use a case-insensitive comparison
+      // by default, double check that the filename is an exact match.
+      if ($item->uri === $uri) {
+        $file = $item;
+        break;
+      }
+    }
+  }
+  if (!isset($file)) {
+    return;
+  }
+
+  // Find out which (if any) fields of this type contain the file.
+  $references = file_get_file_references($file, NULL, FIELD_LOAD_CURRENT, $field_type);
+
+  // Stop processing if there are no references in order to avoid returning
+  // headers for files controlled by other modules. Make an exception for
+  // temporary files where the host entity has not yet been saved (for example,
+  // an image preview on a node/add form) in which case, allow download by the
+  // file's owner.
+  if (empty($references) && ($file->status == FILE_STATUS_PERMANENT || $file->uid != $user->uid)) {
+    return;
+  }
+
+  // Default to allow access.
+  $denied = FALSE;
+  // Loop through all references of this file. If a reference explicitly allows
+  // access to the field to which this file belongs, no further checks are done
+  // and download access is granted. If a reference denies access, eventually
+  // existing additional references are checked. If all references were checked
+  // and no reference denied access, access is granted as well. If at least one
+  // reference denied access, access is denied.
+  foreach ($references as $field_name => $field_references) {
+    foreach ($field_references as $entity_type => $type_references) {
+      foreach ($type_references as $id => $reference) {
+        // Try to load $entity and $field.
+        $entity = entity_load($entity_type, array($id));
+        $entity = reset($entity);
+        $field = field_info_field($field_name);
+
+        // Load the field item that references the file.
+        $field_item = NULL;
+        if ($entity) {
+          // Load all field items for that entity.
+          $field_items = field_get_items($entity_type, $entity, $field_name);
+
+          // Find the field item with the matching URI.
+          foreach ($field_items as $item) {
+            if ($item['uri'] == $uri) {
+              $field_item = $item;
+              break;
+            }
+          }
+        }
+
+        // Check that $entity, $field and $field_item were loaded successfully
+        // and check if access to that field is not disallowed. If any of these
+        // checks fail, stop checking access for this reference.
+        if (empty($entity) || empty($field) || empty($field_item) || !field_access('view', $field, $entity_type, $entity)) {
+          $denied = TRUE;
+          break;
+        }
+
+        // Invoke hook and collect grants/denies for download access.
+        // Default to FALSE and let entities overrule this ruling.
+        $grants = array('system' => FALSE);
+        foreach (module_implements('file_download_access') as $module) {
+          $grants = array_merge($grants, array($module => module_invoke($module, 'file_download_access', $field_item, $entity_type, $entity)));
+        }
+        // Allow other modules to alter the returned grants/denies.
+        drupal_alter('file_download_access', $grants, $field_item, $entity_type, $entity);
+
+        if (in_array(TRUE, $grants)) {
+          // If TRUE is returned, access is granted and no further checks are
+          // necessary.
+          $denied = FALSE;
+          break 3;
+        }
+
+        if (in_array(FALSE, $grants)) {
+          // If an implementation returns FALSE, access to this entity is denied
+          // but the file could belong to another entity to which the user might
+          // have access. Continue with these.
+          $denied = TRUE;
+        }
+      }
+    }
+  }
+
+  // Access specifically denied.
+  if ($denied) {
+    return -1;
+  }
+
+  // Access is granted.
+  if ($field_type == 'image') {
+    $headers = private_image_cache_file_get_content_headers($file);
+  }
+  else {
+    $headers = file_get_content_headers($file);
+  }
+
+  return $headers;
+}
+
+/**
+ * Override of image_file_download().
+ *
+ * Control the access to files underneath the styles directory.
+ */
+function private_image_cache_image_file_download($uri) {
+  $path = file_uri_target($uri);
+
+  // Private file access for image style derivatives.
+  if (strpos($path, 'styles/') === 0) {
+    $args = explode('/', $path);
+    // Discard the first part of the path (styles).
+    array_shift($args);
+    // Get the style name from the second part.
+    $style_name = array_shift($args);
+    // Remove the scheme from the path.
+    array_shift($args);
+
+    // Then the remaining parts are the path to the image.
+    $original_uri = file_uri_scheme($uri) . '://' . implode('/', $args);
+
+    // Check that the file exists and is an image.
+    if ($info = image_get_info($uri)) {
+      // Check the permissions of the original to grant access to this image.
+      $headers = module_invoke_all('file_download', $original_uri);
+      // Confirm there's at least one module granting access and none denying access.
+      if (!empty($headers) && !in_array(-1, $headers)) {
+        $max_age = variable_get('page_cache_maximum_age', 0);
+
+        return array(
+          'Content-Type' => $info['mime_type'],
+          'Content-Length' => $info['file_size'],
+          'Cache-Control' => 'public, max-age=' . $max_age,
+          'Vary' => 'Cookie',
+        );
+      }
+    }
+    return -1;
+  }
+
+  // Private file access for the original files. Note that we only check access
+  // for non-temporary images, since file.module will grant access for all
+  // temporary files.
+  $files = file_load_multiple(array(), array('uri' => $uri));
+  if (count($files)) {
+    $file = reset($files);
+    if ($file->status) {
+      return private_image_cache_file_file_download($uri, 'image');
+    }
+  }
+}
+
+/**
+ * Examines a file object and returns appropriate content headers for download.
+ */
+function private_image_cache_file_get_content_headers($file) {
+  $type = mime_header_encode($file->filemime);
+  $max_age = variable_get('page_cache_maximum_age', 0);
+
+  return array(
+    'Content-Type' => $type,
+    'Content-Length' => $file->filesize,
+    'Cache-Control' => 'public, max-age=' . $max_age,
+    'Vary' => 'Cookie',
+  );
+}

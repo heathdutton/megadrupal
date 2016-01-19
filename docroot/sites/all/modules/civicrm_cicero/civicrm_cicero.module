@@ -1,0 +1,720 @@
+<?php
+/**
+ * @file
+ * Synchronize cicero using the CiviCRM API.
+ */
+
+define('CIVICRM_CICERO_DISTRICT_QUERY_URL', 'https://cicero.azavea.com/v3.1/district_type?format=json');
+define('CIVICRM_CICERO_LEGISLATIVE_QUERY_URL', 'https://cicero.azavea.com/v3.1/legislative_district?');
+define('CIVICRM_CICERO_NONLEGISLATIVE_QUERY_URL', 'https://cicero.azavea.com/v3.1/nonlegislative_district?');
+define('CIVICRM_CICERO_TOKEN_QUERY_URL', 'https://cicero.azavea.com/token/new.json?');
+
+/**
+ * Helper function.
+ *
+ * Initializes CiviCRM api.
+ */
+function civicrm_cicero_use_civi_api() {
+  if (PHP_SAPI === 'cli') {
+    _civicrm_init();
+  }
+  else {
+    civicrm_initialize();
+  }
+  require_once 'api/api.php';
+}
+
+
+/**
+ * Implements hook_permission().
+ */
+function civicrm_cicero_permission() {
+  return array(
+    'administer civicrm cicero' => array(
+      'title' => t('Administer CiviCRM Cicero'),
+      'description' => t('Allows users to change the CiviCRM Cicero settings.'),
+    ),
+  );
+}
+
+/**
+ * Implements hook_menu().
+ */
+function civicrm_cicero_menu() {
+  $items = array();
+  $items['admin/config/civicrm/civicrm-cicero'] = array(
+    'title' => 'CiviCRM Cicero',
+    'description' => 'Cicero Account Settings and Contact Update',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('civicrm_cicero_admin_update_contacts'),
+    'access arguments' => array('administer civicrm cicero'),
+    'file' => 'civicrm_cicero.admin.inc',
+  );
+
+  $items['admin/config/civicrm/civicrm-cicero/update'] = array(
+    'title' => 'Update Civi Contacts with Cicero Information',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('civicrm_cicero_admin_update_contacts'),
+    'access arguments' => array('administer civicrm cicero'),
+    'type' => MENU_DEFAULT_LOCAL_TASK,
+    'weight' => 0,
+    'file' => 'civicrm_cicero.admin.inc',
+  );
+  $items['admin/config/civicrm/civicrm-cicero/account-settings'] = array(
+    'title' => 'Cicero Account Settings',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('civicrm_cicero_admin_account_settings'),
+    'access arguments' => array('administer civicrm cicero'),
+    'type' => MENU_LOCAL_TASK,
+    'weight' => 4,
+    'file' => 'civicrm_cicero.admin.inc',
+  );
+  $items['admin/config/civicrm/civicrm-cicero/delete-run/%'] = array(
+    'title' => 'CiviCRM Cicero',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('civicrm_cicero_admin_delete_run'),
+    'access arguments' => array('administer civicrm cicero'),
+    'file' => 'civicrm_cicero.admin.inc',
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_cron().
+ */
+function civicrm_cicero_cron() {
+  $runs = db_query('SELECT * FROM {civicrm_cicero_sync_runs} WHERE status = :pending OR status = :active AND date_to_run <= :date ',
+    array(
+      ':date' => time(),
+      ':pending' => 'pending',
+      ':active' => 'active',
+    ));
+  foreach ($runs as $rkey => $run) {
+    $progress = unserialize($run->contact_progress);
+    $stop = $progress->start_num + $run->cron_run_limit;
+    if ($progress->start_num == 0) {
+      $stop = $stop - 1;
+    }
+    if ($progress->start_num <= $stop) {
+      $contacts = $progress->contact_ids;
+      foreach ($contacts as $key => $cid) {
+        if ($key >= $progress->start_num && $key <= $stop) {
+          // Run on all contacts, even if the field is filled in.
+          $force = TRUE;
+          civicrm_cicero_contact_update($cid, $force);
+        }
+      }
+    }
+    $progress->start_num = $stop + 1;
+    $status = 'active';
+    if ($stop > $progress->total) {
+      $status = 'completed';
+    }
+    db_update('civicrm_cicero_sync_runs')
+      ->fields(array(
+        'contact_progress' => serialize($progress),
+        'status' => $status,
+        'cicero_user' => variable_get('civicrm_cicero_account_name', NULL),
+      ))
+      ->condition('sync_id', $run->sync_id, '=')
+      ->execute();
+  }
+}
+
+/**
+ * Return information about the Cicero account.
+ *
+ * @return
+ *   An associative array with Cicero username and pass.
+ */
+function civicrm_cicero_cicero_accnt() {
+  $account = array(
+    'username' => variable_get('civicrm_cicero_account_name', NULL),
+    'password' => variable_get('civicrm_cicero_account_pass', NULL),
+  );
+  if ($account['username'] == NULL || $account['password'] == NULL) {
+    $configure_link = l(t('You need to configure your Cicero Account.'), 'admin/config/civicrm/civicrm-cicero/account-settings');
+    drupal_set_message($configure_link, 'error', FALSE);
+    return NULL;
+  }
+  return $account;
+}
+
+/**
+ * Get Respsonse from Cicero.
+ *
+ * Function to do Cicero API calls.
+ *
+ * @param $url
+ *   The url of the cicero page you are getting aresponse from. Defaults to
+ *   'http://cicero.azavea.com/token/new.json'.
+ *
+ * @param $postfields
+ *   The posfields to be passed to the page.
+ *
+ * @return
+ *   Decoded JSON PHP object object returned by the Cicero API or FALSE on error.
+ */
+function civicrm_cicero_get_response($url, $postfields = '') {
+  $try = 1;
+  $tries = 3;
+  $ret = NULL;
+  while ($try <= $tries) {
+    civicrm_cicero_log(t("Contacting cicero with url: @url and postfields: @postfields.", array('@url' => $url, '@postfields' => $postfields)));
+    $json = civicrm_cicero_get_response_curl_setup($url, $postfields);
+    if ($json) {
+      $json_decoded = json_decode($json);
+      if(!is_object($json_decoded)) {
+        civicrm_cicero_log(t("Cicero did not return an object."));
+        return FALSE;
+      }
+      if(count($json_decoded->response->errors) > 0) {
+        $error = NULL;
+        if(is_string($json_decoded->response->errors)) {
+          $error = $json_decoded->response->errors;
+        }
+        elseif(is_array($json_decoded->response->errors)) {
+          $error = array_pop($json_decoded->response->errors);
+        }
+        if($error == 'This account has reached its overdraft limit. Please purchase more credits.') {
+          // This is an error that should get immediate attention even if it means
+          // showing an embarrasing error to a user.
+          drupal_set_message(t("Out of credits for lookup of electoral info."));
+        }
+        civicrm_cicero_log($error);
+        return FALSE;
+      }
+      return $json_decoded;
+    }
+    else {
+      civicrm_cicero_log(t("cicero url: @url returned empty. Trying again.", array('@url' => $url)));
+      sleep(5);
+    }
+    $try++;
+  }
+  civicrm_cicero_log(t("cicero url: @url returned empty @tries times. Giving up.", array('@url' => $url, '@tries' => $tries)));
+  return FALSE;
+}
+
+/**
+ * Helper function to setup curl calls Cicero API calls.
+ *
+ * @param $url
+ *   The url of the cicero page you are getting aresponse from.
+ *
+ * @param $postfields
+ *   The posfields to be passed to the page
+ *
+ * @return
+ *   JSON object returned by the Cicero API, or FALSE.
+ */
+function civicrm_cicero_get_response_curl_setup($url, $postfields) {
+  $ch = curl_init();
+  curl_setopt($ch, CURLOPT_URL, $url);
+  curl_setopt($ch, CURLOPT_RETURNTRANSFER, TRUE);
+  if ($postfields !== '') {
+    curl_setopt($ch, CURLOPT_POST, TRUE);
+    curl_setopt($ch, CURLOPT_POSTFIELDS, $postfields);
+  }
+  $json = curl_exec($ch);
+  curl_close($ch);
+  if ($json == '' || $json == NULL) {
+    return FALSE;
+  }
+  return $json;
+}
+/**
+ * Get an API token from Cicero.
+ *
+ * @return
+ *   Returns an object with the Cicero token, and user set, or an error.
+ */
+function civicrm_cicero_get_token() {
+  // Grab user info.
+  $cicero_accnt = civicrm_cicero_cicero_accnt();
+  if ($cicero_accnt) {
+    $cicero_user = $cicero_accnt['username'];
+    $cicero_pass = $cicero_accnt['password'];
+    // Obtain a token.
+    $response = civicrm_cicero_get_response(CIVICRM_CICERO_TOKEN_QUERY_URL, "username=" . $cicero_user . "&password=" . $cicero_pass);
+    // Check to see if the token was obtained okay.
+    if (FALSE === $response) {
+      civicrm_cicero_log(t("ERROR: Could not obtain token."));
+      return FALSE;
+    }
+    // The token and user obtained are used for other API calls.
+    $token_info->token = $response->token;
+    $token_info->user = $response->user;
+    return $token_info;
+  }
+  return FALSE;
+}
+
+/**
+ * Get an address for a given Civi contact id.
+ *
+ * Helper function to grab the address of a contact by cotact id.
+ *
+ * @param $contact_id
+ *   The Civi contact_id of the record you're looking up.
+ *
+ * @return
+ *   The Address of a contact from tehe Civi API.
+ */
+function civicrm_cicero_get_contact_address($contact_id) {
+  $values = array();
+  if (is_numeric($contact_id)) {
+    civicrm_cicero_use_civi_api();
+
+    // Get all the possible address types we should be looking for.
+    $location_types = variable_get('civicrm_cicero_location_types', civicrm_cicero_get_default_location_types());
+    $location_types = civicrm_cicero_convert_to_ordered_location_types($location_types);
+    while(list(, $v) = each($location_types)) {
+      $params = array(
+        'version' => '3',
+        'contact_id' => $contact_id,
+        'location_type_id' => $v,
+      );
+      $results = civicrm_api("Address", "get", $params);
+      if ($results['is_error'] == 1) {
+        return FALSE;
+      }
+      if (empty($results['values'])) {
+        // If we don't get a result, try the next address type.
+        continue;
+      }
+      // Should return one value.
+      $values = array_pop($results['values']);
+      // Now get the state/province name.
+      $state_id = $values['state_province_id'];
+      $values['state_province_name'] = NULL;
+      $states = civicrm_api('constant', 'get', array('version' => '3', 'name' => 'stateProvince'));
+      if ($states['is_error'] == 0) {
+        if (array_key_exists($state_id, $states['values'])) {
+          $values['state_province_name'] = $states['values'][$state_id];
+        }
+      }
+      // Use parsed address when available, omit apt number, etc.
+      return civicrm_cicero_adjust_street_address($values);
+    }
+  }
+  return $values;
+}
+
+/**
+ * cicero sometimes fails to find a result simply because an apartment
+ * number was included. This functions adjusts the 'street_address' indexed
+ * value based on the parsed address. If civicrm could not parse the address
+ * we assume cicero won't be able to either.
+ *
+ * @param $values
+ *   The values array returned by the get Address civicrm_api call.
+ *
+ * @return
+ *   The adjust values array after attempting to adjust the street_address
+ *   to increase the odds of matching in cicero.
+
+ **/
+function civicrm_cicero_adjust_street_address($values) {
+  if(empty($values['street_address']) || empty($values['street_name'])) {
+    // The address may not have been parsed yet
+    $parsed_values = CRM_Core_BAO_Address::parseStreetAddress($values['street_address']);
+    $values['street_number'] = $parsed_values['street_number'];
+    $values['street_name'] = $parsed_values['street_name'];
+  }
+
+  // Used the parsed values if they are available
+  if(!empty($values['street_address']) && !empty($values['street_name'])) {
+    $values['street_address'] = $values['street_number'] . ' ' . $values['street_name'];
+  }
+  return $values;
+}
+
+/**
+ * Search a contact's Address in Cicero.
+ *
+ * @param $contact_id
+ *   The contact_id of the contact whose address you're searching in Cicero.
+ * @param $all_fields
+ *   If TRUE, return all available fields, otherwise only return fields that
+ *   are mapped. Returning all fields may require more credits than just the
+ *   mapped fields.
+ * @param $force
+ *   If TRUE, update the contact even if the contact already has a value for
+ *   each field requested. Otherwise, skip the lookup if we already have the
+ *   data.
+ *
+ * @return
+ *   An array of search result objects from Cicero, or FALSE on error
+ */
+function civicrm_cicero_search_addr_by_contact($contact_id, $all_fields = FALSE, $force = FALSE) {
+  if (!is_numeric($contact_id)) {
+    return FALSE;
+  }
+  $district_types = variable_get('civicrm_cicero_district_types', NULL);
+  if (is_null($district_types)) {
+    $cicero_district_types = civicrm_cicero_get_response(CIVICRM_CICERO_DISTRICT_QUERY_URL);
+    if(FALSE === $cicero_district_types) {
+      return FALSE;
+    }
+    $district_types = $cicero_district_types->response->results->district_types;
+  }
+  // Get the map, keyed to the cicero name of the field, with the civicrm
+  // name as the value.
+  $req_fields = variable_get('civicrm_cicero_contact_field_map', NULL);
+  if(!$force) {
+    $saved_values = array();
+    // Lookup the existing values for these fields. If we already have a value
+    // we will skip the lookup.
+    // Get an array of civicrm field names to return.
+    $return = array_values($req_fields);
+    $params = array('id' => $contact_id, 'return' => $return);
+    $result = civicrm_api3('Contact', 'get', $params);
+    if($result['is_error'] == 0) {
+      $contact = array_pop($result['values']);
+      // We want $saved_values to be keyed to the civi name of the field.
+      $req_fields_keyed_to_civicrm_field_name = array_flip($req_fields);
+      while(list(,$field) = each($return)) {
+        $cicero_field = $req_fields_keyed_to_civicrm_field_name[$field];
+        $saved_values[$cicero_field] = $contact[$field];
+      }
+    }
+  }
+  $legislative = FALSE;
+  $legislative_noncurrent = FALSE;
+  $non_legislative = FALSE;
+  $non_leg_types = array();
+  foreach ($district_types as $key => $district) {
+    if ($all_fields || array_key_exists($district->name_short, $req_fields)) {
+      if($force || empty($saved_values[$district->name_short])) {
+        if (!$district->is_legislative) {
+          $non_legislative = TRUE;
+          $non_leg_types[] = $district->name_short;
+        }
+        else {
+          // Cicero demands a different query if you are looking for current
+          // vs new or previous district info.
+          // Fixme: this is not generalized - only works for 2010 census
+          // re-districting.
+          if(preg_match('/_2010$/', $district->name_short)) {
+            $legislative_noncurrent = TRUE;
+          } else {
+            $legislative = TRUE;
+          }
+        }
+      } 
+    }
+  }
+  $result = civicrm_cicero_get_contact_address($contact_id);
+  $response = array();
+  if (civicrm_cicero_address_is_complete_enough($result)) {
+    $query_string = civicrm_cicero_query_string_for_address($result);
+    if ($query_string) {
+      if ($legislative_noncurrent) {
+        $url = CIVICRM_CICERO_LEGISLATIVE_QUERY_URL . $query_string . 
+          '&type=ALL_2010';
+        $resp_obj = civicrm_cicero_get_response($url);
+        if(FALSE === $resp_obj) {
+          civicrm_cicero_log(t("Failed to obtain legislative non-current response. Continuing..."));
+        }
+        else {
+          $response['legislative'][] = $resp_obj;
+        }
+      }
+      if ($legislative) {
+        $url = CIVICRM_CICERO_LEGISLATIVE_QUERY_URL . $query_string;
+        $resp_obj = civicrm_cicero_get_response($url);
+        if(FALSE === $resp_obj) {
+          civicrm_cicero_log(t("Failed to obtain legislative current response. Continuing..."));
+        }
+        else {
+          $response['legislative'][] = $resp_obj;
+        }
+      }
+      if ($non_legislative) {
+        while(list(,$type) = each($non_leg_types)) {
+          $url = CIVICRM_CICERO_NONLEGISLATIVE_QUERY_URL . $query_string . 
+            '&type=' . $type; 
+        }
+        $resp_obj = civicrm_cicero_get_response($url);
+        if(FALSE === $resp_obj) {
+          civicrm_cicero_log(t("Failed to obtain non-legislative response. Continuing..."));
+        }
+        else {
+          $response['nonlegislative'][] = $resp_obj;
+        }
+
+      }
+      return $response;
+    }
+  }
+  else {
+    civicrm_cicero_log(t("Failed to find enough address parameters to justify a lookup."));
+    return FALSE;
+  }
+  return $response;
+}
+
+/**
+ * Ensure that the address that has been returned is complete
+ * enough to justify attempting a cicero lookup, which will
+ * cost money even if no matches are made.
+ **/
+function civicrm_cicero_address_is_complete_enough($values) {
+  if(!$values) return FALSE;
+  $cant_be_empty = array('street_address', 'state_province_name', 'city');
+
+  while(list(,$field) = each($cant_be_empty)) {
+    if(empty($values[$field])) return FALSE;
+  }
+  return TRUE;
+}
+
+/**
+ * Format address into query string.
+ *
+ * @param $address
+ *   The output of civicrm_cicero_get_contact_address().
+ *
+ * @return
+ *   A string that can be used as a query.
+ */
+function civicrm_cicero_query_string_for_address($address) {
+  $street_address = array_key_exists('street_address', $address) ? $address['street_address'] : NULL;
+  $city = array_key_exists('city', $address) ? $address['city'] : NULL;
+  $state_province_name = array_key_exists('state_province_name', $address) ? $address['state_province_name'] : NULL;
+  $postal_code = array_key_exists('postal_code', $address) ? $address['postal_code'] : NULL;
+  $search_loc = str_replace(' ', '+', $street_address . '+' . $city . '+' . $state_province_name . '+' . $postal_code);
+  // Get an official query response.
+  $api_key = variable_get('civicrm_cicero_api_key', NULL);
+  if(!is_null($api_key)) {
+    return 'search_loc=' . $search_loc . '&key=' . $api_key . '&format=json';
+  }
+  else {
+    $token = civicrm_cicero_get_token();
+    if ($token) {
+      return 'search_loc=' . $search_loc . '&token=' . $token->token . '&user=' . $token->user . '&format=json';
+    }
+  }
+  return FALSE;
+}
+
+/**
+ * Pull core voter info fields from cicero.
+ *
+ * @param $cicero_data
+ *   The output of civicrm_cicero_search_addr_by_contact().
+ *
+ * @return
+ *   An array containing values for the searched address.
+ *
+ * @see civicrm_cicero_search_addr_by_contact()
+ */
+function civicrm_cicero_pull_addr_info($cicero_data) {
+  $values = civicrm_cicero_get_values($cicero_data);
+  $ret_values = array();
+  if ($values) {
+    $req_fields = variable_get('civicrm_cicero_contact_field_map', NULL);
+    foreach ($req_fields as $cicero_field => $civi_field) {
+      foreach ($values as $field => $value) {
+        if ($cicero_field == $field) {
+          $ret_values[$cicero_field] = $value;
+        }
+      }
+    }
+  }
+  return $ret_values;
+}
+
+/**
+ * Helper function.
+ *
+ * Convert cicero data response into an array with just the district info
+ * we want.
+ *
+ * @param $cicero_data
+ *   The output of civicrm_cicero_search_addr_by_contact().
+ *
+ * @return
+ *   An array containing cicero district objects.
+ */
+function civicrm_cicero_get_values($cicero_data) {
+  $types = array('legislative', 'legislative_noncurrent', 'nonlegislative');
+  $values = array();
+  while (list(,$type) = each($types)) {
+    if(!array_key_exists($type, $cicero_data)) {
+      continue;
+    }
+    while(list($index,$object) = each($cicero_data[$type])) {
+      $errors = $object->response->errors;
+      if (count($errors) == 0) {
+        if (is_array($object->response->results->candidates)) {
+          foreach ($object->response->results->candidates as $key => $field_cand) {
+            // Grab the districts for the possible matched address.
+            foreach ($field_cand->districts as $key => $district) {
+              if($type == 'nonlegislative') {
+                // For nonlegislative districts, label seems more useful.
+                if(!empty($district->label)) {
+                  $values[$district->district_type] = $district->label;
+                } else {
+                  $values[$district->district_type] = $district->district_id;
+                }
+              } else {
+                // Cicero sometimes has more than one value for a given field. However,
+                // we can only store one value per field. As far as I know, the only times
+                // cicero has more than one value is when they return one more more AT LARGE
+                // responses and just one district-specific response. In these cases we want
+                // to skip the AT LARGE ones, and only get the district specific one. 
+                if($district->district_id == 'AT LARGE') continue;
+                $values[$district->district_type] = $district->district_id;
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  return $values;
+}
+
+/**
+ * Update contact with Cicero data.
+ *
+ * Syncronize a CiviCRM contact with district information from Cicero.
+ *
+ * @param $contact_id
+ *   The contact id of the contact whose record you are attempting to update.
+ *
+ * @return
+ *   An array of values updated by cicero
+ *
+ * @see civicrm_cicero_search_addr_by_contact()
+ *
+ * @see civicrm_cicero_pull_addr_info()
+ */
+function civicrm_cicero_contact_update($contact_id, $force = FALSE) {
+  $updates = array();
+  $field_map = variable_get('civicrm_cicero_contact_field_map', NULL);
+  civicrm_cicero_use_civi_api();
+  $all_fields = FALSE;
+  $addr_resps = civicrm_cicero_search_addr_by_contact($contact_id, $all_fields, $force);
+  if(FALSE === $addr_resps) {
+    civicrm_cicero_log(t("Not updating contact, something went wrong with the cicero lookup."));
+    return FALSE;
+  }
+  if(count($addr_resps) == 0) {
+    civicrm_cicero_log(t("Not updating contact, no new data from Cicero (try using FORCE)."));
+    return $updates;
+  }
+
+  $values = civicrm_cicero_pull_addr_info($addr_resps);
+  foreach ($values as $col_name => $info) {
+    if (empty($info)) {
+      continue;
+    }
+    $civicrm_field = $field_map[$col_name];
+    $updates[$civicrm_field] = $info;
+  }
+  if (count($updates) > 0) {
+    $params = $updates;
+    $params['version'] = 3;
+    $params['id'] = $contact_id;
+    $update_date_field = variable_get('civicrm_cicero_last_updated_field', NULL);
+    if (!empty($update_date_field) && $update_date_field != 'NONE') {
+      $params[$update_date_field] = date('c');
+    }
+    $result = civicrm_api("Contact", "update", $params);
+    if ($result['is_error'] != 0) {
+      civicrm_cicero_log(t("Failed to update the contact. See error in next message."));
+      civicrm_cicero_log($result['error_message']);
+      return FALSE;
+    }
+  }
+  return $updates;
+}
+
+/**
+ * Log information about civicrm_cicero operations.
+ *
+ * Log everything to watchdog, if we are running drush
+ * also output via drush_log.
+ *
+ **/
+function civicrm_cicero_log($msg, $vars = array(), $severity = WATCHDOG_NOTICE) {
+  watchdog('civicrm_cicero', $msg, $vars, $severity);
+}
+
+/**
+ * When no location types are selected, provide
+ * sensible defaults
+ *
+ **/
+function civicrm_cicero_get_default_location_types() {
+  return 'Home';
+}
+
+/**
+ * Convert a line break separate string of location
+ * types into an ordered array of location type
+ * ids
+ **/
+function civicrm_cicero_convert_to_ordered_location_types($user_types) {
+  $return = array();
+  $civicrm_types = civicrm_cicero_admin_get_civicrm_location_type_options();
+
+  // We need to key by friendly name, not by id so we can more easily
+  // get the id from the friendly name.
+  $civicrm_types = array_flip($civicrm_types);
+  $user_types = explode("\n", $user_types);
+  while(list(,$type) = each($user_types)) {
+    $type = trim($type);
+    if(!array_key_exists($type, $civicrm_types)) {
+      drupal_set_message(t("Failed to find %type in list of available location types.", array('%type' => $type)), 'error');
+      return FALSE;
+    }
+    $key = $civicrm_types[$type];
+    $return[] = $key;
+  }
+  return $return;
+}
+
+/**
+ * Helper function to pull in currently set address types
+ **/
+function civicrm_cicero_admin_get_civicrm_location_type_options() {
+  return CRM_Core_PseudoConstant::get('CRM_Core_DAO_Address', 'location_type_id');
+}
+
+/**
+ * Ensure contacts are sync'ed when a new contact is added.
+ *
+ */
+function civicrm_cicero_civicrm_post($op, $objectName, $id, &$params) {
+  static $loop_detector;
+
+  if($loop_detector == $id) {
+    // Avoid a loop. This code itself will try to save the contact id
+    // in question which, in turn, will trigger a call to this function.
+    // Under normal circumstances, we will see that the cicero fields in 
+    // question have been populated and the loop will be cut short. 
+    // However, if there is a cicero error or cicero doesn't have a value 
+    // for one of the fields, then we could run over and over again.
+    return;
+  }
+
+  $loop_detector = $id;
+  if(variable_get('civicrm_cicero_sync_on_new', FALSE)) {
+    // Only run if we are configured to do so
+    if($op == 'create' && $objectName == 'Individual' && !empty($id)) {
+      // Only operate on new individual records
+      $updates = civicrm_cicero_contact_update($id);
+    }
+  }
+  if(variable_get('civicrm_cicero_sync_on_edit', FALSE)) {
+    // Only run if we are configured to do so
+    if($op == 'edit' && $objectName == 'Individual' && !empty($id)) {
+      $updates = civicrm_cicero_contact_update($id);
+    }
+  }
+}

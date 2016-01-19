@@ -1,0 +1,374 @@
+<?php
+/**
+ * @file
+ * Pure Import main functions.
+ */
+
+/**
+ * Start import with the import class and limit.
+ *
+ * @param string $class_name
+ *  Import class name.
+ * @param int $limit
+ *  Limit of items to import.
+ *
+ * @return bool
+ *  Success or failure.
+ */
+function pure_import_start_migration_with_source($class_name, $limit = 0) {
+  $import_instance = new $class_name();
+
+  if (!$import_instance->checkRequirements()) {
+    // Not complete requirements. Check watchdog.
+    return FALSE;
+  }
+
+  $batch_definition = array(
+    'operations' => array(
+      array('_pure_import_batch_operation', array($import_instance, $limit)),
+    ),
+    'title' => t('Pure Import migration'),
+  );
+  batch_set($batch_definition);
+  if (function_exists('drush_backend_batch_process')) {
+    drush_backend_batch_process();
+  }
+  else {
+    batch_process();
+  }
+
+  return TRUE;
+}
+
+/**
+ * Batch callback operation executing the import.
+ *
+ * @param IPureImportRunnable $import_instance
+ *  Import class instance.
+ * @param $limit
+ *  Limit of imported items.
+ * @param $context
+ *  Batch context array.
+ */
+function _pure_import_batch_operation(IPureImportRunnable $import_instance, $limit, &$context) {
+  if (empty($context['sandbox'])) {
+    $context['sandbox']['total'] = $limit ?: $import_instance->getSourceQuery()->countQuery()->execute()->fetchField();
+    $context['sandbox']['done'] = 0;
+    $context['sandbox']['time'] = microtime(TRUE);
+  }
+
+  $batch_limit = variable_get('pure_import_batch_limit', 1000);
+  $result = $import_instance->getSourceQuery()
+    ->range($context['sandbox']['done'], ($limit && ($limit < $batch_limit)) ? $limit : $batch_limit)
+    ->execute();
+
+  foreach ($result as $record) {
+    $import_instance->processRecord($record);
+    $context['sandbox']['done']++;
+  }
+
+  $current_time = microtime(TRUE);
+  $current_interval = number_format($current_time - $context['sandbox']['time'], 2);
+  $context['sandbox']['time'] = $current_time;
+
+  $context['finished'] = $context['sandbox']['done'] / ($limit ?: $context['sandbox']['total']);
+  $context['message'] = t('@current out of @total is migrated in @time seconds.', array(
+    '@current' => $context['sandbox']['done'],
+    '@total' => $context['sandbox']['total'],
+    '@time' => $current_interval
+  ));
+}
+
+/**
+ * Create node.
+ *
+ * @param array $node_configuration
+ *  Default node values in a key/value array.
+ * @return stdClass
+ *  Node object.
+ */
+function pure_import_create_node(array $node_configuration) {
+  $node = new stdClass();
+  $node->language = LANGUAGE_NONE;
+  $node->status = NODE_PUBLISHED;
+  $node->uid = 1;
+  $node->created = $_SERVER['REQUEST_TIME'];
+  $node->changed = $_SERVER['REQUEST_TIME'];
+  $node->comment = 0;
+  $node->promote = 0;
+  $node->sticky = 0;
+  $node->tnid = 0;
+  $node->translate = 0;
+  $node->title = '';
+  foreach ($node_configuration as $name => $value) {
+    $node->{$name} = $value;
+  }
+  $node->nid = pure_import_insert_record('node', (array) $node, array(
+    'nid', 'vid', 'type', 'language', 'title', 'uid', 'status', 'created', 'changed', 'comment', 'promote', 'sticky', 'tnid', 'translate',
+  ));
+
+  $node->timestamp = $_SERVER['REQUEST_TIME'];
+  $node->log = '';
+  $vid = pure_import_insert_record('node_revision', (array) $node, array(
+    'nid', 'vid', 'uid', 'title', 'log', 'timestamp', 'status', 'comment', 'promote', 'sticky',
+  ));
+  $node->vid = $vid;
+
+  db_query("UPDATE {node} SET vid = :vid WHERE nid = :nid", array(':vid' => $vid, ':nid' => $node->nid));
+
+  return $node;
+}
+
+/**
+ * Create field collection.
+ *
+ * @param $entity_id
+ *  Host entity id.
+ * @param $entity_revision_id
+ *  Host entity revision id.
+ * @param $entity_type
+ *  Host entity type.
+ * @param $bundle
+ *  Host entity bundle.
+ * @param $field_collection_name
+ *  Name of the field collection.
+ * @param int $delta
+ *  Delta.
+ * @return PureImportFieldCollectionContainer
+ *  Object containing item_id and revision_id of the field_collection.
+ */
+function pure_import_create_field_collection($entity_id, $entity_revision_id, $entity_type, $bundle, $field_collection_name, $delta = 0) {
+  $item_id = pure_import_insert_record('field_collection_item', array(
+    'field_name' => $field_collection_name,
+    'revision_id' => 0,
+    'archived' => 0,
+  ));
+
+  $revision_id = pure_import_insert_record('field_collection_item_revision', array('item_id' => $item_id));
+
+  db_query("UPDATE {field_collection_item} SET revision_id = :revision_id WHERE item_id = :item_id", array(
+    ':item_id' => $item_id,
+    ':revision_id' => $revision_id,
+  ));
+
+  $field = array(
+    'entity_id' => $entity_id,
+    'revision_id' => $entity_revision_id,
+    'entity_type' => $entity_type,
+    'bundle' => $bundle,
+    'deleted' => 0,
+    'language' => LANGUAGE_NONE,
+    'delta' => $delta,
+    $field_collection_name . '_value' => $item_id,
+    $field_collection_name . '_revision_id' => $revision_id,
+  );
+  pure_import_insert_record('field_data_' . $field_collection_name, $field);
+  pure_import_insert_record('field_revision_' . $field_collection_name, $field);
+
+  return new PureImportFieldCollectionContainer($item_id, $revision_id, $field_collection_name);
+}
+
+/**
+ * Set a node reference field value.
+ *
+ * @param $entity_id
+ *  Host entity id.
+ * @param $entity_revision_id
+ *  Host entity revision id.
+ * @param $entity_type
+ *  Host entity type.
+ * @param $bundle
+ *  Host entity bundle.
+ * @param $field_name
+ *  Field name.
+ * @param array $values_with_keys
+ *  Array of table values, keys are table column name suffixes.
+ *  Example:
+ *   - ['value' => 12] - typical use case, just one value column,
+ *   - ['nid' => 5232] - node reference field,
+ *   - ['value' => 13094354, 'value2' => 135434324] - date field.
+ * @param int $delta
+ *  Field delta.
+ * @param bool $check_update
+ *  Optional FALSE by default, set to TRUE to look for an update instead of an insert.
+ */
+function pure_import_set_field($entity_id, $entity_revision_id, $entity_type, $bundle, $field_name, array $values_with_keys, $delta = 0, $check_update = FALSE) {
+  $field = array(
+    'entity_type' => $entity_type,
+    'bundle' => $bundle,
+    'deleted' => 0,
+    'entity_id' => $entity_id,
+    'revision_id' => $entity_revision_id,
+    'language' => LANGUAGE_NONE,
+    'delta' => $delta,
+  );
+
+  // Fill out value columns.
+  foreach ($values_with_keys as $suffix => $value) {
+    $field[$field_name . '_' . $suffix] = $value;
+  }
+
+  if ($check_update) {
+    // check if the entity exists.
+    $entity_exists = db_query("
+      SELECT COUNT(*)
+      FROM {" . db_escape_table('field_data_' . $field_name) . "}
+      WHERE entity_type = :entity_type
+      AND deleted = :deleted
+      AND entity_id = :entity_id
+      AND delta = :delta
+      AND language = :language
+    ", array(
+      ':entity_type' => $entity_type,
+      ':deleted' => 0,
+      ':entity_id' => $entity_id,
+      ':delta' => $delta,
+      ':language' => LANGUAGE_NONE,
+    ))->fetchField();
+  }
+
+  if ($check_update && $entity_exists) {
+    // Execute an update.
+    $primary_keys = array('entity_type', 'entity_id', 'deleted', 'language', 'delta');
+    pure_import_update_record('field_data_' . $field_name, $field, $primary_keys);
+    pure_import_update_record('field_revision_' . $field_name, $field, $primary_keys);
+  }
+  else {
+    // Execute an insert.
+    pure_import_insert_record('field_data_' . $field_name, $field);
+    pure_import_insert_record('field_revision_' . $field_name, $field);
+  }
+}
+
+/**
+ * Shortcut for SQL INSERT that returns the last inserted key.
+ *
+ * @param $table
+ *  Table name.
+ * @param array $record
+ *  Record details - key/value array.
+ * @param array $column_filter
+ *  Allowed table columns to insert. If it's empty then all items from $record is used.
+ * @param $db_target
+ *  Database target. Default: 'default'.
+ * @param $db_key
+ *  Database key. Default: 'default'.
+ *
+ * @return int
+ *  Last inserted key.
+ */
+function pure_import_insert_record($table, array $record, array $column_filter = array(), $db_target = 'default', $db_key = 'default') {
+  if ($column_filter) {
+    $record = array_intersect_key($record, array_flip($column_filter));
+  }
+
+  $sql_args = array();
+  foreach ($record as $key => $value) {
+    $sql_args[':' . $key] = $value;
+  }
+
+  return Database::getConnection($db_target, $db_key)->query("
+    INSERT INTO {" . db_escape_table($table) . "}
+    (" . implode(', ', array_keys($record)) . ")
+    VALUES
+    (" . implode(', ', array_keys($sql_args)) . ");
+  ", $sql_args, array('return' => Database::RETURN_INSERT_ID));
+}
+
+/**
+ * Shortcut for SQL UPDATE that returns the number of affected rows.
+ *
+ * @param $table
+ *  Table name.
+ * @param array $record
+ *  Record details - key/value array.
+ * @param array $primary_keys
+ *  List of primary keys of the table.
+ * @param array $column_filter
+ *  Allowed table columns to insert. If it's empty then all items from $record is used.
+ * @param $db_target
+ *  Database target. Default: 'default'.
+ * @param $db_key
+ *  Database key. Default: 'default'.
+ *
+ * @return int
+ *  Last inserted key.
+ */
+function pure_import_update_record($table, array $record, array $primary_keys, array $column_filter = array(), $db_target = 'default', $db_key = 'default') {
+  // Creating SQL condition by primary keys.
+  $conditions = array();
+  $primary_key_args = array();
+  foreach ($primary_keys as $primary_key) {
+    $conditions[] = "$primary_key = :$primary_key";
+    $primary_key_args[":$primary_key"] = $record[$primary_key];
+    unset($record[$primary_key]);
+  }
+
+  // Removing unused columns from the update.
+  if ($column_filter) {
+    $record = array_intersect_key($record, array_flip($column_filter));
+  }
+
+  // Collect arguments for the update and the condition.
+  $sql_args = array();
+  $updates = array();
+  foreach ($record as $key => $value) {
+    $updates[] = "$key = :$key";
+    $sql_args[":$key"] = $value;
+  }
+  $sql_args = array_merge($sql_args, $primary_key_args);
+
+  return Database::getConnection($db_target, $db_key)->query("
+    UPDATE {" . db_escape_table($table) . "}
+    SET " . implode(', ', $updates) . "
+    WHERE " . implode(' AND ', $conditions),
+  $sql_args, array('return' => Database::RETURN_AFFECTED));
+}
+
+/**
+ * Class PureImportFieldCollectionContainer
+ * Container for the field collection item ids.
+ */
+class PureImportFieldCollectionContainer {
+
+  /**
+   * Entity ID.
+   *
+   * @var int
+   */
+  public $item_id;
+
+  /**
+   * Entity revision ID.
+   *
+   * @var int
+   */
+  public $revision_id;
+
+  /**
+   * Entity bundle.
+   *
+   * @var string
+   */
+  public $bundle;
+
+  /**
+   * Entity type.
+   */
+  const ENTITY_TYPE = 'field_collection_item';
+
+  /**
+   * Constructor.
+   *
+   * @param $item_id
+   *  Field collection entity ID.
+   * @param $revision_id
+   *  Field collection entity revision ID.
+   */
+  public function __construct($item_id, $revision_id, $bundle) {
+    $this->item_id = $item_id;
+    $this->revision_id = $revision_id;
+    $this->bundle = $bundle;
+  }
+
+}
