@@ -1,0 +1,298 @@
+<?php
+
+define('VSF_DEFAULT_CHECK_UNCHANGED_FIELDS', 0);
+
+require __DIR__ . '/vsf_wysiwyg.admin.inc';
+
+/**
+ * Implements hook_element_info_alter().
+ */
+function vsf_wysiwyg_element_info_alter(&$types) {
+  if (isset($types['text_format']['#process'])) {
+    $types['text_format']['#process'][] = 'vsf_wysiwyg_pre_render_wysiwyg_element';
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter() for views_exposed_form().
+ */
+function vsf_wysiwyg_form_views_exposed_form_alter(&$form, &$form_state) {
+  if (isset($_GET['ckeditor'], $_GET['vsf_field'])) {
+    $view = $form_state['view'];
+    $field = $_GET['vsf_field'];
+
+    $options = _vsf_wysiwyg_default_image_style_options();
+    $context = compact('form', 'form_state', 'view', 'field');
+    $context['default_formatter'] = variable_get('visual_select_file_default_style', '');
+    drupal_alter('visual_select_file_formatter_options', $options, $context);
+
+    $form['vsf_formatter'] = array(
+      '#type' => 'select',
+      '#title' => t('Formatter'),
+      '#options' => $options,
+      '#default_value' => $context['default_formatter'],
+    );
+  }
+}
+
+/**
+ * Implements hook_ckeditor_plugin().
+ */
+function vsf_wysiwyg_ckeditor_plugin() {
+  return array(
+    'visual_select_file' => array(
+      'name' => 'visual_select_file',
+      'desc' => t('Support for Visual select file'),
+      'path' => drupal_get_path('module', 'visual_select_file') . '/editors/ckeditor/',
+      'buttons' => array(
+        'visual_select_file' => array(
+          'label' => 'Visually select file',
+          'icon' => 'visual_select_file.png',
+        ),
+      ),
+    ),
+  );
+}
+
+/**
+ * Add field instance settings for other parts of the machine to pick up.
+ */
+function vsf_wysiwyg_pre_render_wysiwyg_element($element) {
+  if (!_visual_select_file_user_has_access()) {
+    return $element;
+  }
+
+  $field = isset($element['#entity_type'], $element['#bundle'], $element['#field_name']);
+  $custom = isset($element['#vsf_file_usage_type'], $element['#vsf_file_usage_id']);
+  if ($field || $custom) {
+    $element += array(
+      '#entity_type' => 'custom',
+      '#bundle' => 'custom',
+      '#field_name' => 'custom',
+    );
+
+    // Add field's meta data to field.
+    $element['value']['#attributes']['data-vsf-field'] = $field;
+
+    // Load necessary resources for this page/form.
+    _vsf_wysiwyg_load_resources_ckeditor();
+
+    // Add custom (automatic) file usage to custom non-entity form elements. MAKE SURE YOU DO THIS!
+    if ($custom) {
+      $element['value']['#element_validate'][] = 'vsf_wysiwyg_element_parse_images';
+    }
+  }
+
+  return $element;
+}
+
+/**
+ * Element 'validator' for all VSF WYSIWYG elements.
+ */
+function vsf_wysiwyg_element_parse_images(&$element, &$form_state, $form) {
+  $html = &drupal_array_get_nested_value($form_state['values'], $element['#parents'], $key_exists);
+
+  $fids = array();
+  _vsf_wysiwyg_parse($fids, $html);
+  ksort($fids, SORT_NUMERIC);
+
+  $element['#vsf_wysiwyg_file_usage'] = $fids;
+
+  $type = $element['#vsf_file_usage_type'];
+  $id = $element['#vsf_file_usage_id'];
+  $form_state['vsf_wysiwyg_file_usage'][$type][$id] = (array) @$form_state['vsf_wysiwyg_file_usage'][$type][$id];
+  foreach ($fids as $fid => $count) {
+    @$form_state['vsf_wysiwyg_file_usage'][$type][$id][$fid] += $count;
+  }
+
+  // Since I can't dynamically add a submit handler at this point, YOU HAVE TO DO THAT YOURSELF!
+  // @see vsf_wysiwyg_save_file_usage_submit()
+  // @see YOURMODULE_custom_form() in visual_select_file.api.php
+}
+
+/**
+ * Submit handler for all File Usage loving forms with VSF WYSIWYG elements.
+ */
+function vsf_wysiwyg_save_file_usage_submit($form, &$form_state) {
+  foreach ($form_state['vsf_wysiwyg_file_usage'] as $type => $instances) {
+    foreach ($instances as $id => $files) {
+      // Make sure this id is a valid 32 bit int. {file_usage} expects it, but VSF doesn't want to
+      // force it.
+      if ((string) (int) $id !== (string) $id) {
+        $id = sprintf('%u', crc32($id));
+      }
+
+      // Delete all, for this instance.
+      db_delete('file_usage')
+        ->condition('module', 'vsf_wysiwyg')
+        ->condition('type', $type)
+        ->condition('id', $id)
+        ->execute();
+
+      // Add per found fid.
+      foreach ($files as $fid => $count) {
+        $file = (object) compact('fid');
+        file_usage_add($file, 'vsf_wysiwyg', $type, $id, $count);
+      }
+    }
+  }
+}
+
+/**
+ * Parses HTML for referenced images, probably added by VSF. Count and group by fid.
+ */
+function _vsf_wysiwyg_parse(&$fids, $html) {
+  $fid_map = &drupal_static(__FUNCTION__, array());
+
+  $path = base_path() . variable_get('file_public_path', conf_path() . '/files') . '/';
+
+  $regex = '#(href|src)="' . $path . '([^"]+)"#';
+  if (preg_match_all($regex, $html, $matches)) {
+    foreach ($matches[2] as $path) {
+      $uri = $path;
+      if (preg_match('#^styles/([\w\-]+)/public/(.+)$#', $path, $match)) {
+        $uri = $match[2];
+      }
+      $uri = 'public://' . $uri;
+      if (!isset($fid_map[$uri])) {
+        $fid_map[$uri] = (int) db_query('SELECT fid FROM {file_managed} WHERE uri = :uri', array(
+          ':uri' => $uri,
+        ))->fetchField();
+      }
+      @$fids[ $fid_map[$uri] ]++;
+    }
+  }
+}
+
+/**
+ * Implements hook_field_attach_presave().
+ *
+ * Known issues:
+ * - Files in revisions. I don't know how File or Media handle this.
+ */
+function vsf_wysiwyg_field_attach_presave($entity_type, $entity) {
+  $check_always = variable_get('vsf_wysiwyg_check_unchanged_fields', VSF_DEFAULT_CHECK_UNCHANGED_FIELDS);
+
+  list($id, , $bundle) = entity_extract_ids($entity_type, $entity);
+  $fields = _vsf_wysiwyg_get_text_format_fields($entity_type, $bundle);
+
+  // Parse ALL text_format field values to find used fids, by public uri, by path.
+  $fids = array();
+  foreach ($fields as $field_name) {
+    foreach ((array) @$entity->$field_name as $langcode => $items) {
+      foreach ($items as $delta => $item) {
+        $old_value = @$entity->original->{$field_name}[$langcode][$delta]['value'];
+        $value = @$item['value'];
+        if ($check_always || $old_value != $value) {
+          _vsf_wysiwyg_parse($fids, $value);
+        }
+      }
+    }
+  }
+  ksort($fids, SORT_NUMERIC);
+
+  $entity->vsf_wysiwyg_fids = $fids;
+}
+
+/**
+ * Implements hook_field_attach_insert().
+ */
+function vsf_wysiwyg_field_attach_insert($entity_type, $entity) {
+  vsf_wysiwyg_field_attach_update($entity_type, $entity);
+}
+
+/**
+ * Implements hook_field_attach_update().
+ */
+function vsf_wysiwyg_field_attach_update($entity_type, $entity) {
+  if (!isset($entity->vsf_wysiwyg_fids)) {
+    return;
+  }
+
+  list($id, , $bundle) = entity_extract_ids($entity_type, $entity);
+
+  // Load current usage for this entity.
+  $current_usage = db_query('
+    SELECT fid, count
+    FROM {file_usage}
+    WHERE module = :module AND type = :type AND id = :id
+    ORDER BY fid ASC
+  ', array(
+    ':module' => 'vsf_wysiwyg',
+    ':type' => $entity_type,
+    ':id' => $id,
+  ))->fetchAllKeyed(0, 1);
+
+  // Compare old and new file usage and remove and add. If they differ at all, redo all usage. No point
+  // in spending more effort to find the exact difference.
+  if ($entity->vsf_wysiwyg_fids != $current_usage) {
+    // Delete all, for this entity.
+    db_delete('file_usage')
+      ->condition('module', 'vsf_wysiwyg')
+      ->condition('type', $entity_type)
+      ->condition('id', $id)
+      ->execute();
+
+    // Add per found fid.
+    foreach ($entity->vsf_wysiwyg_fids as $fid => $count) {
+      $file = (object) compact('fid');
+      file_usage_add($file, 'vsf_wysiwyg', $entity_type, $id, $count);
+    }
+
+    watchdog('vsf_wysiwyg', format_string('Updating VSF WYSIWYG file usage for !type # !id', array(
+      '!type' => $entity_type,
+      '!id' => $id,
+    )));
+  }
+}
+
+/**
+ * Find all text-ish fields in a bundle.
+ */
+function _vsf_wysiwyg_get_text_format_fields($entity_type, $bundle) {
+  $field_names = &drupal_static(__FUNCTION__, array());
+
+  if (!isset($field_names[$entity_type][$bundle])) {
+    $field_names[$entity_type][$bundle] = array();
+
+    $instances = field_info_instances($entity_type, $bundle);
+    foreach ($instances as $field_name => $instance) {
+      if (!empty($instance['settings']['text_processing'])) {
+        $field_names[$entity_type][$bundle][$field_name] = $field_name;
+      }
+    }
+  }
+
+  return $field_names[$entity_type][$bundle];
+}
+
+/**
+ * Helper to get the default image style + link options for the wysiwyg image selection.
+ */
+function _vsf_wysiwyg_default_image_style_options() {
+  $options = array('' => t('- Choose -'), 'original' => t('Original'));
+  $styles = image_style_options(FALSE);
+  $options += $styles;
+
+  $options['link'] = t('Link to Original');
+  foreach ($styles as $style => $info) {
+    $options['link:' . $style] = t('Link to @style', array('@style' => $style));
+  }
+
+  return $options;
+}
+
+/**
+ * Helper to load necessary JS and CSS for ckeditor elements.
+ */
+function _vsf_wysiwyg_load_resources_ckeditor() {
+  static $loaded = 0;
+  if (!$loaded) {
+    $loaded = 1;
+
+    drupal_add_library('system', 'ui.dialog');
+
+    $path = drupal_get_path('module', 'visual_select_file');
+    drupal_add_js($path . '/visual_select_file.js');
+  }
+}

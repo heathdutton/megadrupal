@@ -1,0 +1,448 @@
+<?php
+
+/**
+ * @file devel_contrib_generate.module
+ * Provides a developer UI to generate entities.
+ *
+ * Entity types wishing to make use of this should define the
+ * 'devel contrib generator class' property in their entity type's entity info.
+ * This may be set to the included class DevelContribGeneratorDefault, or for
+ * specific requirements, modules may implement their own generator class.
+ */
+
+/**
+ * Implements hook_menu().
+ */
+function devel_contrib_generate_menu() {
+  $items = array();
+
+  foreach (entity_get_info() as $entity_type => $entity_info) {
+    if (isset($entity_info['devel contrib generator class'])) {
+      $items['admin/config/development/generate/'. $entity_type] = array(
+        'title' => 'Generate @type entities',
+        'title arguments' => array('@type' => $entity_info['label']),
+        'page callback' => 'drupal_get_form',
+        'page arguments' => array('devel_contrib_generate_form', $entity_type),
+        'access arguments' => array('generate entities'),
+      );
+    }
+  }
+
+  return $items;
+}
+
+/**
+ * Implement hook_permission().
+ */
+function devel_contrib_generate_permission() {
+  return array(
+    'generate entities' => array(
+      'title' => t('Generate entities'),
+      'description' => t('Access the developer UI to generate entities.'),
+      'restrict access' => TRUE,
+    ),
+  );
+}
+
+/**
+ * Get the generator for an entity type.
+ *
+ * @param $entity_type
+ *  The entity type.
+ *
+ * @return
+ *  The generator object for the entity type, as specified in its entity info.
+ */
+function devel_contrib_generate_get_generator($entity_type) {
+  $entity_info = entity_get_info($entity_type);
+  $generator_class = $entity_info['devel contrib generator class'];
+  $generator = new $generator_class($entity_type);
+  return $generator;
+}
+
+/**
+ * Generator form.
+ *
+ * @param $entity_type
+ *  The entity type to generate.
+ */
+function devel_contrib_generate_form($form, &$form_state, $entity_type) {
+  $entity_info = entity_get_info($entity_type);
+
+  $form['#entity_type'] = $entity_type;
+
+  $form['num_entities'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Number of entities to generate'),
+    '#default_value' => 1,
+    '#size' => 10,
+  );
+
+  // Get the specific bits of the form from the generator.
+  $generator = devel_contrib_generate_get_generator($entity_type);
+  $generator->generateForm($form, $form_state);
+
+  $form['kill'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Delete entities before generating'),
+    '#description' => t('Delete all entities (of the selected bundles) before generating new ones.'),
+  );
+  $form['dry_run'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Dry run'),
+    '#description' => t('Does not save the entities.'),
+  );
+  $form['devel'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Devel output'),
+    '#description' => t("Outputs generated entities with devel's dpm()."),
+  );
+
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Generate'),
+  );
+  $form['#redirect'] = FALSE;
+
+  return $form;
+}
+
+/**
+ * Submit handler.
+ *
+ * Generates the entities either with a batch (>50) or immediately.
+ */
+function devel_contrib_generate_form_submit($form, &$form_state) {
+  $entity_type = $form['#entity_type'];
+  $entity_info = entity_get_info($entity_type);
+
+  if (!empty($form_state['values']['kill'])) {
+    $query = new EntityFieldQuery();
+    $query->entityCondition('entity_type', $entity_type);
+    if (isset($form_state['values']['bundles'])) {
+      $requested_bundles = array_filter($form_state['values']['bundles']);
+      if (!empty($requested_bundles)) {
+        $query->entityCondition('bundle', $requested_bundles, 'IN');
+      }
+    }
+    $result = $query->execute();
+    if (!empty($result[$entity_type])) {
+      $entity_ids = array_keys($result[$entity_type]);
+      entity_delete_multiple($entity_type, $entity_ids);
+
+      drupal_set_message(t('Deleted !count entities.', array(
+        '!count' => count($entity_ids),
+      )));
+    }
+  }
+
+  if ($form_state['values']['num_entities'] <= 50) {
+    // For fewer than 50 entities, generate them on the fly.
+
+    // Get the generator and give it the parameters from the form values.
+    $generator = devel_contrib_generate_get_generator($entity_type);
+    $generator->setGenerationParameters($form_state['values']);
+
+    for ($i = 1; $i <= $form_state['values']['num_entities']; $i++) {
+      $entity = $generator->generateEntity($form_state['values']);
+    }
+
+    drupal_set_message(t("Generated !count %entity-type entities.", array(
+      '!count' => $form_state['values']['num_entities'],
+      '%entity-type' => $entity_info['label'],
+    )));
+  }
+  else {
+    // For more than 50, start a batch.
+    $batch = array(
+      'operations' => array(
+        array('devel_contrib_generate_batch_operation_generate', array($entity_type, $form_state['values'])),
+      ),
+      'finished' => 'devel_contrib_generate_batch_finished',
+    );
+
+    batch_set($batch);
+  }
+}
+
+/**
+ * Implements callback_batch_operation().
+ *
+ * @param $entity_type
+ *  The entity type.
+ * @param $form_values
+ *  The array of form values from the submit handler.
+ */
+function devel_contrib_generate_batch_operation_generate($entity_type, $form_values, &$context) {
+  if (empty($context['sandbox'])) {
+    $context['sandbox']['progress'] = 0;
+    $context['sandbox']['current_entity'] = 0;
+    $context['sandbox']['max'] = $form_values['num_entities'];
+
+    $context['results']['count'] = 0;
+    $context['results']['entity_type'] = $entity_type;
+
+    // Get the generator and give it the parameters from the form values.
+    // Hold on to it in the batch sandbox so the generator can store data
+    // between successive entities.
+    $generator = devel_contrib_generate_get_generator($entity_type);
+    $generator->setGenerationParameters($form_values);
+    $context['sandbox']['generator'] = $generator;
+  }
+  else {
+    $generator = $context['sandbox']['generator'];
+  }
+
+  $current_iteration_progress = 0;
+  $iteration_size = 25;
+
+  // Create entities until we've either reached the total requested count, or
+  // reached our limit for this iteration.
+  while ($context['sandbox']['progress'] < $context['sandbox']['max'] && $current_iteration_progress < $iteration_size) {
+    $entity = $generator->generateEntity($form_values);
+
+    $current_iteration_progress++;
+    $context['sandbox']['progress']++;
+    $context['results']['count']++;
+  }
+
+  if ($context['sandbox']['progress'] != $context['sandbox']['max']) {
+    $context['finished'] = $context['sandbox']['progress'] / $context['sandbox']['max'];
+  }
+}
+
+/**
+ * Implements callback_batch_finished().
+ */
+function devel_contrib_generate_batch_finished($success, $results, $operations) {
+  $entity_info = entity_get_info($results['entity_type']);
+  drupal_set_message(t("Generated !count %entity-type entities.", array(
+    '!count' => $results['count'],
+    '%entity-type' => $entity_info['label'],
+  )));
+}
+
+/**
+ * Default generator class.
+ *
+ * This will try to handle a lot of things to do with entities, but entity types
+ * with specific requirements should subclass this.
+ */
+class DevelContribGeneratorDefault {
+
+  /**
+   * The entity property which holds its creation timestamp.
+   *
+   * Set to NULL if not applicable.
+   */
+  var $created = 'created';
+
+  /**
+   * The entity property which holds its author uid.
+   *
+   * Set to NULL if not applicable.
+   */
+  var $user = 'uid';
+
+  function __construct($entity_type) {
+    $this->entityType = $entity_type;
+    $this->entityInfo = entity_get_info($entity_type);
+  }
+
+  /**
+   * Extend the generator form with options specific to an entity type.
+   */
+  public function generateForm(&$form, &$form_state) {
+    // If the entity type has more than one bundle, allow one or more to be
+    // chosen.
+    if (count($this->entityInfo['bundles'] > 1)) {
+      $options_bundles = array();
+      foreach ($this->entityInfo['bundles'] as $bundle_name => $bundle_info) {
+        $options_bundles[$bundle_name] = $bundle_info['label'];
+      }
+
+      $form['bundles'] = array(
+        '#type' => 'checkboxes',
+        '#title' => t('Bundles'),
+        '#description' => t("Leave empty to use all bundles."),
+        '#options' => $options_bundles,
+      );
+    }
+
+    // Title field if the entity info declares one.
+    if (isset($this->entityInfo['entity keys']['label'])) {
+      $form['label'] = array(
+        '#type' => 'fieldset',
+        '#title' => t("Label generation"),
+        '#tree' => TRUE,
+      );
+
+      $form['label']['label_type'] = array(
+        '#type' => 'radios',
+        '#title' => t('Label type'),
+        '#options' => array(
+          'type_counter' => t("Entity type and counter"),
+          'lorem' => t("Lorem Ipsum"),
+        ),
+      );
+
+      $form['label']['label_length'] = array(
+        '#type' => 'textfield',
+        '#title' => t('Maximum number of words in labels'),
+        '#default_value' => 4,
+        '#size' => 10,
+        // TODO: make this dependent on the 'lorem' option above.
+      );
+    }
+
+    if (!empty($this->created)) {
+      $options = array(1 => t('Now'));
+      foreach (array(3600, 86400, 604800, 2592000, 31536000) as $interval) {
+        $options[$interval] = format_interval($interval, 1) . ' ' . t('ago');
+      }
+      $form['time_range'] = array(
+        '#type' => 'select',
+        '#title' => t('How far back in time the entities should be dated'),
+        '#description' => t('Entity creation dates will be distributed randomly from the current time, back to the selected time.'),
+        '#options' => $options,
+        '#default_value' => 604800,
+      );
+    }
+  }
+
+  /**
+   * Set parameters for entities to generate.
+   *
+   * @param $parameters
+   *  An array of parameters for entities that are to be generated with
+   *  generateEntity(). This has the following properties:
+   *  - 'dry_run': (optional) Do not save the entities. Defaults to FALSE.
+   *  - 'devel': (optional) Output the generated entities with devel's dpm().
+   *  - 'bundles': (optional) An array of bundle names. Generated entities will
+   *    be one of these bundles, taken randomly. Defaults to all bundles.
+   *  - 'label': (optional) An array of settings for how to set labels on the
+   *    entities. Only pass this if the entity has a label entity key. If
+   *    omitted, no label is generated.
+   *    - 'label_type': Indicates the method to use to generate labels. One of:
+   *      - 'type_id': The entity type label with the entity ID appended.
+   *      - 'lorem': The label uses lorem ipsum text.
+   *    - 'label_length': The number of words to use in lorem ipsum labels.
+   *  - 'time_range': (optional) A value in seconds for how far back the entity
+   *    creation time may be set. Creation times are taken randomly from this
+   *    interval. Only applies if the entity has a created timestamp property.
+   */
+  public function setGenerationParameters($parameters) {
+    $this->parameters = $parameters;
+  }
+
+  /**
+   * Generate a single entity.
+   *
+   * This creates and saves a new entity (unless a dry run was requested).
+   *
+   * @return
+   *  The generated entity.
+   */
+  public function generateEntity() {
+    $entity = $this->createEntity();
+    $this->saveEntity($entity);
+
+    return $entity;
+  }
+
+  /**
+   * Create a single unsaved entity.
+   *
+   * This takes care of the following elements:
+   *  - label, if the entity type has a label key
+   *  - author, if this class defines the key for this
+   *  - created time, if this class defines the key for this
+   *  - Field API fields if the entity type is fieldable
+   *
+   * Entity types requiring further features should override this, but are
+   * advised to call the parent method first.
+   */
+  protected function createEntity() {
+    module_load_include('inc', 'devel_generate');
+
+    $entity_values = array();
+
+    // If the entity type has a 'bundle' entity key, then it must be set in the
+    // values array passed to entity_create().
+    if (isset($this->entityInfo['entity keys']['bundle'])) {
+      // If the form has a bundles value, then consider that.
+      if (isset($this->parameters['bundles'])) {
+        $bundles = array_filter($this->parameters['bundles']);
+        // None selected means use all bundles.
+        if (empty($bundles)) {
+          $bundles = array_keys($this->entityInfo['bundles']);
+        }
+      }
+      else {
+        // If the form didn't have a bundles element, that can only be because
+        // there is only one bundle. Get it from the entity info.
+        $bundles = array_keys($this->entityInfo['bundles']);
+      }
+
+      $bundle_property = $this->entityInfo['entity keys']['bundle'];
+
+      // Choose a bundle at random.
+      $entity_values[$bundle_property] = $bundles[array_rand($bundles)];
+    }
+
+    $entity = entity_create($this->entityType, $entity_values);
+
+    // Generate a label if requested.
+    if (isset($this->parameters['label'])) {
+      $label_property = $this->entityInfo['entity keys']['label'];
+
+      switch ($this->parameters['label']['label_type']) {
+        case 'type_counter':
+          if (!isset($this->label_counter)) {
+            $this->label_counter = 0;
+          }
+          $this->label_counter++;
+
+          $label = $this->entityInfo['label'] . ' ' . $this->label_counter;
+          break;
+        case 'lorem':
+          $label = devel_create_greeking($this->parameters['label']['label_length'], TRUE);
+          break;
+      }
+
+      $entity->{$label_property} = $label;
+    }
+
+    if (!empty($this->created)) {
+      $entity->created = REQUEST_TIME - mt_rand(0, $this->parameters['time_range']);
+    }
+
+    //dsm($entity);
+
+    if ($this->entityInfo['fieldable']) {
+      // Populate all core fields on behalf of field.module
+      module_load_include('inc', 'devel_generate', 'devel_generate.fields');
+      // Sadly this doesn't let us tell it which fields to skip in a nice way.
+      list(, , $bundle) = entity_extract_ids($this->entityType, $entity);
+      devel_generate_fields($entity, $this->entityType, $bundle);
+    }
+
+    return $entity;
+  }
+
+  /**
+   * Save the generated entity and/or output it in a dry run.
+   *
+   * Entity types that use Entity API do not need to override this.
+   */
+  protected function saveEntity($entity) {
+    if (empty($this->parameters['dry_run'])) {
+      $entity->save();
+    }
+
+    if (!empty($this->parameters['devel'])) {
+      dpm($entity);
+    }
+  }
+
+}

@@ -1,0 +1,228 @@
+<?php
+/**
+ * @file file_checker.module
+ * We try to harmonzie the db table "files" with the actual filesystem representation.
+ * There we flag missing physical files with a new file status FILE_STATUS_MISSING.
+ */
+
+// Additional file status flag, complementing ~FILE_STATUS_PERMANENT and FILE_STATUS_PERMANENT
+define('FILE_STATUS_MISSING', 2);
+
+include_once('file_checker.pages.inc');
+include_once('file_checker.views.inc');
+
+/**
+ * Verify all files in the files table and check their representation on the file system.
+ * Therefore we create a batch job and separate the whole set into separate junks.
+ * @param $process
+ *   boolean whether to process the batch immediately, not needed of being set as
+ *   on form submission a batch will be triggered automatically
+ */
+function file_checker_process_verification($process = TRUE, $batch_size = NULL) {
+  // calculate number of files
+  $total = file_checker_get_count();
+  // split processing into junks
+  $batch_size = isset($batch_size) ? $batch_size : variable_get('file_checker_process_batch_size', 10000);
+  $operations = array();
+  for ($i = 0; $i < $total; $i += $batch_size) {
+    // the last op will be smaller, don't exceed total size
+    $count = ($total > ($i + $batch_size)) ? $batch_size : ($total - $i);
+    $operations[] = array('file_checker_verify_range', array($i, $count, $total));
+  }
+  // Set batch processor
+  $batch = array(
+    'operations' => $operations,
+    'finished' => 'file_checker_verify_finish', // called after operations have been finished
+    'title' => t('Identify and flag missing physical files'),
+    'init_message' => t('File Checker is starting to process %total files', array('%total' => $total)),
+    'progress_message' => NULL, // suppress here, message to be set in operation function
+    'error_message' => t('File Checker has encountered an error.'),
+    'progressive' => FALSE,
+  );
+  batch_set($batch); // no need to call
+  if ($process) {
+    batch_process();
+  }
+}
+
+/**
+ * This batch operation callback checks a range of files.
+ * @param $from
+ *   file offset
+ * @param $count
+ *   number of files to check
+ * @param $total
+ *   total number of files
+ * @param $context
+ *   batch callback context information
+ */
+function file_checker_verify_range($from, $count, $total, &$context) {
+  //$result = db_query("SELECT * FROM {file_usage} WHERE count>0");
+  $result = db_select('file_usage', 'f')
+    ->fields('f')
+    ->condition('count', 0, '>')
+    ->range($from, $count)
+    ->execute();
+
+  foreach ($result as $data) {
+    // Temporary files (those marked with status = 0) older than the maximum temp age
+    // were, or will be, removed during a cron run.
+    $files = db_select('file_managed', 'f')
+      ->fields('f')
+      ->condition('fid', $data->fid)
+      //->condition('filesize', 0, '>')
+      ->condition('status', 0, '>')
+      ->execute();
+    foreach ($files as $file) {
+      file_checker_verify($file);
+      break; // only need to check one, more would be redundant
+    }
+  }
+  // correct status message here, as we process in larger junks
+  $context['message'] = t('Processed @current out of @total.', array('@current' => ($from + $count), '@total' => $total));
+}
+
+/**
+ * Check if a file contained in the files table physically exists on the file system.
+ * If a file cannot be accessed, we flag the file as missed, i. e. FILE_STATUS_MISSING.
+ * @param $file
+ *   file object
+ */
+function file_checker_verify($file) {
+  // determine file path
+  //$path = file_create_path($file->filepath); // determine file path
+  $path = file_stream_wrapper_uri_normalize($file->uri);
+  // check if file can be accessed
+  if (!file_exists($path) || !is_readable($path)) {
+    $file->status = FILE_STATUS_MISSING;
+    drupal_write_record('file_managed', $file, 'fid');
+  }
+  // if files are falsely marked as missing, revert the status back
+  elseif (($file->status & FILE_STATUS_MISSING) == FILE_STATUS_MISSING) {
+    $file->status = FILE_STATUS_PERMANENT;
+    drupal_write_record('file_managed', $file, 'fid');
+  }
+}
+
+/**
+ * Implements hook_cron()
+ *
+ * Process the file system checking on cron if demanded. This should only be used on small sites if at all.
+ */
+function file_checker_cron() {
+  if (variable_get('file_checker_process_on_cron', FALSE)) {
+    file_checker_process_verification(TRUE);
+  }
+}
+
+/**
+ * Batch callback finisher operation
+ * @param $success
+ *   boolean about operation success
+ * @param $results
+ *   potential ouput
+ * @param $operations
+ *   operations processed
+ */
+function file_checker_verify_finish($success, $results, $operations) {
+  if ($success) {
+    variable_set('file_checker_last_run', REQUEST_TIME);
+    drupal_set_message(t('File verification has been completed.'));
+    watchdog('file_checker', t('File verification has been completed.'));
+  }
+  else {
+    // A fatal error occurred during batch processing
+    $error_operation = reset($operations);
+    $operation = array_shift($error_operation);
+    $arguments = array_shift($error_operation);
+    $arguments_as_string = implode(', ', $arguments);
+    watchdog('file_checker', "Error on file verification when calling operation '%s'('%s')", array($operation, $arguments_as_string), WATCHDOG_ERROR);
+    drupal_set_message(t('An error occurred and has been recorded in the system log.'), 'error');
+  }
+}
+
+/**
+ * Implements hook_menu().
+ *
+ * @return
+ *   array of menu items
+ */
+function file_checker_menu() {
+  $items['admin/config/system/file_checker'] = array(
+    'title' => 'File Checker',
+    'description' => t('Show missing physical files.'),
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('file_checker_admin_settings'),
+    'access callback' => 'file_checker_access',
+    'type' => MENU_NORMAL_ITEM,
+    'file' => 'file_checker.pages.inc',
+  );
+
+  $items['admin/reports/file_checker'] = array(
+    'title' => 'File list',
+    'description' => t('Show physical files, filter them by status, e. g. missing.'),
+    'page callback' => 'file_checker_overview',
+    'access callback' => 'file_checker_access',
+    'type' => MENU_NORMAL_ITEM,
+    'file' => 'file_checker.pages.inc',
+  );
+  return $items;
+}
+
+function file_checker_access() {
+  return user_access('access file checker') ;
+}
+
+/**
+ * Implements hook_permission().
+ * @return multitype:number
+ */
+function file_checker_permission() {
+  return array(
+    'access file checker' => array(
+      'title' => t('Access file checker'),
+      'description' => t('Allow users to access the file checker'),
+    ),
+  );
+}
+
+/**
+ * Implements hook_views_api().
+ * @return multitype:number
+ */
+function file_checker_views_api() {
+  return array(
+    'api' => 2,
+  );
+}
+
+/**
+ * Total count of files.
+ * @return
+ *   SQL statement string
+ */
+function file_checker_get_count() {
+  $total = db_query('SELECT count(*) FROM {file_usage} WHERE count>0')->fetchField();
+  return $total;
+}
+
+/**
+ * Get a list of (relevant) db columuns in the files table. We could also call drupal_get_schema('files'),
+ * but this is more efficient and we have the columns in the order we want them to have.
+ *
+ * @return
+ *  array of file table columns
+ */
+function file_checker_get_db_table_file_cols() {
+  return array(
+    'fid' => array('type' => 'serial'),
+    'timestamp' => array('type' => 'int'),
+    'filename' => array('type' => 'varchar'),
+    'uri' => array('type' => 'varchar'),
+    'filemime' => array('type' => 'varchar'),
+    'filesize' => array('type' => 'int'),
+    'uid' => array('type' => 'int'),
+    'status' => array('type' => 'int'),
+    'type' => array('type' => 'varchar'),
+  );
+}

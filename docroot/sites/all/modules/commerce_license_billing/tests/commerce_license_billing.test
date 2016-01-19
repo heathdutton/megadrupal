@@ -1,0 +1,849 @@
+<?php
+
+/**
+ * @file
+ * Unit tests for the Commerce License Billing module.
+ */
+
+/**
+ * Test the product and product type CRUD.
+ */
+class CommerceLicenseBillingTestCase extends CommerceBaseTestCase {
+
+  protected $profile = 'testing';
+
+  protected $billing_cycle_type = NULL;
+  protected $billing_cycle = NULL;
+  protected $prepaid_product = NULL;
+  protected $another_prepaid_product = NULL;
+  protected $prepaid_product_display = NULL;
+  protected $another_prepaid_product_display = NULL;
+  protected $postpaid_product = NULL;
+  protected $another_postpaid_product = NULL;
+  protected $postpaid_product_display = NULL;
+  protected $prepaid_license = NULL;
+  protected $another_prepaid_license = NULL;
+  protected $postpaid_license = NULL;
+
+  public static function getInfo() {
+    return array(
+      'name' => 'Commerce License Billing',
+      'description' => 'Test recurring billing for licenses.',
+      'group' => 'Commerce License',
+    );
+  }
+
+  public function setUp() {
+    // Install all required modules, and clear the cache so that the required
+    // license & billing fields are created
+    $modules = parent::setUpHelper('ui');
+    $additional_modules = array('commerce_payment_example', 'commerce_license_billing', 'commerce_license_billing_test');
+    $modules = array_merge($modules, $additional_modules);
+    parent::setUp($modules);
+
+    // Enable licensing on the required product and line item types.
+    variable_set('commerce_license_product_types', array('product' => 'product'));
+    variable_set('commerce_license_line_item_types', array('product' => 'product'));
+
+    // Flush the caches to trigger the creation of the license & billing fields.
+    drupal_flush_all_caches();
+
+    $this->createDummyProductDisplayContentType();
+    $this->store_customer = $this->createStoreCustomer();
+    // Create a test billing cycle type.
+    $billing_cycle_type = entity_create('cl_billing_cycle_type', array('engine' => 'test'));
+    $billing_cycle_type->name = 'Test';
+    $billing_cycle_type->title = 'test';
+    $billing_cycle_type->save();
+    $this->billing_cycle_type = $billing_cycle_type;
+    $this->billing_cycle = $billing_cycle_type->getBillingCycle($this->store_customer->uid);
+
+    // Initialize an empty product display.
+    $node = (object) array('type' => 'product_display');
+    node_object_prepare($node);
+    $node->uid = 1;
+
+    // Create a prepaid product that holds the license.
+    $this->prepaid_product = $this->createProduct('PREPAID-LICENSE-PLAN-A', 50, 'prepaid');
+    $this->another_prepaid_product = $this->createProduct('PREPAID-LICENSE-PLAN-B', 50, 'prepaid');
+    // Create product displays for the prepaid products.
+    $prepaid_display = clone $node;
+    $prepaid_display->title = 'Prepaid license';
+    $prepaid_display->field_product[LANGUAGE_NONE][0]['product_id'] = $this->prepaid_product->product_id;
+    node_save($prepaid_display);
+    $this->prepaid_product_display = $prepaid_display;
+    $another_prepaid_display = clone $node;
+    $another_prepaid_display->title = 'Another prepaid license';
+    $another_prepaid_display->field_product[LANGUAGE_NONE][0]['product_id'] = $this->another_prepaid_product->product_id;
+    node_save($another_prepaid_display);
+    $this->another_prepaid_product_display = $another_prepaid_display;
+
+    // Create a postpaid product that holds the license.
+    $this->postpaid_product = $this->createProduct('POSTPAID-LICENSE-PLAN-A', 40, 'postpaid');
+    // Create a product display for the postpaid product.
+    $node = (object) array('type' => 'product_display');
+    node_object_prepare($node);
+    $node->uid = 1;
+    $node->title = 'Postpaid license';
+    $node->field_product[LANGUAGE_NONE][]['product_id'] = $this->postpaid_product->product_id;
+    node_save($node);
+    $this->postpaid_product_display = $node;
+
+    // Serves only as an alternative plan, so it doesn't need a product display.
+    $this->another_postpaid_product = $this->createProduct('POSTPAID-LICENSE-PLAN-B', 80, 'postpaid');
+  }
+
+  /**
+   * Main test, composed of different subtests.
+   *
+   * SimpleTest reinstalls Drupal between test runs, but we want to simulate
+   * a working system from checkout through different renewals, with plan
+   * and usage changes in between.
+   */
+  public function testRecurring() {
+    $checkout_success = $this->checkoutTest();
+    if ($checkout_success !== FALSE) {
+      $this->prepareData();
+      $this->planTest();
+      $this->usageTest();
+      $this->orderRefreshTest();
+      $this->billingCycleCloseTest();
+    }
+  }
+
+  /**
+   * Tests prepaid license cancellations (which need to be scheduled).
+   */
+  public function testPrepaidLicenseCancellation() {
+    // Purchase the second prepaid product.
+    $this->drupalLogin($this->store_customer);
+    $this->drupalPost('node/' . $this->another_prepaid_product_display->nid, array(), t('Add to cart'));
+    $this->completeCheckout();
+
+    $query = new EntityFieldQuery;
+    $query
+      ->entityCondition('entity_type', 'commerce_license')
+      ->propertyCondition('product_id', $this->another_prepaid_product->product_id);
+    $result = $query->execute();
+    if (!$result) {
+      $this->assertTrue(FALSE, 'The second prepaid license was successfuly created.');
+      return;
+    }
+    $this->another_prepaid_license = entity_load_single('commerce_license', key($result['commerce_license']));
+
+    $recurring_order = $this->getBillingCycleOrder($this->billing_cycle);
+    // Confirm that the new license has a line item in the recurring order.
+    $recurring_order_wrapper = entity_metadata_wrapper('commerce_order', $recurring_order);
+    $found = FALSE;
+    $line_item_id = NULL;
+    foreach ($recurring_order_wrapper->commerce_line_items as $line_item_wrapper) {
+      if ($line_item_wrapper->cl_billing_license->raw() == $this->another_prepaid_license->license_id) {
+        $found = TRUE;
+        $line_item_id = $line_item_wrapper->line_item_id->value();
+        break;
+      }
+    }
+    $this->assertTrue($found, 'The second prepaid license has a matching recurring line item.');
+
+    // Schedule cancellation.
+    commerce_license_billing_change_status($this->another_prepaid_license, COMMERCE_LICENSE_REVOKED);
+
+    // Reload the order and re-examine the line items.
+    // Confirm that the license no longer has a line item in the recurring order.
+    entity_get_controller('commerce_order')->resetCache();
+    drupal_static_reset('commerce_license_billing_commerce_order_load');
+    $recurring_order = commerce_order_load($recurring_order->order_id);
+    $recurring_order_wrapper = entity_metadata_wrapper('commerce_order', $recurring_order);
+    $found = FALSE;
+    foreach ($recurring_order_wrapper->commerce_line_items as $line_item_wrapper) {
+      if ($line_item_wrapper->cl_billing_license->raw() == $this->another_prepaid_license->license_id) {
+        $found = TRUE;
+        break;
+      }
+    }
+    $this->assertFalse($found, 'The second prepaid license no longer has a matching recurring line item.');
+    $line_item = commerce_line_item_load($line_item_id);
+    $this->assertFalse($line_item, 'The recurring line item has been deleted from the system.');
+
+    // Close the billing cycle.
+    commerce_license_set_time($this->billing_cycle->end);
+    $item = new stdClass;
+    $item->data = array();
+    $item->data['billing_cycle_id'] = $this->billing_cycle->billing_cycle_id;
+    commerce_license_billing_cycle_renew_queue_process($item);
+    commerce_license_billing_cycle_close_queue_process($item);
+    $recurring_order = commerce_order_load($recurring_order->order_id);
+    $this->assertFalse($recurring_order, 'The empty recurring order has been deleted from the system.');
+  }
+
+  /**
+   * Tests the checkout process for prepaid and postpaid products.
+   *
+   * The process starts on the node page, and ends when checkout is complete,
+   * the billing cycle has been opened, and the recurring order created with the
+   * appropraite line items.
+   */
+  protected function checkoutTest() {
+    $this->drupalLogin($this->store_customer);
+
+    // Add the prepaid and postpaid products to cart.
+    $this->drupalPost('node/' . $this->prepaid_product_display->nid, array(), t('Add to cart'));
+    $this->drupalPost('node/' . $this->postpaid_product_display->nid, array(), t('Add to cart'));
+    $this->drupalGet($this->getCommerceUrl('cart'));
+    $this->assertText($this->prepaid_product->title, 'The prepaid license product is present in the cart view');
+    $this->assertText($this->postpaid_product->title, 'The postpaid license product is present in the cart view');
+    $this->assertText('$50.00', 'The prepaid license product is correctly priced at $50.00');
+    $this->assertText('$0.00', 'The postpaid license product is correctly priced at $0.00');
+
+    // Complete checkout
+    $this->completeCheckout();
+
+    // Confirm that the recurring order for the billing cycle has been created.
+    $has_recurring_order = FALSE;
+    $query = new EntityFieldQuery;
+    $query
+      ->entityCondition('entity_type', 'commerce_order')
+      ->entityCondition('bundle', 'recurring')
+      ->fieldCondition('cl_billing_cycle', 'target_id', $this->billing_cycle->billing_cycle_id);
+    $result = $query->execute();
+    if ($result) {
+      $order_id = key($result['commerce_order']);
+      $has_recurring_order = TRUE;
+    }
+    $this->assertTrue($has_recurring_order, 'A recurring order matching the billing cycle has been created');
+    if (!$has_recurring_order) {
+      // If there's no recurring order, there's no point in further testing.
+      return FALSE;
+    }
+
+    // Confirm the line items on the recurring order.
+    // We are intentionally not loading the order so that the refresh is not
+    // triggered.
+    $query = new EntityFieldQuery;
+    $query
+      ->entityCondition('entity_type', 'commerce_line_item')
+      ->entityCondition('bundle', 'recurring')
+      ->propertyCondition('order_id', $order_id);
+    $result = $query->execute();
+    if ($result) {
+      $line_item_ids = array_keys($result['commerce_line_item']);
+      $line_items = commerce_line_item_load_multiple($line_item_ids);
+      // Key the line items by product_id.
+      foreach ($line_items as $line_item) {
+        $line_item_wrapper = entity_metadata_wrapper('commerce_line_item', $line_item);
+        $product_id = $line_item_wrapper->commerce_product->raw();
+        $line_items_by_product[$product_id] = $line_item;
+      }
+
+      // Try to find the line item for the prepaid product.
+      if (!empty($line_items_by_product[$this->prepaid_product->product_id])) {
+        $line_item = $line_items_by_product[$this->prepaid_product->product_id];
+        $line_item_wrapper = entity_metadata_wrapper('commerce_line_item', $line_item);
+        $this->assertTrue(TRUE, 'Found the recurring line item for the prepaid product');
+
+        $next_billing_cycle = $this->billing_cycle_type->getNextBillingCycle($this->billing_cycle, FALSE);
+        $start = $line_item_wrapper->cl_billing_start->value();
+        $end = $line_item_wrapper->cl_billing_end->value();
+        $this->assertEqual($start, $next_billing_cycle->start, 'The recurring line item for the prepaid product has the correct start date');
+        $this->assertEqual($end , $next_billing_cycle->end, 'The recurring line item for the prepaid product has the correct end date');
+
+        $price_amount = $line_item_wrapper->commerce_unit_price->amount->value();
+        $expected_price_amount = $this->prepaid_product->commerce_price[LANGUAGE_NONE][0]['amount'];
+        $this->assertEqual($price_amount, $expected_price_amount, 'The recurring line item for the prepaid product has the correct price');
+      }
+      else {
+        $this->assertTrue(FALSE, 'Found the recurring line item for the prepaid product');
+      }
+
+      // Try to find the line item for the postpaid product.
+      if (!empty($line_items_by_product[$this->postpaid_product->product_id])) {
+        $line_item = $line_items_by_product[$this->postpaid_product->product_id];
+        $line_item_wrapper = entity_metadata_wrapper('commerce_line_item', $line_item);
+        $this->assertTrue(TRUE, 'Found the recurring line item for the postpaid product');
+
+        $start = $line_item_wrapper->cl_billing_start->value();
+        $end = $line_item_wrapper->cl_billing_end->value();
+        $this->assertEqual($start, $this->billing_cycle->start, 'The recurring line item for the postpaid product has the correct start date');
+        $this->assertEqual($end , $this->billing_cycle->end, 'The recurring line item for the postpaid product has the correct end date');
+
+        $price_amount = $line_item_wrapper->commerce_unit_price->amount->value();
+        $expected_price_amount = $this->postpaid_product->commerce_price[LANGUAGE_NONE][0]['amount'];
+        $this->assertEqual($price_amount, $expected_price_amount, 'The recurring line item for the postpaid product has the correct price');
+      }
+      else {
+        $this->assertTrue(FALSE, 'Found the recurring line item for the postpaid product');
+      }
+    }
+    else {
+      $this->assertTrue(FALSE, 'The recurring order has two valid recurring line items');
+    }
+
+    return TRUE;
+  }
+
+  /**
+   * Tests plan changes.
+   */
+  public function planTest() {
+    // Forward time to the expected start of plan B.
+    commerce_license_set_time($this->plan_durations[1][0]);
+    // Switch the postpaid license from plan A to plan B.
+    $plan_b_product_id = $this->another_postpaid_product->product_id;
+    commerce_license_billing_change_plan($this->postpaid_license, $plan_b_product_id);
+    $plan_history = commerce_license_billing_plan_history_list($this->postpaid_license, $this->billing_cycle);
+    if (count($plan_history) < 2) {
+      // The second record wasn't created, something went wrong, stop here.
+      $this->assertTrue(FALSE, 'The second plan history record was successfuly opened');
+      return;
+    }
+
+    $second_record_valid = FALSE;
+    $product_ids_match = ($plan_history[1]['product_id'] == $plan_b_product_id);
+    $start_times_match = ($plan_history[1]['start'] == $this->plan_durations[1][0]);
+    $end_times_match = ($plan_history[1]['end'] == $this->billing_cycle->end);
+    if ($product_ids_match && $start_times_match && $end_times_match) {
+      $second_record_valid = TRUE;
+    }
+    $this->assertTrue($second_record_valid, 'The second plan history record is valid');
+    $first_record_closed = ($plan_history[0]['end'] + 1 == $plan_history[1]['start']);
+    $this->assertTrue($first_record_closed, 'The first plan history record was successfuly closed');
+
+    // Schedule a plan change for the prepaid license.
+    $plan_b_product_id = $this->another_prepaid_product->product_id;
+    commerce_license_billing_change_plan($this->prepaid_license, $plan_b_product_id);
+    $scheduled_changes = commerce_license_billing_schedule_changes_list($this->prepaid_license);
+    $has_scheduled_change = FALSE;
+    if (count($scheduled_changes) == 1) {
+      $scheduled_change = reset($scheduled_changes);
+      if ($scheduled_change['property'] == 'product' && $scheduled_change['value'] == $plan_b_product_id) {
+        $has_scheduled_change = TRUE;
+      }
+    }
+    $this->assertTrue($has_scheduled_change, "The plan change for the prepaid license was successfuly scheduled.");
+  }
+
+  /**
+   * Tests usage tracking.
+   */
+  protected function usageTest() {
+    $plan_history = commerce_license_billing_plan_history_list($this->postpaid_license, $this->billing_cycle);
+    // Use the start / end timestamps for the first and second postpaid plan as
+    // the usage start / end timestamps. Since the prepaid license had no plan
+    // change, both usage records will fit into its first and only plan.
+    $first_usage_start = $plan_history[0]['start'];
+    $first_usage_end = $plan_history[0]['end'];
+    $second_usage_start = $plan_history[1]['start'];
+    $second_usage_end = $plan_history[1]['end'];
+    $bandwidth = commerce_license_billing_usage_group($this->prepaid_license, 'bandwidth');
+    $bandwidth->addUsage($this->prepaid_license->revision_id, 2050, $first_usage_start, $first_usage_end);
+    $bandwidth->addUsage($this->prepaid_license->revision_id, 1022, $second_usage_start, $second_usage_end);
+    // Confirm the correct current usage.
+    $current_usage = $bandwidth->currentUsage($this->billing_cycle);
+    $this->assertEqual($current_usage, 3072, 'Current bandwidth usage matches total reported quantity');
+
+    // Set initial bandwidth usage for the postpaid license, so that it shows
+    // up as a line item in orderRefreshTest().
+    $plan_history = commerce_license_billing_plan_history_list($this->postpaid_license, $this->billing_cycle);
+    $bandwidth = commerce_license_billing_usage_group($this->postpaid_license, 'bandwidth');
+    $bandwidth->addUsage($plan_history[0]['revision_id'], 2050, $first_usage_start, $first_usage_end);
+
+    // Forward time to expected start of plan B.
+    commerce_license_set_time($this->plan_durations[1][0]);
+
+    // Confirm that the environments gauge has the correct initial value.
+    $environments = commerce_license_billing_usage_group($this->postpaid_license, 'environments');
+    $initial_usage = (int) $environments->currentUsage($this->billing_cycle);
+    $this->assertTrue($initial_usage === 2, 'The initial environment usage was successfuly opened.');
+    // Register new usage for the second plan.
+    $environments->addUsage($plan_history[1]['revision_id'], 4, $second_usage_start);
+    // Confirm that the first usage was correctly closed.
+    $usage_history = commerce_license_billing_usage_history_list($this->postpaid_license, $this->billing_cycle);
+    $usage_history = $usage_history['environments'];
+    $first_record_closed = ($usage_history[1]['end'] + 1 == $usage_history[2]['start']);
+    $this->assertTrue($first_record_closed, 'The first environment usage history record was successfuly closed');
+    // Confirm the correct current usage.
+    $current_usage = $environments->currentUsage($this->billing_cycle);
+    $this->assertEqual($current_usage, 4, 'Current environment usage matches last reported quantity');
+  }
+
+  /**
+   * Tests the recurring order refresh and its pricing logic.
+   */
+  protected function orderRefreshTest() {
+    $plan_durations = $this->plan_durations;
+    $recurring_order = $this->getBillingCycleOrder($this->billing_cycle);
+    // Build an array of expected line items.
+    $next_billing_cycle = $this->billing_cycle_type->getNextBillingCycle($this->billing_cycle);
+    $expected_charges = array();
+    $expected_charges[0] = array(
+      'title' => 'prepaid base product',
+      'product_id' => $this->prepaid_product->product_id,
+      'commerce_unit_price' => array(
+        'amount' => $this->prepaid_product->commerce_price[LANGUAGE_NONE][0]['amount'],
+      ),
+      'quantity' => 1,
+      'cl_billing_start' => $next_billing_cycle->start,
+      'cl_billing_end' => $next_billing_cycle->end,
+    );
+    $counter_product = commerce_product_load_by_sku('BILLING-TEST-BANDWIDTH');
+    $expected_charges[1] = array(
+      'title' => 'bandwidth usage product (prepaid)',
+      'product_id' => $counter_product->product_id,
+      'commerce_unit_price' => array(
+        'amount' => $counter_product->commerce_price[LANGUAGE_NONE][0]['amount'],
+      ),
+      // 1024 is free, the rest is charged for.
+      'quantity' => 2048,
+      'cl_billing_start' => $this->billing_cycle->start,
+      'cl_billing_end' => $this->billing_cycle->end,
+      'prorate' => TRUE,
+    );
+    $expected_charges[2] = array(
+      'title' => 'postpaid base product (plan A)',
+      'product_id' => $this->postpaid_product->product_id,
+      'commerce_unit_price' => array(
+        'amount' => '1000', // 10$
+      ),
+      'quantity' => 1,
+      'cl_billing_start' => $plan_durations[0][0],
+      'cl_billing_end' => $plan_durations[0][1],
+    );
+    // The second plan hasn't been closed yet, so it's taking 3/4 of the cycle.
+    $expected_charges[3] = array(
+      'title' => 'postpaid base product (plan B)',
+      'product_id' => $this->another_postpaid_product->product_id,
+      'commerce_unit_price' => array(
+        'amount' => '6000', // 60$
+      ),
+      'quantity' => 1,
+      'cl_billing_start' => $plan_durations[1][0],
+      'cl_billing_end' => $this->billing_cycle->end,
+    );
+    $expected_charges[4] = array(
+      'title' => 'bandwidth usage product (postpaid)',
+      'product_id' => $counter_product->product_id,
+      'commerce_unit_price' => array(
+        'amount' => $counter_product->commerce_price[LANGUAGE_NONE][0]['amount'],
+      ),
+      // The free quantity is 1024, prorated to 256 since this usage only
+      // covers a quarter of the billing cycle. 2050 - 256 = 1794.
+      'quantity' => 1794,
+      'cl_billing_start' => $this->billing_cycle->start,
+      'cl_billing_end' => $this->billing_cycle->end,
+    );
+    $env_product = commerce_product_load_by_sku('BILLING-TEST-ENV');
+    // 7.50$ is the expected unit price because at this moment the environment
+    // usage is valid for 3/4 of the cycle, so it's 10$ * (3/4). Because the
+    // free quantity on this usage is 3, the expected charged qty is 1.
+    $expected_charges[5] = array(
+      'title' => 'environments usage product (postpaid, plan B)',
+      'product_id' => $env_product->product_id,
+      'commerce_unit_price' => array(
+        'amount' => '750', // 7.50$
+      ),
+      'quantity' => 1,
+      'cl_billing_start' => $plan_durations[1][0],
+      'cl_billing_end' => $this->billing_cycle->end,
+    );
+    $this->assertLineItems($recurring_order, $expected_charges);
+
+    // Forward time to the expected suspension start, and then do it.
+    commerce_license_set_time($this->plan_durations[2][0]);
+    $this->postpaid_license->suspend();
+
+    // Try to register usage for the suspended revision, make sure it fails.
+    $suspended_revision_id = $this->postpaid_license->revision_id;
+    $environments = commerce_license_billing_usage_group($this->postpaid_license, 'environments');
+    try {
+      $environments->addUsage($suspended_revision_id, 4);
+    }
+    catch (Exception $e) {
+      $message = $e->getMessage();
+      $expected_message = 'Tried to register usage for a non-active revision #' . $suspended_revision_id;
+      $this->assertEqual($message, $expected_message, 'Could not register usage for a non-active revision');
+    }
+    if (!isset($message)) {
+      $this->assertTrue(FALSE, 'Could not register usage for a non-active revision');
+    }
+
+    // Forward time to the expected reactivation start, and then do it.
+    commerce_license_set_time($this->plan_durations[3][0]);
+    $this->postpaid_license->activate();
+
+    // The previous active revision went from 3/4 to 1/4 of the billing cycle
+    // so the expected price needs to change.
+    $expected_charges[3]['cl_billing_end'] = $plan_durations[1][1];
+    $expected_charges[3]['commerce_unit_price']['amount'] = '4000'; // 40$.
+    // Remove the old usage, it will be readded.
+    unset($expected_charges[4]);
+    unset($expected_charges[5]);
+    // Add the new active plan.
+    $expected_charges[4] = array(
+      'title' => 'postpaid base product (plan B)',
+      'product_id' => $this->another_postpaid_product->product_id,
+      'commerce_unit_price' => array(
+        'amount' => '1000', // 10$
+      ),
+      'quantity' => 1,
+      'cl_billing_start' => $plan_durations[3][0],
+      'cl_billing_end' => $this->billing_cycle->end,
+    );
+    $expected_charges[5] = array(
+      'title' => 'bandwidth usage product (postpaid)',
+      'product_id' => $counter_product->product_id,
+      'commerce_unit_price' => array(
+        'amount' => $counter_product->commerce_price[LANGUAGE_NONE][0]['amount'],
+      ),
+      // The free quantity is 1024, prorated to 256 since this usage only
+      // covers a quarter of the billing cycle. 2050 - 256 = 1794.
+      'quantity' => 1794,
+      'cl_billing_start' => $this->billing_cycle->start,
+      'cl_billing_end' => $this->billing_cycle->end,
+    );
+    $expected_charges[6] = array(
+      'title' => 'environments usage product (postpaid, plan B)',
+      'product_id' => $env_product->product_id,
+      'commerce_unit_price' => array(
+        'amount' => '500', // 5$
+      ),
+      'quantity' => 1,
+      'cl_billing_start' => $plan_durations[1][0],
+      'cl_billing_end' => $plan_durations[1][1],
+    );
+    $expected_charges[7] = array(
+      'title' => 'environments usage product (postpaid, plan B, reactivated)',
+      'product_id' => $env_product->product_id,
+      'commerce_unit_price' => array(
+        'amount' => '125', // 1.25$
+      ),
+      'quantity' => 1,
+      'cl_billing_start' => $plan_durations[3][0],
+      'cl_billing_end' => $this->billing_cycle->end,
+    );
+    $expected_charges = array_values($expected_charges);
+
+    // Reload the order and re-examine the line items.
+    entity_get_controller('commerce_order')->resetCache();
+    drupal_static_reset('commerce_license_billing_commerce_order_load');
+    $recurring_order = commerce_order_load($recurring_order->order_id);
+    $this->assertLineItems($recurring_order, $expected_charges);
+    $order_wrapper = entity_metadata_wrapper('commerce_order', $recurring_order);
+
+    // Confirm that the order total is correct.
+    $order_total = $order_wrapper->commerce_order_total->amount->value();
+    $expected_order_total = $this->getExpectedOrderTotal($expected_charges);
+    $this->assertEqual($order_total, $expected_order_total, "The recurring order has the expected total.");
+
+    // Store the old line item ids for later comparison.
+    $old_line_item_ids = array();
+    foreach ($order_wrapper->commerce_line_items as $line_item_wrapper) {
+      $old_line_item_ids[] = $line_item_wrapper->raw();
+    }
+
+    // Increase the bandwidth product price from $0.1 to $1.
+    $counter_product->commerce_price[LANGUAGE_NONE][0]['amount'] = '100';
+    commerce_product_save($counter_product);
+    $expected_charges[1]['commerce_unit_price']['amount'] = 100;
+    $expected_charges[5]['commerce_unit_price']['amount'] = 100;
+    // Confirm that the line items have changed. This ensures that the
+    // order refresh works properly when no new line items were created.
+    entity_get_controller('commerce_order')->resetCache();
+    drupal_static_reset('commerce_license_billing_commerce_order_load');
+    $recurring_order = commerce_order_load($recurring_order->order_id);
+    $this->assertLineItems($recurring_order, $expected_charges);
+    $order_wrapper = entity_metadata_wrapper('commerce_order', $recurring_order);
+
+    // Confirm that the order total has been updated.
+    $order_total = $order_wrapper->commerce_order_total->amount->value();
+    $expected_order_total = $this->getExpectedOrderTotal($expected_charges);
+    $this->assertEqual($order_total, $expected_order_total, "The recurring order has the expected total.");
+
+    // Confirm that the old line items were updated, without creating new ones.
+    $new_line_item_ids = array();
+    foreach ($order_wrapper->commerce_line_items as $line_item_wrapper) {
+      $new_line_item_ids[] = $line_item_wrapper->raw();
+    }
+    $same = ($old_line_item_ids == $new_line_item_ids);
+    $this->assertTrue($same, 'The previous line items have been successfully updated.');
+  }
+
+  /**
+   * Tests the closing of a billing cycle.
+   */
+  protected function billingCycleCloseTest() {
+    commerce_license_set_time($this->billing_cycle->end);
+    // Call the queue item manually.
+    $item = new stdClass;
+    $item->data = array();
+    $item->data['billing_cycle_id'] = $this->billing_cycle->billing_cycle_id;
+    commerce_license_billing_cycle_close_queue_process($item);
+
+    // The order hasn't been closed because of missing usage reports.
+    $recurring_order = $this->getBillingCycleOrder($this->billing_cycle);
+    $usage_pending = ($recurring_order->status == 'recurring_usage_pending');
+    $this->assertTrue($usage_pending, "The billing cycle hasn't been closed because of pending usage");
+
+    // Add missing badwidth usage for the postpaid license.
+    $plan_history = commerce_license_billing_plan_history_list($this->postpaid_license, $this->billing_cycle);
+    $bandwidth = commerce_license_billing_usage_group($this->postpaid_license, 'bandwidth');
+    $bandwidth->addUsage($plan_history[1]['revision_id'], 1022, $plan_history[1]['start'], $plan_history[1]['end']);
+    $bandwidth->addUsage($plan_history[2]['revision_id'], 0, $plan_history[2]['start'], $plan_history[2]['end']);
+
+    // Retrigger the close, reload the order and re-examine it.
+    entity_get_controller('commerce_order')->resetCache();
+    commerce_license_billing_cycle_close_queue_process($item);
+
+    $this->billing_cycle = entity_load_single('cl_billing_cycle', $this->billing_cycle->billing_cycle_id);
+    $billing_cycle_closed = ($this->billing_cycle->status == 0);
+    $this->assertTrue($billing_cycle_closed, 'The previous billing cycle was successfully closed');
+    $recurring_order = commerce_order_load($recurring_order->order_id);
+    $payment_pending = ($recurring_order->status == 'recurring_payment_pending');
+    $this->assertTrue($payment_pending, 'The order is now awaiting payment, as expected.');
+
+    commerce_license_billing_cycle_renew_queue_process($item);
+    $expected_start = $this->billing_cycle->end + 1;
+    // Try to find the new billing cycle.
+    $query = new EntityFieldQuery;
+    $query
+      ->entityCondition('entity_type', 'cl_billing_cycle')
+      ->propertyCondition('start', $expected_start);
+    $result = $query->execute();
+    $this->assertTrue($result, 'A new billing cycle was successfully opened');
+    if ($result) {
+      $billing_cycle_id = key($result['cl_billing_cycle']);
+      $new_billing_cycle = entity_load_single('cl_billing_cycle', $billing_cycle_id);
+      $new_recurring_order = $this->getBillingCycleOrder($new_billing_cycle);
+      $opened_new_order = ($new_recurring_order && $new_recurring_order->status == 'recurring_open');
+      $this->assertTrue($opened_new_order, 'A new recurring order was successfuly opened');
+
+      $licenses = commerce_license_billing_get_recurring_order_licenses($new_recurring_order);
+      $licenses_renewed = (count($licenses) == 2);
+      $bandwidth_usage_reset = TRUE;
+      foreach ($licenses as $license) {
+        if ($license->expires != $new_billing_cycle->end) {
+          $licenses_renewed = FALSE;
+        }
+        $bandwidth_usage = commerce_license_billing_usage_group($license, 'bandwidth')->currentUsage($this->billing_cycle);
+        if ($bandwidth_usage != 0) {
+          $bandwidth_usage_reset = FALSE;
+        }
+      }
+      $this->assertTrue($licenses_renewed, 'The licenses have been successfully renewed');
+      $this->assertTrue($bandwidth_usage_reset, 'The bandwidth usage has been successfully reset.');
+
+      // Reload the prepaid license and confirm the plan change.
+      $this->prepaid_license = entity_load_single('commerce_license', $this->prepaid_license->license_id);
+      $changed_plan = ($this->prepaid_license->product_id == $this->another_prepaid_product->product_id);
+      $this->assertTrue($changed_plan, "The scheduled plan change for the prepaid license has been executed.");
+    }
+
+    // Go to the end of the second billing cycle, register usage.
+    commerce_license_set_time($new_billing_cycle->end + 1);
+    $bandwidth = commerce_license_billing_usage_group($this->prepaid_license, 'bandwidth');
+    $bandwidth->addUsage($this->prepaid_license->revision_id, 0, $new_billing_cycle->start, $new_billing_cycle->end);
+    $bandwidth = commerce_license_billing_usage_group($this->postpaid_license, 'bandwidth');
+    $bandwidth->addUsage($this->postpaid_license->revision_id, 0, $new_billing_cycle->start, $new_billing_cycle->end);
+
+    // Cancel all licenses.
+    foreach ($licenses as $license) {
+      $license->revoke();
+    }
+
+    // Close the second biling cycle.
+    $item = new stdClass;
+    $item->data = array();
+    $item->data['billing_cycle_id'] = $new_billing_cycle->billing_cycle_id;
+    commerce_license_billing_cycle_renew_queue_process($item);
+    commerce_license_billing_cycle_close_queue_process($item);
+
+    $new_billing_cycle = entity_load_single('cl_billing_cycle', $new_billing_cycle->billing_cycle_id);
+    // Confirm that no new billing cycle was opened.
+    $expected_start = $new_billing_cycle->end + 1;
+    $query = new EntityFieldQuery;
+    $query
+      ->entityCondition('entity_type', 'cl_billing_cycle')
+      ->propertyCondition('start', $expected_start);
+    $result = $query->execute();
+    $this->assertFalse($result, 'A new billing cycle was not opened');
+  }
+
+  /**
+   * Prepares the data needed for further testing.
+   *
+   * Loads $this->prepaid_license and $this->postpaid_license.
+   * Calculates the plan durations and stores them in $this->plan_durations.
+   */
+  protected function prepareData() {
+    // Load the prepaid license.
+    $query = new EntityFieldQuery;
+    $query
+      ->entityCondition('entity_type', 'commerce_license')
+      ->propertyCondition('product_id', $this->prepaid_product->product_id);
+    $result = $query->execute();
+    $this->prepaid_license = entity_load_single('commerce_license', key($result['commerce_license']));
+
+    // Load the postpaid license.
+    $postpaid_product_ids = array(
+      $this->postpaid_product->product_id,
+      $this->another_postpaid_product->product_id,
+    );
+    $query = new EntityFieldQuery;
+    $query
+      ->entityCondition('entity_type', 'commerce_license')
+      ->propertyCondition('product_id', $postpaid_product_ids);
+    $result = $query->execute();
+    $this->postpaid_license = entity_load_single('commerce_license', key($result['commerce_license']));
+
+    // Update the initial license timestamps to match the beginning of the
+    // initial cycle. Otherwise they won't match, since the checkoutTest()
+    // requests had a different REQUEST_TIME than the main test flow.
+    $this->prepaid_license->granted = $this->billing_cycle->start;
+    $this->prepaid_license->revision_created = $this->billing_cycle->start;
+    $this->prepaid_license->save();
+    $this->postpaid_license->granted = $this->billing_cycle->start;
+    $this->postpaid_license->revision_created = $this->billing_cycle->start;
+    $this->postpaid_license->save();
+    // Do the same for usage.
+    db_update('cl_billing_usage')
+      ->fields(array(
+        'start' => $this->billing_cycle->start,
+        ))
+      ->execute();
+    drupal_static_reset('commerce_license_billing_usage_history_list');
+
+    // Prepare the plan durations.
+    // First plan: 1/4 of the billing cycle, second plan 2/4, suspend 1/8,
+    // reactive second plan 1/8.
+    $billing_cycle_duration = $this->billing_cycle->end - $this->billing_cycle->start;
+    $duration_part = ($billing_cycle_duration + 1) / 8;
+    $first_plan_start = $this->billing_cycle->start;
+    $second_plan_start = $first_plan_start + ($duration_part * 2);
+    $suspension_start = $second_plan_start + ($duration_part * 4);
+    $reactivation_start = $suspension_start + $duration_part;
+    $plan_durations = array();
+    $plan_durations[] = array($first_plan_start, $second_plan_start - 1);
+    $plan_durations[] = array($second_plan_start, $suspension_start - 1);
+    $plan_durations[] = array($suspension_start, $reactivation_start - 1);
+    $plan_durations[] = array($reactivation_start, 0);
+    // Store the plan durations for further test usage.
+    $this->plan_durations = $plan_durations;
+  }
+
+  /**
+   * Get the recurring order of a billing cycle.
+   *
+   * @param $billing_cycle
+   *   The billing cycle entity.
+   *
+   * @return
+   *   A loaded recurring order, or FALSE if not found.
+   */
+  protected function getBillingCycleOrder($billing_cycle) {
+    $query = new EntityFieldQuery;
+    $query
+      ->entityCondition('entity_type', 'commerce_order')
+      ->entityCondition('bundle', 'recurring')
+      ->fieldCondition('cl_billing_cycle', 'target_id', $billing_cycle->billing_cycle_id);
+    $result = $query->execute();
+    if ($result) {
+      $order_id = key($result['commerce_order']);
+      return commerce_order_load($order_id);
+    }
+    else {
+      return FALSE;
+    }
+  }
+
+  /**
+   * Create and save a recurring product.
+   *
+   * @param $sku
+   *   The sku of the new product.
+   * @param $price
+   *   The price of the new product.
+   * @param $billing_type
+   *   The billing type (prepaid or postpaid).
+   *
+   * @return
+   *   The newly saved product.
+   */
+  protected function createProduct($sku, $price, $billing_type) {
+    $product = commerce_product_new('product');
+    $product->sku = $sku;
+    $product->title = str_replace('-', ' ', ucfirst(strtolower($sku)));
+    $product->uid = 1;
+    $product->commerce_price[LANGUAGE_NONE][0]['amount'] = $price * 100;
+    $product->commerce_price[LANGUAGE_NONE][0]['currency_code'] = 'USD';
+    $product->commerce_license_type[LANGUAGE_NONE][0]['value'] = 'billing_test';
+    $product->commerce_license_duration[LANGUAGE_NONE][0]['value'] = 0;
+    $product->cl_billing_cycle_type[LANGUAGE_NONE][0]['target_id'] = $this->billing_cycle_type->billing_cycle_type_id;
+    $product->cl_billing_type[LANGUAGE_NONE][0]['value'] = $billing_type;
+    commerce_product_save($product);
+
+    return $product;
+  }
+
+  /**
+   * Completes checkout.
+   */
+  protected function completeCheckout() {
+    $this->drupalGet($this->getCommerceUrl('checkout'));
+    $address_info = $this->generateAddressInformation();
+    $info = array(
+      'customer_profile_billing[commerce_customer_address][und][0][name_line]' => $address_info['name_line'],
+      'customer_profile_billing[commerce_customer_address][und][0][thoroughfare]' => $address_info['thoroughfare'],
+      'customer_profile_billing[commerce_customer_address][und][0][locality]' => $address_info['locality'],
+    );
+    $this->drupalPost(NULL, $info, 'Continue to next step');
+    $this->drupalPost(NULL, array(), 'Continue to next step');
+    $this->assertTitle('Checkout complete' . ' | Drupal', 'Checkout has been completed');
+  }
+
+  /**
+   * Asserts that the provided order has the expected line items.
+   *
+   * @param $order
+   *   The order entity
+   * @param $expected_charges
+   *   The expected charges.
+   */
+  protected function assertLineItems($order, $expected_charges) {
+    $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+    foreach ($expected_charges as $index => $expected_charge) {
+      $match_found = FALSE;
+      if (isset($order_wrapper->commerce_line_items[$index])) {
+        $wrapper = $order_wrapper->commerce_line_items[$index];
+        $match = array();
+        $match['product'] = ($wrapper->commerce_product->raw() == $expected_charge['product_id']);
+        $match['price'] = ($wrapper->commerce_unit_price->amount->value() == $expected_charge['commerce_unit_price']['amount']);
+        $match['quantity'] = ($wrapper->quantity->value() == $expected_charge['quantity']);
+        $match['start'] = ($wrapper->cl_billing_start->value() == $expected_charge['cl_billing_start']);
+        $match['end'] = ($wrapper->cl_billing_end->value() == $expected_charge['cl_billing_end']);
+        $matching = array_filter($match);
+        $non_matching = array_diff($match, $matching);
+        $match_found = (count($non_matching) == 0);
+        if ($non_matching) {
+          debug($non_matching, 'Non-matching');
+          debug($wrapper->value());
+        }
+      }
+      $this->assertTrue($match_found, 'Found valid matching line item for ' . $expected_charge['title']);
+    }
+  }
+
+  /**
+   * Calculates the expected order total based on the expected charges.
+   *
+   * @param $expected_charges
+   *   The expected charges.
+   */
+  protected function getExpectedOrderTotal($expected_charges) {
+    // Add them up.
+    $total = 0;
+    foreach ($expected_charges as $index => $expected_charge) {
+      $total += $expected_charge['commerce_unit_price']['amount'] * $expected_charge['quantity'];
+    }
+
+    return $total;
+  }
+}

@@ -1,0 +1,1703 @@
+<?php
+
+
+/**
+ * @file
+ * This module implements Quantum Gateway payment services for use in Drupal Commerce.
+ * CDG Commerce is the merchant service that uses Quantum Gateway. If you are setting up a 
+ * merchant account with CDGcommerce please use referral code 2655 to help project originator.
+ *  Drupal project page: http://drupal.org/project/commerce_quantum
+ *  Project originator's page: http://cocoavillagepublishing.com/e-commerce/creditcards
+ */
+
+
+
+/**
+ * Implements hook_menu().
+ *
+ * Here we setup the URL paths to be used... or more formally said:
+ *  Enables modules to register paths in order to define how URL requests are handled.
+ *  hook_menu() implementations return an associative array whose keys define paths and whose 
+ *  values are an associative array of properties for each path.
+ *
+ * In the future perhaps more hooks can be added for features beyond single transactions
+ * to take advantage of vaulting, transaction details and recurring that Quantum XML requester supports.
+ *
+ */
+function commerce_quantum_menu() {
+
+  // start an array of menu items
+  $items = array();
+
+  // Add a menu item for capturing authorizations.
+  $items['admin/commerce/orders/%commerce_order/payment/%commerce_payment_transaction/quantum-xmlrequester-capture'] = array(
+    'title' => 'Capture',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('commerce_quantum_xmlrequester_capture_form', 3, 5),
+    'access callback' => 'commerce_quantum_xmlrequester_capture_access',
+    'access arguments' => array(3, 5),
+    'type' => MENU_DEFAULT_LOCAL_TASK,
+    'context' => MENU_CONTEXT_INLINE,
+    'weight' => 2,
+    'file' => 'includes/commerce_quantum.admin.inc',
+  );
+
+  // Add a menu item for voiding transactions.
+  $items['admin/commerce/orders/%commerce_order/payment/%commerce_payment_transaction/quantum-xmlrequester-void'] = array(
+    'title' => 'Void',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('commerce_quantum_void_form', 3, 5),
+    'access callback' => 'commerce_quantum_xmlrequester_void_access',
+    'access arguments' => array(3, 5),
+    'type' => MENU_DEFAULT_LOCAL_TASK,
+    'context' => MENU_CONTEXT_INLINE,
+    'weight' => 2,
+    'file' => 'includes/commerce_quantum.admin.inc',
+  ); 
+
+  // Add a menu item for issuing credits.
+  $items['admin/commerce/orders/%commerce_order/payment/%commerce_payment_transaction/quantum-xmlrequester-credit'] = array(
+    'title' => 'Credit',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('commerce_quantum_xmlrequester_credit_form', 3, 5),
+    'access callback' => 'commerce_quantum_xmlrequester_credit_access',
+    'access arguments' => array(3, 5),
+    'type' => MENU_DEFAULT_LOCAL_TASK,
+    'context' => MENU_CONTEXT_INLINE,
+    'weight' => 2,
+    'file' => 'includes/commerce_authnet.admin.inc',
+  );
+
+  // now we have menu items defined in our array, return that array with those items
+  return $items;
+}
+
+
+
+/**
+ * Determines access to the prior authorization capture form for Quantum Gateway
+ *   XMLrequester credit card transactions
+ *
+ * @param $order
+ *   The order the transaction is on.
+ * @param $transaction
+ *   The payment transaction object to be captured.
+ *
+ * @return
+ *   TRUE or FALSE indicating capture access.
+ *
+ *  Note this function used in access callback for menu item for capturing authorizations
+ */
+function commerce_quantum_xmlrequester_capture_access($order, $transaction) {
+  // Return FALSE if the transaction isn't for Quantum XMLrequester or isn't
+  // awaiting capture.
+  if ($transaction->payment_method != 'quantum_xmlrequester' || strtoupper($transaction->remote_status) != 'AUTH_ONLY') {
+    return FALSE;
+  }
+
+  // Return FALSE if it is more than 30 days past the original authorization.
+  if (time() - $transaction->created > 86400 * 30) {
+    return FALSE;
+  }
+
+  // Allow access if the user can update payments on this transaction.
+  return commerce_payment_transaction_access('update', $transaction);
+}
+
+
+
+/**
+ * Determines access to the void form for 
+ * Quauntm XMLrequester credit card transactions
+ *
+ * @param $order
+ *   The order the transaction is on.
+ * @param $transaction
+ *   The payment transaction object to be voided.
+ *
+ * @return
+ *   TRUE or FALSE indicating void access.
+ *
+ *  Note this function used in access callback for menu item for voiding authorizations
+ */
+function commerce_quantum_xmlrequester_void_access($order, $transaction) {
+   if ($transaction->payment_method != 'quantum_xmlrequester' || empty($transaction->remote_id) ||
+     !in_array(strtoupper($transaction->remote_status), array('AUTH_ONLY', 'PRIOR_AUTH_CAPTURE', 'AUTH_CAPTURE'))) {
+     return FALSE;
+   }
+ 
+   // Return FALSE if it is more than 24 hours since the last update to the
+   // transaction, as it will already have been settled.
+   if (time() - $transaction->changed > 2600 * 24) {
+     return FALSE;
+   }
+ 
+   // Allow access if the user can update this transaction.
+   return commerce_payment_transaction_access('update', $transaction);
+}
+
+
+
+/**
+ * Determines access to the credit form for successful 
+ * Quantum XMLrequester credit card transactions.
+ *
+ * @param $order
+ *   The order the transaction is on.
+ * @param $transaction
+ *   The payment transaction object to be credited.
+ *
+ * @return
+ *   TRUE or FALSE indicating credit access.
+ *
+ *  Note this function used in access callback for menu item for issuing credits
+ */
+function commerce_quantum_xmlrequester_credit_access($order, $transaction) {
+  // Return FALSE if the transaction isn't for Quantum XMLrequester, doesn't have a
+  // success status or has an amount of 0 or less.
+  if ($transaction->payment_method != 'authnet_aim' || $transaction->status != 'success' || $transaction->amount <= 0) {
+    return FALSE;
+  }
+
+  // Return FALSE if it is more than 120 days past the original capture.
+  if (time() - $transaction->created > 86400 * 120) {
+    return FALSE;
+  }
+
+  // Allow access if the user can update this transaction.
+  return commerce_payment_transaction_access('update', $transaction);
+}
+
+
+
+/**
+ * Implements hook_commerce_payment_method_info().
+ *
+ * We do this to define the payment method via hook_commerce_payment_method_info()
+ * The Payment module uses this hook to gather information on payment methods defined by enabled modules.
+ * Drupal Commerce doesn't maintain Ubercart's separation of payment methods from payment gateways but
+ * rather defines payment methods as any single way of collecting payment from a customer per payment provider.
+ * This means there will not be a single Credit Card payment method with plugin modules for CyberSource,
+ * Authorize.Net, etc. but a separate CC payment method for each payment provider with a common base set of
+ * code for building credit card forms and handling the data securely
+ *
+ **/
+function commerce_quantum_commerce_payment_method_info() {
+  $payment_methods = array();
+  $payment_methods['quantum_xmlrequester'] = array(
+    'base' => 'commerce_quantum_xmlrequester',
+    'title' => t('Quantum XML Requester - Credit Card'),
+    'short_title' => t('Quantum Gateway CC'),
+    'display_title' => t('Credit card'),
+    'description' => t('Integrates Quantum Gateway XML Requester for card not present CC transactons.'),
+    //--The support for CardOnFile depends upon the module commerce_cardonfile which may not be stable,
+    //--later we may want to develop support for that module after it is well supported by another payment type.
+    'cardonfile' => array(
+      'update callback' => 'commerce_quantum_vault_cardonfile_update',
+      'delete callback' => 'commerce_quantum_vault_cardonfile_delete',
+    ),
+  );
+  return $payment_methods;
+}
+
+
+
+/**
+ * Returns the default settings for the payment method.
+ *    Will use this in function that does the method callback: settings form.
+ */
+function commerce_quantum_xmlrequester_default_settings() {
+  return array(
+    // For testing same gateway but different login/key for authentication, so set as a parameter 
+    // not as a constant as done by authnet, and use txn_mode for which to use login/key to use.
+    // Will use "live" for live and "test" for test.
+    'txn_mode' => 'live',
+    'txn_type' => COMMERCE_CREDIT_AUTH_CAPTURE,
+    //'LiveGatewayID' => '',
+    //'LiveRestrictKey' => '',
+    //'LiveVaultKey' => '',
+    //'TestGatewayID' => '',
+    //'TestRestrictKey' => '',
+    //'TestVaultKey' => '',
+    'vault_cardonfile' => FALSE,
+    // Quantum Gateway Parameter CustomerEmail (integer) Y/N (Y will always send email)
+    'CustomerEmail' => '0',
+    'log' => array('request' => '0', 'response' => '0'),
+    'card_types' => array(),
+  );
+}
+
+
+
+/**
+ * Payment method callback: settings form.
+ *
+ *  settings_form - ($settings = NULL) - returns form elements for the payment 
+ *  method's settings form included as part of the payment method's enabling action in Rules
+ *
+ */
+function commerce_quantum_xmlrequester_settings_form($settings = NULL) {
+  
+  // use module_load_include to be able to use functions like commerce_payment_credit_card_types(),  
+  module_load_include('inc', 'commerce_payment', 'includes/commerce_payment.credit_card');
+  
+  // Merge default settings into the stored settings array.
+  // (used the before function to set defaults and now pull them in...)
+  $settings = (array) $settings + commerce_quantum_xmlrequester_default_settings();
+
+  $form = array();
+
+  // For txn_mode we will use 'live' and 'test' as possible parameter values.
+  $form['txn_mode'] = array(
+    '#type' => 'radios',
+    '#title' => t('Transaction mode'),
+    '#description' => t('Set to Live for real Gateway login and key, or set to Test to use test login and key'),
+    '#options' => array(
+      'live' => t('Live transactions with your gateway ID and keys that will process for real'),
+      'test' => t('Test transactions with a developer test gateway ID and test keys'),
+     ),
+    '#default_value' => $settings['txn_mode'],
+  );
+
+  // For the gateway authentication settings we will prefix the naming for this module with
+  // 'Live' for authentication account login/key setup by Quantum Gateway that will process for real
+  // and 'Test' if you have a developers test account login/key that you want to use
+
+  $form['LiveGatewayID'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Gateway ID'),
+    '#description' => t('Your live Gateway ID.'),
+    '#default_value' => $settings['LiveGatewayID'],
+    '#required' => TRUE,
+  );
+
+  $form['LiveRestrictKey'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Restrict Key'),
+    '#description' => t('Your live Restrict Key, used for virtual terminal and single processing.'),
+    '#default_value' => $settings['LiveRestrictKey'],
+    '#required' => TRUE,
+  );
+
+  $form['LiveVaultKey'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Vault Key'),
+    '#description' => t('Your live Vault Key, used with vaulted transactions. Module support not finished, best to leave blank.'),
+    '#default_value' => $settings['LiveVaultKey'],
+    '#required' => FALSE,
+  );
+
+  $form['TestGatewayID'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Test Gateway Key'),
+    '#description' => t('Your Test Gateway ID.'),
+    '#default_value' => $settings['TestGatewayID'],
+    '#required' => FALSE,
+  );
+
+  $form['TestRestrictKey'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Test Restrict Key'),
+    '#description' => t('Your Test Restrict Key. If you do not expect to use test gateway account leave blank.'),
+    '#default_value' => $settings['TestRestrictKey'],
+    '#required' => FALSE,
+  );
+
+  $form['TestVaultKey'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Test Vault Key'),
+    '#description' => t('Your Test Vault Key. Experimental -LEAVE BLANK UNLESS doing development'),
+    '#default_value' => $settings['TestVaultKey'],
+    '#required' => FALSE,
+  );
+
+  $form['txn_type'] = array(
+    '#type' => 'radios',
+    '#title' => t('Default credit card transaction type'),
+    '#description' => t('The default will be used to process transactions during checkout.'),
+    '#options' => array(
+      COMMERCE_CREDIT_AUTH_ONLY => t('Authorization only - requires manual or automated capture after checkout.'),
+      COMMERCE_CREDIT_AUTH_CAPTURE => t('Authorization and capture'),
+      ),
+    '#default_value' => $settings['txn_type'],
+  );
+
+  $form['card_types'] = array(
+    '#type' => 'checkboxes',
+    '#title' => t('Limit accepted credit cards to the following types'),
+    '#description' => t('To limit accepted cards select types here to accept.') . '<br />' . t('If none checked any type will be accepted.'),
+    '#options' => commerce_payment_credit_card_types(),
+    '#default_value' => $settings['card_types'],
+  );
+
+  // VAULT may be supported in conjunction with this module and may require the Card on File module.
+    if (module_exists('commerce_cardonfile')) {
+    $form['vault_cardonfile'] = array(
+      '#type' => 'checkbox',
+      '#title' => t('Enable Card on File functionality with this payment method using Vault capability of Quantum Gateway'),
+      '#description' => t('EXPERIMENTAL - only enable for development - This requires vault authenticaiton in settings.'),
+      '#default_value' => $settings['vault_cardonfile'],
+    );
+  }
+
+  $form['CustomerEmail'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Request Quantum Gateway to e-mail the customer a receipt.'),
+    '#default_value' => $settings['CustomerEmail'],
+  );
+
+  $form['log'] = array(
+    '#type' => 'checkboxes',
+    '#title' => t('Log the following messages for debugging'),
+    '#options' => array(
+      'request' => t('API request messages'),
+      'response' => t('API response messages'),
+    ),
+    '#default_value' => $settings['log'],
+  );
+
+  return $form;
+}
+
+
+
+/**
+ * Payment method callback: checkout form.
+ *
+ * submit_form - ($payment_method, $pane_values, $checkout_pane, $order)
+ *  returns form elements to collect details from the customer required to process the payment
+ *
+ * Drupal Commerce has some helper functions that we can use here so we do not have to reinvent code
+ *  that would be used by most payment method.  We will use  helper functions from the 
+ *  commerce_payment.credit_card and the function commerce_payment_credit_card_form()
+ *
+ * commerce_payment_credit_card_form() is in the commerce payment include and it returns a set of credit card
+ *  form elements that payment method modules can incorporate into their submission form callbacks.
+ *   'type' 'owner' 'number' 'start_month' 'start_year' 'exp_month' 'exp_year' 'issue' 'code' 'bank'
+ *
+ * DrupalCommerce includes/commerce_payment.credit_card.inc
+ *   Credit-card helper functions for Drupal Commerce
+ *
+ **/
+function commerce_quantum_xmlrequester_submit_form($payment_method, $pane_values, $checkout_pane, $order) {
+  // include credit-card helper functions in drupal commerce
+  module_load_include('inc', 'commerce_payment', 'includes/commerce_payment.credit_card');
+  // Prepare the fields to include on the credit card form.
+  $fields = array(
+    'code' => '',
+  );
+  // Add the credit card types array if necessary.
+  $card_types = array_diff(array_values($payment_method['settings']['card_types']), array(0));
+  if (!empty($card_types)) {
+    $fields['type'] = $card_types;
+  }
+  return commerce_payment_credit_card_form($fields);
+}
+
+
+
+/**
+ * Payment method callback: checkout form validation.
+ */
+function commerce_quantum_xmlrequester_submit_form_validate($payment_method, $pane_form, $pane_values, $order, $form_parents = array()) {
+  // If the customer specified a card on file, skip the normal validation.
+  if (module_exists('commerce_cardonfile') && $payment_method['settings']['vault_cardonfile'] && $pane_values['cardonfile'] !== 'new') {
+    return;
+  }
+
+  // Load drupal commerce helper functions
+  module_load_include('inc', 'commerce_payment', 'includes/commerce_payment.credit_card');
+
+  // Validate the credit card fields.
+  $settings = array(
+    'form_parents' => array_merge($form_parents, array('credit_card')),
+  );
+
+  if (!commerce_payment_credit_card_validate($pane_values['credit_card'], $settings)) {
+    return FALSE;
+  }
+}
+
+
+
+/**
+ * Payment method callback: checkout form submission.
+ *
+ * Drupal Commerce
+ *  submit_form_submit - ($payment_method, $pane_form, $pane_values, $order, $charge)
+ *  processes payment as necessary using data inputted via the payment details form elements on the form,
+ *  resulting in the creation of a payment transaction
+ *
+ **/
+function commerce_quantum_xmlrequester_submit_form_submit($payment_method, $pane_form, $pane_values, $order, $charge) {
+  // If the customer specified payment using a card on file, attempt that now
+  // and simply return the result.
+  if (module_exists('commerce_cardonfile') && $payment_method['settings']['vault_cardonfile'] &&
+    !empty($pane_values['cardonfile']) && $pane_values['cardonfile'] !== 'new') {
+    // commerce_quantum_vault_submit_form_submit() initiates the checkout form for vaulted and it in this file.
+    return commerce_quantum_vault_submit_form_submit($payment_method, $pane_form, $pane_values, $order, $charge);
+  }
+
+  // Determine the credit card type if possible for use in later code.
+  if (!empty($pane_values['credit_card']['number'])) {
+    // include helper drupal commerce credit card helper function
+    module_load_include('inc', 'commerce_payment', 'includes/commerce_payment.credit_card');
+    $card_type = commerce_payment_validate_credit_card_type($pane_values['credit_card']['number'], array_keys(commerce_payment_credit_card_types()));
+  }
+
+  // If the charge amount is 0...
+  if ($charge['amount'] == 0) {
+    // Prevent the transaction except under limited circumstances.
+    $prevent_transaction = TRUE;
+    // 
+    // Allow 0 amount authorizations on Visa cards.
+    if ($payment_method['settings']['txn_type'] == COMMERCE_CREDIT_AUTH_ONLY && $card_type == 'visa') {
+      $prevent_transaction = FALSE;
+    } 
+    // 
+    // If the transaction should still be prevented...
+    if ($prevent_transaction) {
+      // Create a transaction to log the skipped transaction and display a
+      // helpful message to the customer.
+      $transaction = commerce_payment_transaction_new('quantum_xmlrequester', $order->order_id);
+      $transaction->amount = $charge['amount'];
+      $transaction->currency_code = $charge['currency_code'];
+      $transaction->status = COMMERCE_PAYMENT_STATUS_FAILURE;
+      $transaction->message = t('Invalid @amount transaction not attempted.', array('@amount' => commerce_currency_format($charge['amount'], $charge['currency_code'])));
+      commerce_payment_transaction_save($transaction);
+      // NOTE may want to have this message be editable in admin settings or at top of code? 
+      drupal_set_message('An error was encountered processing your transaction. Contact us to resolve.', 'error');
+      return FALSE;
+    }
+  }
+
+  $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+
+  // Get the default transaction type from the payment method settings.
+  $txn_type = $payment_method['settings']['txn_type'];
+  
+  // If txn_type has been specified in the pane values array, such as through
+  // the special select element we alter onto the payment terminal form, use that instead.
+  // ??? this code left from authorize.net module, may need to verify if appropriate.
+  if (!empty($pane_values['txn_type'])) {
+    $txn_type = $pane_values['txn_type'];
+  }
+
+  // Build a name-value pair array for this Request part of the transaction.
+  $requestnvp = array(
+    // At this time we are only doing process single transaction, 'ProcessSingleTransaction'
+    // In the future we may want to do a different type of transaction request. For example 
+    // 'CreateTransaction' may be used to create an individual Debit/Credit from VAULT customer.
+    'RequestType' => 'ProcessSingleTransaction',
+    // We are not doing EFT so do not use DEBIT, set TransactionType to the other choiceCREDIT for CC
+    'TransactionType' => 'CREDIT', 
+    // for ProcessType use a later function to give Quantum equivalent string for Drupalcommerce
+    // If we did not state a value it would default to 'SALES' which skitps AVS and CVV2 and may not work well.
+    'ProcessType' => commerce_quantum_txn_type($payment_method['settings']['txn_type']),
+    // We are doing CREDIT and not using EFT so we use CC for 'PaymentType'
+    'PaymentType' => 'CC',
+    // Use Drupalcomerce function to get amount
+    'Amount' => commerce_currency_amount_to_decimal($charge['amount'], $charge['currency_code']),
+    'CreditCardNumber' => $pane_values['credit_card']['number'],
+    'ExpireMonth' => $pane_values['credit_card']['exp_month'],
+    'ExpireYear' => $pane_values['credit_card']['exp_year'],
+  );
+
+  if (isset($pane_values['credit_card']['code'])) {
+    $requestnvp['CVV2'] = $pane_values['credit_card']['code'];
+  }
+
+  // Build a description for the order.
+  $description = array();
+
+  foreach ($order_wrapper->commerce_line_items as $delta => $line_item_wrapper) {
+    if (in_array($line_item_wrapper->type->value(), commerce_product_line_item_types())) {
+      $description[] = round($line_item_wrapper->quantity->value(), 2) . 'x ' . $line_item_wrapper->line_item_label->value();
+    }
+  }
+
+  // Add additional transaction invormation to the request name value pairs.
+  $requestnvp += array(
+    // Order Information
+    'InvoiceNumber' => $order->order_number,
+    'InvoiceDescription' => substr(implode(', ', $description), 0, 255),
+    // Customer Information
+    'EmailAddress' => substr($order->mail, 0, 255),
+    'CustomerID' => substr($order->uid, 0, 20),
+    'IPAddress' => substr(ip_address(), 0, 15),
+  );
+
+  // Prepare the billing address and add to $requestnvp for use in the request.
+  if ($order_wrapper->commerce_customer_billing->value()){
+    $billing_address = $order_wrapper->commerce_customer_billing->commerce_customer_address->value();
+    //
+    if (empty($billing_address['first_name'])) {
+      $name_parts = explode(' ', $billing_address['name_line']);
+      $billing_address['first_name'] = array_shift($name_parts);
+      $billing_address['last_name'] = implode(' ', $name_parts);
+    }
+    //
+    $requestnvp += array(
+      // Customer Billing Address
+      'FirstName' => substr($billing_address['first_name'], 0, 50),
+      'LastName' => substr($billing_address['last_name'], 0, 50),
+      // Not sure that Quantum Gateway accepts parameter for Organisation Name?
+      //'x_company' => substr($billing_address['organisation_name'], 0, 50),
+      'Address' => substr($billing_address['thoroughfare'], 0, 60),
+      'City' => substr($billing_address['locality'], 0, 40),
+      'State' => substr($billing_address['administrative_area'], 0, 40),
+      'ZipCode' => substr($billing_address['postal_code'], 0, 20),
+      'Country' => $billing_address['country'],
+    );
+  }
+  else {
+    $billing_address = array();
+  }
+
+
+  // Do the <Request> by setting a variable for Response to a function that does it. 
+  // This function is defined in this file. WARNING, the response is a string
+  // with XML and we may can then make it an SimpleXML object to use.
+  // We are avoiding having the response be an object serialed so we are passing it as a string.
+  // http://php.net/manual/en/simplexml.examples-basic.php
+  $stringGWresponse = commerce_quantum_xmlrequester_request($payment_method, $requestnvp);
+
+  // We may use the php function SimpleXMLElement to create an object that we can use much 
+  // like an array, but remember that it is an object not array.
+  //  http://php.net/manual/en/simplexml.examples-basic.php
+  $simplexmlGWresponse = simplexml_load_string($stringGWresponse);
+
+  /** The elements of the Gateway response are expected to be similar to below examples
+    *
+    * EXAMPLE OF SUCCESS,
+    *  $response->ResponseSummary->Status = "Success"
+    *  $response->ResponseSummary->StatusDescription = "Request was successful"
+    *  $response->Result->Status = "APPROVED"
+    *  $response->Result->StatusDescription = "....."
+    *
+    *  <QGWRequest>
+    *    <ResponseSummary>
+    *      ...
+    *      <Status>Success</Status>
+    *      <StatusDescription>Request was successful.</StatusDescription>
+    *      ...
+    *    </ResponseSummary>
+    *    <Result>
+    *      <TransactionID>123456789</TransactionID>
+    *      ...
+    *      <Status>APPROVED</Status>
+    *      <StatusDescription>.....</StatusDescription>
+    *      ...
+    *    </Result>
+    *  </QGWRequest>
+    *
+    *
+    * EXAMPLE OF DECLINED  (with bad credit card number, visa 41111111111111)
+    *  $response->ResponseSummary->Status = "Success"
+    *  $response->ResponseSummary->StatusDescription = "Request was successful"
+    *  $response->Result->Status = "DECLINED"
+    *  $response->Result->Status = "Transaction is DECLINED"
+    *
+    *  <QGWRequest>
+    *    <ResponseSummary>
+    *      ...
+    *      <Status>Success</Status>
+    *      <StatusDescription>Request was successful.</StatusDescription>
+    *      ...
+    *    </ResponseSummary>
+    *    <Result>
+    *      <TransactionID>123456789</TransactionID>
+    *      <Status>DECLINED</Status>
+    *      <StatusDescription>Transaction is DECLINED</StatusDescription>
+    *      <TransactionType>CREDIT</TransactionType>
+    *      ...
+    *    </Result>
+    *  </QGWRequest>
+    *
+    *
+    * EXAMPLE OF ERROR  (with bad RestrictKey)
+    * $response->ResponseSummary->Status = "Error"
+    * $response->ResponseSummary->StatusDescription = "RestrictKey and Gateway Account Do Not Match"
+    *
+    *  <QGWRequest>
+    *    <ResponseSummary>
+    *      <RequestType>ProcessSingleTransaction</RequestType>
+    *      <Status>ERROR</Status>
+    *      <StatusDescription>RestrictKey and Gateway Account Do Not Match</StatusDescription>
+    *      <TimeStamp>2012-12-26 17:12:47</TimeStamp>
+    *    </ResponseSummary>
+    *  </QGWRequest>
+    *
+    **/ 
+
+  // Prepare a transaction object to log the API response.
+  $transaction = commerce_payment_transaction_new('quantum_xmlrequester', $order->order_id);
+  $transaction->instance_id = $payment_method['instance_id'];
+  $transaction->remote_id = (string) $simplexmlGWresponse->Result->TransactionID;
+  $transaction->amount = $charge['amount'];
+  $transaction->currency_code = $charge['currency_code'];
+  $transaction->payload[REQUEST_TIME] = $stringGWresponse;
+
+  // Set $transaction-> status by the Status 
+  // ??? We are also going to try adding an element to transaction for statusdescription ??? 
+  if ($simplexmlGWresponse->ResponseSummary->Status == "Success") {
+    if ($simplexmlGWresponse->Result->Status == "APPROVED") {
+      // Set the transaction status based on the type of transaction this was.
+      switch ($payment_method['settings']['txn_type']) {
+        case COMMERCE_CREDIT_AUTH_ONLY:
+          $transaction->status = COMMERCE_PAYMENT_STATUS_PENDING;
+          break;
+        case COMMERCE_CREDIT_AUTH_CAPTURE:
+          $transaction->status = COMMERCE_PAYMENT_STATUS_SUCCESS;
+          break; 
+      }
+      $transaction->statusdescription = (string)$simplexmlGWresponse->Result->StatusDescription;
+    }
+    else {
+      // The ResponseSummary was approved but the Result was not approved, likely declined
+      // Create a failed transaction with the error message.
+      $transaction->status = COMMERCE_PAYMENT_STATUS_FAILURE;
+      $transaction->statusdescription = (string)$simplexmlGWresponse->ResponseSummary->StatusDescription;
+    }
+  }
+  else {
+    // The response summary was not a success, could be something like bad gateway login.
+    // Create a failed transaction with the error message.
+    $transaction->status = COMMERCE_PAYMENT_STATUS_FAILURE;
+  }
+
+
+  // Store the type of transaction in the remote status.
+  $transaction->remote_status =  (string) $simplexmlGWresponse->Result->ProcessType;
+
+  // Build a meaningful response message.
+  $message = array(
+    '<b>' . commerce_quantum_reverse_txn_type($simplexmlGWresponse->Result->ProcessType) . '</b>',
+    '<b>' . (string)$transaction->status . ':</b> ' . (string)$transaction->status, 
+    '<b>AVSresponse: </b>' . (string)$simplexmlGWresponse->Result->AVSResonseCode, 
+  );
+
+  // Add the CVV response if enabled.
+  if (isset($requestnvp['CVV2'])) {
+    $message[] =  t('CVV match: @cvv', array('@cvv => (string) $simplexmlGWresponse->Result->CVV2ResponseCode')); 
+  }
+
+  $transaction->message = implode('<br />', $message);
+
+  // Save the transaction information
+  commerce_payment_transaction_save($transaction);
+
+  // If the payment failed either ResponseSummary or Result, display an error and rebuild the form.
+  if ($simplexmlGWresponse->ResponseSummary->Status != "Success") {
+    drupal_set_message(t('The Merchant Gateway was not successful when requesting this payment method:'), 'error');
+    drupal_set_message((string)$simplexmlGWresponse->ResponseSummary->StatusDescription, 'error');
+    return FALSE;
+  }
+  elseif ($simplexmlGWresponse->Result->Status != "APPROVED") {
+     drupal_set_message(t('The credit card processor returned the following error. You may attempt to re-enter, use a different card or another payment method.'), 'error');
+     drupal_set_message((string) $simplexmlGWresponse->Result->StatusDescription, 'error');
+     return FALSE;
+  }
+
+  // If Card on File storage is enabled via VAULT and the form says to store data...
+  if (module_exists('commerce_cardonfile') && $payment_method['settings']['vault_cardonfile'] && $pane_values['credit_card']['cardonfile_store']) {
+    // Build a payment details array for the credit card.
+    $payment_details = array(
+      'cardNumber' => $pane_values['credit_card']['number'],
+      'expirationDate' => $pane_values['credit_card']['exp_year'] . '-' . $pane_values['credit_card']['exp_month'],
+    );
+
+    if (isset($pane_values['credit_card']['code'])) {
+      $payment_details['cardCode'] = $pane_values['credit_card']['code'];
+    }
+
+    // First look to see if we already have cards on file for the user.
+    $stored_cards = commerce_cardonfile_data_load_multiple($order->uid, $payment_method['instance_id']);
+    $add_to_profile = NULL;
+
+    // If we didn't find any, attempt to make a new Customer Profile now.
+    if (empty($stored_cards)) {
+      // Submit a VAULT request to create the Customer Profile.
+      if ($response = commerce_quantum_vault_create_customer_profile_request($payment_method, $order, $payment_details)) {
+        // If the Customer Profile creation was a success, store the new card on
+        // file data locally.
+           // ???????????? investigate this code, not checked yet for quantum module ???????????????????
+           //  ??????????? this $response is from cardonfile module ????
+        if ((string) $response->messages->resultCode == 'Ok') {
+          // Build a remote ID that includes the Customer Profile ID and the
+          // Payment Profile ID.
+          $remote_id = (string) $response->customerProfileId . '|' . (string) $response->customerPaymentProfileIdList->numericString;
+
+          $card_data = array(
+            'uid' => $order->uid,
+            'payment_method' => $payment_method['method_id'],
+            'instance_id' => $payment_method['instance_id'],
+            'remote_id' => $remote_id,
+            'card_type' => 'card',
+            'card_name' => !empty($billing_address['name_line']) ? $billing_address['name_line'] : '',
+            'card_number' => substr($pane_values['credit_card']['number'], -4),
+            'card_exp_month' => $pane_values['credit_card']['exp_month'],
+            'card_exp_year' => $pane_values['credit_card']['exp_year'],
+            'status' => 1,
+          );
+
+          // Save and log the creation of the new card on file.
+          commerce_cardonfile_data_save($card_data);
+          watchdog('commerce_quantum', 'VAULT Customer Profile @profile_id created and saved to user @uid.', array('@profile_id' => (string) $response->customerProfileId, '@uid' => $order->uid));
+        }
+        elseif ((string) $response->messages->message->code == 'E00039') {
+          // But if a Customer Profile already existed for this user, attempt
+          // instead to add this card as a new Payment Profile to it.
+          $result = array_filter(explode(' ', (string) $response->messages->message->text), 'is_numeric');
+          $add_to_profile = reset($result);
+        }
+      }
+    }
+    else {
+      // Extract the user's Customer Profile ID from the first card's remote ID.
+      $card_data = reset($stored_cards);
+      list($vault_customer_profile_id, $vault_payment_profile_id) = explode('|', $card_data['remote_id']);
+
+      // Attempt to add the card as a new payment profile to this Customer Profile.
+      $add_to_profile = $vault_customer_profile_id;
+    }
+
+    // Attempt to add the card to an existing Customer Profile if specified.
+    if (!empty($add_to_profile)) {
+      $response = commerce_quantum_vault_create_customer_payment_profile_request($payment_method, $add_to_profile, $order, $payment_details);
+
+      // If the Payment Profile creation was a success, store the new card on
+      // file data locally.
+      if ((string) $response->messages->resultCode == 'Ok') {
+        // Build a remote ID that includes the Customer Profile ID and the new
+        // Payment Profile ID.
+        $remote_id = $add_to_profile . '|' . (string) $response->customerPaymentProfileId;
+
+        $card_data = array(
+          'uid' => $order->uid,
+          'payment_method' => $payment_method['method_id'],
+          'instance_id' => $payment_method['instance_id'],
+          'remote_id' => $remote_id,
+          'card_type' => 'card',
+          'card_name' => !empty($billing_address['name_line']) ? $billing_address['name_line'] : '',
+          'card_number' => substr($pane_values['credit_card']['number'], -4),
+          'card_exp_month' => $pane_values['credit_card']['exp_month'],
+          'card_exp_year' => $pane_values['credit_card']['exp_year'],
+          'status' => 1,
+        );
+
+        // Save and log the creation of the new card on file.
+        commerce_cardonfile_data_save($card_data);
+        watchdog('commerce_quantum', 'CIM Payment Profile added to Customer Profile @profile_id for user @uid.', array('@profile_id' => $add_to_profile, '@uid' => $order->uid));
+      }
+      elseif (!empty($card_data) && (string) $response->messages->message->code == 'E00040') {
+        // But if we could not find a customer profile, assume the existing
+        // customer profile ID we had is no longer valid and deactivate the card
+        // data that resulted in the error.
+        $card_data['status'] = 0;
+        commerce_cardonfile_data_save($card_data);
+
+        // Submit a VAULT request to create the Customer Profile.
+        if ($response = commerce_quantum_vault_create_customer_profile_request($payment_method, $order, $payment_details)) {
+          // If the Customer Profile creation was a success, store the new card on
+          // file data locally.
+          if ((string) $response->messages->resultCode == 'Ok') {
+            // Build a remote ID that includes the Customer Profile ID and the
+            // Payment Profile ID.
+            $remote_id = (string) $response->customerProfileId . '|' . (string) $response->customerPaymentProfileIdList->numericString;
+
+            $card_data = array(
+              'uid' => $order->uid,
+              'payment_method' => $payment_method['method_id'],
+              'instance_id' => $payment_method['instance_id'],
+              'remote_id' => $remote_id,
+              'card_type' => 'card',
+              'card_name' => !empty($billing_address['name_line']) ? $billing_address['name_line'] : '',
+              'card_number' => substr($pane_values['credit_card']['number'], -4),
+              'card_exp_month' => $pane_values['credit_card']['exp_month'],
+              'card_exp_year' => $pane_values['credit_card']['exp_year'],
+              'status' => 1,
+            );
+
+            // Save and log the creation of the new card on file.
+            commerce_cardonfile_data_save($card_data);
+            watchdog('commerce_quantum', 'VAULT Customer Profile @profile_id created and saved to user @uid.', array('@profile_id' => (string) $response->customerProfileId, '@uid' => $order->uid));
+          }
+        }
+      }
+    }
+  }
+}
+
+
+
+
+
+/**
+ * Imitates the checkout form submission callback for the payment method.
+ *
+ *  ????????????? THIS STILL HAS AUTHNET CODE AND IS NOT FINISHED !!!!!!!
+ */
+function commerce_quantum_vault_submit_form_submit($payment_method, $pane_form, $pane_values, $order, $charge) {
+  // First attempt to load the card on file.
+  $card_data = commerce_cardonfile_data_load($pane_values['cardonfile']);
+
+  // Fail now if it is no longer available or the card is inactive.
+  if (empty($card_data) || $card_data['status'] == 0) {
+    drupal_set_message(t('The requested card on file is no longer valid.'), 'error');
+    return FALSE;
+  }
+
+  // Extract the Customer Profile and Payment Profile IDs from the remote_id.
+  list($vault_customer_profile_id, $vault_payment_profile_id) = explode('|', $card_data['remote_id']);
+
+  // Determine the proper transaction element to use inside the XML.
+  $element_name = commerce_quantum_vault_transaction_element_name($payment_method['settings']['txn_type']);
+
+  // Build a data array for the transaction API request.
+  $api_request_data = array(
+    'transaction' => array(
+      $element_name => array(
+        'amount' => commerce_currency_amount_to_decimal($charge['amount'], $charge['currency_code']),
+        'customerProfileId' => $vault_customer_profile_id,
+        'customerPaymentProfileId' => $vault_payment_profile_id,
+        'order' => array(
+          'invoiceNumber' => $order->order_number,
+        ),
+      ),
+    ),
+    'extraOptions' => '<![CDATA[x_delim_data=TRUE&amp;x_delim_char=|&amp;x_encap_char="&amp;x_customer_ip=' . substr(ip_address(), 0, 15) . ']]>',
+  );
+
+  // If we get a response from the API server...
+  $xml_response = commerce_quantum_vault_request($payment_method, 'createCustomerProfileTransactionRequest', $api_request_data);
+
+  if (!empty($xml_response->directResponse)) {
+    // Extract the response data from the XML.
+    $response = explode('|', (string) $xml_response->directResponse);
+
+    for ($i = 0; $i < count($response); $i++) {
+      $response[$i] = substr($response[$i], 1, strlen($response[$i]) - 2);
+    }
+
+    // Prepare a transaction object to represent the transaction attempt.
+    $transaction = commerce_payment_transaction_new('quantum_xmlrequester', $order->order_id);
+    $transaction->instance_id = $payment_method['instance_id'];
+    $transaction->remote_id = $response[6];
+    $transaction->amount = $charge['amount'];
+    $transaction->currency_code = $charge['currency_code'];
+    $transaction->payload[REQUEST_TIME] = $stringresponse;
+
+    // If we didn't get an approval response code...
+    if ($response[0] != '1') {
+      // Create a failed transaction with the error message.
+      $transaction->status = COMMERCE_PAYMENT_STATUS_FAILURE;
+    }
+    else {
+      // Set the transaction status based on the type of transaction this was.
+      switch ($payment_method['settings']['txn_type']) {
+        case COMMERCE_CREDIT_AUTH_ONLY:
+          $transaction->status = COMMERCE_PAYMENT_STATUS_PENDING;
+          break;
+
+        case COMMERCE_CREDIT_AUTH_CAPTURE:
+          $transaction->status = COMMERCE_PAYMENT_STATUS_SUCCESS;
+          break;
+      }
+    }
+
+    // Store the type of transaction in the remote status.
+    $transaction->remote_status = $response[11];
+
+    // Build a meaningful response message.
+    $message = array(
+      '<b>' . commerce_quantum_reverse_txn_type(commerce_quantum_txn_type($payment_method['settings']['txn_type'])) . '</b>',
+      '<b>' . ($response[0] != '1' ? t('REJECTED') : t('ACCEPTED')) . ':</b> ' . check_plain($response[3]),
+      t('AVS response: @avs', array('@avs' => commerce_quantum_avs_response($response[5]))),
+    );
+
+    $transaction->message = implode('<br />', $message);
+
+    // Save the transaction information.
+    commerce_payment_transaction_save($transaction);
+
+    // If the payment failed, display an error and rebuild the form.
+    if ($response[0] != '1') {
+      drupal_set_message(t('We received the following error processing your card. Please enter you information again or try a different card.'), 'error');
+      drupal_set_message(check_plain($response[3]), 'error');
+      return FALSE;
+    }
+
+    return;
+  }
+  elseif ((string) $xml_response->messages->message->code == 'E00040') {
+    // If the response indicated a non-existent profile, deactive it now.
+    $card_data['status'] = 0;
+    commerce_cardonfile_data_save($card_data);
+
+    drupal_set_message(t('The card you selected is no longer valid. Please use a different card to complete payment.'), 'error');
+    return FALSE;
+  }
+
+  drupal_set_message(t('We could not process your card on file at this time. Please try again or use a different card.'), 'error');
+  return FALSE;
+}
+
+
+
+
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function commerce_quantum_form_commerce_cardonfile_update_form_alter(&$form, &$form_state) {
+  // Extract the card data from the form and load the payment method instance.
+  $card_data = $form['card_data']['#value'];
+  $payment_method = commerce_payment_method_instance_load($card_data['instance_id']);
+
+  // Extract the Customer Profile and Payment Profile IDs from the remote_id.
+  list($vault_customer_profile_id, $vault_payment_profile_id) = explode('|', $card_data['remote_id']);
+
+  // Load the full payment profile from Authorize.Net.
+  $payment_profile_xml = commerce_quantum_vault_get_customer_payment_profile_request($payment_method, $vault_customer_profile_id, $vault_payment_profile_id);
+
+  if ($payment_profile_xml->messages->message->code == 'I00001') {
+    $billto = $payment_profile_xml->paymentProfile->billTo;
+
+    $address = array(
+      '<strong>' . t('Billing address:') . '</strong>',
+      (string) $billto->firstName . ' ' . (string) $billto->lastName,
+      (string) $billto->company,
+      (string) $billto->address,
+      (string) $billto->city . ', ' . (string) $billto->state . ' ' . (string) $billto->zip,
+      (string) $billto->country,
+    );
+
+    // Add the address info to the form.
+    $form['billto'] = array(
+      '#type' => 'markup',
+      '#markup' => '<div class="commerce-quantum-vault-billto">' . implode('<br />', array_diff($address, array(''))) . '</div>',
+      '#weight' => -50,
+    );
+
+    $form_state['billto_xml'] = $billto;
+  }
+}
+
+
+
+
+
+/**
+ * Card on file callback: updates the associated customer payment profile.
+ */
+function commerce_quantum_vault_cardonfile_update($form, &$form_state, $payment_method, $card_data) {
+  // Extract the Customer Profile and Payment Profile IDs from the remote_id.
+  list($vault_customer_profile_id, $vault_payment_profile_id) = explode('|', $card_data['remote_id']);
+
+  if ($form_state['values']['credit_card']['number'] != $form['credit_card']['number']['#default_value']) {
+    $number = $form_state['values']['credit_card']['number'];
+  }
+  else {
+    $number = 'XXXX' . $card_data['card_number'];
+  }
+
+  // Build the base profile update data.
+  $api_request_data = array(
+    'customerProfileId' => $vault_customer_profile_id,
+    'paymentProfile' => array(
+      'payment' => array(
+        'creditCard' => array(
+          'cardNumber' => $number,
+          'expirationDate' => $card_data['card_exp_year'] . '-' . $card_data['card_exp_month'],
+        ),
+      ),
+      'customerPaymentProfileId' => $vault_payment_profile_id,
+    ),
+  );
+
+  // Fetch the response from the API server and let Card on File know if the
+  // update was successful.
+  $xml_response = commerce_quantum_vault_request($payment_method, 'updateCustomerPaymentProfileRequest', $api_request_data);
+
+  return (string) $xml_response->messages->message->code == 'I00001';
+}
+
+
+
+
+
+/**
+ * Card on file callback: deletes the associated customer payment profile.
+ */
+function commerce_quantum_vault_cardonfile_delete($form, &$form_state, $payment_method, $card_data) {
+  // Extract the Customer Profile and Payment Profile IDs from the remote_id.
+  list($vault_customer_profile_id, $vault_payment_profile_id) = explode('|', $card_data['remote_id']);
+
+  // Fetch the response from the API server and let Card on File know that the
+  // delete was either successful or not necessary.
+  $xml_response = commerce_quantum_vault_delete_customer_payment_profile_request($payment_method, $vault_customer_profile_id, $vault_payment_profile_id);
+  $code = (string) $xml_response->messages->message->code;
+
+  return in_array($code, array('I00001', 'E00040'));
+}
+
+/**
+ * Generates a billTo array for CIM API requests.
+ *
+ * @param $order
+ *   The order object containing the billing information used for the billTo.
+ *
+ * @return
+ *   An array used to generate the billTo XML in CIM API requests.
+ */
+function commerce_quantum_vault_billto_array($order) {
+  // Prepare the billing address for use in the request.
+  $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+  $billing_address = $order_wrapper->commerce_customer_billing->commerce_customer_address->value();
+
+  // Ensure we have a first and last name in the address.
+  if (empty($billing_address['first_name'])) {
+    $name_parts = explode(' ', $billing_address['name_line']);
+    $billing_address['first_name'] = array_shift($name_parts);
+    $billing_address['last_name'] = implode(' ', $name_parts);
+  }
+
+  // Return the billTo array.
+  return array(
+    'firstName' => substr($billing_address['first_name'], 0, 50),
+    'lastName' => substr($billing_address['last_name'], 0, 50),
+    'company' => substr($billing_address['organisation_name'], 0, 50),
+    'address' => substr($billing_address['thoroughfare'], 0, 60),
+    'city' => substr($billing_address['locality'], 0, 40),
+    'state' => substr($billing_address['administrative_area'], 0, 40),
+    'zip' => substr($billing_address['postal_code'], 0, 20),
+    'country' => $billing_address['country'],
+  );
+}
+
+
+
+
+
+/**
+ * Generates a creditCard array for VAULT API requests.
+ *
+ * @param $payment_details
+ *   An array of payment details used in a CIM API request that doesn't have to
+ *   include credit card data. If it does, the following keys are expected:
+ *   - cardNumber: the full credit card number
+ *   - expirationDate: the expiration date in YYYY-MM format
+ *   - cardCode: the three or four digit card security code
+ */
+function commerce_quantum_vault_credit_card_array($payment_details) {
+  $credit_card = array();
+
+  foreach (array('cardNumber', 'expirationDate', 'cardCode') as $key) {
+    if (!empty($payment_details[$key])) {
+      $credit_card[$key] = $payment_details[$key];
+    }
+  }
+
+  return $credit_card;
+}
+
+/**
+ * Submits a createCustomerProfileRequest XML VAULT API request to Quantum Gateway
+ *
+ * This function will attempt to create a VAULT Customer Profile and a default
+ * Payment Profile for it using the given payment details.
+ *
+ * @param $payment_method
+ *   The payment method instance array containing the API credentials for a CIM
+ *   enabled Authorize.Net account.
+ * @param $order
+ *   The order object containing the billing address and e-mail to use for the
+ *   customer profile.
+ * @param $payment_details
+ *   An array of payment details to use in the default payment profile. See the
+ *   respective helper array functions for possible keys.
+ *
+ * @return
+ *   A string of SimpleXMLElement containing the API response.
+ *
+ * @see commerce_quantum_vault_credit_card_array()
+ */
+function commerce_quantum_vault_create_customer_profile_request($payment_method, $order, $payment_details) {
+//??????????????? investigate this function ?????????????????????????????????????????????
+  $billto = commerce_quantum_vault_billto_array($order);
+
+  // Build the base profile request data.
+  $api_request_data = array(
+    'profile' => array(
+      'merchantCustomerId' => $order->uid,
+      'description' => $billto['firstName'] . ' ' . $billto['lastName'],
+      'email' => $order->mail,
+      'paymentProfiles' => array(
+        'billTo' => $billto,
+        'payment' => array(),
+      ),
+    ),
+  );
+
+  // If the order is anonymous, unset the merchantCustomerId from the request.
+  if (empty($api_request_data['profile']['merchantCustomerId'])) {
+    unset($api_request_data['profile']['merchantCustomerId']);
+  }
+
+  // Add credit card payment details to the default payment profile if given.
+  $credit_card = commerce_quantum_vault_credit_card_array($payment_details);
+
+  if (!empty($credit_card)) {
+    $api_request_data['profile']['paymentProfiles']['payment']['creditCard'] = $credit_card;
+  }
+
+  return commerce_quantum_vault_request($payment_method, 'createCustomerProfileRequest', $api_request_data);
+}
+
+
+
+
+
+/**
+ * Submits a createCustomerPaymentProfileRequest XML CIM API request to Authorize.Net.
+ *
+ * @param $payment_method
+ *   The payment method instance array containing the API credentials for a CIM
+ *   enabled Authorize.Net account.
+ * @param $vault_customer_profile_id
+ *   A numerical CIM Customer Profile ID.
+ * @param $order
+ *   The order object containing the billing address and e-mail to use for the
+ *   payment profile.
+ * @param $payment_details
+ *   An array of payment details to use in the default payment profile. See the
+ *   respective helper array functions for possible keys.
+ *
+ * @return
+ *   A SimpleXMLElement containing the API response.
+ *
+ * @see commerce_quantum_vault_credit_card_array()
+ */
+function commerce_quantum_vault_create_customer_payment_profile_request($payment_method, $vault_customer_profile_id, $order, $payment_details) {
+  $billto = commerce_quantum_vault_billto_array($order);
+
+  // Build the base profile request data.
+  $api_request_data = array(
+    'customerProfileId' => $vault_customer_profile_id,
+    'paymentProfile' => array(
+      'billTo' => $billto,
+      'payment' => array(),
+    ),
+  );
+
+  // Add credit card payment details to the default payment profile if given.
+  $credit_card = commerce_quantum_vault_credit_card_array($payment_details);
+
+  if (!empty($credit_card)) {
+    $api_request_data['paymentProfile']['payment']['creditCard'] = $credit_card;
+  }
+
+  return commerce_quantum_vault_request($payment_method, 'createCustomerPaymentProfileRequest', $api_request_data);
+}
+
+
+
+
+
+/**
+ * Submits a getCustomerPaymentProfileRequest XML CIM API request to Authorize.Net.
+ *
+ * @param $payment_method
+ *   The payment method instance array containing the API credentials for a CIM
+ *   enabled Authorize.Net account.
+ * @param $vault_customer_profile_id
+ *   A numerical CIM Customer Profile ID.
+ * @param $vault_payment_profile_id
+ *   A numerical CIM Customer Payment Profile ID.
+ *
+ * @return
+ *   A SimpleXMLElement containing the API response.
+ */
+function commerce_quantum_vault_get_customer_payment_profile_request($payment_method, $vault_customer_profile_id, $vault_payment_profile_id) {
+  // Build the get payment profile request data.
+  $api_request_data = array(
+    'customerProfileId' => $vault_customer_profile_id,
+    'customerPaymentProfileId' => $vault_payment_profile_id,
+  );
+
+  return commerce_quantum_vault_request($payment_method, 'getCustomerPaymentProfileRequest', $api_request_data);
+}
+
+
+
+
+
+/**
+ * Submits a deleteCustomerPaymentProfileRequest XML CIM API request to Authorize.Net.
+ *
+ * @param $payment_method
+ *   The payment method instance array containing the API credentials for a CIM
+ *   enabled Authorize.Net account.
+ * @param $vault_customer_profile_id
+ *   A numerical CIM Customer Profile ID.
+ * @param $vault_payment_profile_id
+ *   A numerical CIM Customer Payment Profile ID.
+ *
+ * @return
+ *   A SimpleXMLElement containing the API response.
+ */
+function commerce_quantum_vault_delete_customer_payment_profile_request($payment_method, $vault_customer_profile_id, $vault_payment_profile_id) {
+  // Build the payment profile delete request data.
+  $api_request_data = array(
+    'customerProfileId' => $vault_customer_profile_id,
+    'customerPaymentProfileId' => $vault_payment_profile_id,
+  );
+
+  return commerce_quantum_vault_request($payment_method, 'deleteCustomerPaymentProfileRequest', $api_request_data);
+}
+
+
+
+
+
+/**
+ * Submits an API request to Commerce Gateway
+ *
+ * @param $payment_method
+ *   The payment method instance array associated with this API request.
+ */
+function commerce_quantum_xmlrequester_request($payment_method, $requestnvp = array()) {
+
+  // Set the $url variable for URL of the Gateway
+  //  note in some payment methods the URL is different if in test or live or whatever
+  //  but for Quantum Gateway they use a different login/key to determine if test or live
+  $url = "https://secure.quantumgateway.com/cgi/xml_requester.php";
+
+  // Additional parameters,
+  // Send integer Y/N to request Quantum Gateway if we want them to send an email also to customer 
+  $requestnvp += array(  
+    'CustomerEmail' => $payment_method['settings']['CustomerEmail'],
+  );
+
+  // Allow modules to alter parameters of the API request:  drupal_alter() 
+  //  This dispatch function hands off the passed-in variables to type-specific hook_TYPE_alter() 
+  //  implementations in modules. It ensures a consistent interface for all altering operations.
+  drupal_alter('commerce_quantum_xmlrequester_request', $requestnvp);
+
+  // Log the request if specified, but do NOT log full card number nor CVV2 code!
+  if ($payment_method['settings']['log']['request'] == 'request') {
+    // Copy the requestnvp and mask array elements for card number and cvv code
+    $log_requestnvp = $requestnvp;
+
+    // mask card number
+    if (!empty($log_requestnvp['CreditCardNumber'])) {
+     $log_requestnvp['CreditCardNumber'] = str_repeat('X', strlen($log_requestnvp['CreditCardNumber']) - 4) . substr($log_requestnvp['CreditCardNumber'], -4);
+    }
+
+    // mask card code
+    if (!empty($log_requestnvp['CVV2'])) {
+      $log_requestnvp['CVV2'] = str_repeat('X', strlen($log_requestnvp['CVV2']));
+    }
+
+    // The watchdog function in drupal core logs a system message which can be invaluable for debugging code.
+    watchdog('commerce_quantum', 'Quantum XMLrequester request to @url: !param', array('@url' => $url, '!param' => '<pre>' . check_plain(print_r($log_requestnvp, TRUE)) . '</pre>'), WATCHDOG_DEBUG);
+  }
+
+  // Craft the transaction xml to send
+  $transaction_xml = "<QGWRequest>\n";
+  $transaction_xml .= "<Authentication>\n";
+  // Choose which login/key to use by txn_mode
+  switch ($payment_method['settings']['txn_mode']) {
+    case "live":
+      $transaction_xml .= "<GatewayLogin>" . $payment_method['settings']['LiveGatewayID'] . "</GatewayLogin>\n";
+      $transaction_xml .= "<GatewayKey>" .  $payment_method['settings']['LiveRestrictKey'] . "</GatewayKey>";
+    case "test":
+      $transaction_xml .= "<GatewayLogin>" . $payment_method['settings']['TestGatewayID'] . "</GatewayLogin>\n";
+      $transaction_xml .= "<GatewayKey>" .  $payment_method['settings']['TestRestrictKey'] . "</GatewayKey>"; 
+  }
+  $transaction_xml .= "</Authentication>";
+  $transaction_xml .= "<Request>\n";
+  // Add the xml for <Request>, since we have them in an array with name and value, can use loop to build string.
+  foreach ($requestnvp as $key => $value) {
+    $transaction_xml .= '<' . $key . '>' . $value . '</' . $key . '>\n' ;
+  }
+  $transaction_xml .= "</Request>\n"; 
+  $transaction_xml .= "</QGWRequest>\n";
+
+  // Will use a custom curl header with transaction xml 
+  $curlheader = "POST $url HTTP/1.1\n";
+  $curlheader.= "Host: " . $_SERVER["SERVER_NAME"] . "\n";
+  $curlheader.= "Content-Length: ".strlen($transaction_xml)."\n";
+  $curlheader.= "Content-type: text/xml; charset=UTF8\n";
+  $curlheader.= "Connection: close; Keep-Alive\n\n";
+  $curlheader.= $transaction_xml;
+
+  // Setup the cURL request and options, http://php.net/manual/en/function.curl-setopt.php
+  $ch = curl_init();
+  curl_setopt($ch, CURLOPT_URL, $url);
+  // Other payment modules did not specify timeout, Quantum example used 120?
+  curl_setopt($ch, CURLOPT_TIMEOUT, 120);
+  // CURLOPT_RETURNTRANSFER, TRUE to return the transfer as a string of the return value of curl_exec() 
+  // instead of outputting it out directly.
+  curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
+  // CURLOPT_CUSTOMREQUEST, A custom request method to use instead of "GET" or "HEAD" when doing a HTTP request.  
+  curl_setopt($ch, CURLOPT_CUSTOMREQUEST,$curlheader);
+  // CURLOPT_POST, set to true does a regular http post
+  curl_setopt($ch, CURLOPT_POST, 1);
+  // curlopt_verbose, TRUE to output verbose info. Writes output to STDERR, or file specified by CURLOPT_STDERR.
+  curl_setopt($ch, CURLOPT_VERBOSE, 0);
+  // CURLOPT_SSL_VERIFYPEER, FALSE to stop cURL from verifying the peer's certificate. True by default for cURL 7.10
+  curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, 0);
+  // CURLOPT_NOPROGRESS, TRUE to disable the progress meter for cURL transfers. PHP set to TRUE automatically 
+  curl_setopt($ch, CURLOPT_NOPROGRESS, 1);
+  // CURLOPT_FOLLOWLOCATION,TRUE to follow any "Location: " header that the server sends as part of the HTTP header
+  curl_setopt($ch, CURLOPT_FOLLOWLOCATION, 0);
+  // CURLOPT_POSTFIELDS, The full data to post in a HTTP "POST" operation. 
+  // This parameter can either be passed as a urlencoded string like 'para1=val1&para2=val2&...' 
+  // or as an array with the field name as key and field data as value. If value is an array, 
+  // the Content-Type header will be set to multipart/form-data. As of PHP 5.2.0, value must be an array if 
+  // files are passed to this option with the @ prefix.
+  //  However the Quantum Gateway example sends the xml as a string, will do same as their example?
+  curl_setopt($ch, CURLOPT_POSTFIELDS, $transaction_xml);
+
+  // set result to execute the communication with cURL.
+  $result = curl_exec($ch);
+
+  // THE result is expected to be an XML string.... 
+ 
+
+  // Log any errors to the watchdog.
+  if ($error = curl_error($ch)) {
+    watchdog('commerce_quantum', 'cURL error: @error', array('@error' => $error), WATCHDOG_ERROR);
+    return FALSE;
+  }
+  curl_close($ch);
+ 
+  // Just to be sure we do not run a foul an object being serialized, lets just
+  // cast this result as a string and return.  May want to investigate if this a good idea or necessary...? 
+  // http://php.net/manual/en/language.types.type-juggling.php
+  $response = (string)$result;
+
+  // Log the response if specified.
+  if ($payment_method['settings']['log']['response'] == 'response') {
+  watchdog('commerce_quantum', 'Quantum XMLrequester response: !param', array('!param' => '<pre>' . check_plain(print_r($response, TRUE)) . '</pre>', WATCHDOG_DEBUG));
+  }
+
+  return $response;
+}
+
+
+
+/**
+ * Submits a VAULT XML API request to Quantum Gateway.
+ *
+ * @param $payment_method
+ *   The payment method instance array associated with this API request.
+ * @param $request_type
+ *   The name of the request type to submit.
+ * @param $api_request_data
+ *   An associative array of data to be turned into a VAULT XML API request.
+ *
+ *  ???????  this is not ready to be used, still has authnet code ?????????????
+ */
+function commerce_quantum_vault_request($payment_method, $request_type, $api_request_data) {
+  //  In some payment methods the URL is different if in test or live or whatever
+  //  but for Quantum Gateway they use a different login/key to determine if test or live
+  //  and URL is same for vault as it is for others, but the request types are different
+  $url = "https://secure.quantumgateway.com/cgi/xml_requester.php";
+
+  // Add default data to the API request data array.
+  if (!isset($api_request_data['merchantAuthentication'])) {
+    $api_request_data = array(
+      'merchantAuthentication' => array(
+        'name' => $payment_method['settings']['login'],
+        'transactionKey' => $payment_method['settings']['tran_key'],
+      ),
+    ) + $api_request_data;
+  }
+
+  // Determine if it is necessary to add a validation mode to the API request.
+  $validation_mode = '';
+
+  switch ($request_type) {
+    case 'createCustomerProfileRequest':
+      if (empty($api_request_data['profile']['paymentProfiles'])) {
+        $validation_mode = 'none';
+      }
+      else {
+        $validation_mode = $payment_method['settings']['txn_mode'] == QUANTUM_TXN_MODE_LIVE ? 'liveMode' : 'testMode';
+      }
+      break;
+
+    case 'createCustomerPaymentProfileRequest':
+    case 'updateCustomerPaymentProfileRequest':
+    case 'validateCustomerPaymentProfileRequest':
+      $validation_mode = $payment_method['settings']['txn_mode'] == QUANTUM_TXN_MODE_LIVE ? 'liveMode' : 'testMode';
+      break;
+
+    default:
+      break;
+  }
+
+  // Add the validation mode now if one was found.
+  if (!empty($validation_mode)) {
+    $api_request_data['validationMode'] = $validation_mode;
+  }
+
+  // Build and populate the API request SimpleXML element.
+  $api_request_element = new SimpleXMLElement('<' . $request_type . '/>');
+  $api_request_element->addAttribute('xmlns', 'AnetApi/xml/v1/schema/AnetApiSchema.xsd');
+  commerce_simplexml_add_children($api_request_element, $api_request_data);
+
+  // Allow modules an opportunity to alter the request before it is sent.
+  drupal_alter('commerce_quantum_vault_request', $api_request_element);
+
+  // Generate an XML string.
+  $xml = $api_request_element->asXML();
+
+  // Log the request if specified.
+  if ($payment_method['settings']['log']['request'] == 'request') {
+    // Mask the credit card number and CVV.
+    $log_element = clone($api_request_element);
+    $log_element->merchantAuthentication->name = str_repeat('X', strlen((string) $log_element->merchantAuthentication->name));
+    $log_element->merchantAuthentication->transactionKey = str_repeat('X', strlen((string) $log_element->merchantAuthentication->transactionKey));
+
+    if (!empty($log_element->profile->paymentProfiles->payment->creditCard->cardNumber)) {
+      $card_number = (string) $log_element->profile->paymentProfiles->payment->creditCard->cardNumber;
+      $log_element->profile->paymentProfiles->payment->creditCard->cardNumber = str_repeat('X', strlen($card_number) - 4) . substr($card_number, -4);
+    }
+
+    if (!empty($log_element->paymentProfile->payment->creditCard->cardNumber)) {
+      $card_number = (string) $log_element->paymentProfile->payment->creditCard->cardNumber;
+      $log_element->paymentProfile->payment->creditCard->cardNumber = str_repeat('X', strlen($card_number) - 4) . substr($card_number, -4);
+    }
+
+    if (!empty($log_element->profile->paymentProfiles->payment->creditCard->cardCode)) {
+      $log_element->profile->paymentProfiles->payment->creditCard->cardCode = str_repeat('X', strlen((string) $log_element->profile->paymentProfiles->payment->creditCard->cardCode));
+    }
+
+    if (!empty($log_element->paymentProfile->payment->creditCard->cardCode)) {
+      $log_element->paymentProfile->payment->creditCard->cardCode = str_repeat('X', strlen((string) $log_element->paymentProfile->payment->creditCard->cardCode));
+    }
+
+    watchdog('commerce_quantum', 'Authorize.Net CIM @type to @url: @xml', array('@type' => $request_type, '@url' => $url, '@xml' => $log_element->asXML()), WATCHDOG_DEBUG);
+  }
+
+  // Build the array of header information for the request.
+  $header = array();
+  $header[] = 'Content-type: text/xml; charset=utf-8';
+  $header[] = 'Content-length: ' . strlen($api_request_element->asXML());
+
+  // Setup the cURL request.
+  $ch = curl_init();
+  curl_setopt($ch, CURLOPT_URL, $url);
+  curl_setopt($ch, CURLOPT_VERBOSE, 0);
+  curl_setopt($ch, CURLOPT_POST, 1);
+  curl_setopt($ch, CURLOPT_POSTFIELDS, $xml);
+  curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
+  curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, 0);
+  curl_setopt($ch, CURLOPT_NOPROGRESS, 1);
+  curl_setopt($ch, CURLOPT_FOLLOWLOCATION, 0);
+  curl_setopt($ch, CURLOPT_HTTPHEADER, $header);
+  $result = curl_exec($ch);
+
+  // Log any errors to the watchdog.
+  if ($error = curl_error($ch)) {
+    watchdog('commerce_quantum', 'cURL error: @error', array('@error' => $error), WATCHDOG_ERROR);
+    return FALSE;
+  }
+  curl_close($ch);
+
+  // If we received data back from the server...
+  if (!empty($result)) {
+    // Remove non-absolute XML namespaces to prevent SimpleXML warnings.
+    $result = str_replace(' xmlns="AnetApi/xml/v1/schema/AnetApiSchema.xsd"', '', $result);
+
+    // Extract the result into an XML response object.
+    $response = new SimpleXMLElement($result);
+
+    // Log the API response if specified.
+    if ($payment_method['settings']['log']['response'] == 'response') {
+      watchdog('commerce_quantum', 'API response received:<pre>@xml</pre>', array('@xml' => $response->asXML()));
+    }
+
+    return $response;
+  }
+  else {
+    return FALSE;
+  }
+}
+
+
+
+/**
+ * Returns the transaction type string for Quantum Gateway that corresponds to the
+ *   Drupal Commerce constant.
+ *
+ * @param $txn_type
+ *   A Drupal Commerce transaction type constant.
+ *
+ * Quantum Gateway ProcessType parameter and equivalent DrupalCommerce Constant:
+ *  AUTH_CAPTURE (Auth Then Sales)    COMMERCE_CREDIT_AUTH_CAPTURE
+ *  AUTH_ONLY (Auth only)             COMMERCE_CREDIT_AUTH_ONLY
+ * Quantum Gateway also accepts but may not be used by this module?
+ *  SALES (default - Skips AVS and CVV2)  VOID (Requires TransactionID)  PREVIOUS_SALE (Force An AUTH)
+ *
+ */
+function commerce_quantum_txn_type($txn_type) {
+  switch ($txn_type) {
+    // Used to just authorize an amount on a credit card account.
+    case COMMERCE_CREDIT_AUTH_ONLY:
+      return 'AUTH_ONLY';
+    // Used to capture funds from a prior authorization. 
+    // ??? not sure about this, test to verify ???
+    case COMMERCE_CREDIT_PRIOR_AUTH_CAPTURE:
+      return 'PREVIOUS_SALE';
+    // Used to authorize and capture money all at once.
+    case COMMERCE_CREDIT_AUTH_CAPTURE:
+      return 'AUTH_CAPTURE';
+    case COMMERCE_CREDIT_REFERENCE_SET:
+    case COMMERCE_CREDIT_REFERENCE_TXN:
+    case COMMERCE_CREDIT_REFERENCE_REMOVE:
+    case COMMERCE_CREDIT_REFERENCE_CREDIT:
+      return NULL;
+    case COMMERCE_CREDIT_CREDIT:
+      return 'CREDIT';
+    case COMMERCE_CREDIT_VOID:
+      return 'VOID';
+  }
+}
+
+
+
+
+
+/**
+ * Returns the CIM transaction request type that correponds to a the Drupal
+ * Commerce constant.
+ *
+ * @param $txn_type
+ *   A Drupal Commerce transaction type constant.
+ *
+ *  ??????????? not ready to be used still has authnet code !!!!!
+ *
+ */
+function commerce_quantum_vault_transaction_element_name($txn_type) {
+  switch ($txn_type) {
+    case COMMERCE_CREDIT_AUTH_ONLY:
+      return 'profileTransAuthOnly';
+    case COMMERCE_CREDIT_AUTH_CAPTURE:
+      return 'profileTransAuthCapture';
+    case COMMERCE_CREDIT_CAPTURE_ONLY:
+      return 'profileTransCaptureOnly';
+    case COMMERCE_CREDIT_PRIOR_AUTH_CAPTURE:
+      return 'profileTransPriorAuthCapture';
+    case COMMERCE_CREDIT_CREDT:
+      return 'profileTransRefund';
+    case COMMERCE_CREDIT_VOID:
+      return 'profileTransVoid';
+    default:
+      return '';
+  }
+}
+
+
+
+
+
+/**
+ * Returns the description of an Authorize.Net transaction type.
+ *
+ * @param $txn_type
+ *   An Authorize.Net transaction type string.
+ *
+ * ???????????  not ready to be used, may not be relevant!!!!!!!!!
+ */
+function commerce_quantum_reverse_txn_type($txn_type) {
+  switch (strtoupper($txn_type)) {
+    case 'AUTH_ONLY':
+      return t('Authorization only');
+    case 'PRIOR_AUTH_CAPTURE':
+      return t('Prior authorization capture');
+    case 'AUTH_CAPTURE':
+      return t('Authorization and capture');
+    case 'CREDIT':
+      return t('Credit');
+    case 'VOID':
+      return t('Void');
+  }
+}
+
+
+
+
+
+/**
+ * Returns the message text for an AVS response code.
+ *  ?????? may not be as relevant for Quantum
+ */
+function commerce_quantum_avs_response($code) {
+  switch ($code) {
+    case 'A':
+      return t('Address (Street) matches, ZIP does not');
+    case 'B':
+      return t('Address information not provided for AVS check');
+    case 'E':
+      return t('AVS error');
+    case 'G':
+      return t('Non-U.S. Card Issuing Bank');
+    case 'N':
+      return t('No Match on Address (Street) or ZIP');
+    case 'P':
+      return t('AVS not applicable for this transaction');
+    case 'R':
+      return t('Retry – System unavailable or timed out');
+    case 'S':
+      return t('Service not supported by issuer');
+    case 'U':
+      return t('Address information is unavailable');
+    case 'W':
+      return t('Nine digit ZIP matches, Address (Street) does not');
+    case 'X':
+      return t('Address (Street) and nine digit ZIP match');
+    case 'Y':
+      return t('Address (Street) and five digit ZIP match');
+    case 'Z':
+      return t('Five digit ZIP matches, Address (Street) does not');
+  }
+
+  return '-';
+}
+
+
+
+
+
+/**
+ * Returns the message text for a CVV match.
+ *
+ *  need list from quantum ??????????
+ * ???????????? not ready to be used, may not be relevant ???????????
+ */
+function commerce_quantum_cvv_response($code) {
+  switch ($code) {
+    case 'M':
+      return t('Match');
+    case 'N':
+      return t('No Match');
+    case 'P':
+      return t('Not Processed');
+    case 'S':
+      return t('Should have been present');
+    case 'U':
+      return t('Issuer unable to process request');
+  }
+
+  return '-';
+}
+
+
+
+
+

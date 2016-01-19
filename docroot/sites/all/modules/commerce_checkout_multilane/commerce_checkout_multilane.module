@@ -1,0 +1,245 @@
+<?php
+/**
+ * @file
+ * Provides means to create additional checkout sequences (lanes) with different
+ * pane visibility and order.
+ */
+
+/**
+ * The default string used to separate the lane suffix in checkout pane ids.
+ */
+define('COMMERCE_CHECKOUT_MULTILANE_DEFAULT_SEPARATOR', '--');
+
+/**
+ * The lane id used for the default checkout lane.
+ */
+define('COMMERCE_CHECKOUT_MULTILANE_DEFAULT_LANE_ID', 'default');
+
+/**
+ * Determines and returns the active checkout lane id for the current page.
+ *
+ * @param string $path
+ *   (optional) The path used to determine the lane. Defaults to the path of the
+ *   current page.
+ *
+ * @return string|NULL
+ *   The lane id or NULL if no custom lane is active on the given path.
+ */
+function commerce_checkout_multilane_active_lane($path = NULL) {
+  $lane_id = COMMERCE_CHECKOUT_MULTILANE_DEFAULT_LANE_ID;
+
+  // Try to get the lane id from the active order when on a checkout page.
+  if (arg(0, $path) == 'checkout' && ($order = menu_get_object('commerce_order', 1, $path))) {
+    $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+    $lane_id = $order_wrapper->checkout_lane_id->value();
+  }
+  elseif (!empty($_POST['checkout_lane_id']) && !empty($_POST['checkout_lane_token']) && drupal_valid_token($_POST['checkout_lane_token'], $_POST['checkout_lane_id'])) {
+    // Try to get the lane id from post variables. (See
+    // commerce_checkout_multilane_form_commerce_checkout_form_alter())
+    $lane_id = $_POST['checkout_lane_id'];
+  }
+
+  drupal_alter('commerce_checkout_multilane_active_lane', $lane_id);
+
+  return $lane_id;
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * Expose the lane id as a hidden field, such that it is possible to retrieve it
+ * from within an Ajax request via $_POST.
+ */
+function commerce_checkout_multilane_form_commerce_checkout_form_alter(&$form, &$form_state) {
+  $order_wrapper = entity_metadata_wrapper('commerce_order', $form_state['order']);
+  $lane_id = $order_wrapper->checkout_lane_id->value();
+
+  if ($lane_id != COMMERCE_CHECKOUT_MULTILANE_DEFAULT_LANE_ID) {
+    $form['checkout_lane_id'] = array(
+      '#type' => 'hidden',
+      '#value' => $lane_id,
+    );
+    $form['checkout_lane_token'] = array(
+      '#type' => 'hidden',
+      '#value' => drupal_get_token($lane_id),
+    );
+  }
+}
+
+/**
+ * Loads and returns a list of lane records keyed by lane id.
+ *
+ * @return array
+ *   An associative array of lane records keyed by the lane id.
+ */
+function commerce_checkout_multilane_lanes() {
+  $lanes = module_invoke_all('commerce_checkout_multilane_lane_info');
+  drupal_alter('commerce_checkout_multilane_lane_info', $lanes);
+
+  // Not allowed as a custom lane id.
+  unset($lanes[COMMERCE_CHECKOUT_MULTILANE_DEFAULT_LANE_ID]);
+
+  return $lanes;
+}
+
+/**
+ * Implements hook_commerce_checkout_multilane_lane_info().
+ */
+function commerce_checkout_multilane_commerce_checkout_multilane_lane_info() {
+  $lanes = array();
+  foreach (variable_get('commerce_checkout_multilane_lanes', array()) as $id => $title) {
+    $lanes[$id] = array(
+      'title' => $title,
+    );
+  }
+  return $lanes;
+}
+
+/**
+ * Implements hook_commerce_checkout_pane_info().
+ *
+ * Create a copy of every defined checkout pane for each lane.
+ */
+function commerce_checkout_multilane_commerce_checkout_pane_info() {
+  static $recursion_flag;
+
+  $lane_panes = array();
+  if (empty($recursion_flag)) {
+    $recursion_flag = TRUE;
+    $separator = variable_get('commerce_checkout_multilane_separator', COMMERCE_CHECKOUT_MULTILANE_DEFAULT_SEPARATOR);
+    foreach (module_implements('commerce_checkout_pane_info') as $module) {
+      foreach (module_invoke($module, 'commerce_checkout_pane_info') as $pane_id => $checkout_pane) {
+        foreach (commerce_checkout_multilane_lanes() as $lane_id => $lane) {
+          // Copy the pane and backup original module and pane_id.
+          $lane_panes[$pane_id . $separator . $lane_id] = array(
+            '#lane_id' => $lane_id,
+            '#orig' => array('pane_id' => $pane_id, 'module' => $module),
+          ) + $checkout_pane;
+        }
+      }
+    }
+    $recursion_flag = FALSE;
+  }
+
+  return $lane_panes;
+}
+
+/**
+ * Implements hook_commerce_checkout_pane_info_alter().
+ *
+ * Remove all checkout panes belonging to a different lane.
+ */
+function commerce_checkout_multilane_commerce_checkout_pane_info_alter(&$checkout_panes) {
+
+  // Override original panes with the pane configuration of the active lane.
+  $lane_id = commerce_checkout_multilane_active_lane();
+  if ($lane_id != COMMERCE_CHECKOUT_MULTILANE_DEFAULT_LANE_ID) {
+    foreach (array_keys($checkout_panes) as $pane_id) {
+      if (isset($checkout_panes[$pane_id]['#lane_id']) && $checkout_panes[$pane_id]['#lane_id'] == $lane_id) {
+        $lane_pane = $checkout_panes[$pane_id];
+        $lane_pane = $lane_pane['#orig'] + $lane_pane;
+        unset($lane_pane['#orig']);
+        unset($lane_pane['#lane_id']);
+
+        $checkout_panes[$lane_pane['pane_id']] = $lane_pane;
+      }
+    }
+  }
+
+  // Remove all the panes spoofed by our hook_commerce_checkout_pane_info()
+  // implementation above.
+  foreach (array_keys($checkout_panes) as $pane_id) {
+    if (isset($checkout_panes[$pane_id]['#lane_id'])) {
+      unset($checkout_panes[$pane_id]);
+    }
+  }
+
+  $alter_hooks = array(
+    'commerce_checkout_multilane_pane_info',
+    'commerce_checkout_multilane_pane_info_' . $lane_id,
+  );
+  drupal_alter($alter_hooks, $checkout_panes, $lane_id);
+}
+
+/**
+ * Implements hook_module_implements_alter().
+ *
+ * Ensure that the commerce_checkout_pane_info_alter implementation is called as
+ * early as possible.
+ */
+function commerce_checkout_multilane_module_implements_alter(&$implementations, $hook) {
+  if ($hook == 'commerce_checkout_pane_info_alter') {
+    $key_order = array_flip(array_keys($implementations));
+    $key_order['commerce_checkout_multilane'] = -1;
+    array_multisort($key_order, $implementations);
+  }
+}
+
+/**
+ * Implements hook_hook_info().
+ */
+function commerce_checkout_multilane_hook_info() {
+  $hooks = array(
+    'commerce_checkout_multilane_lane_info' => array(
+      'group' => 'commerce',
+    ),
+    'commerce_checkout_multilane_lane_info_alter' => array(
+      'group' => 'commerce',
+    ),
+    'commerce_checkout_multilane_active_lane_alter' => array(
+      'group' => 'commerce',
+    ),
+    'commerce_checkout_multilane_pane_info_alter' => array(
+      'group' => 'commerce',
+    ),
+  );
+
+  return $hooks;
+}
+
+/**
+ * Implements hook_entity_property_info_alter().
+ */
+function commerce_checkout_multilane_entity_property_info_alter(&$info) {
+  // Property for the checkout lane this order is associated with.
+  $info['commerce_order']['properties']['checkout_lane_id'] = array(
+    'label' => t('Checkout lane'),
+    'description' => t('The lane this order is using during checkout'),
+    'getter callback' => 'commerce_checkout_multilane_data_property_get',
+    'setter callback' => 'commerce_checkout_multilane_data_property_set',
+    'type' => 'text',
+    'options list' => 'commerce_checkout_multilane_lane_options',
+  );
+}
+
+/**
+ * Return the value of a data-entry from a commerce_order.
+ */
+function commerce_checkout_multilane_data_property_get($commerce_order, array $options, $name, $type, $info) {
+  return empty($commerce_order->data[$name]) ? COMMERCE_CHECKOUT_MULTILANE_DEFAULT_LANE_ID : $commerce_order->data[$name];
+}
+
+/**
+ * Return the value of a data-entry of a commerce_order.
+ */
+function commerce_checkout_multilane_data_property_set(&$commerce_order, $name, $value, $langcode, $type, $info) {
+  $commerce_order->data[$name] = $value;
+}
+
+/**
+ * Returns a list of lane names keyed by lane id.
+ *
+ * @return array
+ *   An associative array of lane names keyed by the lane id.
+ */
+function commerce_checkout_multilane_lane_options() {
+  $options = array(
+    COMMERCE_CHECKOUT_MULTILANE_DEFAULT_LANE_ID => t('Default'),
+  );
+
+  foreach (commerce_checkout_multilane_lanes() as $key => $lane) {
+    $options[$key] = $lane['title'];
+  }
+
+  return $options;
+}

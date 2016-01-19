@@ -1,0 +1,561 @@
+<?php
+
+/**
+ * @file
+ * 2Checkout Payment Gateway for MS Core.
+ *
+ * Original author: Leighton Whiting - Released under GENERAL PUBLIC LICENSE
+ * Current maintenance by multiple MoneySuite users.
+ * Re: new initiative: https://www.drupal.org/node/2315653 
+ * Developed with the help of Craig Christenson from 2checkout.com
+ */
+
+/**
+ * Implements hook_menu().
+ */
+function ms_twocheckout_menu() {
+  $items = array();
+
+  $items['ms_twocheckout/return_ok'] = array(
+    'page callback' => 'ms_twocheckout_return_ok',
+    'access callback' => 'ms_core_view_page_access_test',
+    'type' => MENU_CALLBACK,
+  );
+  $items['ms_twocheckout/cancel/%'] = array(
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('ms_twocheckout_cancel_page_confirm', 2),
+    'access callback' => 'ms_twocheckout_cancel_test',
+    'access arguments' => array(2),
+    'type' => MENU_CALLBACK,
+  );
+  $items['ms_twocheckout/template_call'] = array(
+    'title' => '2Checkout Secure Payment',
+    'page callback' => 'ms_twocheckout_template',
+    'access callback' => 'ms_core_view_page_access_test',
+    'type' => MENU_CALLBACK,
+  );
+  $items['ms/checkout/twocheckout'] = array(
+    'title' => 'Checkout',
+    'page callback' => 'ms_twocheckout_checkout',
+    'access callback' => 'ms_core_view_page_access_test',
+    'type' => MENU_CALLBACK,
+  );
+
+  return $items;
+}
+
+/**
+ * Access callback: Checks if the user can cancel their order.
+ *
+ * @param int $oid
+ *   The order id.
+ */
+function ms_twocheckout_cancel_test($oid) {
+  global $user;
+  $order = ms_core_order_load($oid);
+  if ($user->uid == $order->uid OR user_access('administer moneysuite orders')) {
+    return TRUE;
+  }
+  return FALSE;
+}
+
+/**
+ * Get the Cancellation URL for a recurring order
+ */
+function ms_twocheckout_cancel_url($order) {
+  return 'ms_twocheckout/cancel/' . $order->oid;
+}
+
+/**
+ * Form constructor for the cancel order form.
+ *
+ * @param int $oid
+ *   The order id.
+ *
+ * @see ms_twocheckout_cancel_page_confirm_submit()
+ * @see confirm_form()
+ * @ingroup forms
+ */
+function ms_twocheckout_cancel_page_confirm($form, &$form_state, $oid) {
+  $order = ms_core_order_load($oid);
+  $form['#ms_core_oid'] = $order->oid;
+  return confirm_form($form, t('Are you sure you want to cancel your order?'), '', t('This action cannot be undone.'), t('Confirm'));
+}
+
+/**
+ * Form submission handler for ms_twocheckout_cancel_page_confirm().
+ */
+function ms_twocheckout_cancel_page_confirm_submit($form, &$form_state) {
+  $order = ms_core_order_load($form['#ms_core_oid']);
+
+  $params = array(
+    'sale_id' => $order->payments[0]->transaction
+  );
+
+  $response = twocheckout_stop_recurring($params);
+
+  if ($response == 'Success') {
+    $payment = ms_core_new_payment($order->oid, 'ms_twocheckout', 'rec_cancel');
+
+    // Generate a Unique Transaction ID.
+    $payment->transaction = $order->oid;
+    $payment->currency = $order->currency;
+    $payment->recurring_id = $order->oid;
+    $payment->billing_address = $order->billing_address;
+    $payment->shipping_address = $order->shipping_address;
+
+    ms_core_enter_payment($payment);
+  } else {
+    // Log the error.
+    ms_core_log_error('ms_twocheckout', 'There was a problem canceling the order: @error',
+      array('@error' => $response));
+    drupal_set_message(t('There was an error canceling the order. The error has been logged.'), 'error');
+  }
+}
+
+/**
+ * Stops a recurring payment subscription.
+ *
+ * @param array $params
+ *   (optional) An array of parameters.
+ * @param string $format
+ *   (optional) The format to use.
+ *
+ * @return array
+ *   The result of the API call.
+ */
+function twocheckout_stop_recurring($params = array(), $format = 'json') {
+  $urlSuffix = 'sales/detail_sale';
+  $result = twocheckout_api_request($urlSuffix, $params);
+  $result = _ms_twocheckout_object_to_array($result);
+  $lineitemData = twocheckout_active_lineitems($result);
+  if (isset($lineitemData[0])) {
+    $i = 0;
+    $stoppedLineitems = array();
+    $urlSuffix = 'sales/stop_lineitem_recurring';
+    foreach ($lineitemData as $value) {
+      $params = array('lineitem_id' => $value);
+      $result = twocheckout_api_request($urlSuffix, $params);
+      $result = json_decode($result, true);
+      if ($result['response_code'] == "OK") {
+        $stoppedLineitems[$i] = $value;
+      }
+      $i++;
+    }
+    $result = 'Success';
+  } else {
+    $result = 'No recurring lineitems to stop.';
+  }
+  return $result;
+}
+
+/**
+ * Gets Active Lineitems.
+ */
+function twocheckout_active_lineitems($saleDetail) {
+  $i = 0;
+  $invoiceData = array();
+  while (isset($saleDetail['sale']['invoices'][$i])) {
+    $invoiceData[$i] = $saleDetail['sale']['invoices'][$i];
+    $i++;
+  }
+  $invoice = max($invoiceData);
+  $i = 0;
+  $lineitemData = array();
+  while (isset($invoice['lineitems'][$i])) {
+    if ($invoice['lineitems'][$i]['billing']['recurring_status'] == "active") {
+      $lineitemData[$i] = $invoice['lineitems'][$i]['billing']['lineitem_id'];
+    }
+    $i++;
+  }
+  return $lineitemData;
+}
+
+/**
+ * Makes an API Call.
+ */
+function twocheckout_api_request($urlSuffix, $data = array()) {
+  $apiBaseUrl = 'https://www.2checkout.com/api/';
+  $user = variable_get('ms_twocheckout_user', TRUE);
+  $pass = variable_get('ms_twocheckout_pass', TRUE);
+  $url = $apiBaseUrl . $urlSuffix;
+  $ch = curl_init($url);
+  curl_setopt($ch, CURLOPT_HEADER, 0);
+  curl_setopt($ch, CURLOPT_HTTPHEADER, array("Accept: application/json"));
+  curl_setopt($ch, CURLOPT_POST, 0);
+  curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, 0);
+  curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
+  curl_setopt($ch, CURLOPT_HTTPAUTH, CURLAUTH_BASIC);
+  curl_setopt($ch, CURLOPT_USERPWD, "{$user}:{$pass}");
+  curl_setopt($ch, CURLOPT_POSTFIELDS, $data);
+  $resp = curl_exec($ch);
+  curl_close($ch);
+  return $resp;
+}
+
+/**
+ * Converts JSON Object to Array.
+ */
+function _ms_twocheckout_object_to_array($object) {
+  $object = json_decode($object, true);
+  $array = array();
+  foreach ($object as $member => $data) {
+    $array[$member] = $data;
+  }
+  return $array;
+}
+
+/**
+ * Form constructor for the Admin Settings Form.
+ */
+function ms_twocheckout_admin() {
+  $form['main'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Main Settings'),
+    '#collapsible' => FALSE,
+    '#collapsed' => FALSE,
+  );
+  $form['main']['ms_twocheckout_layout_title'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Payment Method Title'),
+    '#default_value' => variable_get('ms_twocheckout_layout_title', 'Secure Checkout'),
+    '#description' => t('Title displayed on the checkout page.'),
+  );
+  $form['main']['ms_twocheckout_demo'] = array(
+    '#type' => 'select',
+    '#title' => t('Gateway Mode'),
+    '#options' => array(
+      'Y' => t('Test Mode'),
+      'N' => t('Production'),
+    ),
+    '#default_value' => variable_get('ms_twocheckout_demo', 'N'),
+  );
+  $form['main']['ms_twocheckout_sid'] = array(
+    '#type' => 'textfield',
+    '#title' => t('2Checkout Seller ID'),
+    '#default_value' => variable_get('ms_twocheckout_sid', ''),
+    '#description' => t('2Checkout Account Number'),
+  );
+  $form['main']['ms_twocheckout_language'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Language'),
+    '#default_value' => variable_get('ms_twocheckout_language', 'en'),
+    '#description' => t('See 2Checkout documentation for language codes.'),
+  );
+  $form['main']['ms_twocheckout_secret'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Secret Word'),
+    '#default_value' => variable_get('ms_twocheckout_secret', 'tango'),
+    '#description' => t('2Checkout Secret Word'),
+  );
+  $form['main']['ms_twocheckout_user'] = array(
+    '#type' => 'textfield',
+    '#title' => t('2Checkout Username'),
+    '#default_value' => variable_get('ms_twocheckout_user', ''),
+    '#description' => t('You must create an additional API user in your account.'),
+  );
+  $form['main']['ms_twocheckout_pass'] = array(
+    '#type' => 'textfield',
+    '#title' => t('API Password'),
+    '#default_value' => variable_get('ms_twocheckout_pass', ''),
+    '#description' => t('You must create an additional API user in your account.'),
+  );
+
+  return $form;
+}
+
+/**
+ * Implements hook_ms_core_payment_gateway().
+ */
+function ms_twocheckout_ms_core_payment_gateway() {
+  $gateway['ms_twocheckout'] = array(
+    'name' => '2Checkout',
+    'display_name' => variable_get('ms_twocheckout_layout_title', ''),
+    'description' => variable_get('ms_twocheckout_layout_title', '') . '<br /><span style="padding-left: 5.5em;">'
+      . '</b>'
+      . '<img src="https://www.2checkout.com/files/2012/07/paymentlogoshorizontal.png" alt="Credit Cards or PayPal" />',
+    'module' => 'ms_twocheckout',
+    'checkout_path' => 'ms/checkout/twocheckout',
+    'cancel_url' => 'ms_twocheckout_cancel_url',
+    'settings' => ms_twocheckout_admin(),
+  );
+  return $gateway;
+}
+
+/**
+ * Page callback: Error return page.
+ *
+ * @see ms_twocheckout_menu()
+ */
+function ms_twocheckout_false() {
+  drupal_set_message(t('2Checkout returned an error for your payment. Your order is not completed. Please try again or contact us.'), 'ERROR');
+  ms_core_log_error('ms_twocheckout', '2Checkout returned an error for this payment.');
+  drupal_goto('ms/checkout');
+}
+
+/**
+ * Page callback: Return from 2Checkout.
+ *
+ * Processes INS messages.
+ *
+ * @param bool $auto
+ *   (optional) Defaults to FALSE.
+ *
+ * @see ms_twocheckout_menu()
+ */
+function ms_twocheckout_return_ok($auto = FALSE) {
+  $secret = variable_get('ms_twocheckout_secret', TRUE);
+  $sid = variable_get('ms_twocheckout_sid', TRUE);
+  $params = $_REQUEST;
+
+  // If true call is INS message.
+  if (isset($params['message_type'])) {
+    $orderid = $params['vendor_order_id'];
+    $key = $params['md5_hash'];
+
+    // @todo - Also check the payment amount matches the order amount.
+
+    $valid = md5($params['sale_id'] . $sid . $params['invoice_id'] . $secret);
+    if (drupal_strtolower($key) === drupal_strtolower($valid)) {
+      if ($order = ms_core_order_load($orderid)) {
+        switch ($params['message_type']) {
+          case 'FRAUD_STATUS_CHANGED':
+            // Report fraud failed on the Order.
+            $payment = ms_core_new_payment($order->oid, 'ms_twocheckout', 'rec_payment');
+            $payment->type = 'failed';
+            ms_core_enter_payment($payment);
+            return t('INS message "' . $params['message_type'] . '" handeled.');
+
+          case 'RECURRING_INSTALLMENT_SUCCESS':
+            // Add the Payment to the Order.
+            $payment = ms_core_new_payment($order->oid, 'ms_twocheckout', 'rec_payment');
+            $payment->type = 'rec_payment';
+            $payment->transaction = $params['invoice_id'];
+            $payment->amount = $params['invoice_list_amount'];
+            $payment->currency = $params['list_currency'];
+            $payment->data = $params;
+            ms_core_enter_payment($payment);
+            return t('INS message "' . $params['message_type'] . '" handeled.');
+
+          case 'RECURRING_INSTALLMENT_FAILED':
+            // Report failed notification on the Order.
+            $payment = ms_core_new_payment($order->oid, 'ms_twocheckout', 'rec_payment');
+            $payment->type = 'failed';
+            ms_core_enter_payment($payment);
+            return t('INS message "' . $params['message_type'] . '" handeled.');
+
+          case 'RECURRING_INSTALLMENT_STOPPED':
+            // Report stopped notification on the Order.
+            $payment = ms_core_new_payment($order->oid, 'ms_twocheckout', 'rec_payment');
+            $payment->type = 'rec_cancel';
+            ms_core_enter_payment($payment);
+            return t('INS message "' . $params['message_type'] . '" handeled.');
+
+          default:
+            return t('INS message "' . $params['message_type'] . '" not handeled.');
+        }
+      }
+    }
+  } // Call is return passback.
+  else {
+    $orderid = $params['merchant_order_id'];
+    $key = $params['key'];
+
+    if ($orderid === FALSE) {
+      return t('An error has occurred during payment.  Please contact us to ensure your order has submitted.');
+    }
+
+    if (variable_get('ms_twocheckout_demo', 'N') === 'Y') {
+      $order_number = 1;
+    } else {
+      $order_number = $params['order_number'];
+    }
+
+    $valid = md5($secret . $sid . $order_number . $params['total']);
+    if (drupal_strtolower($key) === drupal_strtolower($valid)) {
+      if ($order = ms_core_order_load($orderid)) {
+        $extra['txn_id'] = $params['order_number'];
+        $extra['approved'] = TRUE;
+
+        switch ($order->order_type) {
+          case 'recurring':
+            if ($extra['approved'] == TRUE) {
+              // Insert the Payment to the database
+              $payment = ms_core_new_payment($order->oid, 'ms_twocheckout', 'rec_signup');
+              $payment->transaction = $extra['txn_id'];
+              $payment->amount = $params['total'];
+              $payment->data = array();
+
+              // Update the address
+              $payment->billing_address = array(
+                'street' => $params['street_address'],
+                'city' => $params['city'],
+                'state' => $params['state'],
+                'zip' => $params['zip'],
+                'country' => $params['country'],
+                'phone' => $params['phone'],
+              );
+              // Update the contact details
+              $name = explode(' ', $params['card_holder_name']);
+              $payment->first_name = $name[0];
+              $payment->last_name = $name[1];
+
+              // Add the Payment to the Order
+              ms_core_enter_payment($payment);
+
+              drupal_goto('ms/thankyou');
+            } else {
+              // There was an error, log this
+              ms_core_log_error('ms_twocheckout', 'There was an error with the payment: !data',
+                array('!data' => ms_core_print_r($params)));
+            }
+            break;
+
+          case 'cart':
+            if ($extra['approved'] == TRUE) {
+              // Insert the Payment to the database
+              $payment = ms_core_new_payment($order->oid, 'ms_twocheckout', 'cart');
+              $payment->transaction = $extra['txn_id'];
+              $payment->amount = $params['total'];
+              $payment->data = array();
+
+              // Update the address
+              $payment->billing_address = array(
+                'street' => $params['street_address'],
+                'city' => $params['city'],
+                'state' => $params['state'],
+                'zip' => $params['zip'],
+                'country' => $params['country'],
+                'phone' => $params['phone'],
+              );
+
+              // Add the Payment to the Order
+              ms_core_enter_payment($payment);
+
+              drupal_goto('ms/thankyou');
+            } else {
+              // There was an error, log this
+              ms_core_log_error('ms_twocheckout', 'There was an error with the payment: !data',
+                array('!data' => ms_core_print_r($params)));
+            }
+            break;
+        }
+      } else {
+        ms_core_log_error('ms_twocheckout', 'Error loading the order for a 2Checkout Return: !data',
+          array('!data' => ms_core_print_r($params)));
+        echo "no order";
+      }
+    } else {
+      ms_core_log_error('ms_twocheckout', 'MD5 Hash did not match: !data',
+        array('!data' => ms_core_print_r($params)));
+      return t('There was an error with the payment. Please contact an administrator for more help.');
+    }
+  }
+}
+
+/**
+ * Returns a template.
+ */
+function ms_twocheckout_template() {
+  drupal_set_title(variable_get('ms_twocheckout_layout_title', TRUE));
+  $template = '<div align="right">IMAGE</div>';
+  $template .= '<div align="center"><div align="left" style="width: 550px; padding: 10px; border:2px solid #666; background-color: #fff;">';
+  $template .= '<h1>' . filter_xss(variable_get('ms_twocheckout_layout_title', TRUE)) . '</h1>';
+  $template .= '$$$PAYMENT ZONE$$$';
+  $template .= '</div></div>';
+  return $template;
+}
+
+/*
+ * Page callback: Checkout page, to collect the CC and Address Info.
+ *
+ * @see ms_twocheckout_menu()
+ */
+function ms_twocheckout_checkout() {
+  // Get the $order from the session.
+  if (!$order = ms_core_load_session_order()) {
+    // Error.
+    return t('The order could not be loaded from the session');
+  }
+
+  $redirect_message1 = t('One moment please, you will automaticaly be redirected to the payment gateway...');
+  $redirect_message2 = t('Please click the 2Checkout image to open the payment page if it does not open automaticaly.');
+
+  $params = array(
+    'sid' => filter_xss(variable_get('ms_twocheckout_sid', TRUE)),
+    'merchant_order_id' => $order->oid,
+    'mode' => '2CO',
+    'demo' => variable_get('ms_twocheckout_demo', 'N'),
+    'fixed' => 'Y',
+    'lang' => filter_xss(variable_get('ms_twocheckout_language', 'en')),
+    'x_receipt_link_url' => url('ms_twocheckout/return_ok', array('absolute' => TRUE)),
+    'card_holder_name' => substr((($order->first_name) ? $order->first_name . ' ' . $order->last_name : ''), 0, 35),
+    'email' => $order->email_address,
+    'currency_code' => $order->currency,
+  );
+
+  $params['li_0_name'] = $order->title;
+  $params['li_0_price'] = $order->amount;
+
+  if ($order->order_type == 'recurring') {
+    switch ($order->recurring_schedule['main_unit']) {
+      case 'D':
+        print t("2Checkout does not support daily recurring sales, please choose a different payment method!");
+        $params['li_0_recurrence'] = $order->recurring_schedule['main_length'] . ' Day';
+        $params['li_0_duration'] = ($order->recurring_schedule['total_occurrences']) ? $order->recurring_schedule['total_occurrences'] . ' Day' : 'FOREVER';
+        break;
+
+      case 'M':
+        $params['li_0_recurrence'] = $order->recurring_schedule['main_length'] . ' Month';
+
+        $params['li_0_duration'] = ($order->recurring_schedule['total_occurrences']) ? $order->recurring_schedule['total_occurrences'] . ' Month' : 'FOREVER';
+        break;
+
+      case 'S':
+        $params['li_0_recurrence'] = '2 Week';
+        $params['li_0_duration'] = ($order->recurring_schedule['total_occurrences']) ? $order->recurring_schedule['total_occurrences'] . ' Week' : 'FOREVER';
+        break;
+
+      case 'W':
+        $params['li_0_recurrence'] = $order->recurring_schedule['main_length'] . ' Week';
+        $params['li_0_duration'] = ($order->recurring_schedule['total_occurrences']) ? $order->recurring_schedule['total_occurrences'] . ' Week' : 'FOREVER';
+        break;
+
+      case 'Y':
+        $params['li_0_recurrence'] = $order->recurring_schedule['main_length'] . ' Year';
+        $params['li_0_duration'] = ($order->recurring_schedule['total_occurrences']) ? $order->recurring_schedule['total_occurrences'] . ' Year' : 'FOREVER';
+        break;
+    }
+  }
+
+  $input_params = "";
+  foreach ($params as $key => $value) {
+    if (strlen($value) > 0) {
+      $input_params .= "<input type='hidden' name='$key' value='$value' />";
+    }
+  }
+
+  $html = '
+    <div class="twocheckout_redirect_message_top">
+      ' . $redirect_message1 . '
+      </br>
+    </div>
+    <div class="twocheckout_redirect_container">
+      <div class="twocheckout_redirect_form">';
+  // @ignore security_18
+  $html .= '<form method="post" action="https://www.2checkout.com/checkout/spurchase" id="twocheckout_form" name="twocheckout_form">
+          ' . $input_params . '
+          <input type="image" src="https://www.2checkout.com/files/2012/07/paymentlogoshorizontal.png" name="2checkout" />
+        </form>
+      </div>
+    </div>
+    <div class="twocheckout_redirect_message_bottom">
+            ' . $redirect_message2 . '
+        </div>
+    ';
+
+  // Add in the JS.
+  //$js = "document.getElementById('twocheckout_form').submit()";
+  //drupal_add_js($js, array('type' => 'inline', 'scope' => 'footer'));
+  return $html;
+}

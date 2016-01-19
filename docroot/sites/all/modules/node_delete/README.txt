@@ -1,0 +1,1 @@
+This module alter the node allow mark a node is deleted.

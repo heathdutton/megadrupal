@@ -1,0 +1,332 @@
+<?php
+
+module_load_include('inc', 'entity_translation_hierarchy', 'entity_translation_hierarchy.node');
+
+/**
+ * Implements hook_views_api().
+ */
+function entity_translation_hierarchy_views_api() {
+  return array(
+    'api' => 3,
+    'path' => drupal_get_path('module', 'entity_translation_hierarchy') . '/views',
+  );
+}
+
+/**
+ * Implements hook_field_attach_view_alter().
+ *
+ * Hide the entity if language fallback is enabled and there are no languages to fallback to for given entity.
+ */
+function entity_translation_hierarchy_field_attach_view_alter(&$output, $context) {
+  $entity = $context['entity'];
+  $entity_type = $context['entity_type'];
+
+  // Hide the entity if language fallback is enabled and there are no languages
+  // to fallback to for given entity.
+  if (entity_translation_enabled($entity_type)) {
+    $handler = entity_translation_get_handler($entity_type, $entity);
+    $translations = $handler->getTranslations();
+    $langcode = !empty($context['language']) ? $context['language'] : $GLOBALS['language_content']->language;
+
+    // If the parent translation can't be loaded we need to notify the user that
+    // the translation is unavailable (missing or unpublished).
+    if (!empty($translations->data) && ((!isset($translations->data[$langcode]) && !isset($translations->data[LANGUAGE_NONE])) || ((isset($translations->data[$langcode]) && !entity_translation_access($entity_type, $translations->data[$langcode])))) && $langcode != LANGUAGE_NONE) {
+      // Hide blocking translation.
+      if (!empty($translations->data[$langcode]['blocking'])) {
+        $output['#access'] = user_access('translate any entity') || user_access("translate $entity_type entities");
+      }
+      // Try to load parent translation and display message to user if it can't
+      // if it's unavailable (missing or unpublished)
+      elseif (!$candidate = entity_translation_hierarchy_get_candidate($entity, $entity_type, $langcode)) {
+        // Provide context for rendering.
+        $output['#entity'] = $entity;
+        $output['#entity_type'] = $entity_type;
+        $output['#view_mode'] = $context['view_mode'];
+        // We perform theming here because the theming function might need to set
+        // system messages. It would be too late in the #post_render callback.
+        $output['#entity_translation_unavailable'] = theme('entity_translation_unavailable', array('element' => $output));
+        // As we used a string key, other modules implementing
+        // hook_field_attach_view_alter() may unset/override this.
+        $output['#post_render']['entity_translation'] = 'entity_translation_unavailable';
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_preprocess_entity_translation_overview().
+ */
+function entity_translation_hierarchy_preprocess_entity_translation_overview(&$variables) {
+  // The order of languages in this list exactly the same as order in the table (or at least it's assumed that this is the case. We are not responsible for rouge modules that change this order on the theme level).
+  // The reason we only take array_values is so the indexes of language list match the ones in $variables['rows']
+  $languages = array_values(language_hierarchy_language_list());
+
+  foreach ($languages as $index => $language) {
+    $variables['rows'][$index]['data'][0] .= theme('indentation', array('size' => $language->depth));
+
+    // Load currently viewed entity.
+    if ($current_entity = _entity_translation_hierarchy_load_current_entity()) {
+      list($entity_type, $entity) = $current_entity;
+
+      // Show information about blocking translations.
+      if ($entity && !empty($entity->translations->data[$language->language]['blocking'])) {
+        $variables['rows'][$index]['data'][3] = t('Blocking');
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function entity_translation_hierarchy_form_alter(&$form, &$form_state, $form_id) {
+  if ($handler = entity_translation_entity_form_get_handler($form, $form_state)) {
+    $translations = $handler->getTranslations();
+    $form_langcode = $handler->getFormLanguage();
+
+    // Attach JS file that collapses list of translations.
+    language_hierarchy_attach_language_selector($form);
+
+    // Add option to mark translation as blocking...
+    if (isset($form['translation'])) {
+      $form['translation']['blocking'] = array(
+        '#type' => 'checkbox',
+        '#title' => t('Flag translation as blocking'),
+        '#description' => t("An blocking translation will not be visible and the parent translation won't be used instead. The difference between blocking translation and not published one is that a blocking translation won't load parent translation in place of the blocking one."),
+        '#default_value' => !empty($translations->data[$form_langcode]['blocking']),
+        '#weight' => -98
+      );
+
+      // Move "This translation is published" checkbox above "Flag translation as blocking".
+      $form['translation']['status']['#weight'] = -99;
+
+      // Uncheck "This translation is published" when translation is blocked.
+      $form['translation']['status']['#states'] = array(
+        'disabled' => array(
+          '#edit-translation-blocking' => array('checked' => TRUE),
+        ),
+        'unchecked' => array(
+          '#edit-translation-blocking' => array('checked' => TRUE),
+        ),
+      );
+
+      $form['translation']['#attached']['js'][] = drupal_get_path('module', 'entity_translation_hierarchy') . '/entity_translation_hierarchy.form.js';
+    }
+  }
+}
+
+/**
+ * Implementation of hook_field_attach_submit().
+ */
+function entity_translation_hierarchy_field_attach_submit($entity_type, $entity, $form, &$form_state) {
+  if ($handler = entity_translation_entity_form_get_handler($form, $form_state)) {
+    if (!$handler->isNewEntity() && isset($form_state['values']['translation']['blocking'])) {
+      $form_language = $handler->getFormLanguage();
+      $translations = $handler->getTranslations();
+
+      // Add "blocking" key to translation.
+      $translations->data[$form_language]['blocking'] = $form_state['values']['translation']['blocking'];
+    }
+  }
+}
+
+/**
+ * Implements hook_field_attach_update().
+ */
+function entity_translation_hierarchy_field_attach_update($entity_type, $entity) {
+  entity_translation_hierarchy_save_blocking_info($entity_type, $entity);
+}
+
+/**
+ * Implements hook_field_attach_insert().
+ */
+function entity_translation_hierarchy_field_attach_insert($entity_type, $entity) {
+  entity_translation_hierarchy_save_blocking_info($entity_type, $entity);
+}
+
+/**
+ * Helper function to save data to "blocking" column.
+ *
+ * @see EntityTranslationDefaultHandler::saveTranslations
+ */
+function entity_translation_hierarchy_save_blocking_info($entity_type, $entity) {
+  if (entity_translation_enabled($entity_type, $entity) && $handler = entity_translation_get_handler($entity_type, $entity, TRUE)) {
+    _entity_translation_hierarchy_save_blocking_info_table($entity_type, $entity, $handler, 'entity_translation');
+    if ($handler->isRevisionable()) {
+      _entity_translation_hierarchy_save_blocking_info_table($entity_type, $entity, $handler, 'entity_translation_revision', TRUE);
+    }
+  }
+}
+
+/**
+ * Save data to the blocking column in entity_revision tables.
+ *
+ * @see entity_translation_hierarchy_save_blocking_info
+ */
+function _entity_translation_hierarchy_save_blocking_info_table($entity_type, $entity, EntityTranslationHandlerInterface $handler, $table, $revision = FALSE) {
+  list($entity_id, $revision_id) = entity_extract_ids($entity_type, $entity);
+  $translations = $handler->getTranslations();
+
+  // Delete and insert, rather than update, in case a value was added.
+  $query = db_delete($table)
+    ->condition('entity_type', $entity_type)
+    ->condition('entity_id', $entity_id);
+  // If we are storing translations for the current revision or we are
+  // deleting the entity we should remove all translation data.
+  $langcode = $translations->original;
+  $hook = isset($translations->hook) ? $translations->hook : array();
+  if ($revision && $handler->isRevisionable() && (empty($hook[$langcode]['hook']) || $hook[$langcode]['hook'] != 'delete')) {
+    $query->condition('revision_id', $revision_id);
+  }
+  $query->execute();
+
+
+  if (count($translations->data)) {
+
+    $columns = array('entity_type', 'entity_id', 'revision_id', 'language', 'source', 'uid', 'status', 'translate', 'created', 'changed', 'blocking');
+    $query = db_insert($table)->fields($columns);
+
+    // These values should override the translation ones as they are not
+    // supposed to change.
+    $overrides = array(
+      'entity_id' => $entity_id,
+      'entity_type' => $entity_type,
+      'revision_id' => $handler->isRevisionable() ? $revision_id : $entity_id,
+    );
+
+    // These instead are just defaults.
+    $defaults = array(
+      'source' => '',
+      'uid' => $GLOBALS['user']->uid,
+      'translate' => 0,
+      'status' => 0,
+      'created' => REQUEST_TIME,
+      'changed' => REQUEST_TIME,
+      'blocking' => 0,
+    );
+
+    foreach ($translations->data as $langcode => $translation) {
+      $translation = $overrides + $translation + $defaults;
+      $query->values($translation);
+    }
+
+    $query->execute();
+  }
+}
+
+/**
+ * Returns langcode of entity translation candidate.
+ *
+ * @param object $entity
+ * @param string $entity_type
+ * @param string $langcode
+ * @param bool $include_current
+ *
+ * @return string|null
+ */
+function entity_translation_hierarchy_get_candidate($entity, $entity_type, $langcode, $include_current = TRUE) {
+  if ($handler = entity_translation_get_handler($entity_type, $entity, TRUE)) {
+    if ($translations = $handler->getTranslations()) {
+      // Make a copy of this so we can operate on translation data without affecting the original.
+      $translation_candidates = $translations->data;
+
+      // Filter out unpublished or inaccessible translations.
+      // We treat them as non existing - they can't block nor be displayed at all.
+      // Inheritance process flows through them, so to speak...
+      foreach ($translations->data as $translation_langcode => $translation) {
+        if (!entity_translation_access($entity_type, $translation)) {
+          unset($translation_candidates[$translation_langcode]);
+        }
+      }
+
+      // Remove current candidate.
+      if (!$include_current && isset($translation_candidates[$langcode])) {
+        unset($translation_candidates[$langcode]);
+      }
+
+      $fallback_candidates = array_keys(language_hierarchy_get_ancestors($langcode));
+      array_unshift($fallback_candidates, $langcode);
+
+      // Return the closest candidate with existing translation.
+      $translation_candidate_langcodes = array_keys($translation_candidates);
+      return current(array_intersect($fallback_candidates, $translation_candidate_langcodes));
+    }
+  }
+
+  return NULL;
+}
+
+/**
+ * Checks if for given language the entity is blocked.
+ *
+ * @param $entity
+ * @param $entity_type
+ * @param $langcode
+ * @return bool
+ */
+function entity_translation_hierarchy_is_blocked($entity, $entity_type, $langcode) {
+  if (!entity_translation_enabled($entity_type, $entity)) {
+    return FALSE;
+  }
+
+  if ($handler = entity_translation_get_handler($entity_type, $entity, TRUE)) {
+    // Get translations from the entity we're trying to view and determine what
+    // are the translation candidates and figure out which candidate is going to
+    // be viewed.
+    if ($translations = $handler->getTranslations()) {
+      // If the entity doesn't have any translation data associated we consider it non-blocking.
+      if (!isset($translations) || !$translations->original || empty($translations->data)) {
+        return FALSE;
+      }
+
+      $view_candidate = entity_translation_hierarchy_get_candidate($entity, $entity_type, $langcode);
+
+      // If there's no view candidate at all (No parents have translations), then mark as blocking too.
+      if (!$view_candidate) {
+        return TRUE;
+      }
+
+      $is_blocking = !empty($translations->data[$view_candidate]['blocking']);
+
+      // Block access to this entity if this translation is blocking.
+      if ($is_blocking && (!user_access('translate any entity') && !user_access("translate $entity_type entities"))) {
+        return TRUE;
+      }
+    }
+  }
+
+  return FALSE;
+}
+
+/**
+ * Helper function to load current entity.
+ *
+ * @return array
+ *   A numerically indexed array (not a hash table) containing these
+ *   elements:
+ *   - 0: Type of entity.
+ *   - 1: Loaded entity object.
+ */
+function _entity_translation_hierarchy_load_current_entity() {
+  // Get load function from current menu item.
+  $menu_item = menu_get_item();
+  list($load_function) = array_values($menu_item['load_functions']);
+  $arg_position = array_search($load_function, $menu_item['load_functions']);
+
+  // Get entity type.
+  $entity_info = entity_get_info();
+  foreach ($entity_info as $current_entity_type => $info) {
+    if ($info['load hook'] == $load_function) {
+      $entity_type = $current_entity_type;
+    }
+  }
+
+  // Verify and return entity.
+  if (!empty($entity_type) && $entity = menu_get_object($entity_type, $arg_position)) {
+    if (is_object($entity)) {
+      return array($entity_type, $entity);
+    }
+  }
+
+  return array();
+}

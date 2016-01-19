@@ -1,0 +1,632 @@
+<?php
+/**
+ * @file
+ *  wildfire_rpc_jobs.test
+ *
+ * Tests the RPC Jobs system.
+ *
+ * This makes extensive use of the RPC server emulator.
+ *
+ * TODO: Improve failure condition testing and handling.
+ */
+module_load_include('test', 'wildfire', 'tests/wildfire');
+
+/**
+ * Test the RPC Jobs functionality
+ */
+class WildfireRPCJobsTestCase extends WildfireWebTestCase {
+
+  /**
+   * Implementation of getInfo() method.
+   */
+  public static function getInfo() {
+    return array(
+      'name' => 'RPC Jobs - Main',
+      'description' => 'Tests the RPC Jobs functionality of the Wildfire system',
+      'group' => 'Wildfire',
+    );
+  }
+
+  /**
+   * Implementation of setUp()
+   */
+  public function setUp() {
+    // Set up the server emulator
+    parent::setUp(
+      array(
+        'wildfire_rpc_jobs',
+        'wildfire_rpc_emu'
+      )
+    );
+
+    // Create some extra permissions needed for this module
+    $permissions = array(
+      'use wildfire rpc jobs status refresh',
+      'use wildfire rpc jobs retry',
+    );
+
+    // Add a new role with these permissions
+    $new_role = $this->drupalCreateRole($permissions);
+
+    // Add this additional role to the user account.
+    $this->user->roles[$new_role] = $new_role;
+    user_save($this->user);
+
+    // Log in again to ensure the permissions are being picked up
+    $this->drupalLogin($this->user);
+
+  }
+
+  /**
+   * Implementation of tearDown()
+   */
+  public function tearDown() {
+    parent::tearDown();
+  }
+
+
+  /**
+   * Runs the tests
+   */
+  public function testRPCServer() {
+
+    // Test Job creation and send
+    $this->checkJobRPC();
+
+    // Test Job cron
+    $this->checkJobCron();
+
+    // Test RPC-related UI functions
+    $this->checkUI();
+
+  }
+
+  /**
+   * Test job creation and send
+   */
+  public function checkJobRPC() {
+
+    // Get the emulators starting state
+    cache_clear_all('wildfire_rpc_emu', 'cache');
+    $state = $this->emuState();
+    $this->verbose(print_r($state, TRUE));
+
+    // Set the system name and auth key. The emulator may also read these
+    // for hash checking, etc.
+    variable_set('wildfire_system_name', $this->randomName(32));
+    variable_set('wildfire_rpc_authkey', $this->randomName(32));
+
+    // === CHECK PASS CONDITIONS ===
+
+    /**
+     * Create a new Job. We are only interested in the RPC functionality,
+     * which is derived from WildfireJob; that class is already checked
+     * elsewhere in the test suite, so no need to repeat full checks
+     * again here.
+     */
+
+    $message = $this->generateBroadcast(0);
+
+    $job = new WildfireClientJobRpc();
+    $job->newJob(
+      $this->template,
+      rand(0, 999),
+      'broadcast',
+      $message->id,
+      0
+    );
+
+    // Store the job snapshot
+    $job->newContent();
+    $job->newJobMails(-1);
+
+    // Count what we have created
+    $content_count = $job->getContentCount();
+    $list_count = $job->getListUsersCount();
+
+    // Create a new remote job
+    $new_job = $job->sendRequest(
+      'wildfire.job.newJob',
+      array(
+        'content_count' => $content_count,
+        'list_count' => $list_count
+      )
+    );
+
+    // Check we got the correct response
+    $this->assertTrue(
+      !empty($new_job['uid']),
+      t(
+        'Job UID created, UID=!uid',
+        array(
+          '!uid' => $new_job['uid']
+        )
+      )
+    );
+
+    // Save the result code to the job object
+    $job->setJuid($new_job['uid']);
+
+    // Upload the content
+    $chunks = $job->getContent();
+    foreach ($chunks as $chunk) {
+
+      $chunk['uid'] = $new_job['uid'];
+
+      foreach ($chunk['content'] as &$fragment) {
+        $fragment = base64_encode($fragment);
+      }
+
+      $chunk_added = $job->sendRequest(
+        'wildfire.job.addToContentSet',
+        $chunk
+      );
+
+      // Check we got the correct response
+      $this->assertTrue(
+        $chunk_added['success'],
+        t(
+          'Chunk was uploaded to the job',
+          array(
+            '!uid' => $new_job['uid']
+          )
+        )
+      );
+
+    }
+
+    // Upload the list
+    $users = $job->getListUsers();
+    $result = $job->sendRequest(
+      'wildfire.job.addToList',
+      array(
+        'uid' => $new_job['uid'],
+        'entries' => $users,
+      )
+    );
+
+    // Check we got the correct response
+    $this->assertTrue(
+      !empty($result),
+      t(
+        'List was uploaded to the job',
+        array(
+          '!uid' => $new_job['uid']
+        )
+      )
+    );
+    $this->assertEqual(
+      $result['total'],
+      $result['added'],
+      t(
+        'All users were uploaded to the job',
+        array(
+          '!uid' => $new_job['uid']
+        )
+      )
+    );
+
+    // Read the status back for the job. It should be WILDFIRE_JOB_PREPARING
+    $status = $job->getStatus();
+    $this->assertEqual(
+      $status,
+      WILDFIRE_JOB_PREPARING,
+      t('Job status read is WILDFIRE_JOB_PREPARING')
+    );
+
+    // Process the job.
+    $processed = $job->processJob();
+    $this->assertEqual(
+      $processed['status'],
+      WILDFIRE_JOB_PREPARED,
+      t('Job is in the WILDFIRE_JOB_PREPARED state after initiating processJob')
+    );
+
+    // Read the status back for the job. It should be WILDFIRE_JOB_PREPARED too.
+    $status = $job->getStatus();
+    $this->assertEqual(
+      $status,
+      WILDFIRE_JOB_PREPARED,
+      t('Job status read is WILDFIRE_JOB_PREPARED')
+    );
+
+    // Get a list of the jobs for this system
+    $result = $job->sendRequest(
+      'wildfire.jobs.list',
+      array(
+
+      )
+    );
+
+    // === CHECK FAIL CONDITIONS ===
+
+    /**
+     * Change the emulators state so that it will fail on a new job being
+     * created. This will emulate an invalid system, missing keys, etc,
+     * type of response.
+     */
+    $state['return_values']['new_job'] = FALSE;
+    $this->emuState($state);
+
+    $message = $this->generateBroadcast(0);
+
+    // Create a new job.
+    $job = new WildfireClientJobRpc();
+    $job->newJob(
+      $this->template,
+      rand(0, 999),
+      'broadcast',
+      $message->id,
+      0
+    );
+
+    $content_count = $job->getContentCount();
+    $list_count = $job->getListUsersCount();
+
+    // Create a new remote job. We expect this to raise an exception hence we
+    // try to catch it to obtain any message raised.
+    $e_raised = FALSE;
+    try {
+      $new_job = $job->sendRequest(
+        'wildfire.job.newJob',
+        array(
+          'content_count' => $content_count,
+          'list_count' => $list_count
+        )
+      );
+    }
+    catch (Exception $e) {
+      $e_raised = TRUE;
+      $this->verbose($e->getMessage());
+    }
+
+    $this->assertTrue(
+      $e_raised,
+      t('Exception was correctly raised from server returning FALSE on job creation')
+    );
+
+    // Reset the return code for process job to a fail condition.
+    $state['return_values']['process_job'] = FALSE;
+    $this->emuState($state);
+
+    /**
+     * Try to start the job. This now shouldn't work, and should raise an
+     * exception.
+     */
+    $e_raised = FALSE;
+    try {
+      $processed = $job->processJob();
+    }
+    catch (Exception $e) {
+      $this->verbose($e->getMessage());
+    }
+
+    $this->assertFalse(
+      $processed,
+      t('Result of processJob was FALSE')
+    );
+
+  }
+
+  /**
+   * Test Job cron
+   */
+  public function checkJobCron() {
+
+    // Get the emulators starting state
+    cache_clear_all('wildfire_rpc_emu', 'cache');
+    $state = $this->emuState();
+    $this->verbose(print_r($state, TRUE));
+
+    // Set the system name and auth key. The emulator may also read these
+    // for hash checking, etc.
+    variable_set('wildfire_system_name', $this->randomName(32));
+    variable_set('wildfire_rpc_authkey', $this->randomName(32));
+
+    // Set up a job in the local system
+    $message = $this->generateBroadcast(0);
+
+    $job = new WildfireClientJobRpc();
+    $job->newJob(
+      $this->template,
+      rand(0, 999),
+      'broadcast',
+      $message->id,
+      0
+    );
+
+    // Ensure that the job is uploaded, else checking status on it will not work
+    $job->uploadJob();
+
+    // Get the current status of the job
+    $status = $job->getStatus();
+
+    /**
+     * Check it's in the WILDFIRE_JOB_PREPARING state to start with.
+     * Jobs generally move from preparing to processing to complete.
+     */
+    $this->assertEqual(
+      $status,
+      WILDFIRE_JOB_PREPARING,
+      t('Job is currently in a preparing state')
+    );
+
+    /**
+     * Set up the emu to mimick this job being completed at the remote end.
+     * We increment the last_modified field to indicate that the remote record
+     * was updated since the last check.
+     */
+    $state['return_values']['get_status']['status'] = WILDFIRE_JOB_COMPLETE;
+    $state['return_values']['get_status']['completed'] = time();
+    $state['return_values']['get_status']['last_modified'] = time() + 300;
+    $this->emuState($state);
+
+    /**
+     * Run hook_cron() for this module to emulate what cron will actually do
+     * when live. This should read all of the statuses of pending jobs from the
+     * remote end, and update the local jobs accordingly if it's working.
+     */
+    wildfire_rpc_jobs_cron();
+
+    // The jobs status locally should now be WILDFIRE_JOB_COMPLETE
+    $status = $job->getStatus();
+    $this->assertEqual(
+      $status,
+      WILDFIRE_JOB_COMPLETE,
+      t('Job is currently in a completed state')
+    );
+
+  }
+
+  /**
+   * Test RPC-related UI functions
+   */
+  public function checkUI() {
+
+    // Get the emulators starting state
+    cache_clear_all('wildfire_rpc_emu', 'cache');
+    $state = $this->emuState();
+    $this->verbose(print_r($state, TRUE));
+
+    // Set the system name and auth key. The emulator may also read these
+    // for hash checking, etc.
+    variable_set('wildfire_system_name', $this->randomName(32));
+    variable_set('wildfire_rpc_authkey', $this->randomName(32));
+
+    // Set up a job in the local system
+    $message = $this->generateBroadcast(0);
+
+    $job = new WildfireClientJobRpc();
+    $job->newJob(
+      $this->template,
+      rand(0, 999),
+      'broadcast',
+      $message->id,
+      0
+    );
+
+    // === CHECK PASS CONDITIONS ===
+
+    // Fake a JUID for the job; checking a job without a JUID will fail.
+    $job->setJuid('wf_job_t1t1t1t1t1t1t1.t1t1t1t1');
+
+    /**
+     * Set all of the jobs status in the emu to WILDFIRE_JOB_FAILED, as this
+     * is where the results should come in from.
+     */
+    $state['return_values']['get_status']['status'] = WILDFIRE_JOB_FAILED;
+    $this->emuState($state);
+
+    /**
+     * Try using the 'status-refresh' UI, and check that it processes the
+     * results from the server correctly
+     */
+    $this->drupalGet('admin/wildfire/jobs/' . $job->jid . '/status-refresh');
+
+    // Check that the relevant text is shown
+    $this->assertText(
+      t(
+        'Refreshed status for Job #!jid',
+        array(
+          '!jid' => $job->jid
+        )
+      )
+    );
+
+    /**
+     * Get the status directly from the stored job object, and check it
+     * matches what it should have been set to as a result of the status refresh
+     */
+    $job = new WildfireClientJobRpc($job->jid);
+
+    $this->assertEqual(
+      $job->status,
+      WILDFIRE_JOB_FAILED,
+      t(
+        'Job status matches the result expected after a status refresh (!s/!e)',
+        array(
+          '!s' => $job->status,
+          '!e' => WILDFIRE_JOB_FAILED
+        )
+      )
+    );
+
+    // Set the job to paused, and make the emulator believe it too
+    $state['return_values']['retry_job']['job_is'] = WILDFIRE_JOB_PAUSED;
+    $this->emuState($state);
+    $job->status = WILDFIRE_JOB_PAUSED;
+    $job->save();
+
+    /**
+     * Trigger a job retry via the UI.
+     */
+    $this->drupalGet('admin/wildfire/jobs/' . $job->jid . '/retry');
+
+    // Check that the UI shows the success text
+    $this->assertText(
+      t(
+        'Requested a retry for Job #!jid',
+        array(
+          '!jid' => $job->jid
+        )
+      )
+    );
+
+    // === CHECK FAIL CONDITIONS ===
+
+    // Check that checking a job without a JUID results in an error
+    $job->setJuid('');
+
+    $this->drupalGet('admin/wildfire/jobs/' . $job->jid . '/status-refresh');
+
+    $this->assertText(
+      t(
+        'Cannot obtain status for Job #!jid',
+        array(
+          '!jid' => $job->jid
+        )
+      )
+    );
+
+    // Check that requesting a retry for  a job without a JUID results in an
+    // error too
+    $this->drupalGet('admin/wildfire/jobs/' . $job->jid . '/retry');
+
+    $this->assertText(
+      t(
+        'Cannot request a retry for Job #!jid',
+        array(
+          '!jid' => $job->jid
+        )
+      ),
+      t('Job retry failed for no JUID text shown')
+    );
+
+    // Fake a JUID for the job
+    $job->setJuid('wf_job_t1t1t1t1t1t1t1.t1t1t1t1');
+
+    /**
+     * Set the job to processing, which is a status that a retry cannot be
+     * requested for, because it's working thus does not need to be retried.
+     */
+    $state['return_values']['retry_job']['job_is'] = WILDFIRE_JOB_PROCESSING;
+    $this->emuState($state);
+    $job->status = WILDFIRE_JOB_PROCESSING;
+    $job->save();
+
+    /**
+     * Trigger a job retry via the UI. The job isn't in the right state,
+     * so the UI should indicate a failure
+     */
+    $this->drupalGet('admin/wildfire/jobs/' . $job->jid . '/retry');
+
+    // Check that the UI shows the fail text
+    $this->assertText(
+      t(
+        'Job #!jid could not be retried',
+        array(
+          '!jid' => $job->jid
+        )
+      )
+    );
+
+    // Job should also still be in the WILDFIRE_JOB_PROCESSING state
+    $this->assertEqual(
+      $job->status,
+      WILDFIRE_JOB_PROCESSING,
+      t(
+        'Job status matches the result expected after a failed retry refresh (!s/!e)',
+        array(
+          '!s' => $job->status,
+          '!e' => WILDFIRE_JOB_PROCESSING
+        )
+      )
+    );
+
+  }
+
+  /**
+   * Allows the internal state of the emulator to be changed. This uses
+   * the cache to store a temporary state whilst the test runs.
+   *
+   * See: http://api.drupal.org/api/drupal/includes%21session.inc/7
+   *
+   * @param array $state
+   *  If set, will reset the internal state of the emulator to this value
+   *
+   * @return array
+   *  The internal state of the emulator.
+   */
+  public function emuState($state = NULL) {
+
+    if (!empty($state)) {
+      cache_set('wildfire_rpc_emu', $state, 'cache', CACHE_TEMPORARY);
+    }
+
+    $cache = cache_get('wildfire_rpc_emu', 'cache');
+    if (empty($cache)) {
+      /**
+       * This array represents the initial state of the server. It's intended
+       * that the tests call wildfire_rpc_server_emu_state() to set the
+       * emulators state to emulate the server returning a good, bad, or ugly
+       * response.
+       */
+      $state = array(
+        'job' => array(),
+        'content' => array(),
+        'list' => array(),
+        'return_values' => array(
+          'new_job' => array(
+            'uid' => 'wf_job_t1t1t1t1t1t1t1.t1t1t1t1'
+          ),
+          'add_to_content_set' => array(
+            'success' => TRUE,
+          ),
+          'add_to_list' => array(
+            'total' => 0,
+            'added' => 0,
+            'failed' => 0,
+          ),
+          'process_job' => array(
+            'status' => WILDFIRE_JOB_PREPARING,
+          ),
+          'get_status' => array(
+            'status' => WILDFIRE_JOB_PREPARING,
+            'total_mails' => 0,
+            'sent_mails' => 0,
+            'failed_mails' => 0,
+            'last_modified' => time(),
+            'started' => time(),
+            'completed' => time(),
+          ),
+          'list_jobs' => array(
+            'wf_job_t1t1t1t1t1t1t1.t1t1t1t1'
+          ),
+          'lists_remove_user' => array(
+            'status' => TRUE
+          ),
+          'amend_job' => array(
+            'content_count_diff' => 0,
+            'list_count_diff' => 0,
+          ),
+          'get_quota' => array(
+            'total' => 100,
+            'top-up' => 90,
+            'monthly' => 10,
+          ),
+          'retry_job' => array(
+            'job_is' => WILDFIRE_JOB_PAUSED
+          ),
+        ),
+      );
+
+      cache_set('wildfire_rpc_emu', $state, 'cache', CACHE_TEMPORARY);
+      $cache = cache_get('wildfire_rpc_emu', 'cache');
+
+    }
+
+    return $cache->data;
+
+  }
+
+}

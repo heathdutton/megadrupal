@@ -1,0 +1,396 @@
+<?php
+/**
+ * @file
+ * Main module file for Wildfire signup module
+ */
+
+/**
+ * Implements hook_permission().
+ */
+function wildfire_signup_permission() {
+  return array(
+    'administer wildfire signup' => array(
+      'title' => t('administer wildfire signup'),
+      'description' => t('Allows settings to be changed in Wildfire signup'),
+    ),
+  );
+}
+
+/**
+ * Implements hook_menu().
+ */
+function wildfire_signup_menu() {
+  $items = array();
+
+  $items['wildfire_signup_form'] = array(
+    'title'           => 'Sign up for Wildfire newsletters',
+    'type'            => MENU_CALLBACK,
+    'page callback'   => 'drupal_get_form',
+    'page arguments'  => array('wildfire_signup_form'),
+    'access callback' => TRUE,
+  );
+  $items['wildfire_signup/%'] = array(
+    'title'           => 'One-click sign up for Wildfire newsletters',
+    'type'            => MENU_CALLBACK,
+    'page callback'   => 'wildfire_signup_signup',
+    'page arguments'  => array(1),
+    'access callback' => TRUE,
+  );
+  $items['admin/wildfire/settings/signup'] = array(
+    'title'             => 'Signup settings',
+    'type'              => MENU_LOCAL_TASK,
+    'description'       => 'Configure Wildfire signup settings',
+    'access arguments'  => array('administer wildfire signup'),
+    'page callback'     => 'drupal_get_form',
+    'page arguments'    => array('wildfire_signup_settings_form'),
+    'weight'            => 9,
+  );
+
+  return $items;
+}
+
+/**
+ * Signs a user up to the default Wildfire list.
+ *
+ * @param int $uid
+ */
+function wildfire_signup_signup($uid) {
+  global $user;
+
+  // Examine the URL for destination=foo to see where the user needs to go after
+  // we're done. If it's not found, redirect to the front page.
+  $dest = isset($_GET['destination']) ? $_GET['destination'] : '<front>';
+
+  // Make sure that only the user who owns this account is allowed to update
+  // the newsletter signup field.
+  if ($uid != $user->uid) {
+    drupal_set_message(t('A problem occurred while signing up to the newsletter.'), 'error');
+    watchdog(
+      'wildfire_signup',
+      'User %useruid tried to sign user %uid up for the newsletter. No action was taken.',
+      array('%useruid' => $user->uid, '%uid' => $uid),
+      WATCHDOG_ERROR
+    );
+    drupal_goto($dest);
+  }
+
+  // Make sure we can use the wildfire module.
+  if (module_exists('wildfire')) {
+    module_load_include('inc', 'wildfire_lists', 'wildfire_lists.api');
+  }
+  else {
+    drupal_set_message(t('A problem occurred while signing up to the newsletter.'), 'error');
+    watchdog(
+      'wildfire_signup',
+      'User %useruid tried to sign up for the newsletter but the wildfire module was not found.',
+      array('%useruid' => $uid),
+      WATCHDOG_ERROR
+    );
+    drupal_goto($dest);
+  }
+
+  // Check that the list ID we are attempting to add to is valid
+  $lid = wildfire_signup_get_list();
+  if ($lid === FALSE) {
+    drupal_set_message(t('A problem occurred while signing up to the newsletter.'), 'error');
+    watchdog(
+      'wildfire_signup',
+      'User %useruid tried to sign up for the newsletter but the list ID %listid is invalid',
+      array('%useruid' => $uid, '%listid' => $lid),
+      WATCHDOG_ERROR
+    );
+    drupal_goto($dest);
+  }
+
+  // Remove the global opt-out for this user if one exists, as this will prevent
+  // emails of any kind.
+  wildfire_list_resubscribe($uid, 0);
+
+  /*
+   * Put the user in the relevant list. If already in the list, this is still
+   * safe to use.
+   */
+  wildfire_lists_user_add($uid, $lid);
+  drupal_set_message(t('Congratulations. You will now receive the regular email newsletter.'));
+
+  drupal_goto($dest);
+}
+
+/**
+ * FAPI form to allow users to sign up to the Wildfire system.
+ */
+function wildfire_signup_form($form, &$form_state) {
+  global $user;
+  $form = array();
+
+  $form['#action'] = '/wildfire_signup/' . $user->uid;
+  $form['email'] = array(
+    '#type'           => 'textfield',
+    '#default_value'  => t('Email address'),
+    '#maxlength'      => 128,
+    '#size'           => 20,
+  );
+  $form['submit'] = array(
+    '#type'           => 'submit',
+    '#value'          => t('Sign up'),
+  );
+
+  // If the user is logged in but not signed up, put their email address in the
+  // box by default.
+  if ($user->uid > 0) {
+    $form['email']['#default_value'] = $user->mail;
+    $form['email']['#disabled'] = TRUE;
+  }
+
+  return $form;
+}
+
+/**
+ * Validation handler for wildfire_signup_form().
+ */
+function wildfire_signup_form_validate(&$form, &$form_state) {
+  global $user;
+
+  if ($user->uid > 0) {
+    // User is already registered, so replace the disabled email address with
+    // the user's email.
+    $form_state['values']['email'] = $user->mail;
+  }
+  else {
+    // Must have an email address and it must be valid.
+    if (empty($form_state['values']['email']) || !wildfire_valid_email_address($form_state['values']['email'])) {
+      form_set_error('email', t('Please enter a valid email address'));
+    }
+
+    // Make sure the user hasn't already signed up to the site.
+    $result = db_result(db_query(
+      "SELECT uid FROM {users} WHERE mail = '%s'", $form_state['values']['email']
+    ));
+
+    if ($result !== FALSE) {
+      form_set_error('email', t('That email address is already registered. Have you !link?', array('!link' => l(t('forgotten your password'), 'user/password'))));
+    }
+  }
+}
+
+/**
+ * Submit handler for wildfire_signup_form().
+ *
+ * Create a user account, if necessary, then sign the user up to the Wildfire
+ * system.
+ */
+function wildfire_signup_form_submit(&$form, &$form_state) {
+  global $user;
+  $uid = 0;
+
+  // Create a user if we need to.
+  if ($user->uid == 0) {
+    $account = new stdClass;
+    $array = array();
+    $array['mail'] = $array['name'] = $form_state['values']['email'];
+    $array['status'] = 1;
+
+    // Random password.
+    $chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!"£$%^&*()';
+    $len = drupal_strlen($chars);
+    $array['pass'] = '';
+
+    for ($i = 0; $i < 12; $i++) {
+      $array['pass'] .= drupal_substr($chars, rand(0, $len - 1), 1);
+    }
+
+    // Save the account information and log the user in.
+    $result = user_save($account, $array);
+    $account = user_authenticate(array(
+      'name'  => $array['name'],
+      'pass'  => $array['pass'],
+    ));
+    $uid = $account->uid;
+  }
+  else {
+    $uid = $user->uid;
+  }
+
+  // Finally sign the user up to Wildfire.
+  wildfire_signup_signup($uid);
+}
+
+/**
+ * Determine if the current user is subscribed to the newsletter.
+ *
+ * @return bool
+ *    TRUE if the user is subscribed to the newsletter. FALSE if not, or if
+ *    there was a problem such as an invalid parameter.
+ */
+function wildfire_signup_user_subscribed() {
+  global $user;
+
+  // We need the wildfire module to be available at this stage.
+  if (!module_exists('wildfire')) {
+    return FALSE;
+  }
+
+  module_load_include('inc', 'wildfire_lists', 'wildfire_lists.api');
+  return wildfire_user_is_subscribed(
+    $user->uid,
+    wildfire_signup_get_list()
+  );
+}
+
+/**
+ * Provides FAPI settings form for the Wildfire signup module
+ *
+ * @return array
+ *    Return code from system_settings_form() call
+ */
+function wildfire_signup_settings_form() {
+
+  $form = array();
+
+  // We need the wildfire module to be available at this stage.
+  if (!module_exists('wildfire')) {
+    return FALSE;
+  }
+  module_load_include('inc', 'wildfire_lists', 'wildfire_lists.api');
+
+  $lists = wildfire_lists_get();
+
+  $options = array(0 => t('(none)'));
+
+  foreach ($lists as $lid => $list) {
+    $options[$lid] = $list;
+  }
+
+  $form['list_fieldset'] = array(
+    '#type'           => 'fieldset',
+    '#title'          => t('List settings'),
+  );
+  $form['list_fieldset']['wildfire_signup_list'] = array(
+    '#type'           => 'select',
+    '#title'          => t('Default list on signup'),
+    '#description'    => t('When a user signup occurs, place the user in the specified list.'),
+    '#options'        => $options,
+    '#default_value'  => wildfire_signup_get_list(),
+  );
+
+  return system_settings_form($form);
+}
+
+/**
+ * Determines the list to place signup users into.
+ *
+ * @return int
+ *  Default list ID, or FALSE if no lists are available.
+ */
+function wildfire_signup_get_list() {
+
+  /*
+   * The list selection criteria is as follows:
+   * 1/ Use the 'wildfire_signup_list' setting if set
+   * 2/ If this isn't valid or set, use the 'wildfire_registration_list' global
+   *    Wildfire setting
+   * 3/ If that isn't set (unlikely unless it's an unconfigured install), use
+   *    any existing list found that's named 'Subscribers'
+   * 4/ If there isn't one (again, probably on new install), use the first
+   *    list returned by wildfire_lists_get()
+   * 5/ If all else fails (i.e. no lists), return FALSE
+   */
+
+  /* Note, we have our own setting for a list ID in this module, but it will
+   * use the Wildfire default otherwise. This allows an out-of-the-box install
+   * to work without any configuration, but also allows it to be overridden
+   * if imported users / users on registration should go in one list, one-click
+   * self-signups into another. I can't think of why you might want this right
+   * now but best not discount the possibility that somebody might require it.
+   */
+
+  $list_id = variable_get('wildfire_signup_list', NULL);
+  if ($list_id !== NULL) {
+    return $list_id;
+  }
+
+  $list_id = variable_get('wildfire_registration_list', NULL);
+  if ($list_id !== NULL) {
+    return $list_id;
+  }
+
+  if (!module_exists('wildfire')) {
+    return FALSE;
+  }
+  module_load_include('inc', 'wildfire_lists', 'wildfire_lists.api');
+
+  $lists = wildfire_lists_get();
+
+  if (count($lists) == 0) {
+    return FALSE;
+  }
+
+  $default_list = array();
+
+  foreach ($lists as $lid => $list) {
+    if ($list == 'Subscribers') {
+      $default_list['lid'] = $lid;
+      $default_list['name'] = $list;
+      break;
+    }
+  }
+
+  if (empty($default_list)) {
+    $keys = array_keys($lists);
+    $default_list['lid'] = $keys[0];
+    $default_list['name'] = $lists[$keys[0]];
+  }
+
+  // Set the modules overridden setting to this default, so it doesn't have
+  // to be worked out again
+  variable_set('wildfire_signup_list', $default_list['lid']);
+
+  return $default_list['lid'];
+
+}
+
+/**
+ * Implements hook_theme().
+ */
+function wildfire_signup_theme() {
+
+  return array(
+    'wildfire_signup' => array(
+      'file' => 'wildfire_signup.theme',
+      'path' => drupal_get_path('module', 'wildfire_signup') . '/templates',
+      'template' => 'wildfire-signup-form',
+    )
+  );
+
+}
+
+/**
+ * Implements hook_block_info().
+ */
+function wildfire_signup_block_info() {
+
+  return array(
+    0 => array(
+      'info' => t('Wildfire signup form'),
+      'cache' => DRUPAL_CACHE_PER_USER,
+    )
+  );
+
+}
+
+/**
+ * Implements hook_block_view().
+ */
+function wildfire_signup_block_view($delta = 0) {
+
+  if ($delta == 0) {
+    return array(
+      'subject' => t('Sign up to newsletter'),
+      'content' => theme('wildfire_signup'),
+    );
+  }
+  else{
+    return array();
+  }
+
+}

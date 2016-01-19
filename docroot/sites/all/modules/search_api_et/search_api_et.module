@@ -1,0 +1,437 @@
+<?php
+
+/**
+ * @file
+ * Adds Entity Translation support to the Search API.
+ */
+
+/**
+ * Implements hook_views_api().
+ */
+function search_api_et_views_api() {
+  return array(
+    'api' => '3',
+  );
+}
+
+/**
+ * Implements hook_search_api_item_type_info().
+ *
+ * Provides a multilingual version of all entity types.
+ */
+function search_api_et_search_api_item_type_info() {
+  $types = array();
+
+  foreach (entity_get_property_info() as $type => $property_info) {
+    if (($info = entity_get_info($type)) && field_has_translation_handler($type)) {
+      $types["search_api_et_$type"] = array(
+        'name' => t('Multilingual !type', array('!type' => $info['label'])),
+        'datasource controller' => 'SearchApiEtDatasourceController',
+        'entity_type' => $type,
+      );
+    }
+  }
+
+  return $types;
+}
+
+/**
+ * Implements search_api_index_update().
+ */
+function search_api_et_search_api_index_update(SearchApiIndex $index) {
+  // On feature reverts, the index's numerical ID might change. In that case,
+  // we need to keep the {search_api_et_item} table up to date.
+  if ($index->id != $index->original->id) {
+    db_update('search_api_et_item')
+      ->fields(array('index_id' => $index->id))
+      ->condition('index_id', $index->original->id)
+      ->execute();
+  }
+}
+
+/**
+ * Retrieve the Search API ET settings for a specific index.
+ *
+ * @param SearchApiIndex $index
+ *   The index whose settings should be retrieved.
+ *
+ * @return array
+ *   An associative array with the Search API ET settings for the specified
+ *   index. The settings are as follows:
+ *   - languages: All languages which should be included in the index.
+ *   - include: Determines with which languages an item should be included in
+ *     the index. Possible values are:
+ *     - all: Include items in all enabled languages, even if they don't have a
+ *       translation.
+ *     - incomplete: Include languages which have at least one translated fields
+ *       on the entity.
+ *     - complete: Only include entities for which all translatable fields have
+ *       been translated.
+ *   - fallback language: The language to be used for fields if the field isn't
+ *     available in the target language. If NULL, fields without appropriate
+ *     translations are removed.
+ */
+function search_api_et_get_index_settings(SearchApiIndex $index) {
+  $settings = isset($index->options['search_api_et']) ? $index->options['search_api_et'] : array();
+  $settings += array(
+    'include' => 'incomplete',
+    'fallback language' => NULL,
+  );
+  return $settings;
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter() for search_api_admin_index_edit().
+ *
+ * @see search_api_admin_index_edit()
+ */
+function search_api_et_form_search_api_admin_index_edit_alter(&$form, &$form_state) {
+  $index = $form_state['build_info']['args'][0];
+  $controller = search_api_get_datasource_controller($index->item_type);
+  if ($controller instanceof SearchApiEtDatasourceController) {
+    $settings = search_api_et_get_index_settings($index);
+
+    $form['options']['search_api_et'] = array(
+      '#type' => 'fieldset',
+      '#title' => t('Multilingual settings'),
+    );
+
+    $form['options']['search_api_et']['include'] = array(
+      '#type' => 'select',
+      '#title' => t('Languages to be included in the index'),
+      '#description' => t('Determines for which languages an item should be created in the index for each entity:') . '<br />'
+                      . t("- <em>all site languages</em>: create items for all languages enabled on the site, even if specific entity fields don't have a translation in a given language,") . '<br />'
+                      . t('- <em>all entity languages</em>: create items for languages which have at least one translated field on the specific entity (recommended),') . '<br />'
+                      . t('- <em>completed entity languages</em>: only include languages for which all translatable fields have been translated on the specific entity.') . '<br />'
+                      . t('Changing this setting will force content for this index to be re-queued and re-indexed.'),
+      '#options' => array(
+        'all' => t('all site languages'),
+        'incomplete' => t('all entity languages'),
+        'complete' => t('completed entity languages'),
+      ),
+      '#default_value' => $settings['include'],
+    );
+
+    $form['options']['search_api_et']['fallback language'] = array(
+      '#type' => 'select',
+      '#title' => t('Fallback language'),
+      '#description' => t("The language to be used for fields if the field isn't available in the target language. If none, fields without appropriate translations will be removed."),
+      '#options' => search_api_et_languages(TRUE, FALSE),
+      '#empty_option' => t('- none -'),
+      '#default_value' => $settings['fallback language'],
+    );
+
+    // Extra submit function to re-queue index items if required.
+    $form['#submit'][] = 'search_api_et_admin_index_edit_submit';
+  }
+}
+
+/**
+ * Form submission handler for search_api_admin_index_edit().
+ *
+ * @see search_api_admin_index_edit()
+ * @see search_api_et_form_search_api_admin_index_edit_alter()
+ */
+function search_api_et_admin_index_edit_submit(array $form, array &$form_state) {
+  // When 'Languages to be included in the index' setting value has changed,
+  // all index items need to be re-queued and re-indexed, as most probably
+  // their number will change.
+  if ($form_state['values']['options']['search_api_et']['include'] != $form['options']['search_api_et']['include']['#default_value']) {
+    $index = $form_state['index'];
+    $index->queueItems();
+    $index->reindex();
+    drupal_set_message(t('The index was successfully scheduled for re-indexing.'));
+  }
+}
+
+/**
+ * Returns list of languages available/enabled on the site.
+ *
+ * @param bool $enabled
+ *   A boolean indicating whether to include all languages added to the site
+ *   or only those enabled.
+ * @param bool $neutral
+ *   A boolean indicating whether to add the neutral language (LANGUAGE_NONE)
+ *   to the language list.
+ *
+ * @return array
+ *   An array with language codes as keys and language names as values.
+ *
+ * @see SearchApiAlterLanguageControl::configurationForm()
+ */
+function search_api_et_languages($enabled = FALSE, $neutral = TRUE) {
+  $languages = array();
+  if (!empty($neutral)) {
+    $languages[LANGUAGE_NONE] = t('Language neutral');
+  }
+  $list = language_list('enabled') + array(array(), array());
+  foreach (array($list[1], $list[0]) as $list) {
+    foreach ($list as $lang) {
+      $name = t($lang->name);
+      $native = $lang->native;
+      $languages[$lang->language] = ($name == $native) ? $name : "$name ($native)";
+      if (empty($enabled) && !$lang->enabled) {
+        $languages[$lang->language] .= ' [' . t('disabled') . ']';
+      }
+    }
+  }
+  return $languages;
+}
+
+/**
+ * Determines the languages that are available for an entity in a certain index.
+ *
+ * @param object $entity
+ *   The entity for which languages should be determined.
+ * @param string $type
+ *   The entity type of the entity.
+ * @param SearchApiIndex $index
+ *   The index whose settings should be used for determining the languages.
+ *
+ * @return array
+ *   An array of language codes for the languages that are available.
+ */
+function search_api_et_item_languages($entity, $type, SearchApiIndex $index) {
+  $settings = search_api_et_get_index_settings($index);
+  if ($settings['include'] == 'all') {
+    return array_keys(search_api_et_languages(FALSE, TRUE));
+  }
+  list(, , $bundle) = entity_extract_ids($type, $entity);
+  $languages = array();
+  $field_count = 0;
+  foreach (field_info_instances($type, $bundle) as $field_name => $instance) {
+    if (isset($entity->{$instance['field_name']})) {
+      ++$field_count;
+      foreach ($entity->{$instance['field_name']} as $lang => $data) {
+        $languages += array($lang => 0);
+        ++$languages[$lang];
+      }
+    }
+  }
+  if ($settings['include'] == 'complete') {
+    foreach ($languages as $lang => $count) {
+      if ($count < $field_count) {
+        unset($languages[$lang]);
+      }
+    }
+  }
+  return array_keys($languages);
+}
+
+/**
+ * Implements hook_entity_update().
+ */
+function search_api_et_entity_update($entity, $entity_type) {
+  // Entity original language has been changed.
+  list($entity_id) = entity_extract_ids($entity_type, $entity);
+  if (!empty($entity->language) && !empty($entity->original->language)) {
+    $original_item_id = $entity->original->language . '_' . $entity_id;
+    $item_id = $entity->language . '_' . $entity_id;
+    // Remove tracking for not only old, but also for new item ID, just in case.
+    search_api_track_item_delete('search_api_et_' . $entity_type, array($original_item_id));
+    search_api_track_item_delete('search_api_et_' . $entity_type, array($item_id));
+    search_api_track_item_insert('search_api_et_' . $entity_type, array($item_id));
+    // Optionally run re-queueing for "completed entity languages" indexes.
+    drupal_register_shutdown_function('search_api_et_shutdown_requeue_indexes', $entity_type);
+  }
+}
+
+/**
+ * Implements hook_entity_translation_insert().
+ */
+function search_api_et_entity_translation_insert($entity_type, $entity, $translation, $values = array()) {
+  list($entity_id) = entity_extract_ids($entity_type, $entity);
+  $item_id = $translation['language'] . '_' . $entity_id;
+  // First try to remove existing entries to avoid possible PDO Exception.
+  // See issue https://www.drupal.org/node/2284405
+  search_api_track_item_delete('search_api_et_' . $entity_type, array($item_id));
+  search_api_track_item_insert('search_api_et_' . $entity_type, array($item_id));
+  // Optionally run re-queueing for "completed entity languages" indexes.
+  drupal_register_shutdown_function('search_api_et_shutdown_requeue_indexes', $entity_type);
+}
+
+/**
+ * Implements hook_entity_translation_update().
+ */
+function search_api_et_entity_translation_update($entity_type, $entity, $translation, $values = array()) {
+  list($entity_id) = entity_extract_ids($entity_type, $entity);
+  $item_id = $translation['language'] . '_' . $entity_id;
+  search_api_track_item_change('search_api_et_' . $entity_type, array($item_id));
+  // Optionally run re-queueing for "completed entity languages" indexes.
+  drupal_register_shutdown_function('search_api_et_shutdown_requeue_indexes', $entity_type);
+}
+
+/**
+ * Implements hook_entity_translation_delete().
+ */
+function search_api_et_entity_translation_delete($entity_type, $entity, $langcode) {
+  list($entity_id) = entity_extract_ids($entity_type, $entity);
+  $item_id = $langcode . '_' . $entity_id;
+  search_api_track_item_delete('search_api_et_' . $entity_type, array($item_id));
+  // No need to additionally re-queue "completed entity languages" indexes here,
+  // as in two hooks above, as everything is taken care of by default.
+}
+
+/**
+ * Implements hook_field_update_field().
+ *
+ * Re-queue all "completed entity languages" indexes on field instance creation
+ * (which actually is a 3-step process, and translation can be enabled only on
+ * the last step, which actually then becomes field update) and update - needed
+ * only when field translation is being enabled or disabled.
+ */
+function search_api_et_field_update_field($field, $prior_field, $has_data) {
+  if ($field['translatable'] != $prior_field['translatable']) {
+    $entity_types = array_keys($field['bundles']);
+    drupal_register_shutdown_function('search_api_et_shutdown_requeue_indexes', $entity_types);
+  }
+}
+
+/**
+ * Implements hook_field_delete_instance().
+ *
+ * Re-queue all "completed entity languages" indexes on field instance deletion.
+ *
+ * Note that instance creation and updates are handled by
+ * hook_field_update_field() implementation.
+ */
+function search_api_et_field_delete_instance($instance) {
+  $field_info = field_info_field($instance['field_name']);
+  if (field_is_translatable($instance['entity_type'], $field_info)) {
+    drupal_register_shutdown_function('search_api_et_shutdown_requeue_indexes', $instance['entity_type']);
+  }
+}
+
+/**
+ * Implements hook_multilingual_settings_changed().
+ *
+ * Re-queue all "completed entity languages" indexes when a language has been
+ * added, removed, enabled or disabled.
+ */
+function search_api_et_multilingual_settings_changed() {
+  drupal_register_shutdown_function('search_api_et_shutdown_requeue_indexes');
+}
+
+/**
+ * Shutdown function to re-queue "completed entity languages" indexes.
+ *
+ * If there are any multilingual indexes configured to use "completed entity
+ * languages" only (for which all translatable fields have to be translated
+ * for a translation to be included in an index), after each translation
+ * update we need to re-check if such translation should be included in an
+ * index. (For example, for a completed translation already existing in the
+ * index, if a translation of a single field was removed, then the whole
+ * translation needs to be removed from the index, as it is not "complete"
+ * anymore.)
+ *
+ * The re-queueing is called from the shutdown function because some of the
+ * update hooks are invoked before the relevant change is really saved to the
+ * database (for example hook_entity_translation_update() implementation is
+ * called before the translation is really saved), which means that we can't
+ * force index re-queueing from such hook, as it would work with incorrect
+ * (old) data. Instead, we need to wait for the new data to be saved first,
+ * therefore use a shutdown function to force re-queueing.
+ *
+ * @param string $entity_type
+ *   The entity type for which indexes need to be re-queued.
+ *
+ * @see search_api_et_entity_translation_insert()
+ * @see search_api_et_entity_translation_update()
+ * @see search_api_et_field_update_field()
+ * @see search_api_et_field_delete_instance()
+ * @see search_api_et_multilingual_settings_changed()
+ */
+function search_api_et_shutdown_requeue_indexes($entity_types = NULL) {
+  $conditions = array(
+    'enabled' => 1,
+    'read_only' => 0,
+  );
+  if (!empty($entity_types)) {
+    if (!is_array($entity_types)) {
+      $entity_types = array($entity_types);
+    }
+    $entity_types = array_map('_search_api_et_get_item_type', $entity_types);
+    $conditions['item_type'] = $entity_types;
+  }
+  $indexes = search_api_index_load_multiple(FALSE, $conditions);
+  if (!$indexes) {
+    return;
+  }
+  foreach ($indexes as $index) {
+    // Re-queue only those indexes for which "Languages to be included in the
+    // index" option is set to "completed entity languages".
+    if (
+      !empty($index->options['search_api_et']['include'])
+      && $index->options['search_api_et']['include'] == 'complete'
+    ) {
+      $index->queueItems();
+      $index->reindex();
+    }
+  }
+}
+
+/**
+ * Returns multilingual item type name for provided entity type.
+ *
+ * @param string $entity_type
+ *   Entity type name.
+ * @return string
+ *   Multilingual item type name.
+ *
+ * @see search_api_et_shutdown_requeue_indexes()
+ */
+function _search_api_et_get_item_type($entity_type) {
+  return 'search_api_et_' . $entity_type;
+}
+
+/**
+ * Shutdown function to start batch job for queueing items for indexes being
+ * enabled.
+ *
+ * @see SearchApiEtDatasourceController::startTracking()
+ */
+function search_api_et_shutdown_batch_process() {
+  drush_backend_batch_process();
+}
+
+/**
+ * Implements hook_features_export_alter().
+ *
+ * Adds dependency information for relevant exported indexes.
+ */
+function search_api_et_features_export_alter(&$export, $module_name) {
+  if (isset($export['features']['search_api_index'])) {
+    // Check all of the exported index definitions.
+    foreach ($export['features']['search_api_index'] as $index_name) {
+      $indexes = search_api_index_load_multiple(FALSE, array('machine_name' => $index_name));
+      $index = reset($indexes);
+      $controller = search_api_get_datasource_controller($index->item_type);
+      if ($controller instanceof SearchApiEtDatasourceController) {
+        if (!isset($export['dependencies']['search_api_et'])) {
+          $export['dependencies']['search_api_et'] = 'search_api_et';
+        }
+      }
+    }
+    // Ensure the dependencies list is still sorted alphabetically.
+    ksort($export['dependencies']);
+  }
+}
+
+/**
+ * Implements hook_search_api_index_items_alter().
+ *
+ * SearchApiEtDatasourceController::getMetadataWrapper() needs to know which
+ * index it is adding items to, so that it can loop over all indexed fields
+ * first and return their translated values before indexing them.
+ *
+ * @see SearchApiEtDatasourceController::getMetadataWrapper()
+ * @see SearchApiEtDatasourceController::setLanguage()
+ */
+function search_api_et_search_api_index_items_alter(array &$items, SearchApiIndex $index) {
+  $controller = search_api_get_datasource_controller($index->item_type);
+  if ($controller instanceof SearchApiEtDatasourceController) {
+    foreach (element_children($items) as $item_id) {
+      $items[$item_id]->search_api_index = $index;
+    }
+  }
+}

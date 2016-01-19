@@ -1,0 +1,275 @@
+<?php
+
+/**
+ * @file
+ * All the hooks for the 'lingwo_pron' module.
+ */
+
+// get our API functions for dealing with pron
+require_once DRUPAL_ROOT . '/' . drupal_get_path('module', 'lingwo_pron') . '/' . 'lingwo_pron.api.inc';
+// the code for generating the bits on the node form (here for organizational purposes)
+require_once DRUPAL_ROOT . '/' . drupal_get_path('module', 'lingwo_pron') . '/' . 'lingwo_pron.widget.inc';
+
+/**
+ * Implements hook_menu().
+ */
+function lingwo_pron_menu() {
+  $items = array();
+
+  $items['admin/config/lingwo/pron'] = array(
+    'title' => 'Pronunciation',
+    'description' => 'Settings for Lingwo Pronunciation module.',
+    'access arguments' => array('administer site configuration'),
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('lingwo_pron_admin_settings_form'),
+    'file' => 'lingwo_pron.admin.inc',
+    'type' => MENU_LOCAL_TASK,
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_help().
+ */
+function lingwo_pron_help($path, $arg) {
+  switch ($path) {
+    case 'admin/help#lingwo_pron':
+      return '<p>' . t('Adds support for pronunciation to dictionary entries.  It allows users add several pronunciations, which each can have IPA, an audio file and a tag describing what makes this pronunciation differet.  Configure it !here.', array('!here' => l(t('here'), 'admin/config/lingwo/pron'))) . '</p>';
+    case 'admin/config/lingwo/pron':
+      return '<p>' . t('Configure the fields provided for each <em>pronunciation</em> on a dictionary entry.') . '</p>';
+  }
+}
+
+/**
+ * Implements hook_lingwo_entry_exts().
+ */
+function lingwo_pron_lingwo_entry_properties() {
+  return array(
+    'pron' => array(
+      'class' => 'LingwoPron',
+    ),
+  );
+}
+
+/**
+ * Implements hook_i18n_string_refresh().
+ */
+function lingwo_pron_i18n_string_refresh($group) {
+  $count = 0;
+
+  if ($group == 'lingwo') {
+    foreach (language_list() as $language) {
+      foreach (LingwoEntry::getPosOptions($language->language) as $key => $value) {
+        i18n_string_update('lingwo:field:pron_tag:option_' . $key, $value);
+        $count++;
+      }
+    }
+  }
+
+  return $count;
+}
+
+/**
+ * Implements hook_lingwo_language_form().
+ */
+function lingwo_pron_lingwo_language_form($language) {
+  $value = $language->getValue('lingwo_pron_pron_tag_allowed_values', LingwoPron::$settings->pron_tag_allowed_values);
+  $form['lingwo_pron_pron_tag_allowed_values'] = array(
+    '#type' => 'textarea',
+    '#title' => t('Pronunciation tag list'),
+    '#default_value' => $value,
+    '#description' => t('A list of allowed values for the "Tag" field.  Put one part of speech on each line.  Use the pipe symbol if you want the part of speech to have an alternate display name, for example: <em>us|United States</em>.'),
+  );
+  return $form;
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function lingwo_pron_lingwo_entry_form_alter(&$form, $form_state, $node) {
+  // TODO: should we just pass an entry in?
+  $entry = LingwoEntry::fromNode($node);
+  if (!$entry->isTranslation()) {
+    // only applies to entries that are not translations
+    $form['lingwo_pron'] = _lingwo_pron_widget($form, $form_state, $entry);
+  }
+}
+
+/**
+ * Implements hook_field_extra_fields().
+ */
+function lingwo_pron_field_extra_fields() {
+  $type = LingwoEntry::$settings->content_type;
+
+  foreach (array('form', 'display') as $which) {
+    $extra['node'][$type][$which] = array(
+      'lingwo_pron' => array(
+        'label' => t('Lingwo Pronunciation'),
+        'description' => t('lingwo_pron module.'),
+        'weight' => 1,
+      ),
+    );
+  }
+
+  return $extra;
+}
+
+/**
+ * Implements hook_node_view().
+ */
+function lingwo_pron_node_view($node, $view_mode = 'full') {
+  if (LingwoEntry::isEntryNode($node)) {
+    $node->content['lingwo_pron'] = array(
+      '#type' => 'markup',
+      '#markup' => theme('lingwo_pron', array('entry' => LingwoEntry::fromNode($node))),
+    );
+  }
+}
+
+/**
+ * Implements hook_node_load().
+ */
+function lingwo_pron_node_load($nodes, $types) {
+  if (in_array(LingwoEntry::$settings->content_type, $types)) {
+    $res = db_query("SELECT nid, data FROM {lingwo_pron_revisions} WHERE vid IN (:vid)",
+      array(':vid' => array_map(function ($node) { return $node->vid; }, $nodes)));
+
+    foreach ($res as $row) {
+      $nodes[$row->nid]->lingwo_pron = unserialize($row->data);
+    }
+  }
+}
+
+/**
+ * Implements hook_node_insert().
+ */
+function lingwo_pron_node_insert($node) {
+  lingwo_pron_node_update($node);
+}
+
+/**
+ * Implements hook_node_update().
+ */
+function lingwo_pron_node_update($node) {
+  if (LingwoEntry::isEntryNode($node) && !_lingwo_is_translation($node)) {
+    $data = $node->lingwo_pron;
+    // remove items that are marked for removal
+    foreach ($data as $index => &$item) {
+      if (!empty($item['remove'])) {
+        unset($data[$index]);
+      }
+      else {
+        unset($item['remove']);
+      }
+    }
+    // clean-up and save audio items
+    if (in_array('audio', LingwoPron::$settings->enabled_fields)) {
+      foreach ($data as $index => &$item) {
+        // clean-up
+        unset($item['upload']);
+
+        // make the audio file perminent
+        if (!empty($item['audio'])) {
+          if ($item['audio']->status == ~FILE_STATUS_PERMANENT) {
+            // move to the files perminent home
+            if ($dest = _lingwo_pron_file_path()) {
+              $dest .= '/' . $node->nid . '.' . pathinfo($item['audio']->filepath, PATHINFO_EXTENSION);
+              file_move($item['audio'], $dest, FILE_EXISTS_RENAME);
+            }
+
+            // Instead of the normal API, this gets written via drupal_write_record()
+            //file_set_status($item['audio'], FILE_STATUS_PERMANENT);
+            $item['audio']->status = FILE_STATUS_PERMANENT;
+
+            // now write it!
+            drupal_write_record('files', $item['audio'], 'fid');
+          }
+        }
+      }
+    }
+
+    $object = (object) array(
+      'nid' => $node->nid,
+      'vid' => $node->vid,
+      'data' => $data,
+    );
+
+    // We do this since you might have enabled lingwo_pron after using lingwo_entry for awhile
+    // TODO: this is a general problem that should be handled at install!  lingwo_senses meets this problem too.
+    $is_new = !db_query("SELECT vid FROM {lingwo_pron_revisions} WHERE vid = :vid", array(':vid' => $node->vid))->fetch();
+
+    if (!empty($node->revision) || $is_new) {
+      drupal_write_record('lingwo_pron_revisions', $object);
+    }
+    else {
+      drupal_write_record('lingwo_pron_revisions', $object, 'vid');
+    }
+  }
+}
+
+/**
+ * Implements hook_node_revision_delete().
+ */
+function lingwo_pron_node_revision_delete($node) {
+  if (LingwoEntry::isEntryNode($node) && !_lingwo_is_translation($node)) {
+    db_delete('lingwo_pron_revisions')
+      ->condition('vid', $node->vid)
+      ->execute();
+  }
+}
+
+/**
+ * Implements hook_node_delete().
+ */
+function lingwo_pron_node_delete($node) {
+  if (LingwoEntry::isEntryNode($node) && !_lingwo_is_translation($node)) {
+    db_delete('lingwo_pron_revisions')
+      ->condition('nid', $node->nid)
+      ->execute();
+  }
+}
+
+/**
+ * Implements hook_theme().
+ */
+function lingwo_pron_theme() {
+  return array(
+    'lingwo_pron' => array(
+      'variables' => array('entry' => NULL),
+      'template' => 'lingwo-pron',
+    ),
+    'lingwo_pron_form' => array(
+      'render element' => 'form',
+      'file' => 'lingwo_pron.theme.inc',
+    ),
+    'lingwo_pron_audio_widget' => array(
+      'variables' => array('file' => NULL),
+      'file' => 'lingwo_pron.theme.inc',
+    ),
+  );
+}
+
+function template_preprocess_lingwo_pron(&$vars) {
+  global $language;
+
+  $entry = $vars['entry'];
+  if ($source_node = $entry->getTranslationSource()) {
+    // display the pron as if this were the source node
+    $entry = LingwoEntry::fromNode($source_node);
+  }
+
+  $vars['pron_list'] = array();
+  foreach ($entry->pron as $pron) {
+    if (!empty($pron['tag'])) {
+      $pron['tag'] = LingwoPron::getTagOptions($language->language, TRUE, $pron['tag']);
+    }
+
+    if (!empty($pron['audio'])) {
+      $pron['audio_widget'] = theme('lingwo_pron_audio_widget', array('file' => $pron['audio']));
+    }
+
+    $vars['pron_list'][] = $pron;
+  }
+}
+

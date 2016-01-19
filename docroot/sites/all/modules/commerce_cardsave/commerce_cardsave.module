@@ -1,0 +1,487 @@
+<?php
+
+/**
+ * @file
+ * Provides an integration for CardSave payment gateway.
+ */
+
+define('COMMERCE_CARDSAVE_NO_ORDER_ID', 'NO_ORDER_ID');
+
+/**
+ * Implements hook_menu().
+ */
+function commerce_cardsave_menu() {
+  $items = array();
+
+  // Add a menu item for capturing authorizations.
+  $items['admin/commerce/orders/%commerce_order/payment/%commerce_payment_transaction/cardsave-capture'] = array(
+    'title' => 'Capture',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('commerce_cardsave_capture_form', 3, 5),
+    'access callback' => 'commerce_cardsave_capture_access',
+    'access arguments' => array(3, 5),
+    'type' => MENU_LOCAL_TASK,
+    'context' => MENU_CONTEXT_INLINE,
+    'file' => 'commerce_cardsave.admin.inc',
+    'weight' => 1,
+  );
+
+  // Add a menu item for refunding transactions.
+  $items['admin/commerce/orders/%commerce_order/payment/%commerce_payment_transaction/cardsave-refund'] = array(
+    'title' => 'Refund',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('commerce_cardsave_refund_form', 3, 5),
+    'access callback' => 'commerce_cardsave_refund_access',
+    'access arguments' => array(3, 5),
+    'type' => MENU_LOCAL_TASK,
+    'context' => MENU_CONTEXT_INLINE,
+    'file' => 'commerce_cardsave.admin.inc',
+    'weight' => 2,
+  );
+
+  // Add a menu item for voiding transactions.
+  $items['admin/commerce/orders/%commerce_order/payment/%commerce_payment_transaction/cardsave-void'] = array(
+    'title' => 'Void',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('commerce_cardsave_void_form', 3, 5),
+    'access callback' => 'commerce_cardsave_void_access',
+    'access arguments' => array(3, 5),
+    'type' => MENU_LOCAL_TASK,
+    'context' => MENU_CONTEXT_INLINE,
+    'file' => 'commerce_cardsave.admin.inc',
+    'weight' => 3,
+  );
+
+  // 3ds initiation.
+  $items['commerce-cardsave/3ds/init/%/%'] = array(
+    'page callback' => 'commerce_cardsave_3ds_init_form',
+    'access callback' => 'commerce_cardsave_3ds_init_access',
+    'page arguments' => array(3, 4),
+    'type' => MENU_CALLBACK,
+  );
+
+  // 3ds callback.
+  $items['commerce-cardsave/3ds/callback/%commerce_order/%commerce_payment_transaction'] = array(
+    'page callback' => 'commerce_cardsave_3ds_callback',
+    'page arguments' => array(3, 4),
+    'access callback' => 'commerce_cardsave_3ds_callback_access',
+    'type' => MENU_CALLBACK,
+  );
+
+  return $items;
+}
+
+/**
+ * Access callback: CardSave 3ds authorization callback.
+ */
+function commerce_cardsave_3ds_callback_access() {
+  return !empty($_POST['PaRes']);
+}
+
+/**
+ * Access callback: CardSave 3ds authorization initiation.
+ */
+function commerce_cardsave_3ds_init_access() {
+  return !empty($_SESSION['commerce_cardsave_md']);
+}
+
+/**
+ * Page callback: CardSave 3ds authorization callback.
+ */
+function commerce_cardsave_3ds_callback($order, $transaction) {
+  $payment_method = commerce_payment_method_instance_load($transaction->instance_id);
+  $api = commerce_cardsave_get_api();
+  $api->finalize3ds($_POST['PaRes'], $_POST['MD']);
+
+  if ($api->getSuccess()) {
+    if ($payment_method['settings']['transaction_type'] === 'sale') {
+      $transaction->status = COMMERCE_PAYMENT_STATUS_SUCCESS;
+    }
+    $transaction->message .= '<br />' . t('3D secure authorization successful.');
+    commerce_payment_redirect_pane_next_page($order);
+  }
+  else {
+    $transaction->status = COMMERCE_PAYMENT_STATUS_FAILURE;
+    $transaction->message .= '<br />' . t('3D secure authorization failed.');
+    commerce_payment_redirect_pane_previous_page($order);
+    drupal_set_message(t('3D secure authentification failed. Please try again or use another card.'), 'error');
+  }
+
+  $transaction->remote_id = $api->getCrossReference();
+
+  commerce_payment_transaction_save($transaction);
+  drupal_goto('checkout/' . $order->order_id . '/review');
+}
+
+/**
+ * Form structure: CardSave 3ds authorization initiation.
+ */
+function commerce_cardsave_3ds_init_form($order_id, $transaction_id) {
+  $form['wrapper'] = array(
+    '#type' => 'form',
+    '#action' => $_SESSION['commerce_cardsave_acsurl'],
+  );
+
+  $form['wrapper']['pareq'] = array(
+    '#type' => 'hidden',
+    '#value' => $_SESSION['commerce_cardsave_pareq'],
+    '#name' => 'PaReq',
+  );
+
+  $form['wrapper']['md'] = array(
+    '#type' => 'hidden',
+    '#value' => $_SESSION['commerce_cardsave_md'],
+    '#name' => 'MD',
+  );
+
+  $form['wrapper']['termurl'] = array(
+    '#type' => 'hidden',
+    '#value' => url('commerce-cardsave/3ds/callback/' . $order_id . '/' . $transaction_id, array('absolute' => TRUE)),
+    '#name' => 'TermUrl',
+  );
+
+  // Script for automatic form submission.
+  $form['js']['#markup'] = '<script type="text/javascript">window.document.forms[0].submit();</script>';
+
+  // No JS fallback.
+  $form['wrapper']['nojs']['#markup'] = '<noscript><input type="submit" value="' . t('Please click this button to authorise your card') . '" /></noscript>';
+
+  print drupal_render($form);
+}
+
+/**
+ * Returns the default settings for the CardSave payment method.
+ */
+function commerce_cardsave_default_settings() {
+  return array(
+    'merchant_id' => '',
+    'password' => '',
+    'cardonfile' => FALSE,
+    '3ds' => '0',
+    'transaction_type' => 'sale',
+  );
+}
+
+/**
+ * Determines access to the prior authorization capture form.
+ *
+ * @param object $order
+ *   The order the transaction is on.
+ * @param object $transaction
+ *   The payment transaction object to be captured.
+ *
+ * @return bool
+ *   Indicating capture access.
+ */
+function commerce_cardsave_capture_access($order, $transaction) {
+  // Return FALSE if the transaction isn't for CardSave or isn't
+  // awaiting capture.
+  if ($transaction->payment_method !== 'cardsave' || empty($transaction->remote_id) || $transaction->status !== COMMERCE_PAYMENT_STATUS_PENDING) {
+    return FALSE;
+  }
+
+  // Return FALSE if it is more than 3 days past the original authorization.
+  if (REQUEST_TIME - $transaction->created > 86400 * 3) {
+    return FALSE;
+  }
+
+  // Allow access if the user can update this transaction.
+  return commerce_payment_transaction_access('update', $transaction);
+}
+
+/**
+ * Determines access to the prior refund form.
+ *
+ * @param object $order
+ *   The order the transaction is on.
+ * @param object $transaction
+ *   The payment transaction object to be captured.
+ *
+ * @return bool
+ *   Indicating capture access.
+ */
+function commerce_cardsave_refund_access($order, $transaction) {
+  // Return FALSE if the transaction isn't for CardSave.
+  if ($transaction->payment_method !== 'cardsave') {
+    return FALSE;
+  }
+
+  if ($transaction->amount <= 0) {
+    return FALSE;
+  }
+
+  // Return FALSE if it is more than 365 days past the original authorization.
+  if (REQUEST_TIME - $transaction->created > 86400 * 365) {
+    return FALSE;
+  }
+
+  // Allow access if the user can update this transaction.
+  return commerce_payment_transaction_access('update', $transaction);
+}
+
+/**
+ * Determines access to the void form for CardSave credit card transactions.
+ *
+ * @param object $order
+ *   The order the transaction is on.
+ * @param object $transaction
+ *   The payment transaction object to be voided.
+ *
+ * @return bool
+ *   Indicating void access.
+ */
+function commerce_cardsave_void_access($order, $transaction) {
+  if ($transaction->payment_method !== 'cardsave' || empty($transaction->remote_id) || $transaction->status !== COMMERCE_PAYMENT_STATUS_PENDING) {
+    return FALSE;
+  }
+
+  // Allow access if the user can update this transaction.
+  return commerce_payment_transaction_access('update', $transaction);
+}
+
+/**
+ * Payment method callback: settings form.
+ */
+function commerce_cardsave_settings_form($settings = array()) {
+  // Merge default settings into the stored settings array.
+  $settings += commerce_cardsave_default_settings();
+
+  $form['merchant_id'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Merchant ID'),
+    '#default_value' => $settings['merchant_id'],
+    '#required' => TRUE,
+  );
+
+  $form['password'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Password'),
+    '#default_value' => $settings['password'],
+    '#required' => TRUE,
+  );
+
+  $form['transaction_type'] = array(
+    '#type' => 'radios',
+    '#title' => t('Payment capture method'),
+    '#default_value' => $settings['transaction_type'],
+    '#options' => array(
+      'sale' => t('Authomatic'),
+      'preauth' => t('Manual'),
+    ),
+  );
+
+  // Card on File module support.
+  if (module_exists('commerce_cardonfile')) {
+    $form['cardonfile'] = array(
+      '#type' => 'checkbox',
+      '#title' => t('Enable Card on File functionality with this payment method.'),
+      '#description' => t('Stores tokenised value for card data.'),
+      '#default_value' => $settings['cardonfile'],
+    );
+  }
+
+  $form['help'] = array(
+    '#markup' => '<p>' . t('Please log into your merhcant account at <a href="https://mms.cardsaveonlinepayments.com">https://mms.cardsaveonlinepayments.com</a> to manage the 3D Secure, AVS and CV2 behaviour.') . '</p>',
+  );
+
+  return $form;
+}
+
+/**
+ * Implements hook_commerce_payment_method_info().
+ */
+function commerce_cardsave_commerce_payment_method_info() {
+  $payment_methods = array();
+
+  $payment_methods['cardsave'] = array(
+    'base' => 'commerce_cardsave',
+    'title' => t('CardSave - Credit/Debit Card'),
+    'display_title' => t('Credit/Debit card (CardSave)'),
+    'cardonfile' => array(
+      'charge callback' => 'commerce_cardsave_cardonfile_charge',
+      'update callback' => 'commerce_cardsave_cardonfile_update',
+      'delete callback' => 'commerce_cardsave_cardonfile_delete',
+      'create callback' => 'commerce_cardsave_cardonfile_create',
+    ),
+  );
+
+  return $payment_methods;
+}
+
+/**
+ * Cardonfile charge callback.
+ */
+function commerce_cardsave_cardonfile_charge($payment_method, $card_data, $order, $charge) {
+  $api = commerce_cardsave_get_api();
+  $api->crossPayment($order->order_id, $charge['amount'], $charge['currency_code'], t('Recurring transaction'), $card_data->remote_id);
+
+  if ($api->getSuccess()) {
+    $transaction = commerce_payment_transaction_new('cardsave', $order->order_id);
+    $transaction->instance_id = $payment_method['instance_id'];
+    $transaction->amount = $charge['amount'];
+    $transaction->remote_id = $api->getCrossReference();
+    $transaction->currency_code = $charge['currency_code'];
+    $transaction->status = $payment_method['settings']['transaction_type'] === 'sale' ? COMMERCE_PAYMENT_STATUS_SUCCESS : COMMERCE_PAYMENT_STATUS_PENDING;
+    $transaction->message = 'Name: @name';
+    $transaction->message_variables = array('@name' => 'CardSave');
+
+    commerce_payment_transaction_save($transaction);
+
+    return TRUE;
+  }
+}
+
+/**
+ * Cardonfile update callback.
+ */
+function commerce_cardsave_cardonfile_update() {
+  return TRUE;
+}
+
+/**
+ * Cardonfile delete callback.
+ */
+function commerce_cardsave_cardonfile_delete() {
+  return TRUE;
+}
+
+/**
+ * Cardonfile create callback.
+ */
+function commerce_cardsave_cardonfile_create($form, $form_state, $payment_method, $card_data) {
+  global $user;
+  $api = commerce_cardsave_get_api();
+  $billing_profiles = commerce_customer_profile_load_multiple(array(), array('uid' => $user->uid, 'type' => 'billing'));
+  $billing_profile = array_pop($billing_profiles);
+
+  $api->directPayment(COMMERCE_CARDSAVE_NO_ORDER_ID, 1, commerce_default_currency(), $form_state['values']['credit_card'], $billing_profile->commerce_customer_address[LANGUAGE_NONE][0], t('A new card on file created'), 'PREAUTH');
+
+  if ($api->getSuccess()) {
+    if ($billing_profile) {
+      // Clone the order profile to use on the Card on File entity.
+      unset($billing_profile->profile_id);
+      unset($billing_profile->revision_id);
+      commerce_customer_profile_save($billing_profile);
+      // Add the billing profile to the card on file.
+      $card_data->commerce_cardonfile_profile[LANGUAGE_NONE][0]['profile_id'] = $billing_profile->profile_id;
+    }
+    $card_data->remote_id = $api->getCrossReference();
+    $card_data->is_new = 1;
+  }
+  else {
+    drupal_set_message(check_plain($api->getMessage()), 'error');
+  }
+
+  return $card_data;
+}
+
+/**
+ * Payment method callback: submit form.
+ */
+function commerce_cardsave_submit_form($payment_method, $pane_values, $checkout_pane, $order) {
+  module_load_include('inc', 'commerce_payment', 'includes/commerce_payment.credit_card');
+
+  $fields = array(
+    'type' => array(
+      'visa',
+      'mastercard',
+      'amex',
+      'jcb',
+      'maestro',
+      'visaelectron',
+    ),
+    'code' => t('CVV/CV2'),
+  );
+
+  return commerce_payment_credit_card_form($fields);
+}
+
+/**
+ * Payment method callback: submit form submission.
+ */
+function commerce_cardsave_submit_form_submit($payment_method, $pane_form, $pane_values, $order, $charge) {
+  $api = commerce_cardsave_get_api();
+  $description = t('Payment for order #@order_id at @site_name', array(
+    '@order_id' => $order->order_id,
+    '@site_name' => variable_get('site_name', ''),
+  ));
+
+  if (!empty($pane_values['cardonfile']) && is_numeric($pane_values['cardonfile'])) {
+    $cardonfile = commerce_cardonfile_load($pane_values['cardonfile']);
+    $api->crossPayment($order->order_id, $charge['amount'], $charge['currency_code'], $description, $cardonfile->remote_id);
+  }
+  else {
+    $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+    $billing = $order_wrapper->commerce_customer_billing->commerce_customer_address->value();
+
+    $api->directPayment($order->order_id, $order->commerce_order_total[LANGUAGE_NONE][0]['amount'], $order->commerce_order_total[LANGUAGE_NONE][0]['currency_code'], $pane_values['credit_card'], $billing, $description);
+  }
+
+  if ($api->getSuccess()) {
+    $transaction = commerce_payment_transaction_new('cardsave', $order->order_id);
+    $transaction->instance_id = $payment_method['instance_id'];
+    $transaction->amount = $charge['amount'];
+    $transaction->remote_id = $api->getCrossReference();
+    $transaction->currency_code = $charge['currency_code'];
+    $transaction->status = ($payment_method['settings']['transaction_type'] === 'sale' && !$api->requireThreeDS()) ? COMMERCE_PAYMENT_STATUS_SUCCESS : COMMERCE_PAYMENT_STATUS_PENDING;
+    $transaction->message = 'Name: @name';
+    $transaction->message_variables = array('@name' => 'CardSave');
+
+    commerce_payment_transaction_save($transaction);
+
+    if (module_exists('commerce_cardonfile') && !empty($pane_values['credit_card']['cardonfile_store'])) {
+      $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+
+      $billing_address = $order_wrapper->commerce_customer_billing->commerce_customer_address->value();
+
+      $card_data = commerce_cardonfile_new();
+      $card_data->uid = $order->uid;
+      $card_data->payment_method = $payment_method['method_id'];
+      $card_data->instance_id = $payment_method['instance_id'];
+      $card_data->remote_id = $api->getCrossReference();
+      $card_data->card_type = $pane_values['credit_card']['type'];
+      $card_data->card_name = !empty($billing_address['name_line']) ? $billing_address['name_line'] : '';
+      $card_data->card_number = substr($pane_values['credit_card']['number'], -4);
+      $card_data->card_exp_month = $pane_values['credit_card']['exp_month'];
+      $card_data->card_exp_year = $pane_values['credit_card']['exp_year'];
+      $card_data->status = 1;
+
+      commerce_cardonfile_save($card_data, $order_wrapper->commerce_customer_billing->value());
+    }
+
+    if ($api->requireThreeDS()) {
+      $order->status = 'checkout_payment';
+      commerce_order_save($order);
+      drupal_goto('commerce-cardsave/3ds/init/' . $transaction->order_id . '/' . $transaction->transaction_id);
+    }
+  }
+  else {
+    drupal_set_message(check_plain($api->getMessage()), 'error');
+  }
+
+  return $api->getSuccess();
+}
+
+/**
+ * Implements hook_cron().
+ */
+function commerce_cardsave_cron() {
+  // CardSave stores the "cross reference" no longer than 12 months, so
+  // the expired cardonfile data should be wiped.
+  if (module_exists('commerce_cardonfile')) {
+    db_delete('commerce_cardonfile')->condition('created', strtotime('-1 year'), '<')->execute();
+  }
+}
+
+/**
+ * Return an API object to work with.
+ *
+ * @param array $settings
+ *   It is possible to pass alternative settings to override the defaults.
+ */
+function commerce_cardsave_get_api($settings = array()) {
+  module_load_include('inc', 'commerce_cardsave', 'commerce_cardsave.api');
+  $instance = commerce_payment_method_instance_load('cardsave|commerce_payment_cardsave');
+
+  return new CommerceCardsave($settings + $instance['settings']);
+}

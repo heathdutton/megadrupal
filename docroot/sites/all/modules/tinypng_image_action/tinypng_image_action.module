@@ -1,0 +1,342 @@
+<?php
+
+/**
+ * @file
+ * Main module file.
+ */
+
+/**
+ * Implements hook_menu().
+ */
+function tinypng_image_action_menu() {
+  $items = array();
+  $items['admin/config/media/tinypng'] = array(
+    'title'            => 'TinyPNG Settings',
+    'description'      => 'API Key and settings for the TinyPNG service',
+    'page callback'    => 'drupal_get_form',
+    'page arguments'   => array('tinypng_image_action_settings_form'),
+    'access arguments' => array('administer tinypng_image_action'),
+    'file'             => 'includes/tinypng_image_action.admin.inc',
+  );
+  return $items;
+}
+
+/**
+ * Implements hook_permission().
+ */
+function tinypng_image_action_permission() {
+  return array(
+    'administer tinypng_image_action' => array(
+      'title'       => t('Administer TinyPNG'),
+      'description' => t('Perform administration tasks for TinyPNG Image Action module.'),
+    ),
+  );
+}
+
+/**
+ * Implements hook_theme().
+ */
+function tinypng_image_action_theme($existing, $type, $theme, $path) {
+  return array(
+    'tinypng_image_action_summary' => array(
+      'variables' => array('data' => NULL),
+    ),
+  );
+}
+
+/**
+ * Effect callback for TinyPNG.
+ */
+function tinypng_image_action_effect(&$image) {
+  if (in_array($image->info['mime_type'], array('image/jpeg', 'image/png'))) {
+    $result = tinypng_image_action_optimize($image);
+    if ($result) {
+      return TRUE;
+    }
+    else {
+      return FALSE;
+    }
+  }
+  else {
+    return FALSE;
+  }
+}
+
+/**
+ * Theme implementation for tinypng image action summary.
+ */
+function theme_tinypng_image_action_summary(array $variables) {
+  drupal_set_message(t("<b>TinyPNG</b>: Image reduced in size. Review image source and example size."), 'status');
+}
+
+/**
+ * Configuration form for effect.
+ */
+function tinypng_image_action_effect_form($form) {
+  $settings = variable_get('tinypng_image_action');
+  if (empty($settings['api_key'])) {
+    drupal_set_message(t('You have to specify TinyPNG API key to use this action.'), 'error');
+  }
+  return $form;
+}
+
+/**
+ * Implements hook_image_effect_info().
+ */
+function tinypng_image_action_image_effect_info() {
+  $effects = array();
+
+  $effects['tinypng'] = array(
+    'label'                  => t('TinyPNG optimization'),
+    'effect callback'        => 'tinypng_image_action_effect',
+    'dimensions passthrough' => TRUE,
+    'form callback'          => 'tinypng_image_action_effect_form',
+    'summary theme'          => 'tinypng_image_action_summary',
+  );
+
+  return $effects;
+}
+
+/**
+ * TinyPNG ImageAPI Optimize service callback.
+ */
+function tinypng_image_action_optimize(&$image) {
+
+  $output = array();
+  // Flag determines if image is cached.
+  $cached = FALSE;
+
+  // Processing image size.
+  $width = $image->info['width'];
+  $height = $image->info['height'];
+
+  // Check if you have curl loaded.
+  if (!function_exists('curl_init')) {
+    drupal_set_message(t('PHP curl library required. Please check that php_curl extension is enabled', 'warning', FALSE));
+    return FALSE;
+  }
+
+  // Check if json is available.
+  if (!function_exists('json_decode')) {
+    drupal_set_message(t('ImageAPI Optimize TinyPNG service requires PHP json support', 'warning', FALSE));
+    return FALSE;
+  }
+
+  // Get tinypng settings.
+  $settings = variable_get('tinypng_image_action');
+  $append = $width . 'x' . $height;
+
+  $path_to_cached = tinypng_image_action_create_cache_path($image->source, $append);
+
+  $filepath = drupal_realpath($path_to_cached);
+
+  // We assume, that we have cached image if file exists.
+  if (file_exists($filepath)) {
+    $cached = TRUE;
+  }
+
+  if (!$cached) {
+
+    // Possible solution without ob.
+    // $string = file_get_contents($image->source).
+    ob_start();
+    switch ($image->info['mime_type']) {
+      case 'image/png':
+        imagesavealpha($image->resource, TRUE);
+        imagepng($image->resource);
+        break;
+
+      case 'image/jpeg':
+        imagejpeg($image->resource);
+        break;
+    }
+    $string = ob_get_contents();
+    ob_end_clean();
+
+    $request = curl_init();
+    curl_setopt_array($request, array(
+      CURLOPT_URL            => 'https://api.tinify.com/shrink',
+      CURLOPT_USERPWD        => "api:" . $settings['api_key'],
+      CURLOPT_POSTFIELDS     => $string,
+      CURLOPT_BINARYTRANSFER => TRUE,
+      CURLOPT_RETURNTRANSFER => TRUE,
+      CURLOPT_SSL_VERIFYPEER => TRUE,
+      CURLOPT_HEADER         => FALSE,
+      CURLOPT_CUSTOMREQUEST  => 'POST',
+    ));
+
+    // Make the request.
+    $response = curl_exec($request);
+    // Decode response.
+    $json = json_decode($response, TRUE);
+
+    $output = array_merge($output, $json);
+
+    if (curl_getinfo($request, CURLINFO_HTTP_CODE) === 201) {
+      $result = drupal_http_request($json['output']['url']);
+      if (!isset($result->error)) {
+        $output['result'] = $result;
+        curl_close($request);
+        $optimized_image_resource = tinypng_image_action_save_optimized($output, $path_to_cached, $image);
+
+        // We will replace source and resource for further processing.
+        if ($optimized_image_resource) {
+          $image->resource = $optimized_image_resource;
+          $image->source = $path_to_cached;
+        }
+        return TRUE;
+      }
+    }
+
+    // Error message.
+    drupal_set_message(t('TinyPNG.com could not process your request for @file. Error code = @error - @msg', array(
+      '@file'  => $image->source,
+      '@error' => $json['error'],
+      '@msg'   => $json['message'],
+    )), 'warning');
+
+    curl_close($request);
+  }
+  else {
+    // Handle cached image.
+    $query = db_select('tinypng_optimized_images', 'ti')
+      ->fields('ti')
+      ->condition('ti.image_uri', $image->source)
+      ->execute();
+    $result = $query->fetchAssoc();
+    if ($result) {
+      $resource = '';
+      $image->source = realpath($result['optimized_image_uri']);
+      imagedestroy($image->resource);
+      switch ($result['image_mime']) {
+        case 'image/png':
+          $resource = imagecreatefrompng($result['optimized_image_uri']);
+          break;
+
+        case 'image/jpeg':
+          $resource = imagecreatefromjpeg($result['optimized_image_uri']);
+          break;
+      }
+      $image->resource = $resource;
+      $image->info['file_size'] = (int) $result['optimized_size'];
+      $image->info['width'] = $result['width'];
+      $image->info['height'] = $result['height'];
+      return TRUE;
+    }
+  }
+  return FALSE;
+}
+
+/**
+ * Helper function to create path for proccesed images storage.
+ *
+ * @param string $append
+ *   Appends.
+ *
+ * @return string
+ *   Prefixed with 'public://tinypng' full path to optimized image storage
+ *   with optional imagename suffix.
+ */
+function tinypng_image_action_create_cache_path($source, $append = NULL) {
+  $cache_dir = 'public://tinypng';
+  $match = '';
+  preg_match('/(?<=:\/\/).*/i', $source, $match);
+  // We're going to get image path without stream name.
+  !empty($match[0]) ? $source = $match[0] : NULL;
+  if ($append) {
+    $source = implode('_' . $append, str_split($source, strrpos($source, '.')));
+  }
+  return $cache_dir . '/' . $source;
+}
+
+/**
+ * Saves optimized image into file cache and writes into into database.
+ *
+ * @param string $data
+ *   CURL response result: string.
+ * @param string $path_to_cached
+ *   Path to save cached image.
+ * @param object $original_image
+ *   Original image cache referenced image object.
+ *
+ * @return resource
+ *   Lala.
+ */
+function tinypng_image_action_save_optimized($data, $path_to_cached, $original_image) {
+
+  $pos = strrpos($path_to_cached, '/');
+  $image_name = substr($path_to_cached, $pos + 1);
+  $image_name_len = strlen($image_name);
+
+  $directory_path = substr($path_to_cached, 0, strlen($path_to_cached) - $image_name_len);
+  file_prepare_directory($directory_path, FILE_CREATE_DIRECTORY);
+  drupal_chmod($directory_path, 0755);
+
+  $image_mime = $original_image->info['mime_type'];
+  $size = $original_image->info['file_size'];
+  $width = $original_image->info['width'];
+  $height = $original_image->info['height'];
+  $optimization_ratio = $data['output']['ratio'];
+
+  $optimized_image = imagecreatefromstring($data['result']->data);
+
+  $save = FALSE;
+  switch ($image_mime) {
+    case 'image/png':
+      $save = imagepng($optimized_image, $path_to_cached);
+      break;
+
+    case 'image/jpeg':
+      $save = imagejpeg($optimized_image, $path_to_cached);
+      break;
+  }
+
+  if ($save) {
+    $optimized_info = image_get_info($path_to_cached);
+    $minified_size = $optimized_info['file_size'];
+
+    // Just write-a-recooord!
+    $record = array(
+      'image_uri'           => $original_image->source,
+      'optimized_image_uri' => $path_to_cached,
+      'width'               => $width,
+      'height'              => $height,
+      'size'                => $size,
+      'optimized_size'      => $minified_size,
+      'optimization_ratio'  => $optimization_ratio,
+      'image_mime'          => $image_mime,
+      'timestamp'           => time(),
+    );
+
+    drupal_write_record('tinypng_optimized_images', $record);
+
+    return $optimized_image;
+  }
+  // We return false if we can't save image.
+  return FALSE;
+}
+
+/**
+ * Gets image size.
+ */
+function tinypng_image_action_get_image_size($filepath) {
+  return array_pad(tinypng_image_action_get_image_info($filepath, array(
+    'width',
+    'height',
+  )), 2, NULL);
+}
+
+/**
+ * Tinypng Image Action wrapper for image_get_info().
+ *
+ * Can return exactly required properties.
+ *
+ * @see image_get_info()
+ */
+function tinypng_image_action_get_image_info($filepath, $properties = array()) {
+  $info = image_get_info($filepath);
+  if ($properties) {
+    $info = array_diff_key($info, array_flip($properties));
+  }
+  return $info;
+}

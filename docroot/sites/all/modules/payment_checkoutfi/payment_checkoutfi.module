@@ -1,0 +1,755 @@
+<?php
+/**
+ * @file
+ * Checkout.fi gateway for the Payment module.
+ */
+
+/**
+ * Checkout.fi payment status strings.
+ * Some of these strings double as variable keys used for payment return messages.
+ */
+define('PAYMENT_CHECKOUTFI_STATUS_REFUNDED', 'payment_checkoutfi_status_refunded');
+define('PAYMENT_CHECKOUTFI_STATUS_NOT_FOUND', 'payment_checkoutfi_status_not_found');
+define('PAYMENT_CHECKOUTFI_STATUS_TIMEOUT', 'payment_checkoutfi_status_timeout');
+define('PAYMENT_CHECKOUTFI_STATUS_CANCELED_BY_SYSTEM', 'payment_checkoutfi_status_canceled_by_system');
+define('PAYMENT_CHECKOUTFI_STATUS_CANCELED_BY_USER', 'payment_checkoutfi_status_canceled_by_user');
+define('PAYMENT_CHECKOUTFI_STATUS_INTERRUPTED', 'payment_checkoutfi_status_interrupted');
+define('PAYMENT_CHECKOUTFI_STATUS_COMPLETE', 'payment_checkoutfi_status_complete');
+define('PAYMENT_CHECKOUTFI_STATUS_PENDING', 'payment_checkoutfi_status_awaiting_payment');
+define('PAYMENT_CHECKOUTFI_STATUS_HELD', 'payment_checkoutfi_status_held');
+define('PAYMENT_CHECKOUTFI_STATUS_THIRD_PARTY_NEEDS_CONFIRMATION', 'payment_checkoutfi_status_third_party_needs_confirmation');
+define('PAYMENT_CHECKOUTFI_STATUS_THIRD_PARTY_CONFIRMED', 'payment_checkoutfi_status_third_party_confirmed');
+
+/**
+ * Implements hook_payment_method_controller_info().
+ */
+function payment_checkoutfi_payment_method_controller_info() {
+  return array('CheckoutFiMethodController');
+}
+
+/**
+ * Implements hook_menu().
+ */
+function payment_checkoutfi_menu() {
+  $items['checkoutfi/pay/%entity_object'] = array(
+    'load arguments' => array('payment'),
+    'title' => 'Payment',
+    'page callback' => 'payment_checkoutfi_payment_gateway',
+    'page arguments' => array(2),
+    'access callback' => 'payment_checkoutfi_payment_gateway_access',
+    'access arguments' => array(2),
+    'type' => MENU_CALLBACK,
+  );
+  $items['checkoutfi/return/%entity_object'] = array(
+    'load arguments' => array('payment'),
+    'title' => 'Payment processed',
+    'page callback' => 'payment_checkoutfi_return',
+    'page arguments' => array(2),
+    'access callback' => 'payment_checkoutfi_return_access',
+    'access arguments' => array(2),
+    'type' => MENU_CALLBACK,
+  );
+  $items['admin/config/services/payment/checkoutfi_messages'] = array(
+    'title' => 'Checkout.fi',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('payment_checkoutfi_configuration_form'),
+    'access arguments' => array('payment.global.administer'),
+    'type' => MENU_LOCAL_TASK,
+  );
+  return $items;
+}
+
+/**
+ * Access callback for the Checkout.fi gateway.
+ *
+ * @param Payment $payment
+ *   The payment object to check access for.
+ *
+ * @return bool
+ *   If access is allowed.
+ */
+function payment_checkoutfi_payment_gateway_access(Payment $payment) {
+  return is_a($payment->method->controller, 'CheckoutFiMethodController')
+    && payment_status_is_or_has_ancestor($payment->getStatus()->status, PAYMENT_STATUS_PENDING);
+}
+
+/**
+ * Access callback for the Checkout.fi return page.
+ *
+ * @param Payment $payment
+ *   The payment object to check access for.
+ *
+ * @return bool
+ *   If access is allowed.
+ *
+ * @todo move to controller?
+ */
+function payment_checkoutfi_return_access(Payment $payment) {
+  $controller = payment_method_controller_load('CheckoutFiMethodController');
+  $data = $controller->getFeedbackData();
+
+  // Is all data available?
+  $expected_data = array(
+    'VERSION',
+    'STAMP',
+    'REFERENCE',
+    'PAYMENT',
+    'STATUS',
+    'ALGORITHM',
+    'MAC',
+  );
+
+  foreach ($expected_data as $key) {
+    if (!isset($data[$key])) {
+      return FALSE;
+    }
+  }
+
+  // Is MAC valid?
+  return $payment->method->controller->validateMac($data, $payment);
+}
+
+/**
+ * Implements hook_entity_load().
+ */
+function payment_checkoutfi_entity_load(array $entities, $entity_type) {
+  if ($entity_type == 'payment_method') {
+    $pmids = array();
+
+    // Load all payment methods using this module
+    // into the pmid array.
+    foreach ($entities as $pmid => $payment_method) {
+      if ($payment_method->controller->name == 'CheckoutFiMethodController') {
+        $pmids[] = $pmid;
+      }
+    }
+
+    if (count($pmids)) {
+      // Get settings for this module's payment
+      // methods.
+      $result = db_select('payment_checkoutfi')
+        ->fields('payment_checkoutfi')
+        ->condition('pmid', $pmids)
+        ->execute();
+
+      // Add settings to the payment_method entities.
+      while ($data = $result->fetchAssoc()) {
+        $payment_method = $entities[$data['pmid']];
+        $payment_method->controller_data = (array) $data;
+        unset($payment_method->controller_data['pmid']);
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_ACTION().
+ */
+function payment_checkoutfi_payment_method_insert(PaymentMethod $payment_method) {
+  // Add controller settings to database.
+  if ($payment_method->controller->name == 'CheckoutFiMethodController') {
+    $values = $payment_method->controller_data += $payment_method->controller->controller_data_defaults;
+    $values['pmid'] = $payment_method->pmid;
+    drupal_write_record('payment_checkoutfi', $values);
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_ACTION().
+ */
+function payment_checkoutfi_payment_method_update(PaymentMethod $payment_method) {
+  // Add controller settings to database.
+  if ($payment_method->controller->name == 'CheckoutFiMethodController') {
+    $values = $payment_method->controller_data += $payment_method->controller->controller_data_defaults;
+    $values['pmid'] = $payment_method->pmid;
+    drupal_write_record('payment_checkoutfi', $values, 'pmid');
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_ACTION().
+ */
+function payment_checkoutfi_payment_method_delete($entity) {
+  // Remove controller settings from database.
+  if ($entity->controller->name == 'CheckoutFiMethodController') {
+    db_delete('payment_checkoutfi')
+      ->condition('pmid', $entity->pmid)
+      ->execute();
+  }
+}
+
+/**
+ * Menu callback for the payment gateway.
+ *
+ * @param Payment $payment
+ *   The payment object.
+ *
+ * @return string
+ *   Inline HTML for the payment gateway or
+ *   a redirect form to the external gateway.
+ */
+function payment_checkoutfi_payment_gateway(Payment $payment) {
+  // Off-site redirection if SimpleXML unavailable or
+  // on-site gateway is disabled.
+  if (!extension_loaded('simplexml') || !$payment->method->controller_data['onsite_gateway']) {
+    return drupal_get_form('payment_checkoutfi_payment_form', $payment);
+  }
+
+  // On-site bank buttons.
+  $payment->method->controller->setDevice('XML');
+  $data = $payment->method->controller->getRequestData($payment);
+
+  $xml = _payment_checkoutfi_http_request(CheckoutFiMethodController::SERVER_URL, $data);
+
+  // XML error, return.
+  if (!$xml) {
+    return;
+  }
+
+  $css_path = drupal_get_path('module', 'payment_checkoutfi') . '/css/payment_checkoutfi.css';
+  drupal_add_css($css_path);
+
+  // Flatten bank parent object.
+  $banks_data = array_values((array) $xml->payments->payment->banks);
+
+  $banks = array();
+  foreach ($banks_data as $bank_data) {
+    $parameters = array();
+    foreach ($bank_data as $key => $value) {
+      $parameters[$key] = array(
+        '#name' => $key,
+        '#type' => 'hidden',
+        '#value' => (string) $value,
+      );
+    }
+
+    $bank = array(
+      'name' => (string) $bank_data['name'],
+      'url' => (string) $bank_data['url'],
+      'icon' => (string) $bank_data['icon'],
+      'parameters' => drupal_render($parameters),
+    );
+    $banks[] = $bank;
+  }
+
+  // Merchant info.
+  $merchant = (array) $xml->merchant;
+  $variables = array(
+    'banks' => $banks,
+    'merchant' => $merchant,
+    'payment' => $payment,
+  );
+
+  return theme('checkout_gateway', $variables);
+}
+
+/**
+ * Menu callback for a returning external payment.
+ *
+ * @param Payment $payment
+ *   The payment object.
+ *
+ * @return string
+ *   Payment status message.
+ *
+ * @todo Move logic to controller?
+ */
+function payment_checkoutfi_return(Payment $payment) {
+  $controller = payment_method_controller_load('CheckoutFiMethodController');
+  $data = $controller->getFeedbackData();
+  // Finalize payment.
+  $payment->method->controller->processFeedback($data, $payment);
+
+  // Link to view payment.
+  $view = '';
+  if (payment_access('view', $payment)) {
+    $view = ' ' . l(t('View payment'), 'payment/' . $payment->pid) . '.';
+  }
+
+  return payment_checkoutfi_get_status_message($data['STATUS']) . $view;
+}
+
+/**
+ * Form API callback for status message configuration.
+ */
+function payment_checkoutfi_configuration_form(array $form, array &$form_state) {
+  drupal_set_title(t('Checkout.fi for Payment configuration'));
+
+  // Fieldset for messages.
+  $form['container'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Custom messages'),
+  );
+
+  // Instructional paragraphs.
+  $form['container']['description'] = array(
+    '#markup' => '<p>' . t('Configure payment status messages for the Checkout.fi payment module. These messages are displayed when a payment is finished, unless the payment\'s finish callback overrides this behavior. To configure payment methods, visit the <a href="@url">Payment methods</a> page.', array('@url' => url('admin/config/services/payment/method'))) . '</p>',
+  );
+  $form['container']['translate'] = array(
+    '#markup' => '<p>' . t('These messages can be translated using the module <em>Variable translation</em>, part of the <a href="@url">Internationalization</a> suite.', array('@url' => url('https://drupal.org/project/i18n'))) . '</p>',
+  );
+
+  // Tab container.
+  $form['container']['messages'] = array(
+    '#type' => 'vertical_tabs',
+  );
+
+  // Messages from variable_info().
+  $messages = payment_checkoutfi_variable_info();
+
+  // Add a vertical tab for each message.
+  foreach ($messages as $variable_name => $variable_info) {
+    $fieldset_name = $variable_name . '_wrapper';
+    $form['container'][$fieldset_name] = array(
+      '#type' => 'fieldset',
+      '#title' => check_plain($variable_info['title']),
+      '#collapsible' => TRUE,
+      '#group' => 'messages',
+    );
+    // Textarea for setting the variable.
+    $form['container'][$fieldset_name][$variable_name] = array(
+      '#type' => 'textarea',
+      '#default_value' => variable_get($variable_name),
+      '#description' => check_plain($variable_info['description']),
+      '#group' => 'messages',
+    );
+  }
+
+  return system_settings_form($form);
+}
+
+/**
+ * Form API callback for payment off-site redirection form.
+ */
+function payment_checkoutfi_payment_form(array $form, array &$form_state, Payment $payment) {
+  $form['#action'] = CheckoutFiMethodController::SERVER_URL;
+
+  // Set upp hidden fields for this request.
+  foreach ($payment->method->controller->getRequestData($payment) as $parameter => $value) {
+    $form[$parameter] = array(
+      '#type' => 'hidden',
+      '#value' => $value,
+    );
+  }
+
+  // Redirect message.
+  // @todo: Add to variables.
+  $form['message'] = array(
+    '#type' => 'markup',
+    '#markup' => '<p>' . t('You will be redirected to the off-site payment server to authorize the payment.') . '</p>',
+  );
+
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Continue'),
+  );
+
+  return $form;
+}
+
+/**
+ * PaymentMethodController::payment_method_configuration_form_elements_callback.
+ */
+function payment_checkoutfi_payment_method_configuration_form_elements(array $form, array &$form_state) {
+  $payment_method = $form_state['payment_method'];
+  $controller = $payment_method->controller;
+
+  // Get current settings (and default if not available).
+  $controller_data = $payment_method->controller_data + $controller->controller_data_defaults;
+
+  // Set up the configuration form for this controller.
+  $form['merchant_id'] = array(
+    '#default_value' => $controller_data['merchant_id'],
+    '#description' => t('Merchant ID provided by Checkout.fi. Set to "375917" for testing. (Stored in plaintext)'),
+    '#required' => TRUE,
+    '#title' => t('Merchant ID'),
+    '#type' => 'textfield',
+  );
+
+  $form['passphrase'] = array(
+    '#default_value' => $controller_data['passphrase'],
+    '#description' => t('Secret passphrase provided by Checkout.fi. Set to "SAIPPUAKAUPPIAS" for testing. (Stored in plaintext)'),
+    '#required' => TRUE,
+    '#title' => t('Passphrase'),
+    '#type' => 'textfield',
+  );
+
+  $form['content'] = array(
+    '#default_value' => ($controller_data['content'] == '2'),
+    '#description' => t('Is the payment method for adult entertainment?'),
+    '#title' => t('Adult entertainment'),
+    '#type' => 'checkbox',
+  );
+
+  $form['message'] = array(
+    '#default_value' => $controller_data['message'],
+    '#description' => t('Default message to display on payment.'),
+    '#title' => t('Default message'),
+    '#type' => 'textarea',
+  );
+
+  $form['date_offset'] = array(
+    '#default_value' => $controller_data['date_offset'],
+    '#description' => t('Default delivery date. Define as a <a href="@php-strtotime">PHP strtotime string</a>. Empty or "now" for immediate.', array('@php-strtotime' => 'http://php.net/manual/en/function.strtotime.php')),
+    '#title' => t('Delivery date'),
+    '#type' => 'textfield',
+  );
+
+  $form['onsite_gateway'] = array(
+    '#default_value' => $controller_data['onsite_gateway'],
+    '#description' => t('When enabled, the payment gateway will be shown on-site, otherwise the user will be redirected to the off-site gateway at Checkout.fi.'),
+    '#title' => t('Use on-site gateway'),
+    '#type' => 'checkbox',
+  );
+
+  return $form;
+}
+
+/**
+ * Validation for payment_checkoutfi_payment_method_configuration_form_elements.
+ *
+ * @see payment_checkoutfi_payment_method_configuration_form_elements()
+ */
+function payment_checkoutfi_payment_method_configuration_form_elements_validate(array $element, array &$form_state) {
+  // Replace current controller settings with submitted ones.
+  $values = drupal_array_get_nested_value($form_state['values'], $element['#parents']);
+  $controller_data = &$form_state['payment_method']->controller_data;
+  $controller_data['merchant_id'] = $values['merchant_id'];
+  $controller_data['passphrase'] = $values['passphrase'];
+  $controller_data['content'] = $values['content'] ? '2' : '1';
+  $controller_data['message'] = $values['message'];
+  $controller_data['date_offset'] = $values['date_offset'];
+  $controller_data['onsite_gateway'] = $values['onsite_gateway'];
+}
+
+/**
+ * Implements hook_cron().
+ */
+function payment_checkoutfi_cron() {
+  // Timeout for pending payments (2h = 7200 seconds).
+  // When this time limit has been reached and checkout
+  // does not return a status, the payment will be timed out.
+  $timeout = 7200;
+
+  // Select which order statuses to check for.
+  $statuses = array(PAYMENT_CHECKOUTFI_STATUS_PENDING);
+  $placeholders = array(
+    ':statuses' => $statuses,
+  );
+
+  // Get order info from db.
+  $query = 'SELECT p.`pid`, pi.`created` FROM {payment} p ';
+  $query .= 'INNER JOIN {payment_status_item} pi ON p.`psiid_last` = pi.`psiid` AND p.`pid` = pi.`pid` ';
+  $query .= 'WHERE pi.`status` IN (:statuses)';
+
+  // Execute.
+  $result = db_query($query, $placeholders);
+
+  // Load all pending order id's.
+  $pending_payments = $result->fetchAllKeyed();
+
+  // Load payments.
+  $payments = entity_load('payment', array_keys($pending_payments));
+
+  foreach ($payments as $payment) {
+    // Skip controllers other than CheckoutFiMethodController.
+    if ($payment->method->controller->name !== 'CheckoutFiMethodController') {
+      continue;
+    }
+
+    // Get XML for payment.
+    $data = $payment->method->controller->getPollingData($payment);
+    $xml = _payment_checkoutfi_http_request(CheckoutFiMethodController::POLLING_URL, $data, FALSE);
+
+    // Update status if a new one is returned.
+    if ($xml && ($status = (string) $xml->trade->status)) {
+      // Update status.
+      $new_status = $payment->method->controller->getPaymentStatus($status, $payment->pid);
+      $payment->setStatus(new PaymentStatusItem(PAYMENT_CHECKOUTFI_STATUS_PENDING));
+      entity_save('payment', $payment);
+    }
+    // If timeout has passed, set payment status to "Timed out".
+    elseif ((REQUEST_TIME - $pending_payments[$payment->pid]) > $timeout) {
+      $payment->setStatus(new PaymentStatusItem(PAYMENT_CHECKOUTFI_STATUS_TIMEOUT));
+      entity_save('payment', $payment);
+    }
+  }
+}
+
+/**
+ * Implements hook_theme().
+ */
+function payment_checkoutfi_theme($existing, $type, $theme, $path) {
+  return array(
+    'checkout_gateway' => array(
+      'template' => 'checkout_gateway',
+      'path' => drupal_get_path('module', 'payment_checkoutfi') . '/theme',
+    ),
+  );
+}
+
+/**
+ * Implements hook_payment_status_info().
+ */
+function payment_checkoutfi_payment_status_info() {
+  return array(
+    new PaymentStatusInfo(array(
+      'description' => t('Payments that have been refunded to user.'),
+      'status' => PAYMENT_CHECKOUTFI_STATUS_REFUNDED,
+      'parent' => PAYMENT_STATUS_FAILED,
+      'title' => t('Refunded'),
+    )),
+    new PaymentStatusInfo(array(
+      'description' => t('Payments that are not found.'),
+      'status' => PAYMENT_CHECKOUTFI_STATUS_NOT_FOUND,
+      'parent' => PAYMENT_STATUS_FAILED,
+      'title' => t('Payment not found'),
+    )),
+    new PaymentStatusInfo(array(
+      'description' => t('Payments that timed out before finishing.'),
+      'status' => PAYMENT_CHECKOUTFI_STATUS_TIMEOUT,
+      'parent' => PAYMENT_STATUS_FAILED,
+      'title' => t('Timeout'),
+    )),
+    new PaymentStatusInfo(array(
+      'description' => t('Payments canceled by the remote system.'),
+      'status' => PAYMENT_CHECKOUTFI_STATUS_CANCELED_BY_SYSTEM,
+      'parent' => PAYMENT_STATUS_CANCELLED,
+      'title' => t('Canceled by system'),
+    )),
+    new PaymentStatusInfo(array(
+      'description' => t('Payments that were canceled by the user.'),
+      'status' => PAYMENT_CHECKOUTFI_STATUS_CANCELED_BY_USER,
+      'parent' => PAYMENT_STATUS_CANCELLED,
+      'title' => t('Canceled by user'),
+    )),
+    new PaymentStatusInfo(array(
+      'description' => t('Payments that were interrupted during processing.'),
+      'status' => PAYMENT_CHECKOUTFI_STATUS_INTERRUPTED,
+      'parent' => PAYMENT_STATUS_FAILED,
+      'title' => t('Interrupted'),
+    )),
+    new PaymentStatusInfo(array(
+      'description' => t('Payments for which funds have been successfully transferred.'),
+      'status' => PAYMENT_CHECKOUTFI_STATUS_COMPLETE,
+      'parent' => PAYMENT_STATUS_SUCCESS,
+      'title' => t('Complete'),
+    )),
+    new PaymentStatusInfo(array(
+      'description' => t('Payments pending completion.'),
+      'status' => PAYMENT_CHECKOUTFI_STATUS_PENDING,
+      'parent' => PAYMENT_STATUS_PENDING,
+      'title' => t('Pending'),
+    )),
+    new PaymentStatusInfo(array(
+      'description' => t('Payments that are held.'),
+      'status' => PAYMENT_CHECKOUTFI_STATUS_HELD,
+      'parent' => PAYMENT_STATUS_SUCCESS,
+      'title' => t('Held'),
+    )),
+    new PaymentStatusInfo(array(
+      'description' => t('A third party needs to get merchant confirmation to process payment.'),
+      'status' => PAYMENT_CHECKOUTFI_STATUS_THIRD_PARTY_NEEDS_CONFIRMATION,
+      'parent' => PAYMENT_STATUS_SUCCESS,
+      'title' => t('Needs confirmation'),
+    )),
+    new PaymentStatusInfo(array(
+      'description' => t('The third party has processed the payment.'),
+      'status' => PAYMENT_CHECKOUTFI_STATUS_THIRD_PARTY_CONFIRMED,
+      'parent' => PAYMENT_STATUS_SUCCESS,
+      'title' => t('Confirmed'),
+    )),
+  );
+}
+
+/**
+ * Implements hook_variable_info().
+ */
+function payment_checkoutfi_variable_info() {
+  // Variable declarations for return messages.
+  $variable['payment_checkoutfi_status_default'] = array(
+    'title' => t('Unknown payment'),
+    'description' => t('Used as fallback in case return status message is missing.'),
+    'type' => 'string',
+    'group' => 'payment_checkoutfi_settings',
+  );
+  $variable[PAYMENT_CHECKOUTFI_STATUS_COMPLETE] = array(
+    'title' => t('Payment complete'),
+    'description' => t('Displayed when a payment has been successfully completed.'),
+    'type' => 'string',
+    'group' => 'payment_checkoutfi_settings',
+  );
+  $variable[PAYMENT_CHECKOUTFI_STATUS_PENDING] = array(
+    'title' => t('Payment pending'),
+    'description' => t('Displayed when a payment is still pending.'),
+    'type' => 'string',
+    'group' => 'payment_checkoutfi_settings',
+  );
+  $variable[PAYMENT_CHECKOUTFI_STATUS_CANCELED_BY_USER] = array(
+    'title' => t('Payment canceled by user'),
+    'description' => t('Displayed when a payment has been canceled by the user.'),
+    'type' => 'string',
+    'group' => 'payment_checkoutfi_settings',
+  );
+  $variable[PAYMENT_CHECKOUTFI_STATUS_CANCELED_BY_SYSTEM] = array(
+    'title' => t('Payment canceled by system'),
+    'description' => t('Displayed when a payment has been canceled by the system.'),
+    'type' => 'string',
+    'group' => 'payment_checkoutfi_settings',
+  );
+  $variable[PAYMENT_CHECKOUTFI_STATUS_TIMEOUT] = array(
+    'title' => t('Payment timed out'),
+    'description' => t('Displayed when a payment has timed out.'),
+    'type' => 'string',
+    'group' => 'payment_checkoutfi_settings',
+  );
+  return $variable;
+}
+/**
+ * Implements hook_variable_group_info().
+ */
+function payment_checkoutfi_variable_group_info() {
+  $groups['payment_checkoutfi_settings'] = array(
+    'title' => t('Checkout.fi messages'),
+    'access' => 'payment.global.administer',
+    'path' => 'admin/config/services/payment/checkoutfi_messages',
+  );
+  return $groups;
+}
+
+/**
+ * Get Payment completion messages.
+ *
+ * @param int $status
+ *   Status code returned by Checkout.fi.
+ *
+ * @return string
+ *   Status message shown to user.
+ *
+ * @todo Make these editable (variable module?).
+ * @todo Move function to controller.
+ */
+function payment_checkoutfi_get_status_message($status) {
+  $status_string = CheckoutFiMethodController::getStatusMap($status);
+  if ($status_string && $message = variable_get($status_string)) {
+    return $message;
+  }
+  return variable_get('payment_checkoutfi_status_default', 'ERROR');
+}
+
+/**
+ * Helper function for HTTP requests.
+ *
+ * @param string $url
+ *   Request url.
+ * @param string $data
+ *   POST data key-value pairs.
+ * @param bool $log
+ *   Whether or not to log errors.
+ *
+ * @return object
+ *   SimpleXML object containing the response
+ *   or FALSE if request failed.
+ */
+function _payment_checkoutfi_http_request($url, $data, $log = TRUE) {
+  // Load button data.
+  $options = array(
+    'method' => 'POST',
+    'data' => http_build_query($data),
+    'timeout' => 20,
+    'headers' => array(
+      'Content-Type' => 'application/x-www-form-urlencoded',
+    ),
+  );
+
+  $response = drupal_http_request($url, $options);
+
+  // Hide errors from user.
+  libxml_use_internal_errors(TRUE);
+  $response_xml = simplexml_load_string($response->data);
+
+  // Could not load XML.
+  if (!$response_xml) {
+    // Parse and log error message(s).
+    $errors = libxml_get_errors();
+    _payment_checkoutfi_log_errors($response, $errors, $payment->pid);
+    return FALSE;
+  }
+
+  return $response_xml;
+}
+
+/**
+ * Helper function to parse and log XML errors.
+ *
+ * @param object $result
+ *   The result object of the drupal_http_request.
+ * @param array $errors
+ *   Array of libXMLError objects.
+ * @param int $pid
+ *   Id of Payment that caused the error.
+ * @param bool $return_code
+ *   Whether or not to return error code.
+ *
+ * @return string
+ *   Error message to display in gateway.
+ */
+function _payment_checkoutfi_log_errors($result, $errors, $pid, $return_code = FALSE) {
+  $error_messages = array();
+  foreach ($errors as $error) {
+    // Assuming "Extra content at end of document" is an
+    // error message returned from Checkout.fi.
+    // XML_ERR_EXTRA_CONTENT = 5.
+    if ($error->code == 5) {
+      // Attempt to parse error.
+      $pattern = '/<p>(.*?)<\/p>/';
+      preg_match_all($pattern, $result->data, $paragraphs);
+
+      // Load error messages into variables.
+      list($message, $details) = $paragraphs[1];
+
+      if ($return_code) {
+        // Extract error code from message.
+        $pattern = '/\((.*?)\)/';
+        preg_match($pattern, $message, $matches);
+        if (!empty($matches[1])) {
+          $error_code = intval($matches[1]);
+        }
+      }
+      else {
+        // Return the generic error message.
+        $error_messages[] = $message;
+      }
+      // Log error information.
+      $variables = array(
+        '@pid' => $pid,
+        '@message' => $message,
+        '@details' => $details,
+      );
+      watchdog('Checkout.fi payment', 'Error in payment #@pid: @message @details', $variables, WATCHDOG_ALERT);
+    }
+    else {
+      // Log error data.
+      $variables = array(
+        '@pid' => $pid,
+        '@level' => $error->level,
+        '@code' => $error->code,
+        '@message' => $error->message,
+      );
+      watchdog('Checkout.fi payment', 'XML error in Payment @pid: @message (Level: @level, Code: @code)', $variables, WATCHDOG_ALERT);
+      $error_messages[] = t('The payment could not be initialized.');
+    }
+  }
+
+  // Display all errors.
+  foreach ($error_messages as $error_message) {
+    $error_message = check_plain($error_message);
+    drupal_set_message($error_message, 'error');
+  }
+
+  // Return error code if set.
+  if ($return_code) {
+    return isset($error_code) ? $error_code : FALSE;
+  }
+  return FALSE;
+}

@@ -1,0 +1,164 @@
+<?php
+
+/**
+ * @file
+ * Simple LDAP SSO module.
+ */
+
+require_once 'simple_ldap_sso.inc';
+
+/**
+ * Implements hook_help().
+ */
+function simple_ldap_sso_help($path, $arg) {
+  switch ($path) {
+    case 'admin/config/people/simple_ldap/sso':
+      global $cookie_domain;
+      $t_args = array(
+        '%cookie_domain' => $cookie_domain,
+      );
+
+      $output = '<p>';
+      $output .= t('<strong>The current cookie domain is %cookie_domain.</strong>', $t_args) . ' ' .
+        t('The cookie domain must be the same for all sites for single-sign-on to work.') . ' ' .
+        t('To set the cookie domain, see your settings.php file inside of your Drupal directory.');
+      $output .= '</p>';
+      return $output;
+
+    case 'admin/help#simple_ldap_sso':
+      // TODO.
+      return '';
+  }
+}
+
+/**
+ * Implements hook_init().
+ */
+function simple_ldap_sso_init() {
+  // Check for the presence of an SSO cookie, and check it's contents against
+  // LDAP. If it doesn't validate, destroy the session by logging the user out.
+  global $user;
+  // Do nothing for anonymous users.
+  if (!user_is_logged_in()
+    // If this is user 1, do nothing.
+    || $user->uid == 1
+    // If the module isn't configured, do nothing.
+    || !simple_ldap_sso_configured()
+    // If no validation needs to occur, just return.
+    || !simple_ldap_sso_does_session_need_validation()) {
+    return;
+  }
+
+  // If we don't have a valid SSO cookie, destroy the session and return.
+  if (!simple_ldap_sso_get_cookie_data()) {
+    simple_ldap_sso_abort();
+    return;
+  }
+
+  // Do not allow any user from the current user's IP if the flood limit has
+  // been reached. Default is 3 failed attempts allowed in one hour.
+  $limit = variable_get('simple_ldap_sso_flood_limit', 3);
+  $window = variable_get('simple_ldap_sso_flood_window', 3600);
+  // Now check the flood table.
+  if ($limit != 0 && !flood_is_allowed(SIMPLE_LDAP_SSO_FLOOD, $limit, $window)) {
+    // If the flood limit has been reached, log the user out and return.
+    simple_ldap_sso_abort();
+    return;
+  }
+  // If we passed the flood check, then check LDAP.
+  if (!simple_ldap_sso_validate_ldap()) {
+    // If the LDAP check failed, log the user out and return.
+    simple_ldap_sso_abort();
+    return;
+  }
+
+  // If we got this far, the session is valid in LDAP. Mark it so.
+  simple_ldap_sso_session_is_valid();
+}
+
+/**
+ * Implements hook_menu().
+ */
+function simple_ldap_sso_menu() {
+  $items['admin/config/people/simple_ldap/sso'] = array(
+    'title' => 'Single Sign On',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('simple_ldap_sso_admin'),
+    'access arguments' => array('administer site configuration'),
+    'file' => 'simple_ldap_sso.admin.inc',
+    'type' => MENU_LOCAL_TASK,
+    'weight' => 3,
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_user_login().
+ */
+function simple_ldap_sso_user_login(array &$edit, stdClass $account) {
+  // If this is user 1, or the module isn't configured, just return.
+  if ($account->uid == 1 || !simple_ldap_sso_configured()) {
+    return;
+  }
+
+  // The session hasn't been written to the sessions table yet, so we need to
+  // wait until that occurs by registering our own shutdown function.
+  drupal_register_shutdown_function('simple_ldap_sso_login_shutdown');
+  // Set our session value that shows that the SSO cookie we're about to
+  // generate doesn't need validation.
+  simple_ldap_sso_session_is_valid();
+}
+
+/**
+ * Shutdown function.
+ *
+ * Sets the cookie with data from the sessions table, and store the session ID
+ * on LDAP.
+ */
+function simple_ldap_sso_login_shutdown() {
+  global $is_https, $user;
+
+  $column = $is_https ? 'ssid' : 'sid';
+
+  $query = db_select('sessions')
+    ->fields('sessions')
+    ->condition($column, session_id());
+  $data = $query->execute()->fetchAssoc();
+  // LDAP needs the name field to look up the user.
+  $data['name'] = $user->name;
+
+  // Clean out the session data.
+  $data['session'] = '';
+
+  $sid = $data[$column];
+
+  try {
+    // And save the session id to LDAP.
+    simple_ldap_sso_ldap_save_sid($user->name, $sid);
+    // Now set the cookie.
+    simple_ldap_sso_set_cookie($data);
+    // Log a message.
+    $message = 'SSO session created for @name.';
+    $t_args = array('@name' => $user->name);
+    watchdog('simple_ldap_sso', $message, $t_args, WATCHDOG_NOTICE);
+  }
+  catch (Exception $e) {
+    $message = 'Unable to set SSO session for user %name. Error: @e';
+    $t_args = array('%name' => $user->name, '@e' => (string) $e);
+    watchdog(__FUNCTION__, $message, $t_args, WATCHDOG_WARNING);
+  }
+}
+
+/**
+ * Implements hook_user_logout().
+ */
+function simple_ldap_sso_user_logout(stdClass $account) {
+  // If this is user 1, or the module isn't configured, just return.
+  if ($account->uid == 1 || !simple_ldap_sso_configured()) {
+    return;
+  }
+
+  simple_ldap_sso_delete_cookie();
+  simple_ldap_sso_ldap_delete_sid($account->name);
+}

@@ -1,0 +1,606 @@
+<?php
+
+define('COMMERCE_PAYPAL_EC_DEBUG_MODE', TRUE);
+define('COMMERCE_PAYPAL_EC_STATUS_REFUND', 'paypal_ec_refund');
+
+/**
+ * @file
+ * Implements PayPal Express Checkout in Drupal Commerce checkout.
+ */
+
+function commerce_paypal_ec_menu() {
+  $items = array();
+
+  $items['admin/commerce/orders/%commerce_order/payment/%commerce_payment_transaction/capture'] = array(
+    'title' => 'Capture',
+    'description' => 'Process a Payment Capture for a PayPal Authorization.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('commerce_paypal_ec_payment_transaction_operation_form', 'Capture', 3, 5),
+    'access callback' => 'commerce_paypal_ec_local_task_access',
+    'access arguments' => array(3, 'update payments'),
+    'type' => MENU_LOCAL_TASK,
+    'context' => MENU_CONTEXT_PAGE,
+    'weight' => 1,
+    'file' => 'includes/commerce_paypal_ec.admin.inc',
+  );
+
+  $items['admin/commerce/orders/%commerce_order/payment/%commerce_payment_transaction/refund'] = array(
+    'title' => 'Refund',
+    'description' => 'Process a total Payment refund for a PayPal transaction.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('commerce_paypal_ec_payment_transaction_operation_form', 'Refund', 3, 5),
+    'access callback' => 'commerce_paypal_ec_local_task_access',
+    'access arguments' => array(3, 'update payments'),
+    'type' => MENU_LOCAL_TASK,
+    'context' => MENU_CONTEXT_PAGE,
+    'weight' => 1,
+    'file' => 'includes/commerce_paypal_ec.admin.inc',
+  );
+
+  return $items;
+}
+
+/**
+ * Custom access callback for our capture and refund local tasks. This avoid
+ * that the PayPal EC local tasks get displayed in transactions that was not
+ * executed via PayPal EC. It wouldn't work and are useless.
+ */
+function commerce_paypal_ec_local_task_access($transaction, $privilege) {
+  // we want to display the item only if the transaction is of type paypal_ec
+  // otherwise it wouldn't support our custom operations that are PayPal specific
+  if (strpos($transaction->data['payment_method'], 'paypal_ec') === FALSE) {
+    return FALSE;
+  }
+  // check tha the user have enough privileges
+  return user_access($privilege);
+}
+
+/**
+ * Implements hook_block_info().
+ */
+function commerce_paypal_ec_block_info() {
+  $blocks = array();
+  $mark_measures = array('37x23', '50x34', '60x38', '180x113');
+  // central logos: https://www.paypal.com/es/cgi-bin/webscr?cmd=xpt/Marketing/general/OnlineLogoCenter-outside
+
+  foreach ($mark_measures as $mark_measure) {
+    $blocks['acceptance_mark_' . $mark_measure] = array(
+      'info' => t("Provide a PayPal Logo acceptane mark {$mark_measure} loaded src from PayPal logo center.")
+    );
+  }
+
+  return $blocks;
+}
+
+/**
+ * Implements hook_block_view()
+ */
+function commerce_paypal_ec_block_view($delta = '') {
+  $block = array('subject' => 'This site accepts PayPal');
+  // the logo measure is indicated in the last 5 chars of $delta
+  $mark_measure = substr($delta, strlen($delta)-5);
+
+  switch ($delta) {
+    case 'acceptance_mark_37x23':
+    case 'acceptance_mark_50x34':
+    case 'acceptance_mark_60x38':
+    case 'acceptance_mark_180x113':
+      $block['content'] = theme('commerce_paypal_ec_acceptance_mark', array('mark_measure' => $mark_measure));
+      break;
+  }
+
+  return $block;
+}
+
+/**
+ * Implements hook_theme()
+ */
+function commerce_paypal_ec_theme($existing, $type, $theme, $path) {
+  return array(
+    'commerce_paypal_ec_acceptance_mark' => array(
+      'variables' => array('mark_measure' => NULL),
+      'path' => drupal_get_path('module', 'commerce_paypal_ec') . '/theme',
+      'template' => 'commerce-paypal-ec-acceptance-mark',
+    ),
+  );
+}
+
+/**
+ * Implements hook_commerce_payment_method_info().
+ */
+function commerce_paypal_ec_commerce_payment_method_info() {
+  $payment_methods = array();
+
+  $icons = commerce_paypal_icons();
+  $display_title = t('!logo PayPal: Pay quickly and securely with your PayPal account or your debit or credit card.', array('!logo' => $icons['paypal']));
+  $display_title .= '<div class="commerce-paypal-icons"><span class="label">' . t('Includes:') . '</span>' . implode(' ', $icons) . '</div>';
+
+  $payment_methods['paypal_ec'] = array(
+    'base' => 'commerce_paypal_ec',
+    'title' => t('PayPal EC'),
+    'short_title' => t('PayPal'),
+    'display_title' => $display_title,
+    'description' => t('PayPal Express Checkout'),
+    'terminal' => FALSE,
+    'offsite' => TRUE,
+    'offsite_autoredirect' => TRUE,
+    'file' => 'includes/commerce_paypal_ec.inc'
+  );
+
+  return $payment_methods;
+}
+
+/**
+ * Implements hook_commerce_payment_transaction_status_info()
+ *
+ * Define a new payment_transaction status to identify the refunds.
+ */
+function commerce_paypal_ec_commerce_payment_transaction_status_info() {
+  $statuses = array();
+
+  $statuses['paypal_ec_refund'] = array(
+    'status' => 'paypal_ec_refund',
+    'title' => t('Refund'),
+    'icon' => drupal_get_path('module', 'commerce_payment') . '/theme/icon-failure.png',
+    'total' => TRUE,
+  );
+
+  return $statuses;
+}
+
+/**
+ * Convert the DoExpressCheckoutPayment response into IPN format and save the date
+ * in the IPN table.
+ *
+ * @param array $response
+ *   the response array returned by the DoExpressCheckoutPayment call and empty if error
+ */
+function commerce_paypal_ec_response_to_ipn($response) {
+  // below we have a sample response array to understand how is done he mapping
+  //[TOKEN] => EC-7NH7208737945171S
+  //[SUCCESSPAGEREDIRECTREQUESTED] => true
+  //[TIMESTAMP] => 2012-08-01T19:20:53Z
+  //[CORRELATIONID] => 401a4da07e0a4
+  //[ACK] => Success
+  //[VERSION] => 88.0
+  //[BUILD] => 3386080
+  //[INSURANCEOPTIONSELECTED] => false
+  //[SHIPPINGOPTIONISDEFAULT] => false
+  //[PAYMENTINFO_0_TRANSACTIONID] => 5D7529189T611753C
+  //[PAYMENTINFO_0_RECEIPTID] => 2187-9357-6058-7491
+  //[PAYMENTINFO_0_TRANSACTIONTYPE] => expresscheckout
+  //[PAYMENTINFO_0_PAYMENTTYPE] => instant
+  //[PAYMENTINFO_0_ORDERTIME] => 2012-08-01T19:20:31Z
+  //[PAYMENTINFO_0_AMT] => 25.50
+  //[PAYMENTINFO_0_TAXAMT] => 0.00
+  //[PAYMENTINFO_0_CURRENCYCODE] => EUR
+  //[PAYMENTINFO_0_PAYMENTSTATUS] => Pending
+  //[PAYMENTINFO_0_PENDINGREASON] => authorization
+  //[PAYMENTINFO_0_REASONCODE] => None
+  //[PAYMENTINFO_0_PROTECTIONELIGIBILITY] => PartiallyEligible
+  //[PAYMENTINFO_0_PROTECTIONELIGIBILITYTYPE] => ItemNotReceivedEligible
+  //[PAYMENTINFO_0_SECUREMERCHANTACCOUNTID] => XD64KS6PBGMW6
+  //[PAYMENTINFO_0_ERRORCODE] => 0
+  //[PAYMENTINFO_0_ACK] => Success
+  //[order_id] => 382
+
+  $required_keys = array(
+    'PAYMENTINFO_0_TRANSACTIONID',
+    'PAYMENTINFO_0_TRANSACTIONTYPE',
+    'PAYMENTINFO_0_AMT',
+    'PAYMENTINFO_0_CURRENCYCODE',
+    'PAYMENTINFO_0_PAYMENTSTATUS',
+    'PAYMENTINFO_0_PAYMENTTYPE',
+    'order_id',
+  );
+
+  // Validate that we have a valid response with the required keys to do the mapping
+  if (!_commerce_paypal_ec_validate_response_keys($required_keys, $response)) {
+    return array();
+  }
+
+  // The fee amount is not retrieved by authorization until are captured
+  $response = (array) $response + array(
+    'PAYMENTINFO_0_FEEAMT' => 0,
+  );
+
+ $ipn = array(
+    'txn_id' => $response['PAYMENTINFO_0_TRANSACTIONID'],
+    'txn_type' => $response['PAYMENTINFO_0_TRANSACTIONTYPE'],
+    // the receiver and payer email are not returned via DoExpressCheckoutPayment
+    'receiver_email' => '',
+    'payer_email' => '',
+    'mc_gross' => $response['PAYMENTINFO_0_AMT'],
+    'mc_currency' => $response['PAYMENTINFO_0_CURRENCYCODE'],
+    'mc_fee' => $response['PAYMENTINFO_0_FEEAMT'],
+    'payment_status' => $response['PAYMENTINFO_0_PAYMENTSTATUS'],
+    'payment_type' => $response['PAYMENTINFO_0_PAYMENTTYPE'],
+    // pending reason is not neccesarily defined, only for authorizations
+    'pending_reason' => isset($response['PAYMENTINFO_0_PENDINGREASON']) ? $response['PAYMENTINFO_0_PENDINGREASON'] : '',
+    'order_id' => $response['order_id'],
+  );
+
+  return $ipn;
+}
+
+/**
+ * Convert the DOCapture response into IPN format to standarize the array
+ * structure we use to process the transactions.
+ *
+ * @param array $response
+ *   the response array returned by the DoExpressCheckoutPayment call
+ */
+function commerce_paypal_ec_response_capture_to_ipn($response) {
+  // below we have a sample array response to understand how is done he mapping
+  //[AUTHORIZATIONID] => 2XK37250HF054033G
+  //[TIMESTAMP] => 2012-04-26T22:32:05Z
+  //[CORRELATIONID] => 64b9f801bc7fd
+  //[ACK] => Success
+  //[BUILD] => 2840849
+  //[TRANSACTIONID] => 4SP62657MF722500N
+  //[PARENTTRANSACTIONID] => 2XK37250HF054033G
+  //[RECEIPTID] => 0292-6201-9458-9117
+  //[TRANSACTIONTYPE] => expresscheckout
+  //[PAYMENTTYPE] => instant
+  //[ORDERTIME] => 2012-04-26T22:32:03Z
+  //[AMT] => 220.00
+  //[FEEAMT] => 8.88
+  //[TAXAMT] => 0.00
+  //[CURRENCYCODE] => USD
+  //[PAYMENTSTATUS] => Completed
+  //[PENDINGREASON] => None
+  //[REASONCODE] => None
+  //[PROTECTIONELIGIBILITY] => PartiallyEligible
+  //[PROTECTIONELIGIBILITYTYPE] => ItemNotReceivedEligible
+
+  $ipn = array(
+    'auth_id' => $response['AUTHORIZATIONID'],
+    'ipn_id' => $response['RECEIPTID'],
+    'txn_id' => $response['TRANSACTIONID'],
+    'txn_type' => $response['TRANSACTIONTYPE'],
+    'transaction_id' => $response['transaction_id'],
+    'mc_gross' => $response['AMT'],
+    'mc_currency' => $response['CURRENCYCODE'],
+    'mc_fee' => $response['FEEAMT'],
+    'payment_status' => $response['PAYMENTSTATUS'],
+    'payment_type' => $response['PAYMENTTYPE'],
+    'pending_reason' => $response['PENDINGREASON'],
+    'order_id' => $response['order_id'],
+  );
+
+  return $ipn;
+}
+
+/**
+ * Convert the RefundTransaction response into IPN format to standarize the array
+ * structure we use to process the transactions.
+ *
+ * @param array $response
+ *   the response array returned by the RefundTransaction call
+ */
+function commerce_paypal_ec_response_refund_to_ipn($response) {
+  // below we have a sample array response to understand how is done he mapping
+  //[REFUNDTRANSACTIONID] => 4NB97799PC946340G
+  //[FEEREFUNDAMT] => 5.85
+  //[GROSSREFUNDAMT] => 149.91
+  //[NETREFUNDAMT] => 144.06
+  //[CURRENCYCODE] => EUR
+  //[TOTALREFUNDEDAMOUNT] => 149.91
+  //[TIMESTAMP] => 2012-10-26T00:38:09Z
+  //[CORRELATIONID] => fd9f1bcbb416
+  //[ACK] => Success
+  //[VERSION] => 88.0
+  //[BUILD] => 4072860
+  //[REFUNDSTATUS] => Instant
+  //[PENDINGREASON] => None
+
+  $ipn = array(
+    'ipn_id' => $response['RECEIPTID'],
+    'txn_id' => $response['REFUNDTRANSACTIONID'],
+    'txn_type' => 'Refund',
+    'transaction_id' => $response['transaction_id'],
+    // reverse the amounts due is a refund
+    'mc_gross' => ($response['GROSSREFUNDAMT'] * -1),
+    'mc_currency' => $response['CURRENCYCODE'],
+    'mc_fee' => ($response['FEEREFUNDAMT'] * -1),
+    'payment_status' => 'Refunded',
+    'pending_reason' => $response['PENDINGREASON'],
+    'order_id' => $response['order_id'],
+  );
+
+  return $ipn;
+}
+
+/**
+ * Validate a API response array to ensure it has all the mandatory keys.
+ *
+ * @param array $required_keys
+ *   An array with the mandatory keys
+ * @param array $response
+ *   An array with the response to validate presence of keys
+ * @return bool $valid
+ *   return TRUE if pass validation and FALSE if not
+ */
+function _commerce_paypal_ec_validate_response_keys($required_keys, $response) {
+  foreach ($required_keys as $key) {
+    if (!isset($response[$key])) {
+      watchdog('commerce_paypal_ec', 'The PayPal EC API unexpected response not include !key', array('!key' => $key), WATCHDOG_ERROR);
+      return FALSE;
+    }
+  }
+  return TRUE;
+}
+
+/**
+ * Payment method callback: validate an IPN
+ */
+function commerce_paypal_ec_paypal_ipn_validate($order, $payment_method, $ipn) {
+  watchdog('commerce_paypal_ec', 'IPN validated for Order @order_number with ID @txn_id.', array('@order_number' => $order->order_number, '@txn_id' => $ipn['txn_id']), WATCHDOG_NOTICE);
+}
+
+/**
+ * Payment method callback: process an IPN once it's been validated.
+ */
+function commerce_paypal_ec_paypal_ipn_process($order, $payment_method, &$ipn) {
+  // Exit when we don't get a payment status we recognize.
+  if (!in_array($ipn['payment_status'], array('Failed', 'Voided', 'Pending', 'Completed', 'Refunded'))) {
+    commerce_payment_redirect_pane_previous_page($order);
+    return FALSE;
+  }
+
+  // If this is a prior authorization capture IPN for which we've already
+  // created a transaction. Consider the Pending status because when the
+  // organization PayPal account receive authorization payment that requieres
+  // the Capture but the received currency is different that the accepted by
+  // Paypal account will stay pending although we execute the Capture, so lets
+  // log that process in the payload.
+  if (in_array($ipn['payment_status'], array('Voided', 'Completed')) && !empty($ipn['auth_id'])) {
+    $transactions = commerce_payment_transaction_load_multiple(array(), array('remote_id' => $ipn['auth_id']));
+  }
+
+  if (isset($transactions)) {
+    // get the transaction to update
+    $transaction = reset($transactions);
+  }
+  else {
+    // Create a new payment transaction for the order.
+    $transaction = commerce_payment_transaction_new('paypal_ec', $order->order_id);
+    $transaction->instance_id = $payment_method['instance_id'];
+  }
+
+  $transaction->remote_id = $ipn['txn_id'];
+  $transaction->amount = commerce_currency_decimal_to_amount($ipn['mc_gross'], $ipn['mc_currency']);
+  $transaction->currency_code = $ipn['mc_currency'];
+  $transaction->payload[REQUEST_TIME] = $ipn;
+
+  // Set the transaction's statuses based on the IPN's payment_status.
+  $transaction->remote_status = $ipn['payment_status'];
+
+  // process the status
+  commerce_paypal_ec_process_status($ipn, $transaction);
+
+  // Save the transaction information.
+  commerce_payment_transaction_save($transaction);
+  $ipn['transaction_id'] = $transaction->transaction_id;
+
+  commerce_payment_redirect_pane_next_page($order);
+  watchdog('commerce_paypal_ec', 'IPN processed for Order @order_number with ID @txn_id.', array('@txn_id' => $ipn['txn_id'], '@order_number' => $order->order_number), WATCHDOG_INFO);
+}
+
+/**
+ * Process the payment status and add status & message properties to transaction
+ * object
+ */
+function commerce_paypal_ec_process_status($ipn, &$transaction) {
+  switch ($ipn['payment_status']) {
+    case 'Failed':
+      $transaction->status = COMMERCE_PAYMENT_STATUS_FAILURE;
+      $transaction->message = t("The payment has failed. This happens only if the payment was made from your customer’s bank account.");
+      break;
+
+    case 'Voided':
+      $transaction->status = COMMERCE_PAYMENT_STATUS_FAILURE;
+      $transaction->message = t('The authorization was voided.');
+      break;
+
+    case 'Pending':
+      $transaction->status = COMMERCE_PAYMENT_STATUS_PENDING;
+      $transaction->message = commerce_paypal_ipn_pending_reason($ipn['pending_reason']);
+      break;
+
+    case 'Completed':
+      $transaction->status = COMMERCE_PAYMENT_STATUS_SUCCESS;
+      $transaction->message = t('The payment has completed.');
+      break;
+
+    case 'Refunded':
+      $transaction->status = COMMERCE_PAYPAL_EC_STATUS_REFUND;
+      $transaction->message = t('Refund for transaction @txn_id', array('@txn_id' => $ipn['txn_id']));
+      break;
+  }
+}
+
+/**
+ * Function to perform the API call to PayPal using API signature
+ *
+ * @param string $methodName
+ *   the method name to invoke
+ * @param array $params
+ *   the parameters that are sent in the method call
+ * @return array $response_data
+ *   returns an associtive array containing the response from the server.
+ */
+function commerce_paypal_ec_api_call($method_name, $params = array(), $settings) {
+  $use_proxy = FALSE;
+  $api_url = commerce_paypal_ec_api_url($settings['server']);
+
+  // convert array params to query string format
+  $params_str = drupal_http_build_query($params);
+
+  // form header string
+  $authentication_str = "PWD=".urlencode($settings['api_password'])."&USER=".urlencode($settings['api_username'])."&SIGNATURE=".urlencode($settings['api_signature']);
+
+  //setting the curl parameters.
+  $ch = curl_init();
+  curl_setopt($ch, CURLOPT_URL, $api_url);
+  curl_setopt($ch, CURLOPT_VERBOSE, 1);
+
+  //turning off the server and peer verification(TrustManager Concept).
+  curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+  curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
+  curl_setopt($ch, CURLOPT_RETURNTRANSFER,1);
+  curl_setopt($ch, CURLOPT_POST, 1);
+
+  // params + signature
+  $request_str = $authentication_str . '&' . $params_str;
+
+  // Set proxy name to PROXY_HOST and port number to PROXY_PORT in constants.php
+  if($use_proxy) {
+    curl_setopt ($ch, CURLOPT_PROXY, PROXY_HOST.":".PROXY_PORT);
+  }
+
+  $request_str = "METHOD=" . urlencode($method_name) . "&VERSION=88.0&" . $request_str;
+
+  //setting the  POST FIELD to curl
+  curl_setopt($ch, CURLOPT_POSTFIELDS, $request_str);
+
+  // execute
+  $response = curl_exec($ch);
+
+  if (empty($response)) {
+    watchdog('commerce_paypal_ec', 'CURL connection with PayPal return empty response. !errors', array('!errors' => curl_error($ch)), WATCHDOG_ERROR);
+  }
+  else {
+    $info = curl_getinfo($ch);
+  }
+
+  curl_close($ch);
+
+  if (empty($info['http_code'])) {
+    watchdog('commerce_paypal_ec', 'No HTTP code was returned. !errors', array('!errors' => curl_error($ch)), WATCHDOG_ERROR);
+  }
+
+  // convert query string response to an array
+  $response_data = drupal_get_query_array($response);
+
+  // if DEBUG mode activated
+  if (COMMERCE_PAYPAL_EC_DEBUG_MODE) {
+    $debug_data = array('!request_data' => print_r($params, TRUE), '!response_data' => print_r($response_data, TRUE));
+    watchdog('commerce_paypal_ec', 'PayPal EC API call DEBUG in ' . $method_name . ' !request_data \n\n !response_data', $debug_data, WATCHDOG_DEBUG);
+  }
+
+  return $response_data;
+}
+
+/**
+ * Returns the URL to the specified PayPal ec server.
+ *
+ * @param $server
+ *   Either sandbox or live indicating which server to get the URL for.
+ *
+ * @return
+ *   The URL to use to submit requests to the PayPal ec server.
+ */
+function commerce_paypal_ec_server_url($server) {
+  // the useraction parameter indicate to the PayPal payment page to display
+  // "Pay Now" instead Continue in the submit button (once a PayPal account or
+  // Credit Card info is introduced)
+  switch ($server) {
+    case 'sandbox':
+      return 'https://www.sandbox.paypal.com/webscr&cmd=_express-checkout&useraction=commit&token=';
+    case 'live':
+      return 'https://www.paypal.com/webscr&cmd=_express-checkout&useraction=commit&token=';
+  }
+}
+
+function commerce_paypal_ec_api_url($server) {
+  switch ($server) {
+    case 'sandbox' :
+      return 'https://api-3t.sandbox.paypal.com/nvp';
+    case 'live' :
+      return 'https://api-3t.paypal.com/nvp';
+  }
+}
+
+/**
+ * Returns an array of all possible language codes.
+ */
+function commerce_paypal_ec_locale() {
+  return array(
+    'multilingual' => 'multilingual',
+    'en_AU' => 'en_AU',
+    //English Australian
+    'de' => 'de_DE',
+    //Deutchland Germany
+    'fr' => 'fr_FR',
+    //French France
+    'it' => 'it_IT',
+    //Italian Italy
+    'en_GB' => 'en_GB',
+    // English UK
+    'es' => 'es_ES',
+    //Spanish Spain
+    'en' => 'en_US',
+    //English US
+    'da_DK' => 'da_DK',
+    //Danish (for Denmark only)
+    'he_IL' => 'he_IL',
+    //Hebrew (all)
+    'id_ID' => 'id_ID',
+    //Indonesian (for Indonesia only)
+    'jp_JP' => 'jp_JP',
+    //Japanese (for Japan only)
+    'no_NO' => 'no_NO',
+    //Norwegian (for Norway only)
+    'pt_BR' => 'pt_BR',
+    //Brazilian Portuguese (for Portugal and Brazil only)
+    'ru_RU' => 'ru_RU',
+    //Russian (for Lithuania, Latvia, and Ukraine only)
+    'sv_SE' => 'sv_SE',
+    //Swedish (for Sweden only)
+    'th_TH' => 'th_TH',
+    //Thai (for Thailand only)
+    'tr_TR' => 'tr_TR',
+    //Turkish (for Turkey only)
+    'zh_CN' => 'zh_CN',
+    //Simplified Chinese (for China only)
+    'zh_HK' => 'zh_HK',
+    //Traditional Chinese (for Hong Kong only)
+    'zh_TW' => 'zh_TW',
+    //Traditional Chinese (for Taiwan only)
+  );
+}
+
+/**
+ * Return the localization country PayPal options
+ */
+function commerce_paypal_ec_countries_locale() {
+  return drupal_map_assoc(array_values(commerce_paypal_ec_locale()));
+}
+
+/**
+ * Returns an array of all possible currency codes.
+ */
+function commerce_paypal_ec_currencies() {
+  return drupal_map_assoc(array('AUD', 'BRL', 'CAD', 'CHF', 'CZK', 'DKK', 'EUR', 'GBP', 'HKD', 'HUF', 'ILS', 'JPY', 'MXN', 'MYR', 'NOK', 'NZD', 'PHP', 'PLN', 'SEK', 'SGD', 'THB', 'TWD', 'USD'));
+}
+
+/**
+ * Determine if a currency code is in the supported PayPal currencies and if not select the default.
+ */
+function _commerce_paypal_ec_lookup_currency_code($order, $payment_settings) {
+  $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+  $amount = $order_wrapper->commerce_order_total->amount->value();
+  $currency_code = $order_wrapper->commerce_order_total->currency_code->value();
+  return in_array($currency_code, array_keys(commerce_paypal_ec_currencies())) ? $currency_code : $payment_settings['currency_code'];
+}
+
+/**
+ * Format PayPal amount to 2 decimals with '.' as decimal separator
+ */
+function commerce_paypal_ec_format_amount($amount, $currency_code) {
+  // convert the amout to specified decimals in the used currency
+  $currency = commerce_currency_load($currency_code);
+  $decimal_price = commerce_currency_amount_to_decimal($amount, $currency_code);
+  return number_format($decimal_price, $currency['decimals'], '.', '');
+}

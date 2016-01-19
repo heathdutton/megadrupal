@@ -1,0 +1,286 @@
+<?php
+/**
+ * @file
+ * Control provisioning of Shibboleth authentication for new Drupal users
+ */
+
+/**
+ * Page callback for administrative settings
+ */
+function shib_provision_admin() {
+  $form = array();
+
+  $identifiers = array(
+    'mail' => t('Email'),
+    'name' => t('Username'),
+    'eppn' => t('EPPN'),
+  );
+
+  $form['shib_provision_unique_identifier'] = array(
+    '#type' => 'radios',
+    '#title' => t('Unique identifier'),
+    '#default_value' => variable_get('shib_provision_unique_identifier', 'mail'),
+    '#options' => $identifiers,
+    '#description' => t("Unique identifier from Shibboleth"),
+  );
+
+  $form['shib_provision_eppn_domain'] = array(
+    '#type' => 'textfield',
+    '#title' => t('EPPN Domain'),
+    '#default_value' => variable_get('shib_provision_eppn_domain', ''),
+    '#size' => 32,
+    '#maxlength' => 128,
+    '#description' => t("Domain to use if EPPN is selected as targeted_id"),
+    '#required' => FALSE,
+  );
+
+  return system_settings_form($form);
+}
+
+/**
+ * Implements hook_menu().
+ */
+function shib_provision_menu() {
+  $items = array();
+
+  $items['admin/config/people/shib_provision'] = array(
+    'title' => 'Shibboleth User Provisioning settings',
+    'description' => 'Settings of the Shibboleth User Provisioning module',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('shib_provision_admin'),
+    'access arguments' => array('administer shibboleth authentication'),
+    'type' => MENU_NORMAL_ITEM,
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter() for user_regsister_form().
+ */
+function shib_provision_form_user_register_form_alter(&$form, &$form_state, $form_id) {
+  $form['person']['shib_provision'] = array(
+    '#type' => 'radios',
+    '#options' => array(t('No'), t('Yes')),
+    '#title' => t('Provision Shibboleth Authentication'),
+    '#access' => user_access('administer users'),
+    '#default_value' => 1,
+    '#description' => t('Note: Shibboleth provisioning will override the password entered above.'),
+  );
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter() for user_profile_form().
+ */
+function shib_provision_form_user_profile_form_alter(&$form, &$form_state, $form_id) {
+  if ($form['#user_category'] == "account") {
+    $provisioned = shib_provision_is_provisioned($form['#user']->uid);
+
+    $form['person']['shib_provision'] = array(
+      '#type' => 'radios',
+      '#options' => array(t('No'), t('Yes')),
+      '#title' => t('Provision Shibboleth Authentication'),
+      '#access' => user_access('administer users'),
+      '#default_value' => ($provisioned ? 1 : 0),
+    );
+  }
+}
+
+/**
+ * Implements hook_user_presave().
+ */
+function shib_provision_user_presave(&$edit, $account, $category) {
+  if (isset($edit['shib_provision']) &&
+      $edit['shib_provision'] &&
+      $account->uid == 0) {
+    $random_password = user_password(32);
+    $edit['pass'] = user_hash_password($random_password);
+  }
+}
+
+/*
+ * @todo Consider error handling and reporting.
+ */
+
+/**
+ * Implements hook_user_insert().
+ */
+function shib_provision_user_insert(&$edit, $account, $category) {
+  if (isset($edit['shib_provision'])) {
+    if ($edit['shib_provision']) {
+      shib_provision_provision($edit['uid'], $edit['name'], $edit['mail']);
+    }
+    else {
+      shib_provision_deprovision($edit['uid'], $edit['name']);
+    }
+  }
+}
+
+/**
+ * Implements hook_user_update().
+ */
+function shib_provision_user_update(&$edit, $account, $category) {
+  if (isset($edit['shib_provision'])) {
+    if ($edit['shib_provision']) {
+      if (shib_provision_is_provisioned($account->uid)) {
+        shib_provision_update_provision($account->uid, $edit['name'], $edit['mail']);
+      }
+      else {
+        shib_provision_provision($account->uid, $edit['name'], $edit['mail']);
+      }
+    }
+    else {
+      shib_provision_deprovision($account->uid, $edit['name']);
+    }
+  }
+}
+
+/**
+ * Check whether account is already provisioned for Shibboleth authentication
+ */
+function shib_provision_is_provisioned($uid) {
+  $authmap_result = db_select('authmap', 'a')
+    ->fields('a')
+    ->condition('uid', $uid, '=')
+    ->condition('module', 'shib_auth', '=')
+    ->execute()
+    ->fetchAssoc();
+
+  if (!$authmap_result) {
+    return FALSE;
+  }
+
+  /*
+   * @todo: Handle inconsistent case where only one of the two records exists.
+   */
+
+  $shib_authmap_result = db_select('shib_authmap', 's')
+    ->fields('s')
+    ->condition('uid', $uid, '=')
+    ->execute()
+    ->fetchAssoc();
+
+  return ($authmap_result && $shib_authmap_result);
+}
+
+/**
+ * Generate targeted_id value based on configured unique identifier.
+ */
+function shib_provision_targeted_id($mail, $name) {
+  switch (variable_get('shib_provision_unique_identifier', 'mail')) {
+    case 'mail':
+      return $mail;
+      break;
+    case 'name':
+      return $name;
+      break;
+    case 'eppn':
+      $domain = variable_get('shib_provision_eppn_domain', '');
+      return $name . '@' . $domain;
+      break;
+  }
+}
+
+/**
+ * Provision for Shibboleth authentication via shib_auth module by
+ * creating necessary records in authmap and shib_authmap tables
+ */
+function shib_provision_provision($uid, $name, $mail) {
+  // This is currently a redundant check but removing it here would risk bugs down the line.
+  if (shib_provision_is_provisioned($uid)) {
+    return;
+  }
+
+  db_insert('authmap')
+    ->fields(array(
+      'uid'      => $uid,
+      'authname' => $name,
+      'module'   => 'shib_auth',
+    ))
+    ->execute();
+
+  db_insert('shib_authmap')
+    ->fields(array(
+      'uid'         => $uid,
+      'targeted_id' => shib_provision_targeted_id($mail, $name),
+      /* To populate idp we'd need to know the IDP strings for all allowable
+         federated users at the time of account creation. */
+      'idp'         => '',
+      'consentver'  => shib_auth_config('terms_ver'),
+      'created'     => time(),
+    ))
+    ->execute();
+
+  watchdog(
+    "shib_provision",
+    "User @name (uid=@uid) provisioned for Shibboleth authentication",
+    array('@name' => $name, '@uid' => $uid)
+  );
+}
+
+/**
+ * Update provisioning for Shibboleth authentication via shib_auth module
+ * by updating existing records in authmap and shib_authmap tables. Note
+ * that this function does not check for changes to the user object; it
+ * updates the provisioning records no matter what. This way it also makes
+ * it possible to get a user's provisioning updated in the event of
+ * configuration changes (to unique identifier or EPPN domain, for
+ * instance), simply by editing and re-saving the user.
+ */
+function shib_provision_update_provision($uid, $name, $mail) {
+  // This is currently a redundant check but removing it here would risk bugs down the line.
+  if (! shib_provision_is_provisioned($uid)) {
+    return;
+  }
+
+  db_update('authmap')
+    ->fields(array(
+      'authname' => $name,
+      'module'   => 'shib_auth',
+    ))
+    ->condition('uid', $uid, '=')
+    ->execute();
+
+  db_update('shib_authmap')
+    ->fields(array(
+      'targeted_id' => shib_provision_targeted_id($mail, $name),
+      /* To populate idp we'd need to know the IDP strings for all allowable
+         federated users at the time of account creation. */
+      'idp'         => '',
+      'consentver'  => shib_auth_config('terms_ver'),
+      'created'     => time(),
+    ))
+    ->condition('uid', $uid, '=')
+    ->execute();
+
+  watchdog(
+    "shib_provision",
+    "User @name (uid=@uid) provisioning updated for Shibboleth authentication",
+    array('@name' => $name, '@uid' => $uid)
+  );
+}
+
+/**
+ * De-provision for Shibboleth authentication via shib_auth module by
+ * by deleting necessary records in authmap and shib_authmap tables
+ */
+function shib_provision_deprovision($uid, $name) {
+  if (!shib_provision_is_provisioned($uid)) {
+    return;
+  }
+
+  $num_deleted_authmap = db_delete('authmap')
+    ->condition('uid', $uid)
+    ->condition('module', 'shib_auth')
+    ->execute();
+
+  $num_deleted_shib_authmap = db_delete('shib_authmap')
+    ->condition('uid', $uid)
+    ->execute();
+
+  watchdog(
+    "shib_provision",
+    "User @name (uid=@uid) de-provisioned for Shibboleth authentication",
+    array('@name' => $name, '@uid' => $uid)
+  );
+}

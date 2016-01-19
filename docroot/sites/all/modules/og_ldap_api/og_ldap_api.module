@@ -1,0 +1,626 @@
+<?php
+
+/**
+ * @file
+ * Provides OG integration with LDAP plugins.
+ */
+
+ //include_once 'og_ldap_api.features.inc';
+
+/**
+ * Implements hook_menu().
+ */
+function og_ldap_api_menu() {
+  $items = array();
+
+  if (module_exists('og_ui')) {
+    $items['admin/config/group/ldap-api'] = array(
+      'title' => 'OG LDAP API',
+      'description' => 'Administer OG LDAP API settings.',
+      'page callback' => 'drupal_get_form',
+      'page arguments' => array('og_ldap_api_admin_settings'),
+      'access arguments' => array('administer group'),
+      'file' => 'og_ldap_api.admin.inc',
+      'weight' => 20,
+    );
+  }
+
+  return $items;
+}
+
+// -----------------------------------------------------------------------
+// Plugin API
+
+/**
+ * Implements hook_ctools_plugin_directory().
+ */
+function og_ldap_api_ctools_plugin_directory($module, $plugin) {
+  if ($module == 'og_ldap_api') {
+    return 'plugins/' . $plugin;
+  }
+}
+
+/**
+ * Implements hook_ctools_plugin_type().
+ */
+function og_ldap_api_ctools_plugin_type() {
+  $plugins['group_server'] = array(
+    'load themes' => FALSE,
+  );
+  return $plugins;
+}
+
+/**
+ * Fetch metadata on a specific group_server plugin.
+ *
+ * @param $plugin_id
+ *   Name of the plugin.
+ *
+ * @return
+ *   An array with information about the requested plugin.
+ */
+function og_ldap_api_group_server_plugin($plugin_id) {
+  ctools_include('plugins');
+  return ctools_get_plugins('og_ldap_api', 'group_server', $plugin_id);
+}
+
+/**
+ * Fetch metadata for all group_server plugins.
+ *
+ * @return
+ *   An array of arrays with information about all available plugins.
+ */
+function og_ldap_api_group_server_plugins() {
+  ctools_include('plugins');
+  $plugins = ctools_get_plugins('og_ldap_api', 'group_server');
+  uasort($plugins, 'ctools_plugin_sort');
+  return $plugins;
+}
+
+/**
+ * Get the list of group_server plugins in a format suitable for #options.
+ */
+function og_ldap_api_group_server_plugins_options() {
+  $options = array();
+  foreach (og_ldap_api_group_server_plugins() as $type => $info) {
+    $options[$type] = t('@title', array('@title' => $info['title']));
+  }
+  return $options;
+}
+
+/**
+ * Invoke a group_server plugin callback function
+ *
+ * @param $plugin_id
+ *   The ctools plugin id
+ * @params $callback
+ *   The plugin callback
+ * @param $args
+ *   Any number of arguments to pass to the callback
+ *
+ * @return
+ *   The result of the callback if it exists
+ */
+function og_ldap_api_group_server_plugin_invoke($plugin_id, $callback) {
+  ctools_include('plugins');
+  $function = ctools_plugin_load_function('og_ldap_api', 'group_server', $plugin_id, $callback);
+  if (!empty($function)) {
+    $args = func_get_args();
+    unset($args[0], $args[1]);
+    return call_user_func_array($function, $args);
+  }
+}
+
+
+// -----------------------------------------------------------------------
+// Global Settings
+
+/**
+ * Returns an array of available membership operations for an options list
+ */
+function og_ldap_api_membership_operations_options() {
+  return array(
+    'grant' => t('Grant'),
+    'revoke' => t('Revoke'),
+  );
+}
+
+
+// -----------------------------------------------------------------------
+// Field handling
+
+/**
+ * Returns an array of field names keyed by og role name
+ */
+function _og_ldap_api_group_role_dn_fields($role_name = NULL) {
+/** @todo: eventually might need field collections with role name and dn **/
+  $fields = array(
+    OG_AUTHENTICATED_ROLE => 'og_ldap_api_members',
+    OG_ADMINISTRATOR_ROLE => 'og_ldap_api_admins',
+  );
+
+  if (isset($role_name)) {
+    return isset($fields[$role_name]) ? $fields[$role_name] : NULL;
+  }
+
+  return $fields;
+}
+
+/**
+ * Implements hook_field_access()
+ * - Control access to ldap fields with same permission as "admin/config/people/ldap"
+ */
+function og_ldap_api_field_access($op, $field, $entity_type, $entity, $account) {
+  // Detect fields added by this feature
+  if (strpos($field['field_name'], 'og_ldap_api_') !== FALSE) {
+    return user_access('administer site configuration', $account);
+  }
+}
+
+
+// -----------------------------------------------------------------------
+// Entity property callbacks
+
+/**
+ * Node properties getter callback
+ */
+function og_ldap_api_node_property_get($entity, array $options, $name) {
+  $entity_wrapper = entity_metadata_wrapper('node', $entity);
+  $ldap_fields = _og_ldap_api_group_role_dn_fields();
+
+  // Exit if not a group
+  if (!og_is_group($entity_wrapper->type(), $entity_wrapper->getIdentifier())) {
+    return;
+  }
+
+  switch ($name) {
+    case 'ogldapIsLDAPCapable':
+      if (!empty($ldap_fields)) {
+        foreach ($ldap_fields as $role_name => $field_name) {
+          if (isset($entity_wrapper->{$field_name})) {
+            return TRUE;
+          }
+        }
+      }
+      return FALSE;
+
+    case 'ogldapIsLDAPEnabled':
+      if (!empty($ldap_fields)) {
+        foreach ($ldap_fields as $role_name => $field_name) {
+          if (isset($entity_wrapper->{$field_name}) && $entity_wrapper->{$field_name}->value()) {
+            return TRUE;
+          }
+        }
+      }
+      return FALSE;
+
+    case 'ogldapIsLDAPWritable':
+      if ($entity_wrapper->ogldapIsLDAPEnabled->value()) {
+        $server_plugin = variable_get('og_ldap_api_default_group_server_plugin', '');
+        if ($server_plugin) {
+          $ops_allowed = variable_get('og_ldap_api_allowed_ldap_membership_ops', array());
+          return !empty($ops_allowed);
+        }
+      }
+      return FALSE;
+  }
+}
+
+
+// -----------------------------------------------------------------------
+// Group membership handling
+
+/**
+ * Implements hook_og_membership_insert()
+ */
+function og_ldap_api_og_membership_insert(OgMembership $og_membership) {
+  if (!og_ldap_api_og_membership_ldap_access('write', $og_membership)) {
+    return;
+  }
+
+  // Only insert active memberships
+  if (!isset($og_membership->state) || $og_membership->state != OG_STATE_ACTIVE) {
+    return;
+  }
+
+  // Update LDAP
+  $role_name = OG_AUTHENTICATED_ROLE;
+  _og_ldap_api_update_ldap_group_memberships('grant', $og_membership->group_type, $og_membership->gid, $og_membership->etid, $role_name);
+}
+
+/**
+ * Implements hook_og_membership_update()
+ */
+function og_ldap_api_og_membership_update(OgMembership $og_membership) {
+  if (!og_ldap_api_og_membership_ldap_access('write', $og_membership)) {
+    return;
+  }
+
+
+  // Update LDAP
+  $role_name = OG_AUTHENTICATED_ROLE;
+/** @todo check if active && was not active, write grant **/
+/** @todo check if !active && was active, write revoke  **/
+/** @todo should this trigger for all user roles? ***/
+}
+
+/**
+ * Implements hook_entity_delete()
+ */
+function og_ldap_api_entity_delete($entity, $entity_type) {
+  list($entity_id, , $bundle_name) = entity_extract_ids($entity_type, $entity);
+  if (empty($bundle_name)) {
+    return;
+  }
+
+  // Check if entity bundle is in the exclusions list
+  $setting = variable_get('og_ldap_api_revoke_entity_delete_exclusions', array());
+  $setting_key = $entity_type . '::' . $bundle_name;
+  if (empty($setting) || !in_array($setting_key, $setting)) {
+    return;
+  }
+
+  // Set cache to exlude membership revoke
+  _og_ldap_api_set_revoke_exclusions_request_cache($entity_type, $entity);
+}
+
+
+/**
+ * Get the static cache per request for entity delete hook calls
+ *
+ * @param $entity_type
+ *  The entity type
+ * @param $entity
+ *  The entity object
+ *
+ * @return
+ *  The cache array if no arguments are provided
+ */
+function _og_ldap_api_get_revoke_exclusions_request_cache($entity_type = NULL, $entity = NULL) {
+  $cache = &drupal_static('_og_ldap_api_set_revoke_exclusions_request_cache', array());
+
+  if (!isset($entity_type) || !isset($entity)) {
+    return $cache;
+  }
+
+  list($entity_id, , $bundle_name) = entity_extract_ids($entity_type, $entity);
+  $cid = $entity_type . '::' . $entity_id;
+  return in_array($cid, $cache) ? $cid : NULL;
+}
+
+/**
+ * Sets static cache per request for entity delete hook calls
+ *
+ * @param $entity_type
+ *  The entity type
+ * @param $entity
+ *  The entity object
+ *
+ * @return
+ *  The cache array if no arguments are provided
+ */
+function _og_ldap_api_set_revoke_exclusions_request_cache($entity_type, $entity) {
+  $queue_limit = 10;
+  $cache = &drupal_static(__FUNCTION__, array());
+
+  if (!isset($entity_type) || !isset($entity)) {
+    return;
+  }
+
+  list($entity_id, , $bundle_name) = entity_extract_ids($entity_type, $entity);
+  if (empty($entity_id)) {
+    return;
+  }
+
+  // Build cache id
+  $cid = $entity_type . '::' . $entity_id;
+
+  // Ensure compact queue
+  $existing_key = array_search($cid, $cache);
+  if ($existing_key !== FALSE) {
+    unset($cache[$existing_key]);
+  }
+
+  // Add to queue
+  array_unshift($cache, $cid);
+
+  // De-queue
+  if (count($cache) > $queue_limit) {
+    array_pop($cache);
+  }
+}
+
+/**
+ * Implements hook_og_membership_delete()
+ */
+function og_ldap_api_og_membership_delete(OgMembership $og_membership) {
+  if (!og_ldap_api_og_membership_ldap_access('write', $og_membership)) {
+    return;
+  }
+
+  // Update LDAP for all controlled roles since og_get_user_roles() is not
+  // accurate since membership has been deleted already
+  foreach (_og_ldap_api_group_role_dn_fields() as $role_name => $field_name) {
+    _og_ldap_api_update_ldap_group_memberships('revoke', $og_membership->group_type, $og_membership->gid, $og_membership->etid, $role_name);
+  }
+}
+
+/**
+ * Implements hook_og_role_grant()
+ */
+function og_ldap_api_og_role_grant($entity_type, $gid, $uid, $rid) {
+  if (!og_ldap_api_og_group_ldap_access('write', $entity_type, $gid)) {
+    return;
+  }
+
+  // Resolve role name
+  $role = og_role_load($rid);
+
+  // Exit if no role name or role is authenticated
+  // - Authenticatd is auto controlled by OG, so og_ldap_api will grant on membership insert
+  if (empty($role) || empty($role->name) || $role->name == OG_AUTHENTICATED_ROLE) {
+    return;
+  }
+
+  // Update LDAP
+  _og_ldap_api_update_ldap_group_memberships('grant', $entity_type, $gid, $uid, $role->name);
+}
+
+/**
+ * Implements hook_og_role_revoke()
+ */
+function og_ldap_api_og_role_revoke($entity_type, $gid, $uid, $rid) {
+  if (!og_ldap_api_og_group_ldap_access('write', $entity_type, $gid)) {
+    return;
+  }
+
+  // Resolve role name
+  $role = og_role_load($rid);
+
+  // Exit if no role name or role is authenticated
+  // - Authenticatd is auto controlled by OG, so og_ldap_api will grant on membership delete
+  if (empty($role) || empty($role->name) || $role->name == OG_AUTHENTICATED_ROLE) {
+    return;
+  }
+
+  // Update LDAP
+  _og_ldap_api_update_ldap_group_memberships('revoke', $entity_type, $gid, $uid, $role->name);
+}
+
+/**
+ * Returns TRUE if the group has LDAP access
+ *
+ * @param $op
+ *   The operation to perform on the membership: read, write
+ */
+function og_ldap_api_og_group_ldap_access($op, $group_type, $gid) {
+  // Wrap the group
+  $group_wrapper = entity_metadata_wrapper($group_type, $gid);
+
+  // Exit if not a targeted entity type or not enabled
+  if (!isset($group_wrapper->ogldapIsLDAPEnabled) || !$group_wrapper->ogldapIsLDAPEnabled->value()) {
+    return FALSE;
+  }
+
+  // Check write access
+  if ($op == 'write') {
+    return isset($group_wrapper->ogldapIsLDAPWritable) && $group_wrapper->ogldapIsLDAPWritable->value();
+  }
+
+  // Default to allow for read access
+  return TRUE;
+}
+
+/**
+ * Returns TRUE if the membership has LDAP access
+ *
+ * @param $op
+ *   The operation to perform on the membership: read, write
+ */
+function og_ldap_api_og_membership_ldap_access($op, OgMembership $og_membership) {
+  // DENY if not associating with a user
+  if (empty($og_membership->entity_type) || $og_membership->entity_type != 'user' || empty($og_membership->etid)) {
+    return FALSE;
+  }
+
+  // DENY if no group
+  if (empty($og_membership->group_type) || empty($og_membership->gid)) {
+    return FALSE;
+  }
+
+  // Return group access
+  return og_ldap_api_og_group_ldap_access($op, $og_membership->group_type, $og_membership->gid);
+}
+
+/**
+ * Update LDAP server with group membership changes
+ */
+function _og_ldap_api_update_ldap_group_memberships($op, $group_type, $gid, $uid, $role_name) {
+  $group_server_plugin = variable_get('og_ldap_api_default_group_server_plugin', '');
+  if (empty($group_server_plugin)) {
+    return;
+  }
+
+  // Exit if operation is not allowed
+  $ops_allowed = variable_get('og_ldap_api_allowed_ldap_membership_ops', array());
+  if (empty($ops_allowed) || !in_array($op, $ops_allowed)) {
+    return;
+  }
+
+  // Exit if no LDAP dn for role
+  $ldap_dn_field = _og_ldap_api_group_role_dn_fields($role_name);
+  if (empty($ldap_dn_field)) {
+    return;
+  }
+
+  // Load user account
+  $account = user_load($uid);
+  if (empty($account)) {
+    return;
+  }
+
+  // Exit if user is excluded by revoke settings
+  if ($op == 'revoke' && _og_ldap_api_get_revoke_exclusions_request_cache('user', $account)) {
+    return;
+  }
+
+  // Wrap the group
+  $group_wrapper = entity_metadata_wrapper($group_type, $gid);
+  if (!isset($group_wrapper->{$ldap_dn_field})) {
+    return;
+  }
+
+  // Exit if group is excluded by revoke settings
+  if ($op == 'revoke' && _og_ldap_api_get_revoke_exclusions_request_cache($group_type, $group_wrapper->value())) {
+    return;
+  }
+
+  // Get the field items
+  $group_ldap_dn_values = $group_wrapper->{$ldap_dn_field}->value();
+  if (empty($group_ldap_dn_values)) {
+    return;
+  }
+
+  // Process field values to an array
+  if (!is_array($group_ldap_dn_values)) {
+    if (!is_scalar($group_ldap_dn_values)) {
+      return;
+    }
+
+    $group_ldap_dn_values = array($group_ldap_dn_values);
+  }
+
+  // Build callback context
+  $context = array(
+    'group_type' => $group_type,
+    'group' => clone($group_wrapper->value()),
+    'account' => $account,
+    'og_role_name' => $role_name,
+  );
+
+  // Invoke plugin callback for results
+  $results = array();
+  try {
+    $results = og_ldap_api_group_server_plugin_invoke($group_server_plugin, 'update membership callback', $op, $group_ldap_dn_values, $account, $context);
+  }
+  catch (Exception $e) {
+    watchdog('og_ldap_api', 'An error occurred while updating LDAP membership for user %uid with role %role in group %gid. LDAP DN: %group_ldap_dns', array(
+      '%uid' => $account->uid,
+      '%gid' => $gid,
+      '%group_ldap_dns' => implode(', ', $group_ldap_dn_values),
+      '%role' => $role_name,
+    ), WATCHDOG_NOTICE);
+    return;
+  }
+
+  $result_sum = 0;
+  if (!empty($results) && is_array($results)) {
+    $result_sum = array_sum($results);
+  }
+/** return from callback is array of success / fail ***/
+/** @todo: better success/error reporting ****/
+  return $result_sum == count($group_ldap_dn_values);
+}
+
+
+// -----------------------------------------------------------------------
+// Queries
+
+/**
+ * Returns an array of all ldap group field values
+ *
+ * @return
+ *   An array keyed by entity type, group role, ldap dn
+ */
+function _og_ldap_api_get_all_ldap_groups() {
+  $group_bundles = og_get_all_group_bundle();
+  if (empty($group_bundles)) {
+    return array();
+  }
+
+  // Get dn fields
+  $fields = _og_ldap_api_group_role_dn_fields();
+  if (empty($fields)) {
+    return array();
+  }
+
+/** @todo probably a more performant way of doing this ****/
+  $all_groups = array();
+
+  // Process each entity_type separately to avoid bundle name collisions
+  foreach ($group_bundles as $entity_type => $bundles) {
+    $bundle_names = array_keys($bundles);
+
+    // build and execute field queries
+    foreach ($fields as $role_name => $field_name) {
+      if (!field_info_field($field_name)) {
+        continue;
+      }
+      $query = new EntityFieldQuery();
+      $query
+        ->entityCondition('entity_type', $entity_type)
+        ->entityCondition('bundle', $bundle_names)
+        ->addTag('DANGEROUS_ACCESS_CHECK_OPT_OUT');
+        $query->fieldCondition($field_name, 'dn', 'NULL', 'IS NOT NULL');
+
+      // Exclude ids that are already flagged to be updated
+      if (!empty($all_groups[$entity_type])) {
+        $query->entityCondition('entity_id', array_keys($all_groups[$entity_type]), 'NOT IN');
+      }
+
+      // Execute query
+      $results = $query->execute();
+
+      // Process results
+      if (!empty($results)) {
+        foreach ($results as $result_entity_type => $entity_stubs) {
+          if (!isset($all_groups[$result_entity_type])) {
+            $all_groups[$result_entity_type] = $entity_stubs;
+          }
+          else {
+            $all_groups[$result_entity_type] += $entity_stubs;
+          }
+        }
+      }
+    }
+  }
+
+  return $all_groups;
+}
+
+
+// -----------------------------------------------------------------------
+// Helpers
+
+/**
+ * Returns an array of all og role names
+ */
+function og_ldap_api_get_all_og_roles() {
+  $roles = array();
+  $group_bundles = og_get_all_group_bundle();
+  foreach ($group_bundles as $entity_type => $bundles) {
+    foreach ($bundles as $bundle_name => $bundle_label) {
+      $bundle_roles = og_roles($entity_type, $bundle_name);
+      if (!empty($bundle_roles)) {
+        $roles += array_flip($bundle_roles);
+      }
+    }
+  }
+
+  if (!empty($roles)) {
+    $roles = array_keys($roles);
+  }
+  else {
+    $roles = og_get_default_roles();
+  }
+
+  return $roles;
+}
+
+/**
+ * Returns an array of all og role names suitable for an options list
+ */
+function og_ldap_api_og_roles_options_list() {
+  $roles = og_ldap_api_get_all_og_roles();
+  return array_combine($roles, array_map('check_plain', $roles));
+}

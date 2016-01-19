@@ -1,0 +1,236 @@
+<?php
+/**
+ * @file
+ * Commerce Search module integrates Drupal Commerce and Drupal core's
+ * search.module to expose products as a search option alongside "Node" and
+ * "User" in the search settings form and search results.
+ */
+
+/**
+ * Implements hook_search_info().
+ */
+function commerce_search_search_info() {
+  return array(
+    'title' => 'Products',
+    'path' => 'product',
+  );
+}
+
+/**
+ * Implements hook_search_status().
+ */
+function commerce_search_search_status() {
+  $return = array(
+    'total' => 'SELECT COUNT(*) FROM {commerce_product} WHERE status = 1',
+    'remaining' => "SELECT COUNT(*)
+      FROM {commerce_product} p
+      LEFT JOIN {search_dataset} d
+        ON d.type = 'commerce_product'
+        AND d.sid = p.product_id
+      WHERE
+        p.status = 1
+        AND (
+          d.sid IS NULL
+          OR d.reindex <> 0
+        )",
+  );
+  foreach ($return as $key => $sql) {
+    $return[$key] = db_query($sql)->fetchField();
+  }
+  return $return;
+}
+
+/**
+ * Implements hook_search_reset().
+ */
+function commerce_search_search_reset() {
+  db_update('search_dataset')
+    ->fields(array('reindex' => REQUEST_TIME))
+    ->condition('type', 'commerce_product')
+    ->execute();
+}
+
+/**
+ * Implements hook_ENTITYTYPE_update().
+ */
+function commerce_search_commerce_product_update($product) {
+  db_update('search_dataset')
+    ->fields(array('reindex' => REQUEST_TIME))
+    ->condition('type', 'commerce_product')
+    ->condition('sid', $product->product_id)
+    ->execute();
+}
+
+/**
+ * Implements hook_ENTITYTYPE_delete().
+ */
+function commerce_search_commerce_product_delete($product) {
+  search_reindex($product->product_id, 'commerce_product');
+}
+
+/**
+ * Implements hook_search_admin().
+ */
+function commerce_search_search_admin() {
+  $form = array();
+
+  $form['commerce_product'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Commerce product'),
+  );
+
+  $form['commerce_product']['commerce_search_sku_separator'] = array(
+    '#type' => 'textfield',
+    '#default_value' => variable_get('commerce_search_sku_separator', '-'),
+    '#title' => t('SKU separator'),
+    '#description' => t('Character used to separate parts of SKUs.  Leave blank to disable the indexing of parts of the SKU.  (The whole SKU will still be indexed if it is part of the Search Index view mode.)'),
+    '#size' => 10,
+    '#maxlength' => 63,
+  );
+
+  return $form;
+}
+
+/**
+ * Implements hook_update_index().
+ */
+function commerce_search_update_index() {
+  $limit = (int)variable_get('search_cron_limit', 100);
+
+  // Based on node_update_index().
+  $sql = "SELECT p.product_id
+    FROM {commerce_product} p
+    LEFT JOIN {search_dataset} d ON
+      d.type = 'commerce_product'
+      AND d.sid = p.product_id
+    WHERE d.sid IS NULL OR d.reindex <> 0
+    ORDER BY d.reindex ASC, p.product_id ASC";
+
+  $results = db_query_range($sql, 0, $limit, array(), array('target' => 'slave'));
+
+  // Load then index each product (instead of loading all at once) so that
+  // nothing is lost if indexing times out.
+  foreach ($results as $row) {
+    $product = commerce_product_load($row->product_id);
+    $text = module_invoke_all('commerce_search_index_product', $product);
+    search_index($row->product_id, 'commerce_product', implode(' ', $text));
+
+    // Debug.
+    // return;
+  }
+}
+
+/**
+ * Implements hook_commerce_search_index_product().
+ */
+function commerce_search_commerce_search_index_product($product) {
+  $view_mode = 'node_search_index';
+
+  // Include the SKU components as separate keywords.
+  $separator = variable_get('commerce_search_sku_separator', '-');
+  $keywords = empty($separator) ? array() : explode($separator, $product->sku);
+
+  // Render the product, not as a node.
+  // @todo Use commerce_product_view() instead of entity_view().
+  // @see https://drupal.org/node/2118111
+  // $renderable = commerce_product_view($product, $view_mode);
+  $renderable = entity_view('commerce_product', array($product), $view_mode);
+  $keywords[] = drupal_render($renderable);
+
+  return $keywords;
+}
+
+/**
+ * Implements hook_search_execute().
+ */
+function commerce_search_search_execute($keys = NULL, $conditions = NULL) {
+  $query = db_select('search_index', 'i', array('target' => 'slave'))
+    ->extend('SearchQuery')
+    ->extend('PagerDefault');
+  $query->join('commerce_product', 'p', 'p.product_id = i.sid');
+  $query
+    ->condition('p.status', 1)
+    ->searchExpression($keys, 'commerce_product');
+
+  // @todo Work out what these do.
+  // Insert special keywords.
+  // $query->setOption('type', 'p.type');
+  // $query->setOption('language', 'p.language');
+  // $query->setOption('sku', 'p.sku');
+  // if ($query->setOption('term', 'ti.tid')) {
+  //   $query->join('taxonomy_index', 'ti', 'n.nid = ti.nid');
+  // }
+
+  // Only continue if the first pass query matches.
+  if (!$query->executeFirstPass()) {
+    return array();
+  }
+
+  $types = commerce_product_ui_commerce_product_type_info();
+
+  $results = array();
+
+  // @todo Does 10 need to be hard coded?
+  // node_search_execute() and hook_search_execute() both do it, but do not
+  // document why.
+  foreach ($query->limit(10)->execute() as $item) {
+    $product = commerce_product_load($item->sid);
+
+    // @todo Use commerce_product_view() instead of entity_view().
+    // @see https://drupal.org/node/2118111
+    // $renderable = commerce_product_view($product, 'node_search_result');
+    $renderable = entity_view('commerce_product', array($product), 'node_search_result');
+    $rendered = drupal_render($renderable);
+
+    // @todo This never returns a path.  Link to product-display node?
+    $link = commerce_product_uri($product);
+    if (empty($link) && commerce_product_access('view', $product)) {
+      $link = 'admin/commerce/products/' . $product->product_id;
+    }
+
+    $results[] = array(
+      'product' => $product,
+      'renderable' => $renderable,
+      'rendered' => $rendered,
+      'title' => $product->title,
+      'date' => $product->changed,
+      'type' => $types[$product->type]['name'],
+      'link' => $link,
+      'user' => theme('username', array('account' => user_load($product->uid))),
+      'extra' => module_invoke_all('commerce_product_search_result', $product),
+      'score' => $item->calculated_score,
+      'snippet' => search_excerpt($keys, $rendered),
+    );
+  }
+
+  return $results;
+}
+
+/**
+ * Implements hook_commerce_product_search_result().
+ */
+function commerce_search_commerce_product_search_result($product) {
+  $types = commerce_product_ui_commerce_product_type_info();
+  return array('type' => check_plain($types[$product->type]['name']));
+}
+
+/**
+ * Implements hook_field_display_ENTITY_TYPE_alter().
+ *
+ * @see node_field_display_node_alter()
+ */
+function commerce_search_field_display_commerce_product_alter(&$display, $context) {
+  // Hide field labels in search index.
+  if ($context['view_mode'] == 'node_search_index') {
+    $display['label'] = 'hidden';
+  }
+}
+
+/**
+ * Implements hook_views_api().
+ */
+function commerce_search_views_api() {
+  return array(
+    'api' => 3,
+  );
+}

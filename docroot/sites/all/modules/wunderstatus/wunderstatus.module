@@ -1,0 +1,347 @@
+<?php
+
+/**
+ * @file
+ * Main module file for SendGrid Integration.
+ *
+ * Provides module configuration and help functionality.
+ */
+
+
+/**
+ * Implements hook_menu().
+ */
+function wunderstatus_menu() {
+  $items = array();
+
+  $items['admin/config/system/wunderstatus'] = array(
+    'title' => 'Wunderstatus settings',
+    'description' => 'Wunderstatus settings',
+    'page callback' =>'drupal_get_form',
+    'page arguments' => array('wunderstatus_admin'),
+    'access callback' => 'user_access',
+    'access arguments' => array('administer wunderstatus settings'),
+  );
+  $items['wunderstatus/renew/%'] = array(
+    'title' => t('Update status'),
+    'description' => 'Refresh information',
+    'page callback' => 'wunderstatus_refresh_requested',
+    'page arguments' => array(2),
+    'access callback' => TRUE,
+    'type' => MENU_IS_LOCAL_ACTION,
+  );
+
+  return $items;
+}
+
+/**
+ * Server has requested update.
+ * @param $key Partial authentication key
+ */
+function wunderstatus_refresh_requested($key) {
+  if (mb_substr(variable_get('wunderstatus_key', ''), 0, 8) != $key) {
+    return;
+  }
+  _wunderstatus_sendmoduleinfo();
+  print drupal_json_encode(array('success' => TRUE));
+}
+
+/**
+ * Implements hook_permissions().
+ */
+function wunderstatus_permission() {
+  return array(
+    'administer wunderstatus settings' => array(
+      'title' => t('Administer Wunderstatus settings'),
+      'description' => t('Configure Wunderstatus options like authentication key'),
+    ),
+  );
+}
+
+/**
+ * Provides Settings Form.
+ */
+function wunderstatus_admin() {
+  $form = array();
+
+  $form['authentication'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Authentication'),
+  );
+
+  $form['authentication']['wunderstatus_key'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Wunderstatus Site Key'),
+    '#description' => t('Site key used for authentication'),
+    '#required' => TRUE,
+    '#default_value' => variable_get('wunderstatus_key', ''),
+  );
+
+  return system_settings_form($form);
+}
+
+/**
+ * Implements hook_cron().
+ */
+function wunderstatus_cron() {
+  // Send information of currently installed modules to service.
+  _wunderstatus_sendmoduleinfo();
+}
+
+/**
+ * Function sending the information.
+ */
+function _wunderstatus_sendmoduleinfo() {
+  module_load_include('inc', 'update', 'update.compare');
+
+  $projects = wunderstatus_get_projects();
+
+  $data = array(
+    'key' => variable_get('wunderstatus_key', ''),
+    'projects' => $projects,
+  );
+
+  // Options for drupal_http_request.
+  $options = array(
+    'method' => 'POST',
+    'data' => drupal_json_encode($data),
+    'timeout' => 30,
+    'headers' => array(
+      'Content-Type' => 'application/json',
+    ),
+  );
+
+  $host = variable_get('wunderstatus_host', 'https://wunderstatus.com') . "/api/projectsinfo";
+  $result = drupal_http_request($host, $options);
+
+  watchdog('Wunderstatus', 'Module list sent.', array(), WATCHDOG_NOTICE, $link = NULL);
+}
+
+/**
+ * Fetches an array of installed and enabled projects.
+ *
+ * This is only responsible for generating an array of projects (taking into
+ * account projects that include more than one module or theme). Other
+ * information like the specific version and install type (official release,
+ * dev snapshot, etc) is handled later in update_process_project_info() since
+ * that logic is only required when preparing the status report, not for
+ * fetching the available release data.
+ *
+ * This array is fairly expensive to construct, since it involves a lot of disk
+ * I/O, so we cache the results into the {cache_update} table using the
+ * 'update_project_projects' cache ID. However, since this is not the data about
+ * available updates fetched from the network, it is acceptable to invalidate it
+ * somewhat quickly. If we keep this data for very long, site administrators are
+ * more likely to see incorrect results if they upgrade to a newer version of a
+ * module or theme but do not visit certain pages that automatically clear this
+ * cache.
+ *
+ * @return
+ *   An associative array of currently enabled projects keyed by the
+ *   machine-readable project short name. Each project contains:
+ *   - name: The machine-readable project short name.
+ *   - info: An array with values from the main .info file for this project.
+ *     - name: The human-readable name of the project.
+ *     - package: The package that the project is grouped under.
+ *     - version: The version of the project.
+ *     - project: The Drupal.org project name.
+ *     - datestamp: The date stamp of the project's main .info file.
+ *     - _info_file_ctime: The maximum file change time for all of the .info
+ *       files included in this project.
+ *   - datestamp: The date stamp when the project was released, if known.
+ *   - includes: An associative array containing all projects included with this
+ *     project, keyed by the machine-readable short name with the human-readable
+ *     name as value.
+ *   - project_type: The type of project. Allowed values are 'module' and
+ *     'theme'.
+ *   - project_status: This indicates if the project is enabled and will always
+ *     be TRUE, as the function only returns enabled projects.
+ *   - sub_themes: If the project is a theme it contains an associative array of
+ *     all sub-themes.
+ *   - base_themes: If the project is a theme it contains an associative array
+ *     of all base-themes.
+ *
+ * @see update_process_project_info()
+ * @see update_calculate_project_data()
+ * @see update_project_cache()
+ */
+function wunderstatus_get_projects() {
+  $projects = &drupal_static(__FUNCTION__, array());
+  if (empty($projects)) {
+    // Retrieve the projects from cache, if present.
+    $projects = array();
+
+    $module_data = system_rebuild_module_data();
+    $theme_data = system_rebuild_theme_data();
+    _wunderstatus_process_info_list($projects, $module_data, 'module', TRUE);
+    _update_process_info_list($projects, $theme_data, 'theme', TRUE);
+    if (variable_get('wunderstatus_check_disabled', FALSE)) {
+      _wunderstatus_process_info_list($projects, $module_data, 'module', FALSE);
+      _wunderstatus_process_info_list($projects, $theme_data, 'theme', FALSE);
+    }
+    // Allow other modules to alter projects before fetching and comparing.
+    drupal_alter('update_projects', $projects);
+
+  }
+  return $projects;
+}
+
+
+/**
+ * Populates an array of project data.
+ *
+ * This iterates over a list of the installed modules or themes and groups them
+ * by project and status. A few parts of this function assume that enabled
+ * modules and themes are always processed first, and if disabled modules or
+ * themes are being processed (there is a setting to control if disabled code
+ * should be included or not in the 'Available updates' report), those are only
+ * processed after $projects has been populated with information about the
+ * enabled code. Modules and themes set as hidden are always ignored. This
+ * function also records the latest change time on the .info files for each
+ * module or theme, which is important data which is used when deciding if the
+ * cached available update data should be invalidated.
+ *
+ * @param $projects
+ *   Reference to the array of project data of what's installed on this site.
+ * @param $list
+ *   Array of data to process to add the relevant info to the $projects array.
+ * @param $project_type
+ *   The kind of data in the list. Can be 'module' or 'theme'.
+ * @param $status
+ *   Boolean that controls what status (enabled or disabled) to process out of
+ *   the $list and add to the $projects array.
+ *
+ * @see wunderstatus_get_projects()
+ */
+function _wunderstatus_process_info_list(&$projects, $list, $project_type, $status) {
+  foreach ($list as $file) {
+    // A disabled base theme of an enabled sub-theme still has all of its code
+    // run by the sub-theme, so we include it in our "enabled" projects list.
+    if ($status && !$file->status && !empty($file->sub_themes)) {
+      foreach ($file->sub_themes as $key => $name) {
+        // Build a list of enabled sub-themes.
+        if ($list[$key]->status) {
+          $file->enabled_sub_themes[$key] = $name;
+        }
+      }
+      // If there are no enabled subthemes, we should ignore this base theme
+      // for the enabled case. If the site is trying to display disabled
+      // themes, we'll catch it then.
+      if (empty($file->enabled_sub_themes)) {
+        continue;
+      }
+    }
+    // Otherwise, just add projects of the proper status to our list.
+    elseif ($file->status != $status) {
+      continue;
+    }
+
+    // Skip if the .info file is broken.
+    if (empty($file->info)) {
+      continue;
+    }
+
+    // Skip if it's a hidden module or theme.
+    if (!empty($file->info['hidden'])) {
+      continue;
+    }
+
+    // If the .info doesn't define the 'project', try to figure it out.
+    if (!isset($file->info['project'])) {
+      $file->info['project'] = update_get_project_name($file);
+    }
+
+    // If we still don't know the 'project', give up.
+    if (empty($file->info['project'])) {
+      continue;
+    }
+
+    // If we don't already know it, grab the change time on the .info file
+    // itself. Note: we need to use the ctime, not the mtime (modification
+    // time) since many (all?) tar implementations will go out of their way to
+    // set the mtime on the files it creates to the timestamps recorded in the
+    // tarball. We want to see the last time the file was changed on disk,
+    // which is left alone by tar and correctly set to the time the .info file
+    // was unpacked.
+    if (!isset($file->info['_info_file_ctime'])) {
+      $info_filename = dirname($file->uri) . '/' . $file->name . '.info';
+      $file->info['_info_file_ctime'] = filectime($info_filename);
+    }
+
+    if (!isset($file->info['datestamp'])) {
+      $file->info['datestamp'] = 0;
+    }
+
+    $project_name = $file->info['project'];
+
+    // Figure out what project type we're going to use to display this module
+    // or theme. If the project name is 'drupal', we don't want it to show up
+    // under the usual "Modules" section, we put it at a special "Drupal Core"
+    // section at the top of the report.
+    if ($project_name == 'drupal') {
+      $project_display_type = 'core';
+    }
+    else {
+      $project_display_type = $project_type;
+    }
+    if (empty($status) && empty($file->enabled_sub_themes)) {
+      // If we're processing disabled modules or themes, append a suffix.
+      // However, we don't do this to a a base theme with enabled
+      // subthemes, since we treat that case as if it is enabled.
+      $project_display_type .= '-disabled';
+    }
+    // Add a list of sub-themes that "depend on" the project and a list of base
+    // themes that are "required by" the project.
+    if ($project_name == 'drupal') {
+      // Drupal core is always required, so this extra info would be noise.
+      $sub_themes = array();
+      $base_themes = array();
+    }
+    else {
+      // Add list of enabled sub-themes.
+      $sub_themes = !empty($file->enabled_sub_themes) ? $file->enabled_sub_themes : array();
+      // Add list of base themes.
+      $base_themes = !empty($file->base_themes) ? $file->base_themes : array();
+    }
+    if (!isset($projects[$project_name])) {
+      // Only process this if we haven't done this project, since a single
+      // project can have multiple modules or themes.
+      $projects[$project_name] = array(
+        'name' => $project_name,
+        // Only save attributes from the .info file we care about so we do not
+        // bloat our RAM usage needlessly.
+        'info' => update_filter_project_info($file->info),
+        'datestamp' => $file->info['datestamp'],
+        'includes' => array($file->name => $file->info['name']),
+        'project_type' => $project_display_type,
+        'project_status' => $status,
+        'sub_themes' => $sub_themes,
+        'base_themes' => $base_themes,
+      );
+    }
+    elseif ($projects[$project_name]['project_type'] == $project_display_type) {
+      // Only add the file we're processing to the 'includes' array for this
+      // project if it is of the same type and status (which is encoded in the
+      // $project_display_type). This prevents listing all the disabled
+      // modules included with an enabled project if we happen to be checking
+      // for disabled modules, too.
+      $projects[$project_name]['includes'][$file->name] = $file->info['name'];
+      $projects[$project_name]['info']['_info_file_ctime'] = max($projects[$project_name]['info']['_info_file_ctime'], $file->info['_info_file_ctime']);
+      $projects[$project_name]['datestamp'] = max($projects[$project_name]['datestamp'], $file->info['datestamp']);
+      if (!empty($sub_themes)) {
+        $projects[$project_name]['sub_themes'] += $sub_themes;
+      }
+      if (!empty($base_themes)) {
+        $projects[$project_name]['base_themes'] += $base_themes;
+      }
+    }
+    elseif (empty($status)) {
+      // If we have a project_name that matches, but the project_display_type
+      // does not, it means we're processing a disabled module or theme that
+      // belongs to a project that has some enabled code. In this case, we add
+      // the disabled thing into a separate array for separate display.
+      $projects[$project_name]['disabled'][$file->name] = $file->info['name'];
+    }
+  }
+}
+

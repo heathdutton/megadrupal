@@ -1,0 +1,673 @@
+<?php
+
+/**
+ * @file
+ * Hooks and functions for the New Relic Insights module.
+ */
+
+
+/**
+ * Defines the name of the New Relic Insights queue.
+ */
+define('NEW_RELIC_INSIGHTS_QUEUE', 'new_relic_insights');
+
+/**
+ * Implements hook_menu().
+ */
+function new_relic_insights_menu() {
+  // Queue runner callback (so you don't have to run cron to run the queue).
+  $items['new-relic-insights-runner/%'] = array(
+    'title' => 'Insights Queue Runner',
+    'description' => 'Runs through queued Insights items.',
+    'type' => MENU_CALLBACK,
+    'page callback' => 'new_relic_insights_run_queue_page',
+    'page arguments' => array(1),
+    'access callback' => TRUE,
+  );
+
+  // Configuration page for the module.
+  $items['admin/config/services/new-relic-insights'] = array(
+    'title' => 'New Relic Insights',
+    'description' => 'Configure options for the New Relic Insights module.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('new_relic_insights_settings'),
+    'access arguments' => array('administer new relic insights'),
+    'file' => 'new_relic_insights.admin.inc',
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_permission().
+ */
+function new_relic_insights_permission() {
+  return array(
+    'administer new relic insights' => array(
+      'title' => t('Administer New Relic Insights'),
+      'description' => t('Perform administration tasks for New Relic Insights.'),
+    ),
+  );
+}
+
+/**
+ * Implements hook_cron().
+ */
+function new_relic_insights_cron() {
+  $info = system_get_info('module', 'new_relic_insights');
+  $version = $info['version'];
+  $old_ua = variable_get('new_relic_insights_ua', '');
+  $new_ua = "Drupal/$version (drupal.org/project/new_relic_insights)";
+
+  // If the version has been updated, set the version UA.
+  if ($old_ua !== $new_ua) {
+    variable_set('new_relic_insights_ua', $new_ua);
+  }
+}
+
+/**
+ * Implements hook_entity_info().
+ */
+function new_relic_insights_entity_info($force_get = FALSE) {
+  // Only declare an Insight entity if Insights is queryable to begin with.
+  if (!new_relic_insights_is_queryable() && !$force_get) {
+    return array();
+  }
+
+  $entities['insight'] = array(
+    'label' => t('New Relic Insight'),
+    'entity class' => 'Insight',
+    'controller class' => 'InsightEntityController',
+    'metadata controller class' => 'RemoteEntityAPIDefaultMetadataController',
+    'base table' => 'insight',
+    'fieldable' => FALSE,
+    'entity keys' => array(
+      'id' => 'eid',
+      'bundle' => 'type',
+    ),
+    'bundles' => array(
+      'Transaction' => array(
+        'remote entity conditions' => array(
+          'name' => 'isset',
+          'realAgentId' => 'isset',
+        ),
+      ),
+      'PageView' => array(
+        'remote entity conditions' => array(
+          'name' => 'isset',
+          'backendDuration' => 'isset',
+        ),
+      ),
+      'watchdog' => array(
+        'remote entity conditions' => array(
+          'type' => 'isset',
+          'message' => 'isset',
+        ),
+      ),
+    ),
+    'load hook' => 'new_relic_insight_load',
+    'label callback' => 'entity_class_label',
+    'uri callback' => 'entity_class_uri',
+    'module' => 'new_relic_insights_entity',
+    'access callback' => '', // @todo
+    'remote base table' => 'Transaction',
+    'remote entity keys' => array(
+      'remote id' => 'iid',
+    ),
+    'property map' => drupal_map_assoc(new_relic_insights_entity_properties('Transaction')),
+  );
+
+  // Respect the configured expiry time (if provided).
+  if ($expiry_time = variable_get('new_relic_insights_expiry_time', 0)) {
+    $entities['insight']['expiry'] = array(
+      'expiry time' => $expiry_time,
+      'purge' => TRUE,
+    );
+  }
+
+  return $entities;
+}
+
+/**
+ * Implements hook_clients_connection_type_info().
+ */
+function new_relic_insights_clients_connection_type_info() {
+  return array(
+    'new_relic_insights_query' => array(
+      'label'  => t('New Relic Insights Query'),
+      'description' => t('Queries New Relic Insights'),
+    ),
+  );
+}
+
+/**
+ * Implements hook_clients_default_connections().
+ */
+function new_relic_insights_clients_default_connections() {
+  $items = array();
+
+  if (new_relic_insights_is_queryable()) {
+    $account = variable_get('new_relic_insights_account_id', '');
+    $query_key = variable_get('new_relic_insights_query_key', '');
+    $base_url = variable_get('new_relic_insights_query_baseurl', 'https://insights-api.newrelic.com/v1');
+    $encoded = addslashes($base_url . '/accounts/' . $account);
+
+    $items['new_relic_insights_query_default'] = entity_import('clients_connection', '{
+      "name" : "new_relic_insights_query_default",
+      "endpoint" : "' . $encoded . '",
+      "configuration" : {
+        "debug" : 0,
+        "credentials_storage" : "connection_configuration",
+        "account" : "' . $account . '",
+        "key" : "' . $query_key . '"
+      },
+      "label" : "Default New Relic Insights Query Client",
+      "type" : "new_relic_insights_query"
+    }');
+  }
+
+  return $items;
+}
+
+/**
+ * Implements hook_clients_default_resources().
+ */
+function new_relic_insights_clients_default_resources() {
+  $items = array();
+
+  if (new_relic_insights_is_queryable()) {
+    $items['new_relic_insight_default_entity'] = entity_import('clients_resource', '{
+      "remoteEntityQuery" : null,
+      "component" : "insight",
+      "connection" : "new_relic_insights_query_default",
+      "name" : "new_relic_insight_default_entity",
+      "label" : "Default New Relic Insights Entity",
+      "type" : "remote_entity",
+      "configuration" : null,
+      "rdf_mapping" : []
+    }');
+  }
+
+  return $items;
+}
+
+/**
+ * Implements hook_remote_entity_query_table_info().
+ */
+function new_relic_insights_remote_entity_query_table_info() {
+  $table_data['new_relic_insights_query_default'] = array(
+    'Transaction' => array(
+      // Fields provided by Insights by default which are not of type "text"
+      'fields' => array(
+        'duration' => array('type' => 'decimal'),
+        'timestamp' => array('type' => 'date'),
+        'realAgentId' => array('type' => 'integer'),
+        'httpResponseCode' => array('type' => 'integer'),
+        'webDuration' => array('type' => 'decimal'),
+        'memcacheDuration' => array('type' => 'decimal'),
+        'appId' => array('type' => 'integer'),
+        'databaseDuration' => array('type' => 'decimal'),
+      ),
+    ),
+  );
+
+  return $table_data;
+}
+
+/**
+ * Implements hook_remote_entity_query_table_info_alter().
+ */
+function new_relic_insights_remote_entity_query_table_info_alter(&$table_data) {
+  // Add metadata for fields provided by better statistics.
+  if (module_exists('better_statistics')) {
+    $fields = &$table_data['new_relic_insights_query_default']['Transaction']['fields'];
+    $stats_fields = variable_get('better_statistics_fields', better_statistics_get_default_fields());
+
+    // Use the timestamp as provided by New Relic.
+    unset($stats_fields['timestamp']);
+
+    // Iterate through each Stats field and append schema definitions.
+    foreach ($stats_fields as $field => $definition) {
+      $fields[$field] = $definition['schema'];
+    }
+  }
+}
+
+/**
+ * Implements hook_entity_query_alter().
+ *
+ * Allows the native use of EntityFieldQuery to query Insights.
+ */
+function new_relic_insights_entity_query_alter($query) {
+  if (isset($query->entityConditions['entity_type']['value'])) {
+    if ($query->entityConditions['entity_type']['value'] === 'insight') {
+      // It's possible we don't want to remotely query Insights (and instead,
+      // query just local copies). We check for that situation by checking if
+      // any property conditions have been set against db schema properties.
+      $schema = drupal_get_schema('insight');
+      $internals = array_keys($schema['fields']);
+      foreach ($query->propertyConditions as $condition) {
+        if (in_array($condition['column'], $internals)) {
+          return;
+        }
+      }
+
+      // Add InsightRemoteEntityQuery to the EntityFieldQuery object.
+      $controller = entity_get_controller('insight');
+      $remote_query = $controller->getRemoteEntityQuery();
+      $query->remoteQuery = $remote_query;
+
+      // Set the EntityFieldQuery execution callback to ours, which will call
+      // the InsightRemoteEntityQuery::buildFromEFQ()
+      $query->executeCallback = '_new_relic_insights_execute_from_efq';
+    }
+  }
+}
+
+/**
+ * Execution callback for EntityFieldQuery when a remote entity type is being
+ * queried and has the appropriate methods.
+ *
+ * @param EntityFieldQuery $efq
+ *   The EntityFieldQuery object with which the remote entity query will be
+ *   built and executed.
+ *
+ * @return mixed
+ *   Either a number if count() was called or an array of associative arrays of
+ *   remote entities.
+ *
+ * @see remote_entity_entity_query_alter()
+ * @see EntityFieldQuery::queryCallback()
+ */
+function _new_relic_insights_execute_from_efq(EntityFieldQuery $efq) {
+  return $efq->remoteQuery->buildFromEFQ($efq)->execute();
+}
+
+/**
+ * Implements hook_views_api().
+ */
+function new_relic_insights_views_api() {
+  return array('api' => 3);
+}
+
+/**
+ * Implements hook_watchdog().
+ */
+function new_relic_insights_watchdog($data) {
+  // Only send watchdog data to Insights if enabled.
+  if (!variable_get('new_relic_insights_collect_watchdog', FALSE)) {
+    return;
+  }
+
+  // Truncate the user object down to just the user's e-mail address.
+  $data['user'] = isset($data['user']->mail) ? $data['user']->mail : '';
+
+  // Provide the fully rendered message as its own key.
+  $data['fullMessage'] = $data['message'];
+  if (isset($data['variables']) && is_array($data['variables'])) {
+    $data['fullMessage'] = format_string($data['fullMessage'], $data['variables']);
+  }
+
+  // The associative array must be flat, so we merge in all variables.
+  if (isset($data['variables']) && is_array($data['variables'])) {
+    foreach ($data['variables'] as $key => $value) {
+      unset($data['variables'][$key]);
+      $new_key = str_replace(array('!', '%', '@'), array('_var_', '_var_', '_var_'), $key);
+      $data['variables'][$new_key] = $value;
+    }
+    $data = array_merge($data, $data['variables']);
+  }
+  unset($data['variables']);
+
+  // Register the event with New Relic.
+  new_relic_insights_register_event('watchdog', $data);
+}
+
+/**
+ * Implements hook_better_statistics_log().
+ */
+function new_relic_insights_better_statistics_log($data) {
+  // Only send accesslog data to Insights if enabled.
+  if (!variable_get('new_relic_insights_collect_accesslog', FALSE)) {
+    return;
+  }
+
+  // Remove the aid key, it's unpopulated and of no use to us.
+  unset($data['aid']);
+
+  // Add an iid parameter so Insight entities can be loaded individually.
+  $data['iid'] = new_relic_insights_generate_uuid();
+
+  // Add custom parameters to this transaction for each Better Stat field.
+  if (function_exists('newrelic_add_custom_parameter')) {
+    foreach ($data as $key => $value) {
+      newrelic_add_custom_parameter($key, $value);
+    }
+  }
+}
+
+/**
+ * Implements hook_cron_queue_info().
+ */
+function new_relic_insights_cron_queue_info() {
+  return array(
+    NEW_RELIC_INSIGHTS_QUEUE => array(
+      'worker callback' => 'new_relic_insights_post_event',
+      'time' => 120,
+    ),
+  );
+}
+
+/**
+ * Registers a custom event with New Relic. If an up-to-date agent is installed,
+ * the event will be passed to the agent. Otherwise, the event will be queued
+ * for manual POSTing through the API later.
+ *
+ * @param string $type
+ *   The event type to be registered / sent.
+ *
+ * @param array $data
+ *   An associative array of event data to pass to New Relic. Keys are property
+ *   names on which NRQL queries can be keyed.
+ */
+function new_relic_insights_register_event($type, $data = array()) {
+  // Add an iid parameter so Insight entities can be loaded individually.
+  $data['iid'] = new_relic_insights_generate_uuid();
+
+  // Notify the New Relic Agent of the event if possible.
+  if (function_exists('newrelic_record_custom_event')) {
+    newrelic_record_custom_event($type, $data);
+  }
+  // Otherwise queue the event for posting via the Insert API.
+  else {
+    // Set the "eventType" key. This is required for the Insert API.
+    $data['eventType'] = $type;
+    $queue = DrupalQueue::get(NEW_RELIC_INSIGHTS_QUEUE);
+    $queue->createItem($data);
+  }
+}
+
+/**
+ * Sends a single event, represented as an associative array, to Insights.
+ *
+ * @param array $data
+ *   An associative array of data to be JSON encoded and POSTed to Insights.
+ */
+function new_relic_insights_post_event($data) {
+  // Only proceed if an account ID and insert key are present.
+  $account_id = variable_get('new_relic_insights_account_id', '');
+  $insert_key = variable_get('new_relic_insights_insert_key', '');
+  if ($account_id && $insert_key) {
+    // Build the Insights Insert API URL.
+    $url = variable_get('new_relic_insights_baseurl', 'https://insights-collector.newrelic.com/v1');
+    $url .= '/accounts/' . $account_id;
+    $url .= '/events';
+
+    // JSON encode the data.
+    $data = drupal_json_encode($data);
+
+    // Initialize, configure, and execute the curl handle.
+    $ch = curl_init($url);
+    curl_setopt($ch, CURLOPT_CUSTOMREQUEST, 'POST');
+    curl_setopt($ch, CURLOPT_POSTFIELDS, $data);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, TRUE);
+    curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, variable_get('new_relic_insights_curl_timeout', 5));
+    curl_setopt($ch, CURLOPT_HTTPHEADER, array(
+      'Content-Type: application/json',
+      'Content-Length: ' . strlen($data),
+      'User-Agent: ' . variable_get('new_relic_insights_ua', 'Drupal (+http://drupal.org/)'),
+      'X-Insert-Key: ' . $insert_key,
+    ));
+    curl_exec($ch);
+    curl_close($ch);
+  }
+}
+
+/**
+ * Runs through and processes all queued items for New Relic Insights.
+ *
+ * @return int
+ *   Returns the number of queued items that were run through.
+ */
+function new_relic_insights_run_queue() {
+  $counter = 0;
+
+  $queue = DrupalQueue::get(NEW_RELIC_INSIGHTS_QUEUE);
+  while ($item = $queue->claimItem()) {
+    new_relic_insights_post_event($item->data);
+    $queue->deleteItem($item);
+    $counter++;
+  }
+
+  return $counter;
+}
+
+/**
+ * Page callback for running through queued items through the GUI. Useful if you
+ * want to only run through queued items without running all of cron or if you
+ * don't use drush queue.
+ *
+ * @param string $cron_key
+ *   A unique token to use to prevent just anyone from running the queue.
+ *
+ * @return string
+ *   Output suitable for display as a page.
+ */
+function new_relic_insights_run_queue_page($cron_key) {
+  // Do not allow this transaction to be cached.
+  drupal_page_is_cacheable(FALSE);
+
+  // Run through all queued events.
+  if ($cron_key == variable_get('cron_key', 'drupal')) {
+    // Some New Relic-specific code.
+    if (extension_loaded('newrelic')) {
+      // Mark this transaction as a background job.
+      newrelic_background_job(TRUE);
+    }
+
+    // Ensure that no time limit is imposed.
+    set_time_limit(0);
+
+    $counter = new_relic_insights_run_queue();
+  }
+
+  return t('Ran %counter queued items successfully.', array(
+    '%counter' => $counter,
+  ));
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function new_relic_insights_form_statistics_settings_form_alter(&$form, &$form_state) {
+  module_load_include('inc', 'new_relic_insights', 'new_relic_insights.admin');
+  _new_relic_insights_form_statistics_settings_form_alter($form, $form_state);
+}
+
+/**
+ * Returns whether or not New Relic Insights are queryable.
+ */
+function new_relic_insights_is_queryable() {
+  $account = variable_get('new_relic_insights_account_id', '');
+  $query_key = variable_get('new_relic_insights_query_key', '');
+
+  return $account && $query_key && module_exists('remote_entity');
+}
+
+/**
+ * Returns an array of entity properties for a given Insight event type,
+ * including all enabled fields in Better Statistics, as well as default
+ * properties provided by New Relic.
+ *
+ * @param string $event_type
+ *   The New Relic Insights event type for which we want entity properties.
+ *
+ * @return array
+ *   An array of entity properties associated with the given New Relic Insights
+ *   event type.
+ */
+function new_relic_insights_entity_properties($event_type) {
+  if ($event_type == 'Transaction') {
+    $nr_defaults = new_relic_insights_entity_default_properties($event_type);
+    $nr_defaults = array_keys($nr_defaults);
+    $stats_fields = array();
+
+    // Load fields currently enabled in Better Statistics.
+    if (module_exists('better_statistics')) {
+      $stats_fields = variable_get('better_statistics_fields', better_statistics_get_default_fields());
+      $stats_fields = array_keys($stats_fields);
+    }
+
+    return array_merge($stats_fields, $nr_defaults);
+  }
+
+  return new_relic_insights_entity_default_properties($event_type);
+}
+
+/**
+ * Returns an associative array, keyed by default properties for a given event
+ * type. Their values are field definitions exactly as expected by Better Stats.
+ *
+ * @param string $event_type
+ *   The New Relic Insights event type for which we want default properties.
+ *
+ * @return array
+ *   An array of default properties associated with the given New Relic Insights
+ *   event type. Not to be confused with those provided by Better Statistics. If
+ *   the type provided is not real, an empty array is returned.
+ */
+function new_relic_insights_entity_default_properties($event_type) {
+  $properties = array(
+    'Transaction' => array(
+      'name' => array(
+        'views_field' => array(
+          'title' => t('Transaction name'),
+          'help' => t('The name of the invoked web transaction (e.g. %eg).', array(
+            '%eg' => 'Controller/customers/show',
+          )),
+        ),
+      ),
+      'duration' => array(
+        'views_field' => array(
+          'title' => t('Transaction duration'),
+          'help' => t('The total response time of the request.'),
+        ),
+      ),
+      'transactionType' => array(
+        'views_field' => array(
+          'title' => t('Transaction type'),
+          'help' => t('The type of the transaction (e.g. %eg1 or %eg2).', array(
+            '%eg1' => 'Web',
+            '%eg2' => 'Background',
+          )),
+        ),
+      ),
+      'appName' => array(
+        'views_field' => array(
+          'title' => t('App name'),
+          'help' => t('The name of your application. In many cases, this may just be the name of application server.'),
+        ),
+      ),
+      'timestamp' => array(
+        'views_field' => array(
+          'title' => t('Date/time'),
+          'help' => t('The date/time that the transaction occurred.'),
+        ),
+      ),
+      'realAgentId' => array(
+        'views_field' => array(
+          'title' => t('Real agent ID'),
+          'help' => t('The ID of the New Relic agent reporting.'),
+        ),
+      ),
+      'httpResponseCode' => array(
+        'views_field' => array(
+          'title' => t('HTTP response code'),
+          'help' => t('Numeric response code with which the app responded (e.g. %eg).', array(
+            '%eg' => 200,
+          )),
+        ),
+      ),
+      'webDuration' => array(
+        'views_field' => array(
+          'title' => t('Web duration'),
+          'help' => t('The total response time of all Web transactions.'),
+        ),
+      ),
+      'type' => array(
+        'views_field' => array(
+          'title' => t('Insight type'),
+          'help' => t('The event type. In this case it will always have the value %value.', array(
+            '%value' => 'Transaction',
+          )),
+        ),
+      ),
+      'memcacheDuration' => array(
+        'views_field' => array(
+          'title' => t('Memcache duration'),
+          'help' => t('The total response time of memcache.'),
+        ),
+      ),
+      'host' => array(
+        'views_field' => array(
+          'title' => t('Transaction host'),
+          'help' => t('The name of the application host that processed this request.'),
+        ),
+      ),
+      'appId' => array(
+        'views_field' => array(
+          'title' => t('App ID'),
+          'help' => t('The ID of your application, as recorded by New Relic.'),
+        ),
+      ),
+      'databaseDuration' => array(
+        'views_field' => array(
+          'title' => t('Database duration'),
+          'help' => t('The database response time.'),
+        ),
+      ),
+      'transactionSubType' => array(
+        'views_field' => array(
+          'title' => t('Transaction sub-type'),
+          'help' => t('The detailed type of the transaction (e.g. %eg1 or %eg2).', array(
+            '%eg1' => 'ResqueJob',
+            '%eg2' => 'Custom',
+          )),
+        ),
+      ),
+      'iid' => array(
+        'views_field' => array(
+          'title' => t('Transaction UUID'),
+          'help' => t('The globally unique ID of this Transaction event.'),
+        ),
+      ),
+    ),
+    // @todo PageView and watchdog
+  );
+
+  return isset($properties[$event_type]) ?   $properties[$event_type] : array();
+}
+
+/**
+ * Returns a v4 UUID, used to mark and load individual Insights events.
+ *
+ * Note, these UUIDs are not necessarily cryptographically secure, but they
+ * don't need to be, for our purposes.
+ */
+function new_relic_insights_generate_uuid() {
+  if (function_exists('openssl_random_pseudo_bytes')) {
+    $data = openssl_random_pseudo_bytes(16);
+    $data[6] = chr(ord($data[6]) & 0x0f | 0x40); // set version to 0100
+    $data[8] = chr(ord($data[8]) & 0x3f | 0x80); // set bits 6-7 to 10
+    return vsprintf('%s%s-%s-%s-%s-%s%s%s', str_split(bin2hex($data), 4));
+  }
+  else {
+    return sprintf( '%04x%04x-%04x-%04x-%04x-%04x%04x%04x',
+      mt_rand(0, 0xffff), mt_rand(0, 0xffff),
+      mt_rand(0, 0xffff),
+      mt_rand(0, 0x0fff) | 0x4000,
+      mt_rand(0, 0x3fff) | 0x8000,
+      mt_rand(0, 0xffff), mt_rand(0, 0xffff), mt_rand(0, 0xffff)
+    );
+  }
+}

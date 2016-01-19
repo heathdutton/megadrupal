@@ -1,0 +1,421 @@
+<?php
+
+/**
+ * @file
+ * The main file for the commerce_sofortbanking module.
+ */
+
+// Import some more module files and the library from SOFORT AG.
+include_once 'ressources/strings.inc';
+include_once 'commerce_sofortbanking.inc';
+include_once 'commerce_sofortbanking.pages.inc';
+include_once 'library/sofortLib.php';
+
+/**
+ * Version string of this module which help SOFORT to analyze server requests.
+ */
+define('COMMERCE_SOFORTBANKING_VERSION', 'drupal7_commerce1_sofortbanking_1');
+
+/**
+ * ID of this payment method used to identify payment transactions in the database.
+ */
+define('COMMERCE_SOFORTBANKING_PAYMENT_METHOD_ID', 'commerce_sofortbanking');
+
+/**
+ * URL of the SOFORT API.
+ */
+define('COMMERCE_SOFORTBANKING_API_URL', 'https://api.sofort.com/api/xml');
+
+/**
+ * Implements hook_help().
+ */
+function commerce_sofortbanking_help($path, $arg) {
+  switch ($path) {
+    case 'admin/help#commerce_sofortbanking':
+      return '<pre>' . file_get_contents(dirname(__FILE__) . '/README.txt') . '</pre>';
+  }
+}
+
+/**
+ * Implements hook_menu().
+ */
+function commerce_sofortbanking_menu() {
+  $items = array();
+
+  $items['commerce_sofortbanking/payment/notify'] = array(
+    'page callback' => 'commerce_sofortbanking_notify',
+    'access arguments' => array('access content'),
+    'type' => MENU_CALLBACK,
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_commerce_payment_method_info().
+ */
+function commerce_sofortbanking_commerce_payment_method_info() {
+  $methods[COMMERCE_SOFORTBANKING_PAYMENT_METHOD_ID] = array(
+    'title' => commerce_sofortbanking_name(),
+    'active' => TRUE,
+    'checkout' => TRUE,
+    'terminal' => FALSE,
+    'offsite' => TRUE,
+    'offsite_autoredirect' => FALSE,
+  );
+  return $methods;
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function commerce_sofortbanking_form_commerce_checkout_form_review_alter(&$form, &$form_state, $form_id) {
+  if(isset($form['commerce_payment']['payment_method']['#options'])) {
+    foreach ($form['commerce_payment']['payment_method']['#options'] as $instance => $description) {
+      $payment_method = $form['commerce_payment']['payment_methods']['#value'][$instance];
+      if ($payment_method['method_id'] == COMMERCE_SOFORTBANKING_PAYMENT_METHOD_ID) {
+        if ($payment_method['settings']['extended']['options']['recommended']) {
+          if (empty($form_state['values'])) {
+            $form['commerce_payment']['payment_method']['#default_value'] = $instance;
+          }
+        }
+        $form['commerce_payment']['payment_method']['#options'][$instance] = commerce_sofortbanking_checkout_display($payment_method['settings']);
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_commerce_checkout_router().
+ *
+ * @param $order
+ * @param $checkout_page
+ */
+function commerce_sofortbanking_commerce_checkout_router($order, $checkout_page) {
+  if (empty($order->data['payment_method']) || (strpos($order->data['payment_method'], COMMERCE_SOFORTBANKING_PAYMENT_METHOD_ID) === FALSE)) {
+    // This is not relevant to us.
+    return;
+  }
+  if (!empty($order->data['payment_redirect_key'])) {
+    $modes = array('success', 'cancel', 'timeout');
+    foreach ($modes as $mode) {
+      // Get the callback URL and remove the leading slash.
+      $url = substr(commerce_sofortbanking_callback_url($mode, $order, FALSE), 1);
+      if ($url == $_GET['q']) {
+        _commerce_sofortbanking_check_status($order, $order->data['commerce_sofortbanking_transaction_id']);
+        break;
+      }
+    }
+  }
+}
+
+/**
+ * Payment method callback; return the settings form for a payment method.
+ *
+ * @param $settings
+ *   An array of the current settings.
+ * @return
+ *   A form snippet.
+ */
+function commerce_sofortbanking_settings_form($settings = array()) {
+  return commerce_sofortbanking_project_form($settings);
+}
+
+/**
+ * Validate the order submit form to determine, if this payment method is properly
+ * configured to be able to receive payments.
+ *
+ * @param $payment_method
+ * @param $pane_form
+ * @param $pane_values
+ * @param $order
+ * @param array $form_parents
+ * @return bool
+ */
+function commerce_sofortbanking_submit_form_validate($payment_method, $pane_form, $pane_values, $order, $form_parents = array()) {
+  if (empty($payment_method['settings']['config_key'])) {
+    drupal_set_message(sofortbanking_strings(9001), 'error');
+    return FALSE;
+  }
+  return TRUE;
+}
+
+/**
+ * Callback to start the actual transaction.
+ *
+ * This function determines all required parameters, initializes a transaction
+ * with SOFORT Banking and redirects the customer to the given URL on the payment
+ * platform.
+ *
+ * If anything goes wrong, this method redirects the customer to the cart
+ * review page again and logs the error details in watchdog.
+ *
+ * @param array $form
+ * @param array $form_state
+ * @param object $order
+ *   The current order from commerce_order which contains all details about the
+ *   order that should be paid.
+ * @param array $payment_method
+ *   The details about the payment method including all settings.
+ */
+function commerce_sofortbanking_redirect_form($form, &$form_state, $order, $payment_method) {
+  $settings = $payment_method['settings'];
+  $balance = commerce_payment_order_balance($order);
+  $amount = round(commerce_currency_amount_to_decimal($balance['amount'], $balance['currency_code']), 2);
+  $currency = $balance['currency_code'];
+  $subject1 = _commerce_sofortbanking_order_subject(1, $order, $settings);
+  $subject2 = _commerce_sofortbanking_order_subject(2, $order, $settings);
+  $url_success = commerce_sofortbanking_callback_url('success', $order);
+  $url_cancel = commerce_sofortbanking_callback_url('cancel', $order);
+  $url_timeout = commerce_sofortbanking_callback_url('timeout', $order);
+  $url_notify = commerce_sofortbanking_callback_url('notify', $order);
+
+  // The following line replaces localhost in the notify_url because the API
+  // would reject the request otherwise. This has no effect on production
+  // platforms that have no "localhost" string in their URL.
+  $url_notify = str_replace('localhost', 'paragon-es.de', $url_notify);
+
+  $sofort = new SofortLib_Multipay($settings['config_key']);
+  commerce_sofortbanking_setup_logger($sofort, $settings);
+  $sofort->setVersion(COMMERCE_SOFORTBANKING_VERSION);
+  $sofort->setAmount($amount, $currency);
+  $sofort->setReason($subject1, $subject2);
+  $sofort->setSuccessUrl($url_success);
+  $sofort->setAbortUrl($url_cancel);
+  $sofort->setTimeoutUrl($url_timeout);
+  $sofort->setNotificationUrl($url_notify);
+  $sofort->setSofortueberweisung($amount);
+  if ($settings['extended']['options']['customer_protection']) {
+    $sofort->setSofortueberweisungCustomerprotection();
+  }
+
+  $sofort->sendRequest();
+
+  if ($sofort->isError()) {
+    watchdog('SOFORT', '!error', array('!error' => $sofort->getError()), WATCHDOG_CRITICAL);
+    drupal_set_message(sofortbanking_strings(9001), 'error');
+    drupal_goto($url_cancel);
+  }
+
+  $id = $sofort->getTransactionId();
+
+  $transaction = commerce_payment_transaction_new(COMMERCE_SOFORTBANKING_PAYMENT_METHOD_ID, $order->order_id);
+  $transaction->instance_id = $payment_method['instance_id'];
+  $transaction->status = COMMERCE_PAYMENT_STATUS_PENDING;
+  $transaction->message = sofortbanking_strings(9006);
+  $transaction->remote_id = $id;
+  $transaction->amount = $balance['amount'];
+  $transaction->currency_code = $balance['currency_code'];
+  commerce_payment_transaction_save($transaction);
+
+  $order->data['commerce_sofortbanking_transaction_id'] = $id;
+  commerce_order_save($order);
+  $values = array(
+    'order_id' => $order->order_id,
+    'transaction_id' => $id,
+    'token' => drupal_get_token(),
+  );
+  db_delete('commerce_sofortbanking_orders')
+    ->condition('order_id', $order->order_id)
+    ->condition('token', drupal_get_token())
+    ->execute();
+  drupal_write_record('commerce_sofortbanking_orders', $values);
+  drupal_goto($sofort->getPaymentUrl());
+}
+
+/**
+ * Callback to determine the proper subject line of a transaction which replaces
+ * the tokens from the SOFORT API by the relevant values.
+ *
+ * @param integer $id
+ *   This value can either be "1" or "2" to identify which of the two
+ *   subject lines should be determined.
+ * @param object $order
+ *   The current order objects from commerce_order which contains all details
+ *   about the order.
+ * @param array $settings
+ *   All settings about the payment method.
+ * @return string
+ *   Proper string for the given subject line with all tokens being replaced.
+ */
+function _commerce_sofortbanking_order_subject($id, $order, $settings) {
+  $profile = commerce_customer_profile_load($order->commerce_customer_billing[LANGUAGE_NONE][0]['profile_id']);
+  $customer = $profile->commerce_customer_address[LANGUAGE_NONE][0];
+  $customer_name = empty($customer['name_line']) ? $customer['first_name'] . ' ' . $customer['last_name'] : $customer['name_line'];
+  $company_name  = empty($customer['company_name']) ? '' : $customer['company_name'];
+  $subject = ($id == 1) ? $settings['extended']['order_subject_1'] : $settings['extended']['order_subject_2'];
+  $subject = str_replace('{{transaction_id}}', '-TRANSACTION-', $subject);
+  $subject = str_replace('{{order_id}}', $order->order_id, $subject);
+  $subject = str_replace('{{order_date}}', format_date($order->changed, 'short'), $subject);
+  $subject = str_replace('{{customer_id}}', $order->uid, $subject);
+  $subject = str_replace('{{customer_name}}', $customer_name, $subject);
+  $subject = str_replace('{{customer_company}}', $company_name, $subject);
+  $subject = str_replace('{{customer_email}}', $order->mail, $subject);
+  return $subject;
+}
+
+/**
+ * Helper function to setup the logging context for the SofortLib.
+ *
+ * @param SofortLib $sofort
+ */
+function commerce_sofortbanking_setup_logger($sofort, $settings) {
+  if (!$settings['extended']['options']['logging']) {
+    return;
+  }
+  $logger = new COMMERCE_SOFORTBANKING_Logger();
+  $sofort->setLogEnabled();
+  $sofort->setLogger($logger);
+}
+
+
+/**
+ * Class UC_PNAG_Logger
+ */
+class COMMERCE_SOFORTBANKING_Logger extends SofortLibLogger {
+
+  /**
+   * Function begin called of the SofortLib has something to log.
+   *
+   * @param string $message
+   *   A string containing the log message.
+   * @param string $uri
+   *   A string containing the URI where to write the log message to. This is
+   *   not used by this module because it utilizes the watchdog framework from
+   *   Drupal.
+   */
+  function log($message, $uri) {
+    watchdog('SOFORT', '!message', array('!message' => $message));
+  }
+
+  /**
+   * Function which would normally be called by SofortLib to rotate log files.
+   * This is not required for this module because it utilizes Drupal's
+   * watchdog framework.
+   *
+   * @param string $uri
+   */
+  function logRotate($uri) {
+    // Nothing to do.
+  }
+
+}
+
+/**
+ * Menu callback to take action if a notification from the SOFORT API was received.
+ *
+ * The request gets validated against the transaction ID and the cart token
+ * which are provided as query parameters of the request.
+ *
+ * If the request got validated successfully, the request gets executed and
+ * the payment status gets changed accordingly.
+ *
+ * @return mixed
+ *   Sends back a http_code in the HTTP result header depending on the success
+ *   of this callback. The following http_codes are possible:
+ *   - 200: if the request was valid and the status could be executed.
+ *   - 404: if the request was valid but the status change request couldn't be interpreted.
+ *   - 500: if the request couldn't be validated.
+ */
+function commerce_sofortbanking_notify() {
+  $sofort = new SofortLib_Notification();
+  $transaction_id = $sofort->getNotification();
+  $order_id = db_select('commerce_sofortbanking_orders', 'o')
+    ->fields('o', array('order_id'))
+    ->condition('o.token', $_GET['cart_token'])
+    ->condition('o.transaction_id', $transaction_id)
+    ->execute()
+    ->fetchField();
+  if (empty($order_id)) {
+    watchdog('SOFORT', 'Illegal notification received.', array(), WATCHDOG_CRITICAL);
+    $result = 500;
+  }
+  else {
+    $order = commerce_order_load($order_id);
+    if (_commerce_sofortbanking_check_status($order, $transaction_id)) {
+      $result = 200;
+    }
+    else {
+      $result = 404;
+    }
+  }
+  header('http_code: ' . $result, TRUE, $result);
+  print $result;
+  exit;
+}
+
+/**
+ * Helper function called by commerce_sofortbanking_notify() to determine the
+ * latest status of the payment transaction at SOFORT Banking and to take
+ * appropriate action in the shop depending on the previous and current status
+ * of the transaction.
+ *
+ * This function makes sure, that if the transaction status hasn't changed,
+ * that no changes will be made to the database records of the shop. In other
+ * words, if multiple notifications with the same status got submitted to the
+ * shop, they would *not* result in multiple database records.
+ *
+ * As it may happen, that multiple notifications get fired at the same or
+ * similar time, this function takes care of multi-threading issues and executes
+ * only one request after the other.
+ *
+ * @param commerce_order $order
+ *   The order object of the Drupal Commerce shop.
+ * @param string $transaction_id
+ *   The transaction ID from SOFORT banking.
+ * @return bool
+ *   Returns TRUE if the status change request could be executed or FALSE otherwise.
+ */
+function _commerce_sofortbanking_check_status($order, $transaction_id) {
+  $lock_key = 'commerce_sofortbanking_status_' . $transaction_id;
+  while (!lock_acquire($lock_key)) {
+    sleep(1);
+  }
+
+  $transactions = (array) commerce_payment_transaction_load_multiple(array(), array(
+    'order_id' => $order->order_id,
+    'payment_method' => COMMERCE_SOFORTBANKING_PAYMENT_METHOD_ID,
+    'remote_id' => $transaction_id,
+  ));
+
+  if (empty($transactions)) {
+    watchdog('SOFORT', 'Transaction not available: !transaction_id', array('!transaction_id' => $transaction_id), WATCHDOG_WARNING);
+    lock_release($lock_key);
+    return FALSE;
+  }
+
+  $transaction = array_shift($transactions);
+  $payment_method = commerce_payment_method_instance_load($transaction->instance_id);
+  $settings = $payment_method['settings'];
+
+  $sofort = new SofortLib_TransactionData($settings['config_key']);
+  commerce_sofortbanking_setup_logger($sofort, $settings);
+  $sofort->setTransaction($transaction_id);
+  $sofort->sendRequest();
+  if ($sofort->isError()) {
+    watchdog('SOFORT', 'Transaction status not available.', array(), WATCHDOG_WARNING);
+    lock_release($lock_key);
+    return FALSE;
+  }
+
+  $status = $sofort->getStatus();
+  $status = empty($status) ? 'cancel' : $status;
+  if ($transaction->remote_status == $status) {
+    // Nothing to do, this payment receipt has already been captured.
+    lock_release($lock_key);
+    return TRUE;
+  }
+
+  $transaction->remote_status = $status;
+  $transaction->message = 'Payment notification from SOFORT Banking: !status (Transaction-ID: !transactionid).';
+  $transaction->message_variables = array('!status' => $status, '!transactionid' => $transaction_id);
+  $transaction->status = empty($settings['extended']['states'][$status]) ? 'cancel' : $settings['extended']['states'][$status];
+  commerce_payment_transaction_save($transaction);
+
+  if (in_array($status, array('untraceable', 'pending', 'received', 'refunded'))) {
+    commerce_checkout_complete($order);
+  }
+
+  lock_release($lock_key);
+  return TRUE;
+}

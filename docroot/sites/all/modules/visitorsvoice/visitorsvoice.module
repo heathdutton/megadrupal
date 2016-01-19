@@ -1,0 +1,1025 @@
+<?php
+
+/**
+ * @file
+ * Provides integration with the Visitors Voice API.
+ */
+
+/**
+ * The current version of the Visitors Voice module.
+ */
+define('VISITORSVOICE_VERSION', '7.x-1.0');
+
+/**
+ * The JSON-based Visitors Voice API's URL.
+ *
+ * @var string
+ */
+define('VISITORSVOICE_API_JSON_ENDPOINT', 'http://api.visitorsvoice.com/Api/V1/');
+
+/**
+ * The Visitors Voice cache table name.
+ *
+ * @var string
+ */
+define('VISITORSVOICE_CACHE', 'cache_visitorsvoice');
+
+// Load search_api_solr-specific hook implementations and functions.
+module_load_include('inc', 'visitorsvoice', 'includes/search_api_solr');
+
+//
+// Hook implementations
+//
+
+/**
+ * Implements hook_menu().
+ */
+function visitorsvoice_menu() {
+  // Endpoint for requests from Visitors Voice.
+  $items['visitorsvoice/%'] = array(
+    'title' => 'Visitors Voice Access',
+    'description' => 'Used by Visitors Voice to access or change search index data on your site.',
+    'page callback' => 'visitorsvoice_request_handler',
+    'page arguments' => array(1),
+    'access callback' => TRUE,
+    'type' => MENU_CALLBACK,
+    'file' => 'visitorsvoice.pages.inc',
+  );
+  // Admin settings screen.
+  $items['admin/config/search/visitorsvoice'] = array(
+    'title' => 'Visitors Voice',
+    'description' => 'Set access and API key for Visitors Voice to allow communication between Visitors Voice and this site.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('visitorsvoice_settings'),
+    'access arguments' => array('administer visitorsvoice'),
+    'file' => 'visitorsvoice.admin.inc',
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_help().
+ */
+function visitorsvoice_help($path, $arg) {
+  switch ($path) {
+    case 'admin/config/search/visitorsvoice':
+      $args['@support-url'] = url('http://visitorsvoice.com/support');
+      $args['@partner-url'] = url('http://visitorsvoice.com/become-a-partner');
+      $args['@premium-url'] = url('http://visitorsvoice.com/visitors-voice-premium-offer');
+      return t('<p>Visitors Voice lets you add, remove and reorder hits in search result pages as you want for any search term.</p><ul><li><a href="@support-url">Contact our support</a> if you need help.</li><li>Read about our partner offer <a href="@partner-url">here</a>.</li><li>Additional premium functionality is currently being developed and will soon be available. <a href="@premium-url">See here</a> for more information.</li></ul>', $args);
+      break;
+  }
+  return NULL;
+}
+
+/**
+ * Implements hook_permission().
+ */
+function visitorsvoice_permission() {
+  return array(
+    'administer visitorsvoice' => array(
+      'title' => t('Administer Visitors Voice'),
+      'description' => t('Configure access keys and settings for the Visitors Voice integration.'),
+    ),
+  );
+}
+
+/**
+ * Implements hook_search_api_query_alter().
+ *
+ * Adds a visitorsvoice_customization option to the query, if appropriate.
+ */
+function visitorsvoice_search_api_query_alter(SearchApiQueryInterface $query) {
+  if (is_string($keys = $query->getOriginalKeys())) {
+    $customization_id = visitorsvoice_customization_id($query->getIndex()->machine_name, $keys);
+    if ($customization_id) {
+      $customization['id'] = $customization_id;
+      // Always include ADD and REMOVE customizations, but only re-order if the
+      // primary sort is on relevance (descending).
+      $customization['customizations'][] = VisitorsvoiceCustomizationInterface::TYPE_ADD;
+      $customization['customizations'][] = VisitorsvoiceCustomizationInterface::TYPE_REMOVE;
+      $sort = $query->getSort();
+      if (!$sort || (reset($sort) === 'DESC' && key($sort) === 'search_api_relevance')) {
+        $customization['customizations'][] = VisitorsvoiceCustomizationInterface::TYPE_ORDER;
+      }
+      $query->setOption('visitorsvoice_customization', $customization);
+    }
+  }
+}
+
+/**
+ * Implements hook_search_api_index_delete().
+ *
+ * Deletes all customizations of the deleted index.
+ */
+function visitorsvoice_search_api_index_delete(SearchApiIndex $index) {
+  // Only react on real deletes, not reverts.
+  if (!$index->hasStatus(ENTITY_IN_CODE)) {
+    $select = db_select('visitorsvoice_keywords', 'k')
+      ->fields('k', array('customization_id'))
+      ->condition('index_id', $index->machine_name);
+    db_delete('visitorsvoice_customization')
+      ->condition('customization_id', $select, 'IN')
+      ->execute();
+    db_delete('visitorsvoice_keywords')
+      ->condition('index_id', $index->machine_name)
+      ->execute();
+  }
+}
+
+//
+// General helper functions
+//
+
+/**
+ * Retrieves the customization ID for a certain index and set of keywords.
+ *
+ * @param string $index_id
+ *   The machine name of the index for which the customization should be
+ *   retrieved.
+ * @param string $keys
+ *   The keywords for which the customization should be retrieved.
+ * @param bool $create_new
+ *   (optional) If TRUE, create a new customization if it does not exist.
+ *
+ * @return int|false
+ *   The customization ID to use for this index and set of keywords; or FALSE if
+ *   none exists and $create_new was not set.
+ *
+ * @throws VisitorsvoiceException
+ *   If overlong keywords (longer than 100 characters) are given and $create_new
+ *   is TRUE.
+ */
+function visitorsvoice_customization_id($index_id, $keys, $create_new = FALSE) {
+  if (strlen($keys) > 100) {
+    if (!$create_new) {
+      return FALSE;
+    }
+    throw new VisitorsvoiceException(t('Overlong keywords string "@keys" given.', array('@keys' => $keys)));
+  }
+  $arguments[':index_id'] = $index_id;
+  $arguments[':keys'] = $keys;
+  $id = db_query('SELECT customization_id FROM {visitorsvoice_keywords} WHERE index_id = :index_id AND keywords = :keys', $arguments)->fetchField();
+  if ($id !== FALSE || !$create_new) {
+    return $id;
+  }
+  // We have to use this method, since non-primary serials are not supported.
+  $id = db_next_id();
+  db_insert('visitorsvoice_keywords')
+    ->fields(array(
+      'index_id' => $index_id,
+      'keywords' => $keys,
+      'customization_id' => $id,
+    ))
+    ->execute();
+  return $id;
+}
+
+/**
+ * Deletes the customizations for a given keyword.
+ *
+ * @param string $index_id
+ *   The machine name of the index being worked on.
+ * @param string $keywords
+ *   The set of keywords for which all customizatiuons should be deleted.
+ *
+ * @return array
+ *   An array with both keys and values containing the IDs of all items that
+ *   were affected by this deletion and should therefore be re-indexed.
+ */
+function visitorsvoice_customization_delete($index_id, $keywords) {
+  $item_ids = array();
+  $customization_id = visitorsvoice_customization_id($index_id, $keywords);
+  if (!$customization_id) {
+    return $item_ids;
+  }
+  // Only delete the concrete customizations if this was the only set of
+  // keywords mapped to that customziation.
+  $customization_keywords = db_select('visitorsvoice_keywords')
+    ->condition('customization_id', $customization_id)
+    ->countQuery()
+    ->execute()
+    ->fetchField();
+  if ($customization_keywords == 1) {
+    $item_ids = db_select('visitorsvoice_customization', 'c')
+      ->fields('c', array('item_id'))
+      ->condition('customization_id', $customization_id)
+      ->execute()
+      ->fetchCol();
+    $item_ids = drupal_map_assoc($item_ids);
+    db_delete('visitorsvoice_customization')
+      ->condition('customization_id', $customization_id)
+      ->execute();
+  }
+  db_delete('visitorsvoice_keywords')
+    ->condition('index_id', $index_id)
+    ->condition('keywords', $keywords)
+    ->execute();
+  return $item_ids;
+}
+
+/**
+ * Retrieves customizations to index for the given items.
+ *
+ * @param string $index_id
+ *   The machine name of the index for which customizations are retrieved.
+ * @param array $item_ids
+ *   (optional) The items for which customizations are retrieved. If NULL,
+ *   retrieve all customizations for this index.
+ *
+ * @return VisitorsvoiceCustomizationInterface[][]
+ *   An array containing item IDs mapped to an array of customizations for that
+ *   item.
+ */
+function visitorsvoice_customizations_load($index_id, array $item_ids = NULL) {
+  $select = db_select('visitorsvoice_customization', 'c')
+    ->fields('c');
+  $select->join('visitorsvoice_keywords', 'k', 'c.customization_id = k.customization_id');
+  $select->condition('k.index_id', $index_id);
+  if (isset($item_ids)) {
+    $select->condition('c.item_id', $item_ids);
+  }
+  $customizations = array();
+  foreach ($select->execute() as $row) {
+    if ($row->custom > 0) {
+      $customizations[$row->item_id][] = new VisitorsvoiceCustomization(VisitorsvoiceCustomizationInterface::TYPE_ORDER, $row->customization_id, $row->custom);
+    }
+    elseif ($row->custom) {
+      $customizations[$row->item_id][] = new VisitorsvoiceCustomization(VisitorsvoiceCustomizationInterface::TYPE_ADD, $row->customization_id);
+      $customizations[$row->item_id][] = new VisitorsvoiceCustomization(VisitorsvoiceCustomizationInterface::TYPE_ORDER, $row->customization_id, -$row->custom);
+    }
+    else {
+      $customizations[$row->item_id][] = new VisitorsvoiceCustomization(VisitorsvoiceCustomizationInterface::TYPE_REMOVE, $row->customization_id);
+    }
+  }
+  return $customizations;
+}
+
+/**
+ * Adds items to the search results for the given customization.
+ *
+ * The caller of this function should ensure that all the changed items are
+ * correctly marked as "changed" in the Search API tracking system so the
+ * customization will be properly picked up.
+ *
+ * @param int $customization_id
+ *   The ID of the customization for which the items should be added.
+ * @param array $item_ids
+ *   The IDs of the items which should be added to the result.
+ *
+ * @return array
+ *   An array with both keys and values containing the IDs of all items that
+ *   were changed and should therefore be re-indexed.
+ */
+function visitorsvoice_customization_add($customization_id, array $item_ids) {
+  if (!$item_ids) {
+    return array();
+  }
+  $item_ids = drupal_map_assoc($item_ids);
+  $changed = array();
+  $order = 0;
+  // Make sure that we don't try to re-insert existing customizations.
+  $args[':customization_id'] = $customization_id;
+  $args[':items'] = $item_ids;
+  $result = db_query('SELECT item_id, custom FROM {visitorsvoice_customization} WHERE customization_id = :customization_id AND item_id IN (:items)', $args);
+  foreach ($result as $row) {
+    unset($item_ids[$row->item_id]);
+    if ($row->custom >= 0) {
+      $new = $row->custom ? -$row->custom : --$order;
+      db_update('visitorsvoice_customization')
+        ->fields(array(
+          'custom' => $new,
+        ))
+        ->condition('customization_id', $customization_id)
+        ->condition('item_id', $row->item_id)
+        ->execute();
+      $changed[$row->item_id] = $row->item_id;
+    }
+  }
+  if (!$item_ids) {
+    return $changed;
+  }
+  $insert = db_insert('visitorsvoice_customization')
+    ->fields(array('customization_id', 'item_id', 'custom'));
+  foreach ($item_ids as $id) {
+    $insert->values(array(
+      'customization_id' => $customization_id,
+      'item_id' => $id,
+      'custom' => --$order,
+    ));
+    $changed[$id] = $id;
+  }
+  $insert->execute();
+  return $changed;
+}
+
+/**
+ * Sets the order of search results for the given customization.
+ *
+ * The caller of this function should ensure that all the changed items are
+ * correctly marked as "changed" in the Search API tracking system so the
+ * customization will be properly picked up.
+ *
+ * @param int $customization_id
+ *   The ID of the customization for which the results should be re-ordered.
+ * @param array $item_ids
+ *   The IDs of the results, in the order in which they should appear (starting
+ *   from the first).
+ *
+ * @return array
+ *   An array with both keys and values containing the IDs of all items that
+ *   were changed and should therefore be re-indexed.
+ */
+function visitorsvoice_customization_order($customization_id, array $item_ids) {
+  if (!$item_ids) {
+    return array();
+  }
+  // Ensure correct indices (0, 1, 2, …). Then flip to get a mapping of item ID
+  // to position.
+  $item_ids = array_merge($item_ids);
+  $changed = array();
+  $order = array_flip($item_ids);
+
+  // Make sure that we treat existing customizations correctly (e.g., don't
+  // change negative values (= adds) to positive, and keep previous ordering).
+  $args[':customization_id'] = $customization_id;
+  $args[':items'] = $item_ids;
+  $result = db_query('SELECT item_id, custom FROM {visitorsvoice_customization} WHERE customization_id = :customization_id AND (custom <> 0 OR item_id IN (:items))', $args);
+
+  // Figure out the new positions for all items.
+  // $further_results_order will contain the order for all items that weren't
+  // specified in this function call.
+  $further_results_order = array();
+  foreach ($result as $row) {
+    // If we have a position specified for this item, simply do an UPDATE.
+    if (isset($order[$row->item_id])) {
+      $new_custom = $order[$row->item_id] + 1;
+      unset($order[$row->item_id]);
+      if ($row->custom < 0) {
+        $new_custom *= -1;
+      }
+      if ($new_custom != $row->custom) {
+        db_update('visitorsvoice_customization')
+          ->fields(array(
+            'custom' => $new_custom,
+          ))
+          ->condition('customization_id', $customization_id)
+          ->condition('item_id', $row->item_id)
+          ->execute();
+        $changed[$row->item_id] = $row->item_id;
+      }
+      continue;
+    }
+    // Otherwise, we add the current custom value to $further_results_order and
+    // later sort it to get the position for all results not specified in this
+    // call.
+    $further_results_order[$row->item_id] = $row->custom;
+  }
+
+  if ($further_results_order) {
+    uasort($further_results_order, '_visitorsvoice_compare_absolute');
+    $item_count = count($item_ids);
+    foreach ($further_results_order as $item_id => $prev_custom) {
+      $new_custom = ++$item_count;
+      if ($prev_custom < 0) {
+        $new_custom *= -1;
+      }
+      if ($new_custom != $prev_custom) {
+        db_update('visitorsvoice_customization')
+          ->fields(array(
+            'custom' => $new_custom,
+          ))
+          ->condition('customization_id', $customization_id)
+          ->condition('item_id', $item_id)
+          ->execute();
+        $changed[$item_id] = $item_id;
+      }
+    }
+  }
+
+  // Finally, insert the positions for those items that didn't have any
+  // customization yet.
+  if (!$order) {
+    return $changed;
+  }
+  $insert = db_insert('visitorsvoice_customization')
+    ->fields(array('customization_id', 'item_id', 'custom'));
+  foreach ($order as $item_id => $new_custom) {
+    $insert->values(array(
+      'customization_id' => $customization_id,
+      'item_id' => $item_id,
+      'custom' => $new_custom + 1,
+    ));
+    $changed[$item_id] = $item_id;
+  }
+  $insert->execute();
+  return $changed;
+}
+
+/**
+ * Removes items from the search results for the given customization.
+ *
+ * The caller of this function should ensure that all the changed items are
+ * correctly marked as "changed" in the Search API tracking system so the
+ * customization will be properly picked up.
+ *
+ * @param int $customization_id
+ *   The ID of the customization for which the items should be removed.
+ * @param array $item_ids
+ *   The IDs of the items which should be removed from the result.
+ *
+ * @return array
+ *   An array with both keys and values containing the IDs of all items that
+ *   were changed and should therefore be re-indexed.
+ */
+function visitorsvoice_customization_remove($customization_id, array $item_ids) {
+  if (!$item_ids) {
+    return array();
+  }
+  $item_ids = drupal_map_assoc($item_ids);
+  $changed = array();
+  // Make sure that we don't try to re-insert existing customizations.
+  $existing_ids = array();
+  $args[':customization_id'] = $customization_id;
+  $args[':items'] = $item_ids;
+  $result = db_query('SELECT item_id, custom FROM {visitorsvoice_customization} WHERE customization_id = :customization_id AND item_id IN (:items)', $args);
+  foreach ($result as $row) {
+    unset($item_ids[$row->item_id]);
+    if ($row->custom) {
+      $existing_ids[] = $row->item_id;
+      $changed[$row->item_id] = $row->item_id;
+    }
+  }
+  if ($existing_ids) {
+    db_update('visitorsvoice_customization')
+      ->fields(array(
+        'custom' => 0,
+      ))
+      ->condition('customization_id', $customization_id)
+      ->condition('item_id', $existing_ids)
+      ->execute();
+  }
+  if (!$item_ids) {
+    return $changed;
+  }
+  $insert = db_insert('visitorsvoice_customization')
+    ->fields(array('customization_id', 'item_id', 'custom'));
+  foreach ($item_ids as $item_id) {
+    $insert->values(array(
+      'customization_id' => $customization_id,
+      'item_id' => $item_id,
+      'custom' => 0,
+    ));
+    $changed[$item_id] = $item_id;
+  }
+  $insert->execute();
+  return $changed;
+}
+
+//
+// API access functions
+//
+
+/**
+ * Checks if your API key is valid.
+ *
+ * @return object|false
+ *   The result object returned by Visitors Voice, or FALSE if the API key is
+ *   not set.
+ */
+function visitorsvoice_api_checkapi() {
+  $api_key = variable_get('visitorsvoice_api_key', '');
+
+  if ($api_key == '') {
+    drupal_set_message(t('The Visitors Voice API key is not set correctly in this site. Please report the problem to site administrator.'));
+    return FALSE;
+  }
+
+  $params = array(
+    'api_key' => $api_key,
+  );
+
+  $endpoint = 'APIKey';
+
+  $data = visitorsvoice_api_retrieve_results($params, $endpoint);
+
+  return $data;
+}
+
+/**
+ * Detects sudden changes in what users are searching for.
+ *
+ * The function returns trending search terms ordered by increase in number of
+ * users that searched (increasedUser). Both real time trends or ones in the
+ * past can be detected.
+ *
+ * @param int $date_zero
+ *   End date of the period where the search term trend should be detected
+ *   (format: yyyymmdd).
+ * @param int $duration
+ *   How many days back from date zero should be used for tracking the search
+ *   term trend (1-10).
+ * @param int $offset
+ *   How many days previous to search term trend should be used for comparison
+ *   (1-30).
+ * @param int $min_user
+ *   Minimum user count per day during trend period (>1).
+ * @param int $min_increase
+ *   Min increase in user count during trend period compared to previous period
+ *   (>1).
+ * @param string $ctr
+ *   Min (GT) / max (LT) click through rate ("GT-61" search terms with max CTR
+ *   of 60 during the trend period. "LT-59" means the opposite).
+ *
+ * @return object|false
+ *   The result object returned by Visitors Voice, or FALSE if the API key is
+ *   not set.
+ */
+function visitorsvoice_api_trending_search_terms($date_zero, $duration, $offset, $min_user, $min_increase, $ctr) {
+  $params = array(
+    'date_zero' => $date_zero,
+    'duration' => $duration,
+    'offset' => $offset,
+    'min_user' => $min_user,
+    'min_increase_percentage' => $min_increase,
+    'click_through_rate' => $ctr,
+  );
+
+  $endpoint = 'trendingsearchterms';
+
+  $data = visitorsvoice_api_retrieve_results($params, $endpoint);
+
+  return $data;
+}
+
+/**
+ * Returns all search terms that were refined and then lead a user to a URL.
+ *
+ * The terms are returned ordered by count.
+ *
+ * @param int $start_date
+ *   From which date should data be retrieved (format: yyyymmdd).
+ * @param int $end_date
+ *   Until which date should data be retrieved (format: yyyymmdd).
+ * @param string $url
+ *   The URL for which to retrieve this data. (E.g.,
+ *   "http://example.com/foo.html").
+ *
+ * @return object[]|false
+ *   An array of search terms with their refinements; or FALSE if the API key is
+ *   not set.
+ */
+function visitorsvoice_api_refinements_to_url($start_date, $end_date, $url) {
+  $params = array(
+    'start_date' => $start_date,
+    'end_date' => $end_date,
+    'url' => $url,
+  );
+
+  $endpoint = 'refinementstourl';
+
+  $data = visitorsvoice_api_retrieve_results($params, $endpoint);
+
+  return $data;
+}
+
+/**
+ * Retrieves all refinements for a search term accumulated over time.
+ *
+ * The terms are returned ordered by count.
+ *
+ * @param string $search_term
+ *   The search term (e.g., "förskola").
+ *
+ * @return object|false
+ *   The result object returned by Visitors Voice, or FALSE if the API key is
+ *   not set.
+ */
+function visitorsvoice_api_refinements_to_search_term($search_term) {
+  $params = array(
+    'searchterm' => $search_term,
+  );
+
+  $endpoint = 'RefinementsToSearchTerm';
+
+  $data = visitorsvoice_api_retrieve_results($params, $endpoint);
+
+  return $data;
+}
+
+/**
+ * Retrieves an extensive set of data for a specific search term.
+ *
+ * Behavioral data of all users who searched for the search term is returned.
+ * All lists are ordered by count, descending.
+ *
+ * @param int $start_date
+ *   From which date should data be retrieved (format: yyyymmdd).
+ * @param int $end_date
+ *   Until which date should data be retrieved (format: yyyymmdd).
+ * @param string $search_term
+ *   The search term (e.g., "förskola").
+ *
+ * @return object|false
+ *   The result object returned by Visitors Voice, or FALSE if the API key is
+ *   not set.
+ */
+function visitorsvoice_api_search_term_context($start_date, $end_date, $search_term) {
+  $params = array(
+    'start_date' => $start_date,
+    'end_date' => $end_date,
+    'searchterm' => $search_term,
+  );
+
+  $endpoint = 'searchtermcontext';
+
+  $data = visitorsvoice_api_retrieve_results($params, $endpoint);
+
+  return $data;
+}
+
+/**
+ * Computes which search terms and keywords relate to the specified URL.
+ *
+ * Retrieves all search terms and keywords that led to and from the URL. All
+ * search terms are ordered by count.
+ *
+ * @param int $start_date
+ *   From which date should data be retrieved (format: yyyymmdd).
+ * @param int $end_date
+ *   Until which date should data be retrieved (format: yyyymmdd).
+ * @param string $url
+ *   The URL (e.g., "http://example.com/foo.html").
+ *
+ * @return object|false
+ *   The result object returned by Visitors Voice, or FALSE if the API key is
+ *   not set.
+ */
+function visitorsvoice_api_url_context($start_date, $end_date, $url) {
+  $params = array(
+    'start_date' => $start_date,
+    'end_date' => $end_date,
+    'url' => $url,
+  );
+
+  $endpoint = 'urlcontext';
+
+  $data = visitorsvoice_api_retrieve_results($params, $endpoint);
+
+  return $data;
+}
+
+/**
+ * Retrieve the complete history of one or more specific sessions.
+ *
+ * Retrieves all actions (clicks and searches) a user has done during his/her
+ * visit, ordered by time sequence with oldest action first.
+ *
+ * @param string $session_id
+ *   The user session ID. More than one session ID can be passed, by separating
+ *   individual IDs with "||".
+ *
+ * @return object[]|false
+ *   An array of user session information objects; or FALSE if the API key is
+ *   not set.
+ */
+function visitorsvoice_api_user_session($session_id) {
+  $params = array(
+    'sessionid' => $session_id,
+  );
+
+  $endpoint = 'usersession';
+
+  $data = visitorsvoice_api_retrieve_results($params, $endpoint);
+
+  return $data;
+}
+
+/**
+ * Retrieves general performance metrics for a specific search term.
+ *
+ * General performance metrics are number of searches, number of users, number
+ * of clicks, number of clickbacks, number of users that clicked in search
+ * engine result page.
+ *
+ * @param int $start_date
+ *   From which date should data be retrieved (format: yyyymmdd).
+ * @param int $end_date
+ *   Until which date should data be retrieved (format: yyyymmdd).
+ * @param string $search_term
+ *   The search term (e.g., "förskola").
+ *
+ * @return object|false
+ *   The result object returned by Visitors Voice, or FALSE if the API key is
+ *   not set.
+ */
+function visitorsvoice_api_search_term_performance($start_date, $end_date, $search_term) {
+  $params = array(
+    'start_date' => $start_date,
+    'end_date' => $end_date,
+  );
+
+  if ($search_term) {
+    // Not a required paramenter.
+    $params['searchterm'] = $search_term;
+  }
+
+  $endpoint = 'searchtermperformance';
+
+  $data = visitorsvoice_api_retrieve_results($params, $endpoint);
+
+  return $data;
+}
+
+/**
+ * Retrieves a general list of search terms with performance metrics.
+ *
+ * Terms are returned ordered by count.
+ *
+ * @param int $start_date
+ *   From which date should data be retrieved (format: yyyymmdd).
+ * @param int $end_date
+ *   Until which date should data be retrieved (format: yyyymmdd).
+ * @param int|null $min_count
+ *   (optional) Only returns search terms where searches > min_count.
+ * @param int|null $min_user
+ *   (optional) Only returns search terms where users > min_user.
+ *
+ * @return object[]|false
+ *   An array of search term information objects; or FALSE if the API key is not
+ *   set.
+ */
+function visitorsvoice_api_search_term_performance_list($start_date, $end_date, $min_count = NULL, $min_user = NULL) {
+  $params = array(
+    'start_date' => $start_date,
+    'end_date' => $end_date,
+  );
+
+  if ($min_count) {
+    // Not a required paramenter.
+    $params['min_count'] = $min_count;
+  }
+
+  if ($min_user) {
+    // Not a required paramenter.
+    $params['min_user'] = $min_user;
+  }
+
+  $endpoint = 'searchtermperformancelist';
+
+  $data = visitorsvoice_api_retrieve_results($params, $endpoint);
+
+  return $data;
+}
+
+/**
+ * Calculates the overall quality of the search results.
+ *
+ * Calculation is done based on total number of searches, total number of users,
+ * total number of clicks and total number of users that clicked for all
+ * keywords used.
+ *
+ * @param int $start_date
+ *   From which date should data be retrieved (format: yyyymmdd).
+ * @param int $end_date
+ *   Until which date should data be retrieved (format: yyyymmdd).
+ *
+ * @return object|false
+ *   The result object returned by Visitors Voice, or FALSE if the API key is
+ *   not set.
+ */
+function visitorsvoice_api_overall_performance($start_date, $end_date) {
+  $params = array(
+    'start_date' => $start_date,
+    'end_date' => $end_date,
+  );
+
+  $endpoint = 'overallperformance';
+
+  $data = visitorsvoice_api_retrieve_results($params, $endpoint);
+
+  return $data;
+}
+
+/**
+ * Retrieves search terms searched to a URL sorted by count, descending.
+ *
+ * @param int $start_date
+ *   From which date should data be retrieved (format: yyyymmdd).
+ * @param int $end_date
+ *   Until which date should data be retrieved (format: yyyymmdd).
+ * @param string $url
+ *   The URL - could also be part of URL and get all URLs matching. (E.g.,
+ *   "http://example.com/foo.html").
+ * @param int $max_searchterms
+ *   (optional) Max. number of search terms to be returned.
+ * @param int $min_count
+ *   (optional) Min. number of searches for each search term to be returned
+ *   (e.g., 5).
+ * @param int $min_user
+ *   (optional) Min. number of users searching for each search term to be
+ *   returned (e.g., 5).
+ *
+ * @return object[]|false
+ *   An array of search term information objects; or FALSE if the API key is not
+ *   set.
+ */
+function visitorsvoice_api_search_terms_to_url($start_date, $end_date, $url, $max_searchterms = 20, $min_count = 0, $min_user = 0) {
+  $params = array(
+    'start_date' => $start_date,
+    'end_date' => $end_date,
+    'url' => $url,
+    'max_searchterms' => $max_searchterms,
+  );
+
+  // Not a required paramenter.
+  if ($min_count) {
+    $params['min_count'] = $min_count;
+  }
+
+  // Not a required paramenter.
+  if ($min_user) {
+    $params['min_user'] = $min_user;
+  }
+
+  $endpoint = 'SearchTermsToUrl';
+
+  $data = visitorsvoice_api_retrieve_results($params, $endpoint);
+
+  return $data;
+}
+
+/**
+ * Retrieves search terms searched from a URL sorted by count descending.
+ *
+ * @param int $start_date
+ *   From which date should data be retrieved (format: yyyymmdd).
+ * @param int $end_date
+ *   Until which date should data be retrieved (format: yyyymmdd).
+ * @param string $url
+ *   The URL - could also be part of URL and get all URLs matching (e.g.,
+ *   "http://example.com/foo.html").
+ * @param int $max_searchterms
+ *   Max. number of search terms to be returned (default is 20).
+ * @param int $min_count
+ *   Min. number of searches for each search term to be returned (e.g., 5).
+ * @param int $min_user
+ *   Min. number of users searching for each search term to be returned (e.g.,
+ *   5).
+ * @param string $max_ctr
+ *   Max. click through rate for each search term to be returned (e.g., 25 %).
+ * @param string $min_ctr
+ *   Min. click through rate for each search term to be returned (e.g., 25 %).
+ *
+ * @return object[]|false
+ *   An array of search term information objects; or FALSE if the API key is not
+ *   set.
+ */
+function visitorsvoice_api_search_terms_from_url($start_date, $end_date, $url, $max_searchterms, $min_count, $min_user, $max_ctr, $min_ctr) {
+  $params = array(
+    'start_date' => $start_date,
+    'end_date' => $end_date,
+    'url' => $url,
+  );
+
+  // Not a required paramenter.  Defaults 20.
+  $params['max_searchterms'] = (($max_searchterms) ? $max_searchterms : 20);
+
+  if ($min_count) {
+    $params['min_count'] = $min_count;
+  }
+
+  if ($min_user) {
+    $params['min_user'] = $min_user;
+  }
+
+  if ($max_ctr) {
+    $params['max_ctr'] = $max_ctr;
+  }
+
+  if ($min_ctr) {
+    $params['min_ctr'] = $min_ctr;
+  }
+
+  $endpoint = 'SearchTermsFromUrl';
+
+  $data = visitorsvoice_api_retrieve_results($params, $endpoint);
+
+  return $data;
+}
+
+/**
+ * Retrieves search terms searched to an URL sorted by count descending.
+ *
+ * @param int $start_date
+ *   From which date should data be retrieved (format: yyyymmdd).
+ * @param int $end_date
+ *   Until which date should data be retrieved (format: yyyymmdd).
+ * @param string $url
+ *   The URL - could also be part of URL and get all URLs matching (e.g.,
+ *   "http://example.com/foo.html").
+ * @param int $max_keywords
+ *   (optional) Max. number of keywords to be returned.
+ * @param int $min_user
+ *   (optional) Min. number of users searching for each search term to be
+ *   returned (e.g., 5).
+ *
+ * @return object[]|false
+ *   An array of keyword information objects; or FALSE if the API key is not
+ *   set.
+ */
+function visitorsvoice_api_keywords_to_url($start_date, $end_date, $url, $max_keywords = 20, $min_user = 0) {
+  $params = array(
+    'start_date' => $start_date,
+    'end_date' => $end_date,
+    'url' => $url,
+    'max_keywords' => $max_keywords,
+  );
+
+  if ($min_user) {
+    $params['min_user'] = $min_user;
+  }
+
+  $endpoint = 'KeywordsToUrl';
+
+  $data = visitorsvoice_api_retrieve_results($params, $endpoint);
+
+  return $data;
+}
+
+/**
+ * Retrieves results from Visitors Voice API.
+ *
+ * @param array $params
+ *   The parameters to use for the request. An "api_key" parameter containing
+ *   the set API key will be automatically added if not present.
+ * @param string $endpoint
+ *   The Visitors Voice API endpoint to contact.
+ *
+ * @return object|false
+ *   The result object returned by Visitors Voice, or FALSE if the API key is
+ *   not set.
+ */
+function visitorsvoice_api_retrieve_results(array $params, $endpoint) {
+  $params += array(
+    'api_key' => variable_get('visitorsvoice_api_key', ''),
+  );
+  $url = VISITORSVOICE_API_JSON_ENDPOINT . $endpoint . '?' . drupal_http_build_query($params);
+
+  $use_cache = variable_get('visitorsvoice_cache_data', FALSE);
+  $cid = '';
+  $data = NULL;
+
+  if ($use_cache) {
+    $cid = 'visitorsvoice:' . md5($url);
+    if ($cached = cache_get($cid, VISITORSVOICE_CACHE)) {
+      $data = $cached->data;
+    }
+  }
+
+  if (!$data) {
+    $response = drupal_http_request($url);
+    if ($response->code != 200 || empty($response->data)) {
+      return FALSE;
+    }
+    $data = json_decode($response->data);
+    if ($use_cache) {
+      $cache_expire = (int) variable_get('visitorsvoice_cache_expire', 0);
+      cache_set($cid, $data, VISITORSVOICE_CACHE, strtotime('+' . $cache_expire . ' minutes', REQUEST_TIME));
+    }
+  }
+
+  if (!$data || !empty($data->ErrorType)) {
+    $variables['@error_type'] = $data->ErrorType;
+    $variables['@message'] = $data->Message;
+    watchdog('visitorsvoice', 'Error "@error_type" while trying to contact Visitors Voice: @message.', $variables, WATCHDOG_ERROR);
+    return FALSE;
+  }
+  else {
+    return $data;
+  }
+}
+
+//
+// Helper functions
+//
+
+/**
+ * Compares two integers by their absolute values.
+ *
+ * Callback for uasort() within visitorsvoice_customization_order().
+ *
+ * @param int $a
+ *   The first integer.
+ * @param int $b
+ *   The second integer.
+ *
+ * @return int
+ *   An integer less than, equal to, or greater than zero if the first
+ *   argument's absolute value is respectively less than, equal to, or greater
+ *   than the second one's.
+ */
+function _visitorsvoice_compare_absolute($a, $b) {
+  return abs($a) - abs($b);
+}

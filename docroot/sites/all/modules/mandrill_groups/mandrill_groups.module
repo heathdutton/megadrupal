@@ -1,0 +1,1003 @@
+<?php
+
+/**
+ * @file
+ * Allows for creation and management of discussion groups that can be
+ * interacted with via Drupal or email.
+ */
+
+define('MANDRILL_GROUPS_EMAIL_FIELD', 'mandrill_groups_email');
+define('MANDRILL_GROUPS_EMAIL_FREQUENCY_FIELD', 'mandrill_groups_email_frequency');
+define('MANDRILL_GROUPS_SUBJECT_FIELD', 'mandrill_groups_subject_prefix');
+define('MANDRILL_GROUPS_EMAIL_REPLY_TO', 'mandrill_groups_email_reply_to');
+define('MANDRILL_GROUPS_MEMBERSHIP_TYPE', 'mandrill_groups_membership_type');
+define('MANDRILL_GROUPS_POSTSCRIPT_FIELD', 'mandrill_groups_postscript');
+define('MANDRILL_GROUPS_GROUP_NODE', 'mandrill_groups_group');
+define('MANDRILL_GROUPS_DISCUSSION_NODE', 'mandrill_groups_discussion');
+define('MANDRILL_GROUPS_MESSAGE_ID_FIELD', 'mandrill_groups_last_message_id');
+define('MANDRILL_GROUPS_MESSAGE_SEPERATOR', "-------- Reply Above This Line --------");
+define('MANDRILL_GROUPS_WEBHOOK_ENDPOINT', 'mandrill/webhook/groups');
+define('MANDRILL_GROUPS_IGNORE_HEADER', 'X-Mandrill-Groups-Ignore');
+define('MANDRILL_GROUPS_EMAIL_NONE', 0);
+define('MANDRILL_GROUPS_EMAIL_DAILY', 1);
+define('MANDRILL_GROUPS_EMAIL_IMMEDIATE', 2);
+define('MANDRILL_GROUPS_FIELD_DIGEST_LAST_SENT', 'field_last_digest_sent');
+define('MANDRILL_GROUPS_EMAIL_SEPARATOR', '+');
+define('MANDRILL_GROUPS_ATTACHMENT_FIELD', 'mandrill_groups_attachments');
+define('MANDRILL_GROUPS_ATTACHMENT_SENDLIMIT', 'mandrill_groups_attach_limit');
+
+/**
+ * Implements hook_menu().
+ */
+function mandrill_groups_menu() {
+  $items = array();
+
+  $items['admin/config/services/mandrill/groups'] = array(
+    'title' => 'Groups',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('mandrill_groups_settings_form'),
+    'access callback' => array('mandrill_groups_access'),
+    'description' => 'Handles Mandrill Incoming Webhooks',
+    'file' => 'includes/mandrill_groups.admin.inc',
+    'type' => MENU_LOCAL_TASK,
+  );
+
+  $items[MANDRILL_GROUPS_WEBHOOK_ENDPOINT] = array(
+    'title' => 'Mandrill Inbound',
+    'description' => 'Inbound email via Mandrill',
+    'page callback' => 'mandrill_groups_process_webhook',
+    'access callback' => array('mandrill_groups_webhook_access'),
+    'type' => MENU_CALLBACK,
+  );
+  $items['admin/config/services/mandrill/groups/%/delete'] = array(
+    'title' => 'Delete Inbound Domain Form',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('mandrill_groups_inbound_domain_delete_form', 5),
+    'access arguments' => array('administer mandrill'),
+    'file' => 'includes/mandrill_groups.admin.inc',
+  );
+  $items['node/%node/add_mandrill_groups_discussion'] = array(
+    'title' => 'Create a discussion',
+    'type' => MENU_LOCAL_ACTION,
+    'page callback' => 'node_add',
+    'page arguments' => array('mandrill_groups_discussion'),
+    'access callback' => array('mandrill_groups_node_discussion_access'),
+    'access arguments' => array(1),
+    'file path' => 'modules/node',
+    'file' => 'node.pages.inc',
+  );
+
+  return $items;
+}
+
+/**
+ * Access callback for mandrill_groups.
+ *
+ * @return bool
+ *   True if current user has access to administer mandrill and valid Mandrill
+ *   API key is present, else false.
+ */
+function mandrill_groups_access() {
+  $access = user_access('administer mandrill');
+  $valid_api_key = variable_get('mandrill_api_key');
+  return $access & !empty($valid_api_key);
+}
+
+/**
+ * Implements hook_permission().
+ */
+function mandrill_groups_permission() {
+  return array(
+    'administer mandrill discussion group' => array(
+      'title' => t('Administer Mandrill Discussion Group'),
+      'description' => t('Select which Mandrill Group a Mandrill Discussion is related to.'),
+      'restrict access' => FALSE,
+    ),
+  );
+}
+
+/**
+ * Access callback for "Discussion" tab on Group nodes.
+ *
+ * Only show tab if user is a member of the Group.
+ *
+ * @param array $group
+ *   Group being accessed.
+ *
+ * @return bool
+ *   Return True if user is a member of the current Group.
+ */
+function mandrill_groups_node_discussion_access($group) {
+  global $user;
+  if (!og_is_member('node', $group->nid, 'user', $user)) {
+    return FALSE;
+  }
+  return TRUE;
+}
+
+/**
+ * Implements hook_node_info().
+ *
+ * We use hook_node_info() to define our node content type.
+ */
+function mandrill_groups_node_info() {
+  // Define content types.
+  return array(
+    MANDRILL_GROUPS_GROUP_NODE => array(
+      'name' => t('Mandrill Group'),
+      'base' => 'mandrill_groups',
+      'description' => t('Users subscribe to a Mandrill Group to be notified of all new Mandrill Discussions within that group.'),
+      'title_label' => t('Group Name'),
+      // 'Locked' protects the machine name of this bundle from alteration.
+      'locked' => TRUE,
+    ),
+    MANDRILL_GROUPS_DISCUSSION_NODE => array(
+      'name' => t('Mandrill Discussion'),
+      'base' => 'mandrill_groups',
+      'description' => t('Discussion thread that is part of a Mandrill Group. Users may opt in or out of individual Mandrill Discussions.'),
+      'title_label' => t('Discussion Topic'),
+      'locked' => TRUE,
+    ),
+  );
+}
+
+/**
+ * Implements hook_entity_property_info_alter().
+ */
+function mandrill_groups_entity_property_info_alter(&$info) {
+  $info['comment']['properties']['mandrill_groups_message_id'] = array(
+    'label' => t('Outgoing Message-ID'),
+    'description' => t('The email Message-ID header value for a Mandrill Groups comment.'),
+    'type' => 'text',
+    'schema field' => 'mandrill_groups_message_id',
+    'setter callback' => 'entity_property_verbatim_set',
+  );
+  $info['comment']['properties']['mandrill_groups_original_msg_id'] = array(
+    'label' => t('Original Message-ID'),
+    'description' => t('The email Message-ID header value from an email-generated comment.'),
+    'type' => 'text',
+    'schema field' => 'mandrill_groups_original_msg_id',
+    'setter callback' => 'entity_property_verbatim_set',
+  );
+}
+
+/**
+ * Implements hook_schema_alter().
+ */
+function mandrill_groups_schema_alter(&$schema) {
+  $schema['comment']['fields']['mandrill_groups_message_id'] = array(
+    'description' => 'The email header Message-ID value of the comment.',
+    'type' => 'varchar',
+    'length' => 255,
+    'not null' => FALSE,
+    'default' => NULL,
+  );
+  $schema['comment']['fields']['mandrill_groups_original_msg_id'] = array(
+    'description' => 'The email Message-ID header value from an email-generated comment.',
+    'type' => 'varchar',
+    'length' => 255,
+    'not null' => FALSE,
+    'default' => NULL,
+  );
+}
+
+/**
+ * Implements hook_form().
+ */
+function mandrill_groups_form($node, $form_state) {
+  $form = node_content_form($node, $form_state);
+  if ($node->type == MANDRILL_GROUPS_GROUP_NODE) {
+    if (isset($node->nid)) {
+      $node_wrapper = entity_metadata_wrapper('node', $node);
+      list($default_name, $default_domain) = explode('@', $node_wrapper->{MANDRILL_GROUPS_EMAIL_FIELD}->value());
+    }
+    $form['email_user'] = array(
+      '#type' => 'machine_name',
+      '#title' => 'Email Address (name)',
+      '#default_value' => isset($default_name) ? $default_name : $node->title,
+      '#maxlength' => 32,
+      '#machine_name' => array(
+        'exists' => FALSE,
+        'source' => array('title'),
+        'label' => t('Email Name'),
+      ),
+      '#element_validate' => array('mandrill_groups_validate_group_email'),
+      '#description' => t('A unique email name for this list. It must only contain lowercase letters, numbers, and underscores. The @domain part of the email address is selected below.'),
+    );
+    $domain_options = array();
+    if ($inbound = mandrill_get_inbound_domains()) {
+      foreach ($inbound as $domain) {
+        $domain_options[$domain['domain']] = '@' . $domain['domain'];
+        if (!$domain['valid_mx']) {
+          $domain_options[$domain['domain']] .= ' (mx not validated)';
+        }
+      }
+    }
+    $form['email_domain'] = array(
+      '#type' => 'select',
+      '#title' => 'Email Domain (@domain.com)',
+      '#options' => $domain_options,
+      '#default_value' => isset($default_domain) ? $default_domain : '',
+      '#required' => TRUE,
+    );
+  }
+  return $form;
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function mandrill_groups_form_mandrill_groups_group_node_form_alter(&$form, &$form_state, $form_id) {
+  // Hide the group email field, which is being built from other form elements
+  // added in mandrill_groups_form().
+  $form['#validate'][] = 'mandrill_groups_apply_form_settings';
+  $form[MANDRILL_GROUPS_EMAIL_FIELD]['#access'] = FALSE;
+  $form[MANDRILL_GROUPS_FIELD_DIGEST_LAST_SENT]['#access'] = FALSE;
+}
+
+/**
+ * Implements hook_cron().
+ */
+function mandrill_groups_cron() {
+  mandrill_groups_send_digest();
+}
+
+/**
+ * Send a daily digest email for each Mandrill Group.
+ */
+function mandrill_groups_send_digest() {
+  $count = 0;
+  $today = new DateTime("today");
+
+  // Get all groups whose last digest hasn't been sent today.
+  $query = new EntityFieldQuery();
+  $result = $query
+    ->entityCondition('entity_type', 'node', '=')
+    ->entityCondition('bundle', MANDRILL_GROUPS_GROUP_NODE, '=')
+    ->fieldCondition(MANDRILL_GROUPS_FIELD_DIGEST_LAST_SENT, NULL, $today->format('Y-m-d 00:00:00'), '<')
+    ->execute();
+
+  // No groups need sending.
+  if (!$result) {
+    return $count;
+  }
+
+  $groups = node_load_multiple(array_keys($result['node']));
+  foreach ($groups as $group) {
+    $message_body = array();
+    $group_wrapper = entity_metadata_wrapper('node', $group);
+    $group_id = $group_wrapper->getIdentifier();
+    // Collect digest recipients.
+    $members = $group_wrapper->{'members__' . OG_STATE_ACTIVE}->value();
+    $recipients = array();
+    foreach ($members as $member) {
+      $membership = entity_metadata_wrapper('og_membership', og_get_membership($group_wrapper->type(), $group_id, 'user', $member->uid));
+      if ($membership->{MANDRILL_GROUPS_EMAIL_FREQUENCY_FIELD}->value() == MANDRILL_GROUPS_EMAIL_DAILY) {
+        $recipients[] = $member->mail;
+      }
+    }
+
+    // No daily subscribers, skip the rest.
+    if (empty($recipients)) {
+      continue;
+    }
+
+    // Get all group content. @todo: More efficient query.
+    $memberships = og_membership_load_multiple(FALSE, array('gid' => $group->nid, 'entity_type' => 'node'));
+    $entities = array();
+    foreach ($memberships as $membership) {
+      $entities[] = $membership->etid;
+    }
+    $discussions = node_load_multiple($entities);
+
+    // Get each discussion comment posted since our last digest went out.
+    foreach ($discussions as $discussion) {
+      $last_comment = new DateTime(format_date($discussion->last_comment_timestamp, 'custom', 'Y/m/d'));
+      $yesterday = new DateTime("yesterday");
+      // Load all comments from the previous day.
+      if ($last_comment == $yesterday) {
+        $message_body[] = '<h2>' . $discussion->title . '</h2>';
+        $query = new EntityFieldQuery();
+        $result = $query
+          ->entityCondition('entity_type', 'comment', '=')
+          ->propertyCondition('nid', $discussion->nid, '=')
+          ->propertyCondition('created', array($yesterday->getTimestamp(), $today->getTimestamp()), 'BETWEEN')
+          ->execute();
+
+        if ($result) {
+          $comments = comment_load_multiple(array_keys($result['comment']));
+          foreach ($comments as $comment) {
+            $comment_wrapper = entity_metadata_wrapper('comment', $comment);
+            if (!empty($comment_wrapper->comment_body->value()) && !empty($comment_wrapper->comment_body->value->value())) {
+              $message_body[] = '<li>' . field_view_field('comment', $comment, 'comment_body')[0]['#markup'] . '</li>';
+            }
+          }
+        }
+      }
+    }
+
+    // Send an email for each group.
+    if (!empty($message_body)) {
+
+      $message = array(
+        'id' => MANDRILL_GROUPS_DISCUSSION_NODE,
+        'subject' => t('Daily Digest for Group @label', array('@label' => $group_wrapper->label())),
+        'body' => array(implode('', $message_body)),
+        'mandrill' => array(
+          'from_name' => variable_get('site_name', 'Drupal Site'),
+          'overrides' => array(
+            'preserve_recipients' => FALSE,
+          ),
+        ),
+      );
+
+      if (isset($group_wrapper->{MANDRILL_GROUPS_SUBJECT_FIELD})) {
+        $message['subject'] = $group_wrapper->{MANDRILL_GROUPS_SUBJECT_FIELD}->value() . ' ' . $message['subject'];
+      }
+
+      $from = $group_wrapper->{MANDRILL_GROUPS_EMAIL_FIELD}->value();
+      $message['mandrill']['header'][MANDRILL_GROUPS_IGNORE_HEADER] = 1;
+      mandrill_groups_send_email($from, $recipients, $message, $group);
+      $group_wrapper->{MANDRILL_GROUPS_FIELD_DIGEST_LAST_SENT}->set($today->getTimestamp());
+      $group_wrapper->save();
+      $count++;
+    }
+  }
+
+  return $count;
+}
+
+/**
+ * Field validator that looks for a unique email_user/email_domain combo.
+ */
+function mandrill_groups_validate_group_email($element, $form_state) {
+  $email = $form_state['input']['email_user'] . '@' . $form_state['input']['email_domain'];
+  $existing_node = mandrill_groups_load_by_mail($email);
+  if (empty($existing_node)) {
+    return;
+  }
+  if (!isset($form_state['node']->nid) || $form_state['node']->nid != $existing_node->nid) {
+    form_error($element, t('The email address @email is already in use, please pick another.', array('@email' => $email)));
+  }
+}
+
+/**
+ * Validator to insert email address inputs into the proper field.
+ */
+function mandrill_groups_apply_form_settings($form, &$form_state) {
+  $today = new DateTime("today");
+  $form_state['values']['mandrill_groups_email'][$form_state['values']['language']][0]['value'] = $form_state['values']['email_user'] . '@' . $form_state['values']['email_domain'];
+  $form_state['values']['field_last_digest_sent'][$form_state['values']['language']][0]['value'] = $today->format('Y-m-d 00:00:00');
+}
+
+/**
+ * Webhook processing for mandrill_groups.
+ */
+function mandrill_groups_process_webhook() {
+  // When the route is being verified, just return an empty string.
+  if ($_SERVER['REQUEST_METHOD'] == 'HEAD') {
+    return "";
+  }
+
+  $events = drupal_json_decode($_POST['mandrill_events']);
+  foreach ($events as $event) {
+    // Process events:
+    switch ($event['event']) {
+      case 'hard_bounce':
+      case 'reject':
+        mandrill_groups_process_bounce($event['msg']);
+        break;
+
+      case 'inbound':
+        mandrill_groups_process_message($event['msg']);
+        break;
+    }
+  }
+  return count($events) . " events processed.";
+}
+
+/**
+ * Validate that a webhook with post data is coming from Mandrill.
+ *
+ * See http://help.mandrill.com/entries/23704122-Authenticating-webhook-requests
+ */
+function mandrill_groups_webhook_access() {
+  // Mandrill verifies new inbound routes with a HEAD request.
+  // @see http://help.mandrill.com/entries/22024856-Why-can-t-my-webhook-or-inbound-route-URL-be-verified-.
+  if ($_SERVER['REQUEST_METHOD'] == 'HEAD') {
+    return TRUE;
+  }
+
+  if (!isset($_POST)) {
+    return FALSE;
+  }
+
+  $webhook = mandrill_groups_filter_webhooks();
+  if (!$webhook || !$webhook['auth_key']) {
+    return FALSE;
+  }
+  $auth_key = $webhook['auth_key'];
+
+  ksort($_POST);
+  global $base_url;
+  $url = $base_url . $_SERVER['REQUEST_URI'];
+  foreach ($_POST as $arg => $val) {
+    $url .= $arg . $val;
+  }
+  $signature = base64_encode(hash_hmac('sha1', $url, $auth_key, TRUE));
+  return $signature == $_SERVER['HTTP_X_MANDRILL_SIGNATURE'];
+}
+
+/**
+ * Return the first active webhook matching this site's URI.
+ *
+ * @return array webhook | bool
+ */
+function mandrill_groups_filter_webhooks() {
+  global $base_url;
+  $url = $base_url . base_path() . MANDRILL_GROUPS_WEBHOOK_ENDPOINT . (isset($_REQUEST['domain']) ? '?domain=' . $_REQUEST['domain'] : '');
+  $auth_key = NULL;
+  $webhooks = mandrill_get_webhooks();
+  foreach ($webhooks as $webhook) {
+    if ($webhook['url'] == $url) {
+      return $webhook;
+    }
+  }
+  return FALSE;
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * FORM ID: mandrill_groups_discussion_node_form.
+ */
+function mandrill_groups_form_mandrill_groups_discussion_node_form_alter(&$form, &$form_state, $form_id) {
+  // Disable the last message ID field: it is populated automatically.
+  $form['mandrill_groups_last_message_id']['#access'] = FALSE;
+
+  // Set default value of "Group Membership" field if we have the Group to
+  // relate the new discussion to in the URL.
+  $group = menu_get_object();
+  if (og_is_group('node', $group)) {
+    $form[OG_AUDIENCE_FIELD][$form['language']['#value']][0]['default']['#default_value'][0] = $group->nid;
+    $form[OG_AUDIENCE_FIELD]['#access'] = user_access('administer content');
+
+    // Add message to tell user they can add comments after creating the topic.
+    $form['title']['#description'] = t('You will be able to add comments after saving the discussion topic.');
+  }
+}
+
+/**
+ * Wrapper function for creating a new comment.
+ */
+function mandrill_groups_add_comment($discussion, $comment_body, $account, $mandrill_groups_original_msg_id = NULL, $parent_comment_id = NULL, $subject = NULL, $files = array()) {
+  $values = array(
+    'subject' => $subject,
+    'uid' => $account->uid,
+    'nid' => $discussion->nid,
+    'name' => $account->name,
+    'status' => COMMENT_PUBLISHED,
+    'node_type' => 'comment_node_' . MANDRILL_GROUPS_DISCUSSION_NODE,
+    'mandrill_groups_original_msg_id' => $mandrill_groups_original_msg_id,
+    'comment_body' => $comment_body,
+  );
+
+  if ($parent_comment_id && comment_load($parent_comment_id)) {
+    $values['pid'] = $parent_comment_id;
+  }
+  $comment = entity_create('comment', $values);
+
+  $comment_wrapper = entity_metadata_wrapper('comment', $comment);
+  foreach ($files as $id => $file) {
+    $comment_wrapper->{MANDRILL_GROUPS_ATTACHMENT_FIELD}[$id]->file->set($file);
+  }
+
+  // If you use more standard save methodology, the comment gets lost, so:
+  comment_submit($comment);
+  comment_save($comment);
+  return $comment;
+}
+
+
+/**
+ * Create a new comment based on an email received via Mandrill.
+ *
+ * The $message['email'] is expected to be in the following format:
+ *
+ * email address: username+0001+0002@domain.tld
+ *
+ * Where username is the unique group identifier, 0001 is the optional
+ * ID and 0002 is the optional parent comment id.
+ */
+function mandrill_groups_process_message($message) {
+  // Ignore this message based on our header. Most likely due the group being
+  // CC'd when the send option is to "reply to sender".
+  if (!empty($message['headers'][MANDRILL_GROUPS_IGNORE_HEADER])) {
+    return FALSE;
+  }
+
+  $user = user_load_by_mail($message['from_email']);
+
+  // A user with this from_email does not exist in the system, return false.
+  if (!$user) {
+    watchdog('mandrill_groups', 'Message from %email denied: no user with that email address exists.',
+      array(
+        '%email' => $message['from_email'],
+      ));
+    return FALSE;
+  }
+
+  // Extract the unique group name and attempt to load the group.
+  list($email_username, $email_domain) = explode('@', $message['email']);
+  list($email_username, $discussion_id, $parent_comment_id) = explode(MANDRILL_GROUPS_EMAIL_SEPARATOR, $email_username);
+  $from_email = $email_username . '@' . $email_domain;
+  $group = mandrill_groups_load_by_mail($from_email);
+
+  // Invalid group, return false.
+  if (empty($group)) {
+    watchdog('mandrill_groups', 'Message from %email denied: no group with the email address %groupemail exists.',
+      array(
+        '%email' => $message['from_email'],
+        '%groupemail' => $message['email'],
+      ));
+    return FALSE;
+  }
+
+  // The user is a not a valid member of the group.
+  if (!og_is_member('node', $group->nid, 'user', $user)) {
+    // This email address doesn't have access to this group.
+    watchdog('mandrill_groups', 'Message from %email denied because no user with that email address has access to group %groupname (NID: %groupid)',
+      array(
+        '%email' => $message['from_email'],
+        '%groupname' => $group->title,
+        '%groupid' => $group->nid,
+      ));
+    return FALSE;
+  }
+
+  $comment_body = array(
+    LANGUAGE_NONE => array(
+      0 => array(
+        'value' => _mandrill_groups_filter_reply($message['html']),
+        'format' => 'mandrill_groups_html',
+      ),
+    ),
+  );
+
+  // Process an unsubscribe request.
+  if (!strcasecmp(trim($message['subject']), 'unsubscribe')) {
+    og_ungroup('node', $group->nid, 'user', $user->uid);
+    // An unsubscribe has been processed.
+    watchdog('mandrill_groups', 'Unsubscribe from %email processed for group %groupname (NID: %groupid)',
+      array(
+        '%email' => $message['from_email'],
+        '%groupname' => $group->title,
+        '%groupid' => $group->nid,
+      ));
+    return TRUE;
+  }
+  $mandrill_groups_original_msg_id = isset($message['headers']['Message-Id']) ? $message['headers']['Message-Id'] : NULL;
+
+  // Load existing discussion, or create a new one:
+  if ($discussion_id) {
+    $discussion = node_load($discussion_id);
+
+    // Fail if the discussion cannot be loaded.
+    if (!$discussion) {
+      watchdog('mandrill_groups', 'Message from %email for discussion %discussion denied because that discussion does not exist.',
+        array(
+          '%email' => $message['from_email'],
+          '%discussion' => $discussion_id,
+        ));
+      return FALSE;
+    }
+
+    // Verify the discussion matches the group attached to this email address:
+    $discussion_wrapper = entity_metadata_wrapper('node', $discussion);
+    if ($group->nid != $discussion_wrapper->{OG_AUDIENCE_FIELD}->raw()) {
+      // Trying to post to a discussion using wrong group email.
+      watchdog('mandrill_groups', 'Message from %email for discussion %discussion denied because the wrong targeting email was used (%groupemail)',
+        array(
+          '%email' => $message['from_email'],
+          '%discussion' => $discussion->nid,
+          '%groupemail' => $message['email'],
+        ));
+      return FALSE;
+    }
+  }
+  else {
+    // Create a new discussion.
+    $values = array(
+      'type' => MANDRILL_GROUPS_DISCUSSION_NODE,
+      'uid' => $user->uid,
+      'title' => $message['subject'],
+      'comment_body' => $comment_body,
+      'mandrill_groups_original_msg_id' => $mandrill_groups_original_msg_id,
+      'mandrill_groups_created_from_email' => TRUE,
+    );
+    $discussion = entity_create('node', $values);
+    $discussion_wrapper = entity_metadata_wrapper('node', $discussion);
+    $discussion_wrapper->{OG_AUDIENCE_FIELD}->set((int) $group->nid);
+    $discussion_wrapper->save();
+    watchdog('mandrill_groups', 'Discussion created: %subject.', array('%subject' => $message['subject']), WATCHDOG_NOTICE, l(t('view'), $discussion_wrapper->url->value()));
+  }
+
+
+  // Add attachments as files on the new comment. Note that we are not adding
+  // images, just attachments. @see https://mandrill.zendesk.com/hc/en-us/articles/205583207-What-is-the-format-of-inbound-email-webhooks.
+  $files = array();
+  if (isset($message['attachments'])) {
+    $field_settings = field_info_instance('comment', MANDRILL_GROUPS_ATTACHMENT_FIELD, 'comment_node_' . MANDRILL_GROUPS_DISCUSSION_NODE);
+
+    // Build an array of allowed file types.
+    $allowed_types = array();
+    $allowed_ext = explode(' ', $field_settings['settings']['file_extensions']);
+    include_once DRUPAL_ROOT . '/includes/file.mimetypes.inc';
+    $mimetype_mappings = file_mimetype_mapping();
+    foreach ($allowed_ext as $ext) {
+      $allowed_types[] = $mimetype_mappings['mimetypes'][$mimetype_mappings['extensions'][$ext]];
+    }
+
+    // Build our base file directory.
+    $base_path = explode("/", $field_settings['settings']['file_directory'])[0] . '/' . $discussion_wrapper->label();
+
+    foreach ($message['attachments'] as $filename => $attachment) {
+      // Invalid file type, continue.
+      if (!in_array($attachment['type'], $allowed_types)) {
+        continue;
+      }
+      $uri = file_build_uri($base_path);
+      file_prepare_directory($uri, FILE_CREATE_DIRECTORY && FILE_MODIFY_PERMISSIONS);
+      $file = file_save_data(base64_decode($attachment['content']), $uri . '/' . $attachment['name']);
+      $files[] = $file;
+    }
+  }
+
+  $comment = mandrill_groups_add_comment($discussion, $comment_body, $user, $mandrill_groups_original_msg_id, $parent_comment_id, $message['subject'], $files);
+  watchdog('mandrill_groups', 'Comment posted: %subject.', array('%subject' => $comment->subject), WATCHDOG_NOTICE, l(t('view'), 'comment/' . $comment->cid, array('fragment' => 'comment-' . $comment->cid)));
+}
+
+/**
+ * Process a bounce notification from Mandrill.
+ *
+ * @param array $message
+ *   Mandrill message.
+ */
+function mandrill_groups_process_bounce(array $message) {
+  $user = user_load_by_mail($message['email']);
+
+  // A user with this from_email does not exist in the system, return false.
+  if (!$user) {
+    watchdog('mandrill_groups', 'Message from %email denied: no user with that email address exists.',
+      array(
+        '%email' => $message['from_email'],
+      ));
+    return FALSE;
+  }
+
+
+  // Extract the unique group name and attempt to load the group.
+  list($email_username, $email_domain) = explode('@', $message['sender']);
+  list($email_username, $discussion_id, $parent_comment_id) = explode(MANDRILL_GROUPS_EMAIL_SEPARATOR, $email_username);
+  $from_email = $email_username . '@' . $email_domain;
+  $group = mandrill_groups_load_by_mail($from_email);
+
+  // Invalid group, return false.
+  if (empty($group)) {
+    watchdog('mandrill_groups', 'Message from %email denied: no group with the email address %groupemail exists.',
+      array(
+        '%email' => $message['from_email'],
+        '%groupemail' => $message['email'],
+      ));
+    return FALSE;
+  }
+
+  // The user is a not a valid member of the group.
+  if (!og_is_member('node', $group->nid, 'user', $user)) {
+    // This email address doesn't have access to this group.
+    watchdog('mandrill_groups', 'Message from %email denied because no user with that email address has access to group %groupname (NID: %groupid)',
+      array(
+        '%email' => $message['from_email'],
+        '%groupname' => $group->title,
+        '%groupid' => $group->nid,
+      ));
+    return FALSE;
+  }
+
+  $group_wrapper = entity_metadata_wrapper('node', $group);
+  $group_id = $group_wrapper->getIdentifier();
+  $membership = og_get_membership($group_wrapper->type(), $group_id, 'user', $user->uid);
+  $membership->state = OG_STATE_BLOCKED;
+
+  $membership->save();
+
+  // Allow other modules to respond to bounces.
+  module_invoke_all('mandrill_groups_process_bounce', $message, $membership);
+}
+
+/**
+ *
+ * @param string $message
+ *
+ * @return string
+ */
+function _mandrill_groups_filter_reply($message) {
+  $reply_line_position = strpos($message, MANDRILL_GROUPS_MESSAGE_SEPERATOR);
+  $quote_tags = variable_get('mandrill_groups_filter_tags', 'gmail_extra');
+  $tags_array = explode(',', $quote_tags);
+  foreach ($tags_array as $tag) {
+    $div_tag = '<div class="' . trim($tag) . '">';
+    $tag_pos = strpos($message, $div_tag);
+    if ($tag_pos !== FALSE) {
+      $reply_line_position = min($reply_line_position, $tag_pos);
+    }
+  }
+  $prior_close_tag_position = strrpos($message, '</', $reply_line_position - strlen($message));
+  $next_open_tag_position = strpos($message, '<', $prior_close_tag_position + 2);
+  // @todo replace "substr" with intelligent parsing of html tags to leave
+  // closing of tags at end.
+  $post = substr($message, 0, $next_open_tag_position);
+  return $post;
+}
+
+/**
+ * Load a Mandrill group node based on the group email.
+ *
+ * @return object|array
+ *   Depending whether $email is set, an array of groups or a single one.
+ */
+function mandrill_groups_load_by_mail($email = NULL) {
+  $query = new EntityFieldQuery();
+  $query->entityCondition('entity_type', 'node')
+    ->propertyCondition('type', MANDRILL_GROUPS_GROUP_NODE, '=');
+  if ($email) {
+    $query->fieldCondition('mandrill_groups_email', 'value', $email);
+  }
+  $results = $query->execute();
+  if (isset($results['node'])) {
+    $result_ids = array_keys($results['node']);
+    $first = reset($result_ids);
+    return $email ? node_load($first) : node_load_multiple($result_ids);
+  }
+  else {
+    return array();
+  }
+}
+
+/**
+ * Implements hook_comment_insert().
+ */
+function mandrill_groups_comment_insert($comment) {
+  if ($comment->node_type != 'comment_node_' . MANDRILL_GROUPS_DISCUSSION_NODE) {
+    return;
+  }
+  // Load posting user:
+  $author = user_load($comment->uid);
+
+  $comment_wrapper = entity_metadata_wrapper('comment', $comment);
+
+  // Load parent node.
+  $node = node_load($comment->nid);
+  $node_wrapper = entity_metadata_wrapper('node', $node);
+
+  // We want to set the reply-to header to match a previous message sent from
+  // this system for threading purposes.
+  $reply_to_id = $node_wrapper->{MANDRILL_GROUPS_MESSAGE_ID_FIELD}->value();
+
+  // If this is the first message, and no ID is available, we set the reply-to
+  // to be the initializing email message ID for the benefit of the person who
+  // created this email.
+  if (empty($reply_to_id) && ($comment->mandrill_groups_original_msg_id)) {
+    $reply_to_id = $comment->mandrill_groups_original_msg_id;
+  }
+  $comment->mandrill_groups_message_id = '<' . date('YmdHis') . '.' . $comment->cid . '.' . $comment->nid . '@' . $_SERVER['HTTP_HOST'] . '>';
+  $node_wrapper->{MANDRILL_GROUPS_MESSAGE_ID_FIELD}->set($comment->mandrill_groups_message_id);
+  $node_wrapper->save();
+
+  // Grab our group.
+  $group = $node_wrapper->{OG_AUDIENCE_FIELD}->value();
+  $group_wrapper = entity_metadata_wrapper('node', $group);
+
+  // Load active members.
+  $members = $group_wrapper->{'members__' . OG_STATE_ACTIVE}->value();
+
+  // Iterate through the group members collect emails for immediate sending.
+  $addresses = array();
+  foreach ($members as $member) {
+    // Don't send emails to the comment author.
+    if ($member->uid == $author->uid) {
+      continue;
+    }
+    $membership = entity_metadata_wrapper('og_membership', og_get_membership($group_wrapper->type(), $group_wrapper->getIdentifier(), 'user', $member->uid));
+    if ($membership->{MANDRILL_GROUPS_EMAIL_FREQUENCY_FIELD}->value() == MANDRILL_GROUPS_EMAIL_IMMEDIATE) {
+      $addresses[] = $member->mail;
+    }
+  }
+
+  if (empty($addresses)) {
+    return;
+  }
+
+  $content = field_view_field('comment', $comment, 'comment_body');
+  $message = array(
+    'id' => MANDRILL_GROUPS_DISCUSSION_NODE,
+    'subject' => $node->title,
+    'body' => array($content[0]['#markup']),
+    'mandrill' => array(
+      'header' => array(
+        'Message-Id' => $comment->mandrill_groups_message_id,
+        'Precedence' => 'List',
+        // Adding list-specific headers. Note that Mandrill is currently only
+        // allowing List-Help through. This may change, so we'll leave these in.
+        'List-Help' => "<{$group_wrapper->url->value()}>, <mailto:{$group_wrapper->author->mail->value()}>",
+        'List-Unsubscribe:' => "<mailto:{$group_wrapper->{MANDRILL_GROUPS_EMAIL_FIELD}->value()}?subject=unsubscribe>",
+        'List-Post:' => "<mailto:{$group_wrapper->{MANDRILL_GROUPS_EMAIL_FIELD}->value()}",
+        'List-Owner:' => "<mailto:{$group_wrapper->author->mail->value()}",
+      ),
+      'from_name' => $author->name . ' via ' . variable_get('site_name', 'Drupal Site'),
+      'overrides' => array(
+        'preserve_recipients' => TRUE,
+      ),
+    ),
+  );
+  if (isset($group_wrapper->{MANDRILL_GROUPS_SUBJECT_FIELD})) {
+    $message['subject'] = $group_wrapper->{MANDRILL_GROUPS_SUBJECT_FIELD}->value() . ' ' . $message['subject'];
+  }
+
+  if (!empty($reply_to_id)) {
+    $message['mandrill']['header']['In-Reply-To'] = $reply_to_id;
+  }
+
+  entity_save('comment', $comment);
+
+  list($from_user, $from_domain) = explode('@', $group_wrapper->{MANDRILL_GROUPS_EMAIL_FIELD}->value());
+  $from = $from_user . MANDRILL_GROUPS_EMAIL_SEPARATOR . $node_wrapper->getIdentifier() . MANDRILL_GROUPS_EMAIL_SEPARATOR . $comment->cid . '@' . $from_domain;
+
+  // Mandrill automatically puts the "From" into "Reply To" and replaces the
+  // "From" with the official system email address.
+  if ($group_wrapper->{MANDRILL_GROUPS_EMAIL_REPLY_TO}->value() == 'sender' && isset($author->mail)) {
+    // Make sure to set the Cc to the group email before overriding with author.
+    $message['mandrill']['header']['Cc'] = $from;
+    $message['mandrill']['header'][MANDRILL_GROUPS_IGNORE_HEADER] = 1;
+
+    $from = $author->mail;
+  }
+
+  // Check for attachments:
+  if ($comment_wrapper->{MANDRILL_GROUPS_ATTACHMENT_FIELD} && count($comment_wrapper->{MANDRILL_GROUPS_ATTACHMENT_FIELD}->value())) {
+    $attachment_values = $comment_wrapper->{MANDRILL_GROUPS_ATTACHMENT_FIELD}->value();
+    $message['attachments'] = array();
+    foreach ($attachment_values as $file_info) {
+      $file = file_load($file_info['fid']);
+      $label = empty($file_info['description']) ? $file->filename : $file_info['description'];
+      if ($file->filesize < 1000000 * $node_wrapper->{OG_AUDIENCE_FIELD}->{MANDRILL_GROUPS_ATTACHMENT_SENDLIMIT}->value()) {
+        $message['attachments'][] = array('uri' => $file->uri);
+      }
+      else {
+        $message['body'][] = l($label, file_create_url($file->uri)) . '<br />';
+      }
+    }
+  }
+
+  mandrill_groups_send_email($from, $addresses, $message, $group, $node);
+}
+
+/**
+ * Send a message relate to a particular discussion.
+ *
+ * This function appends the appropriate postscript to emails, whether they are
+ * individual comment messages or consolidated messages.
+ */
+function mandrill_groups_send_email($from, $addresses, $message, $group, $discussion = NULL) {
+  $group_wrapper = entity_metadata_wrapper('node', $group);
+
+  // Add list specific headers.
+  $mandrill_headers = array(
+    'Precedence' => 'List',
+    // Adding list-specific headers. Note that Mandrill is currently only
+    // allowing List-Help through. This may change, so we'll leave these in.
+    'List-Help' => "<{$group_wrapper->url->value()}>, <mailto:{$group_wrapper->author->mail->value()}>",
+    'List-Unsubscribe:' => "<mailto:{$group_wrapper->{MANDRILL_GROUPS_EMAIL_FIELD}->value()}?subject=unsubscribe>",
+    'List-Post:' => "<mailto:{$group_wrapper->{MANDRILL_GROUPS_EMAIL_FIELD}->value()}",
+    'List-Owner:' => "<mailto:{$group_wrapper->author->mail->value()}",
+  );
+  $message['mandrill']['header'] = array_merge($message['mandrill']['header'], $mandrill_headers);
+
+  $postscript_tokens = array(
+    '@group_name' => $group_wrapper->label(),
+    '@site_name' => variable_get('site_name'),
+    '@group_email' => $group_wrapper->{MANDRILL_GROUPS_EMAIL_FIELD}->value(),
+    '@group_link' => $group_wrapper->url->value(),
+    '@settings_link' => $GLOBALS['base_url'] . '/user',
+  );
+  if ($discussion) {
+    $discussion_wrapper = entity_metadata_wrapper('node', $discussion);
+    $postscript_tokens['@discussion_link'] = $discussion_wrapper->url->value();
+  }
+
+  $postscript = format_string($group_wrapper->{MANDRILL_GROUPS_POSTSCRIPT_FIELD}->value(), $postscript_tokens);
+  // Don't include the 'Reply above this line' for digests.
+  $pos = strpos($message['subject'], 'Daily Digest');
+  if($pos === false) {
+    array_unshift($message['body'], MANDRILL_GROUPS_MESSAGE_SEPERATOR . '<br />');
+  }
+  $message['body'][] = $postscript;
+
+  // Send Email.
+  drupal_mail('mandrill_groups', 'discussion', implode(',', $addresses), LANGUAGE_NONE, $message, $from);
+}
+
+/**
+ * Implements hook_mail().
+ */
+function mandrill_groups_mail($key, &$message, $params) {
+  if ($key == 'discussion') {
+    $message['subject'] = $params['subject'];
+    $message['body'] = $params['body'];
+  }
+}
+
+/**
+ * Implements hook_mandrill_mail_alter().
+ *
+ * Change the 'to' structure to allow for adding CC recipients.
+ */
+function mandrill_groups_mandrill_mail_alter(&$mandrill_params, $message) {
+  if (isset($mandrill_params['message']['headers']['Cc'])) {
+    $mandrill_params['message']['to'][] = array(
+      'email' => $mandrill_params['message']['headers']['Cc'],
+      'type' => 'cc',
+    );
+  }
+}
+
+/**
+ * Implements theme_preprocess_comment().
+ *
+ * Hide the comment title on Mandrill discussions.
+ */
+function mandrill_groups_preprocess_comment(&$variables) {
+  $node_type = $variables['node']->type;
+  if ($node_type == MANDRILL_GROUPS_DISCUSSION_NODE) {
+    $subject_enabled = variable_get('comment_subject_field_' . $node_type, 0);
+
+    if (!$subject_enabled) {
+      // Don't display the comment title.
+      $variables['title_attributes_array']['class'][] = 'element-invisible';
+    }
+  }
+}
+
+/**
+ * Allowed values callback for our email frequency field.
+ *
+ * @return array
+ *   An array of allowed values.
+ */
+function mandrill_groups_email_frequency_allowed_values() {
+  return array(
+    MANDRILL_GROUPS_EMAIL_IMMEDIATE => t('Immediate'),
+    MANDRILL_GROUPS_EMAIL_DAILY => t('Daily digest'),
+    MANDRILL_GROUPS_EMAIL_NONE => t('No email'),
+  );
+}
+
+/**
+ * Implements og_fields_info_alter().
+ *
+ * Set the group membership type on the audience field to Mandrill Groups.
+ */
+function mandrill_groups_og_fields_info_alter(&$fields_info) {
+  $fields_info[OG_AUDIENCE_FIELD]['field']['settings']['handler_settings']['membership_type'] = MANDRILL_GROUPS_MEMBERSHIP_TYPE;
+}
+
+/**
+ * Setup OG access on our group and discussion nodes.
+ */
+function mandrill_groups_setup_og_access() {
+  og_create_field(OG_ACCESS_FIELD, 'node', MANDRILL_GROUPS_GROUP_NODE);
+
+  $og_content_access_field = og_fields_info(OG_CONTENT_ACCESS_FIELD);
+  $og_content_access_field['field']['default_value'] = array(array('value' => OG_CONTENT_ACCESS_PRIVATE));
+  og_create_field(OG_CONTENT_ACCESS_FIELD, 'node', MANDRILL_GROUPS_DISCUSSION_NODE, $og_content_access_field);
+}

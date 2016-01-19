@@ -1,0 +1,469 @@
+<?php
+
+/**
+ * @file
+ * OSM Route module file.
+ *
+ * This module allows to add routing functionality to the site.
+ */
+
+define('OSM_ROUTE_NAME', 'OSM Route');
+define('OSM_ROUTE_YOURNAVIGATION_URL', 'osm_route_yournavigation_url');
+define('OSM_ROUTE_YOURNAVIGATION_QUERY_TEMPLATE', 'osm_route_yournavigation_query_template');
+
+/**
+ * Implements hook_menu().
+ */
+function osm_route_menu() {
+  $items = array();
+
+  $items['admin/config/services/osm_route'] = array(
+    'title' => OSM_ROUTE_NAME,
+    'description' => 'Configuration for the automatic routing calculation.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('osm_route_admin_settings'),
+    'access arguments' => array('administer site configuration'),
+    'type' => MENU_NORMAL_ITEM,
+    'file' => 'osm_route.admin.inc',
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_help().
+ */
+function osm_route_help($path, $arg) {
+  switch ($path) {
+    case 'admin/help#osm_route':
+      return '<p>'
+              . t('Add routes from an array of locations.')
+              . '<br />'
+              . t('Please check the file README.txt inside the module folder for further information.')
+              . '</p>';
+  }
+}
+
+/**
+ * Implements hook_osm_route_poi_nodes_alter().
+ */
+function osm_route_osm_route_poi_nodes_alter(&$poi_nodes_id) {
+  $filtered_poi_nodes_id = array();
+
+  // By default, I remove nodes which are not published or accessible by
+  // anonymous users.
+  $poi_nodes_id_new = array();
+  foreach ($poi_nodes_id as $value) {
+    $poi_nodes_id_new[] = $value['target_id'];
+  }
+
+  $nodes_point = node_load_multiple($poi_nodes_id_new);
+  foreach ($nodes_point as $node_point) {
+    $can_view = node_access('view', $node_point, drupal_anonymous_user());
+    if ($can_view) {
+      $filtered_poi_nodes_id[] = $node_point->nid;
+    }
+  }
+  $poi_nodes_id = $filtered_poi_nodes_id;
+}
+
+/**
+ * Implements hook_node_presave().
+ */
+function osm_route_node_presave($node) {
+
+  $node_type = variable_get('osm_route_node_type', 'itinerary');
+  $field_input = variable_get('osm_route_field_input', 'field_leg');
+  $field_output = variable_get('osm_route_field_output', '');
+  $field_instructions = variable_get('osm_route_field_instructions', 'field_instructions');
+  $field_geofield = variable_get('osm_route_field_input_geofield', 'field_geofield');
+  $varname_lat = 'lat';
+  $varname_lon = 'lon';
+
+  if ($node->type == $node_type) {
+    // I build an array containing the lat/long coordinates.
+    $array_poi = array();
+
+    // I select the list of nodes id, they will be filtered by an alter.
+    $poi_nodes_id = $node->{$field_input}[LANGUAGE_NONE];
+
+    // Will call all modules implementing hook_osm_route_poi_nodes_alter
+    drupal_alter('osm_route_poi_nodes', $poi_nodes_id);
+
+    $nodes_point = node_load_multiple($poi_nodes_id);
+    foreach ($nodes_point as $node_point) {
+      $loc = $node_point->{$field_geofield}[LANGUAGE_NONE];
+      if (count($loc) && isset($loc[0][$varname_lat])) {
+        foreach ($loc as $idx => $value) {
+          $array_poi[] = $loc[$idx];
+        }
+      }
+    }
+
+    if (!isset($node->{$field_output}[LANGUAGE_NONE])) {
+      $node->{$field_output}[LANGUAGE_NONE] = array();
+    }
+
+    $new_routes = array();
+    // If there is only one point I put it for maintaining
+    // the "zoom to the extent" behaviour.
+    if (count($array_poi) == 1) {
+      $new_routes[] = osm_route_get_geofield(
+              $array_poi[0][$varname_lat], $array_poi[0][$varname_lon] + 0.0001, $array_poi[0][$varname_lat], $array_poi[0][$varname_lon] + 0.0001, 'bycicle');
+    }
+
+    // I load a GeoJSon paths exploiting OSM API.
+    for ($i = 1; $i < count($array_poi); $i++) {
+      $flat = $array_poi[$i - 1][$varname_lat];
+      $flon = $array_poi[$i - 1][$varname_lon];
+      $tlat = $array_poi[$i][$varname_lat];
+      $tlon = $array_poi[$i][$varname_lon];
+
+      // If the previous path is ok, do nothing.
+      if (isset($node->{$field_output}[LANGUAGE_NONE][$i - 1])) {
+        if (osm_route_accept_values($node->{$field_output}[LANGUAGE_NONE][$i - 1], $flat, $flon, $tlat, $tlon)) {
+          $new_routes[] = $node->{$field_output}[LANGUAGE_NONE][$i - 1];
+          continue;
+        }
+      }
+
+      $values = osm_route_get_geofield_iterative($flat, $flon, $tlat, $tlon, 'motorcar');
+      if (!osm_route_accept_values($values, $flat, $flon, $tlat, $tlon)) {
+        // Bicycle is more robust than car to broken routes.
+        $values = osm_route_get_geofield_iterative($flat, $flon, $tlat, $tlon, 'bicycle');
+      }
+
+      $new_routes[] = $values;
+      $i_title = t('Driving instructions for segment @i', array('@i' => $i));
+      $i_distance = check_plain($values['i_distance']);
+      $i_traveltime = ceil(floatval($values['i_traveltime']) / 60.0);
+      $allowed_html = array('p', 'br', 'hr');
+      $i_description = filter_xss($values['i_description'], $allowed_html);
+      $segment = theme('osm_route_render_directions', array(
+        'title' => $i_title,
+        'body' => $i_description,
+        'distance' => $i_distance,
+        'traveltime' => $i_traveltime));
+
+      // Check whether the field is empty, the user could have modified it.
+      if (!empty($field_instructions)) {
+        $node->{$field_instructions}[LANGUAGE_NONE][$i]['format'] = 'full_html';
+        $node->{$field_instructions}[LANGUAGE_NONE][$i]['value'] = $segment;
+        // /-} Call osm_route_transcript($segment) to translate or personalize.
+      }
+    }
+    $node->{$field_output}[LANGUAGE_NONE] = $new_routes;
+  }
+}
+
+/**
+ * Evaluates whether a computed path is acceptable or not.
+ *
+ * @param array|float $values
+ *   A geofield item with the route.
+ * @param float $flat
+ *   The "from" latitude.
+ * @param float $flon
+ *   The "from" longitude.
+ * @param float $tlat
+ *   The "to" latitude.
+ * @param float $tlon
+ *   The "to" longitude.
+ *
+ * @return bool
+ *   TRUE if a path is acceptable, false otherwise.
+ */
+function osm_route_accept_values($values, $flat, $flon, $tlat, $tlon) {
+  if (!isset($values)) {
+    return FALSE;
+  }
+  $ok_threshold = variable_get('osm_route_near_threshold', 5e-2);
+  // If top or bottom properties are not set, then no points have been
+  // validated.
+  if (!isset($values['bottom'])) {
+    return FALSE;
+  }
+  if (abs($values['bottom'] - $tlat) < $ok_threshold) {
+    if (abs($values['top'] - $flat) < $ok_threshold) {
+      return TRUE;
+    }
+  }
+  if (abs($values['top'] - $tlat) < $ok_threshold) {
+    if (abs($values['bottom'] - $flat) < $ok_threshold) {
+      return TRUE;
+    }
+  }
+
+  return FALSE;
+}
+
+/**
+ * Returns true if two point are considered near according to the threshold.
+ *
+ * @param float $lat1
+ *   The "from" latitude.
+ * @param float $lon1
+ *   The "from" longitude.
+ * @param float $lat2
+ *   The "to" latitude.
+ * @param float $lon2
+ *   The "to" longitude.
+ *
+ * @return bool
+ *   TRUE if the points are considered near
+ */
+function osm_route_near($lat1, $lon1, $lat2, $lon2) {
+  $ok_threshold = variable_get('osm_route_near_threshold', 5e-2);
+  return abs($lat1 - $lat2) < $ok_threshold && abs($lon1 - $lon2) < $ok_threshold;
+}
+
+/**
+ * Gets the route from "yournavigation" web service and returns a geofield item.
+ *
+ * @param float $flat
+ *   The "from" latitude.
+ * @param float $flon
+ *   The "from" longitude.
+ * @param float $tlat
+ *   The "to" latitude.
+ * @param float $tlon
+ *   The "to" longitude.
+ * @param string $type
+ *   The path tipology, i.e., motorcar, bycicle, foot.
+ *
+ * @return array
+ *   a geofield array item
+ */
+function osm_route_get_geofield($flat, $flon, $tlat, $tlon, $type = 'motorcar', $randomize = 0) {
+  // This is the OSM Query Template, I can handle, path type,
+  // output format, etc.
+  // Example: $apiQuery = 'http://www.yournavigation.org/api/1.0/gosmore.php
+  // ?format=geojson&flat=52.215676&flon=5.963946&tlat=52.2573&tlon=6.1799
+  // &v=motorcar&fast=1&layer=mapnik';.
+  //
+  // Former saved paths are resetted and calculated once again
+  // from new location list.
+  if ($randomize) {
+    $flat = $flat + mt_rand(-100000, 100000) / 100000 * $randomize;
+    $flon = $flon + mt_rand(-100000, 100000) / 100000 * $randomize;
+    $tlat = $tlat + mt_rand(-100000, 100000) / 100000 * $randomize;
+    $tlon = $tlon + mt_rand(-100000, 100000) / 100000 * $randomize;
+  }
+
+  $base_url = variable_get(OSM_ROUTE_YOURNAVIGATION_URL, 'http://www.yournavigation.org/api/1.0/gosmore.php');
+  $query_base = variable_get(OSM_ROUTE_YOURNAVIGATION_QUERY_TEMPLATE, '?format=geojson&flat=%s&flon=%s&tlat=%s&tlon=%s&v=%s&fast=1&layer=mapnik&instructions=1&lang=en_GB');
+  $api_query_template = $base_url . $query_base;
+  $api_query = sprintf($api_query_template, $flat, $flon, $tlat, $tlon, $type);
+  $page_response = drupal_http_request($api_query);
+
+  if ($page_response->code != 200) {
+    // Error Handling.
+    $error_msg = t("The API page @api_page could not be reached.", array('@api_page' => $base_url));
+    drupal_set_message($error_msg, 'error');
+    watchdog(WATCHDOG_ERROR, $error_msg);
+    return NULL;
+  }
+
+  $geo_json = $page_response->data;
+
+  try {
+    $values = geofield_compute_values($geo_json, 'json');
+    $values_json = drupal_json_decode($geo_json);
+    $values["i_description"] = $values_json['properties']['description'];
+    $values["i_distance"] = $values_json['properties']['distance'];
+    $values["i_traveltime"] = $values_json['properties']['traveltime'];
+  }
+  catch (Exception $exc) {
+    $error_msg = t("Error @error while deconding json.", array('@error' => $exc->getMessage()));
+    watchdog(WATCHDOG_ERROR, $error_msg);
+    return NULL;
+  }
+
+  return $values;
+}
+
+/**
+ * Perform a search around a point for robust evaluation.
+ *
+ * @param float $flat
+ *   The "from" latitude.
+ * @param float $flon
+ *   The "from" longitude.
+ * @param float $tlat
+ *   The "to" latitude.
+ * @param float $tlon
+ *   The "to" longitude.
+ * @param string $type
+ *   The path tipology, i.e., motorcar, bycicle, foot.
+ *
+ * @return array
+ *   An array of accepted geofield items
+ */
+function osm_route_get_geofield_iterative($flat, $flon, $tlat, $tlon, $type = 'motorcar') {
+  $values = osm_route_get_geofield($flat, $flon, $tlat, $tlon, $type, 0);
+  if (osm_route_accept_values($values, $flat, $flon, $tlat, $tlon)) {
+    return $values;
+  }
+
+  $trials = array(1e-3, 1e-2);
+  foreach ($trials as $value) {
+    for ($i = 0; $i < variable_get('osm_route_tries_number', 2); $i++) {
+      $values = osm_route_get_geofield($flat, $flon, $tlat, $tlon, $type, $value);
+      if (!isset($values)) {
+        // $values is empty if the API page is wrong. Error reported. Exiting.
+        return;
+      }
+      if (osm_route_accept_values($values, $flat, $flon, $tlat, $tlon)) {
+        return $values;
+      }
+    }
+  }
+  return NULL;
+}
+
+/**
+ * Implements hook_block_info().
+ */
+function osm_route_block_info() {
+  $blocks = array();
+
+  $blocks['osm_route_block_directions'] = array(
+    'info' => t('OSM Route Directions Block'),
+  );
+
+  return $blocks;
+}
+
+/**
+ * Implements hook_block_view().
+ */
+function osm_route_block_view($delta = '') {
+  $block = array();
+
+  switch ($delta) {
+    case 'osm_route_block_directions':
+      $block_content = osm_route_get_node_directions();
+      $block['content'] = '<div id="osm-route-directions">' . $block_content . '</div>';
+      break;
+  }
+
+  return $block;
+}
+
+/**
+ * Renders a block of html text with driving instructions.
+ *
+ * @return string
+ *   Renders an html block containing driving instructions.
+ */
+function osm_route_get_node_directions() {
+
+  $node = menu_get_object();
+  if (!isset($node)) {
+    return "";
+  }
+
+  $node_type = variable_get('osm_route_node_type', 'itinerary');
+  $field_input = variable_get('osm_route_field_input', 'field_leg');
+  $field_geofield = variable_get('osm_route_field_input_geofield', 'field_geofield');
+  $varname_lat = 'lat';
+  $varname_lon = 'lon';
+
+  if ($node->type == $node_type) {
+    // I build an array containing the lat/long coordinates.
+    $array_poi = array();
+
+    // I select the list of nodes id, they will be filtered by an alter.
+    $poi_nodes_id = $node->{$field_input}[LANGUAGE_NONE];
+
+    // Will call all modules implementing hook_osm_route_poi_nodes_alter
+    drupal_alter('osm_route_poi_nodes', $poi_nodes_id);
+
+    foreach ($poi_nodes_id as $value) {
+      $node_point = node_load($value['target_id']);
+      $loc = $node_point->{$field_geofield}[LANGUAGE_NONE];
+      if (count($loc) && isset($loc[0][$varname_lat])) {
+        foreach ($loc as $idx => $value) {
+          $array_poi[] = $loc[$idx];
+        }
+      }
+    }
+
+    $instructions = "";
+
+    // Load GeoJSon paths exploiting OSM API.
+    for ($i = 1; $i < count($array_poi); $i++) {
+      $flat = $array_poi[$i - 1][$varname_lat];
+      $flon = $array_poi[$i - 1][$varname_lon];
+      $tlat = $array_poi[$i][$varname_lat];
+      $tlon = $array_poi[$i][$varname_lon];
+
+      $values = osm_route_get_geofield_iterative($flat, $flon, $tlat, $tlon, 'motorcar');
+      if (!osm_route_accept_values($values, $flat, $flon, $tlat, $tlon)) {
+        // Bicycle is more robust than car to broken routes.
+        $values = osm_route_get_geofield_iterative($flat, $flon, $tlat, $tlon, 'bicycle');
+      }
+
+      $i_title = t('Driving instructions for segment @i', array('@i' => $i));
+      $i_distance = check_plain($values['i_distance']);
+      $i_traveltime = ceil(floatval($values['i_traveltime']) / 60.0);
+      $allowed_html = array('p', 'br', 'hr');
+      $i_description = filter_xss($values['i_description'], $allowed_html);
+      $instructions = $instructions . theme('osm_route_render_directions', array(
+        'title' => $i_title,
+        'body' => $i_description,
+        'distance' => $i_distance,
+        'traveltime' => $i_traveltime));
+    }
+    return $instructions;
+  }
+}
+
+/**
+ * Theme function that renders the driving instructions.
+ *
+ * @param array|object $variables
+ *   The array of variables.
+ *   - title => string
+ *     The title of the block (i.e., the number of the segment).
+ *   - body => html
+ *     The driving instructions.
+ *   - distance => int
+ *     The distance in Km.
+ *   - traveltime => int
+ *     The travel time in minutes.
+ *
+ * @return string
+ *   The driving directions in form of a HTML block.
+ */
+function theme_osm_route_render_directions($variables) {
+  $title = $variables['title'];
+  $body = $variables['body'];
+  $distance = $variables['distance'];
+  $traveltime = $variables['traveltime'];
+
+  if (empty($body)) {
+    return "";
+  }
+
+  $html_render = "<h1>$title</h1>\n<p>$body</p>\n<p>" .
+          t("Distance: @distance Km.", array('@distance' => $distance)) . "</p>\n<p>" .
+          t("Travel time: @traveltime minutes.", array('@traveltime' => $traveltime)) . "</p>\n";
+  return $html_render;
+}
+
+/**
+ * Implements hook_theme().
+ */
+function osm_route_theme() {
+  return array(
+    'osm_route_render_directions' => array(
+      'arguments' => array(
+        'title' => NULL,
+        'body' => NULL,
+        'distance' => NULL,
+        'traveltime' => NULL,
+      ),
+    ),
+  );
+}

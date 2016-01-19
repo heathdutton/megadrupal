@@ -1,0 +1,1743 @@
+<?php
+
+/**
+ * @file
+ * Chatblock module provides a simple on site chat within a block.
+ */
+
+/**
+ * Default values for some config options.
+ */
+define('CHATBLOCK_POLL_RATE_DEFAULT', 5);
+define('CHATBLOCK_POLL_RATE_MAX_DEFAULT', 3);
+define('CHATBLOCK_RETROSPECT_DEFAULT', 10);
+define('CHATBLOCK_STARTUP_MESSAGES_DEFAULT', 30);
+define('CHATBLOCK_ADMIN_URL', 'admin/config/content/chatblock');
+define('CHATBLOCK_BLOCK_ADMIN_URL', 'admin/structure/block/manage/chatblock/chatwindow');
+define('CHATBLOCK_PERMISSIONS_ADMIN_URL', 'admin/people/permissions');
+define('CHATBLOCK_LINKS_SHOW_NEVER', 0);
+define('CHATBLOCK_LINKS_SHOW_CONDITIONAL', 1);
+define('CHATBLOCK_LINKS_SHOW_ALWAYS', 2);
+define('CHATBLOCK_LINKS_DISPLAY_SETTING', variable_get('chatblock_show_function_links', CHATBLOCK_LINKS_SHOW_CONDITIONAL));
+
+/**
+ * Implements hook_block_info().
+ */
+function chatblock_block_info() {
+  $blocks = array(
+    'chatwindow' => array(
+      'info' => t('On site chat'),
+      // We definitely do not want this cached.
+      'cache' => DRUPAL_NO_CACHE,
+    ),
+    'chatinfo' => array(
+      'info' => t('On site chat infos'),
+      // This block will hardly change at all
+      'cache' => DRUPAL_CACHE_GLOBAL,
+    ),
+  );
+  return $blocks;
+}
+
+/**
+ * Implements hook_block_view().
+ */
+function chatblock_block_view($delta = 'chatwindow') {
+  // If $op is "view", then we need to generate the block for display
+  // purposes. The $delta parameter tells us which block is being requested.
+  $block = array();
+  switch ($delta) {
+    case 'chatwindow':
+      $chatblock_content = _chatblock_contents();
+      if (!empty($chatblock_content)) {
+        // The chatblock itself
+        $block['subject'] = check_plain(variable_get('chatblock_default_title', t('Chat')));
+        $block['content'] = array(
+          '#type' => 'markup',
+          '#markup' => $chatblock_content,
+        );
+        if (CHATBLOCK_LINKS_DISPLAY_SETTING == CHATBLOCK_LINKS_SHOW_CONDITIONAL) {
+          $block['content']['#contextual_links'] = array(
+            'settings' => array(
+              CHATBLOCK_ADMIN_URL,
+              array(),
+            ),
+            'infos' => array(
+              'chatblock/info/display',
+              array(),
+            ),
+            'logs' => array(
+              'chatblock/logs/display',
+              array(),
+            ),
+          );
+        }
+      }
+      break;
+    case 'chatinfo':
+      // The info block
+      if (
+        user_access('view chats')
+        ||
+        user_access('join chats')
+        ||
+        user_access('view chat logs')
+      ) {
+        $block['subject'] = t('Chat infos');
+        $block['content'] = chatblock_format_infos(true);
+      }
+    break;
+  }
+  return $block;
+  break;
+}
+
+/**
+ * Ajax callback for retrieving new chat messages.
+ *
+ * Bridge between js module/menu system and the messages function.
+ * Also adds a conditional parameter to the _chatblock_messages()
+ * function call.
+ *
+ * @see chatblock_js()
+ * @see chatblock_menu()
+ * @see _chatblock_messages()
+ */
+function chatblock_chat_callback() {
+  if (
+    user_access('view chats')
+    ||
+    user_access('join chats')
+  ) {
+    _chatblock_messages(TRUE);
+  }
+}
+
+/**
+ * Ajax callback for updating the chat with a message.
+ *
+ * This callback inserts the current message into the database
+ * and feeds back an immediate update towards the client.
+ *
+ * @see chatblock_js()
+ * @see chatblock_menu()
+ */
+function chatblock_chat_update_callback() {
+
+  if (
+    isset($_POST['chatboxtoken'])
+    &&
+    user_access('join chats')
+  ) {
+    if (_chatblock_database('update', $_POST['message'])) {
+      // Generate a json response.
+      _chatblock_messages(TRUE);
+    }
+  }
+}
+
+/**
+ * Renders the message input form.
+ *
+ * @return string
+ *   The HTML for the input form.
+ */
+function chatblock_chatform() {
+  $form = array();
+
+  $form['chatblocktext'] = array(
+    '#type' => 'textfield',
+    '#size' => 20,
+    '#maxlength' => 255,
+  );
+
+  $js = array(
+    'minimizeInputForm' => variable_get('chatblock_minimize_input_form', 1),
+  );
+
+  $field_label = trim(variable_get('chatblock_input_label', t('Enter your message')));
+  if ($field_label != '') {
+    $form['chatblocktext']['#title'] = check_plain($field_label);
+    $js['inputFieldLabel'] = "<$field_label>";
+  }
+
+  // Add JS options for dynamic input form.
+  drupal_add_js(array('chatblock' => $js), 'setting');
+
+  $form['chatblocksubmit'] = array(
+    '#type' => 'submit',
+    '#value' => t('send'),
+  );
+
+  return $form;
+}
+
+/**
+ * Submit callback for the message input form.
+ *
+ * Will only be used for non-JS clients, while Ajax processing
+ * uses chatblock_chat_update_callback and its internal logic.
+ *
+ * @see chatblock_chat_update_callback()
+ */
+function chatblock_chatform_submit($form, &$form_state) {
+  if (isset($form_state['values']['chatblocktext'])) {
+    $message = $form_state['values']['chatblocktext'];
+    _chatblock_database('update', $message);
+  }
+  return;
+}
+
+/**
+ * Callback function. Cleans up message logs.
+ *
+ * @param $timediff
+ *   A positive integer determining the amount of time units.
+ * @param $unit
+ *   A positive integer representing:
+ *   - 5: Years
+ *   - 4: Months
+ *   - 3: Weeks
+ *   - 2: Days
+ *   - 1: Hours
+ *   - 0: Minutes
+ *
+ * @return int|bool
+ *   The result of the DB operation (number of deleted messages) on success,
+ *   FALSE on failures.
+ *
+ * @see chatblock_cleanup_manual()
+ * @see chatblock_cron()
+ */
+function chatblock_cleanup($timediff, $unit) {
+  switch ($unit) {
+    case 5:
+      // Years.
+      $timediff *= 365;
+      break;
+    case 4:
+      // Months.
+      $timediff *= 30;
+      break;
+    case 3:
+      // Weeks
+      $timediff *= 7;
+      break;
+  }
+  switch ($unit) {
+    case 5:
+    case 4:
+    case 3:
+    case 2:
+      // Days.
+      $timediff *= 24;
+    case 1:
+      // Hours.
+      $timediff *= 60;
+    case 0:
+      // Minutes.
+      $timediff *= 60;
+      break;
+  }
+  $due_date = REQUEST_TIME - $timediff;
+  watchdog(
+    'chatblock',
+    'Cleaning up messages older than !due_date from chatblock logs.',
+    array('!due_date' => format_date($due_date))
+  );
+  $query = db_delete('chatblock')
+    ->condition('timestamp', $due_date, '<')
+    ->execute()
+  ;
+  if (FALSE !== $query) {
+    _chatblock_database('cache_rebuild');
+  }
+  return $query;
+}
+
+/**
+ * Callback function for manual cleanup form.
+ *
+ * @see chatblock_cleanup()
+ * @see chatblock.admin.inc
+ * @see chatblock_cleanup_form()
+ */
+function chatblock_cleanup_manual($form, &$form_state) {
+  $result = chatblock_cleanup(
+    $form_state['values']['chatblock_autodelete_value'],
+    $form_state['values']['chatblock_autodelete_unit']
+  );
+  if ($result === FALSE) {
+    drupal_set_message(
+      t('A database error has occured. No messages could be deleted.'),
+      'error'
+    );
+  }
+  else {
+    drupal_set_message(
+      format_plural(
+        $result,
+        'Database operation successful. One message has been cleaned up.',
+        'Database operation successful. @count messages have been cleaned up.'
+      )
+    );
+  }
+}
+
+/**
+ * Implements hook_cron().
+ */
+function chatblock_cron() {
+  $timediff = variable_get('chatblock_autodelete_value', 0);
+  if ($timediff) {
+    $unit = variable_get('chatblock_autodelete_unit', 0);
+    $result = chatblock_cleanup($timediff, $unit);
+    if ($result === FALSE) {
+      watchdog(
+        'chatblock',
+        'A database error has occured. No messages could be deleted.',
+        array(),
+        WATCHDOG_ERROR
+      );
+    }
+    else {
+      watchdog(
+        'chatblock',
+        'Database operation successful. @count messages have been cleaned up.',
+        array('@count' => $result)
+      );
+    }
+  }
+}
+
+/**
+ * Add a submit callback to the user permissions form.
+ *
+ * As changing permissions make existing user tokens useless and
+ * they will have to be regenerated, saving the permissions form
+ * must lead to an immediate token reset.
+ */
+function chatblock_form_user_admin_perm_alter(&$form, &$form_state) {
+  $form['#submit'][] = '_chatblock_permission_form_submit';
+}
+
+/**
+ * Generate filter info page.
+ *
+ * Display information about currently activated chat message
+ * format filter functions.
+ *
+ * @return string
+ *   HTML info page content.
+ */
+function chatblock_format_infos($compact_format = FALSE) {
+
+  // Add the user defined info section.
+  $custom_content = variable_get(
+    'chatblock_infopage_custom_content',
+    array(
+      'value' => '',
+      'format' => NULL,
+    )
+  );
+  $output = trim(strip_tags($custom_content['value']));
+
+  // Filter the user markup, if any.
+  if ($output != '') {
+    $output = '<div id="chatblock-infopage-custom">' . check_markup(
+      $output,
+      $custom_content['format']
+    ) . '</div>';
+  }
+
+  // Generate table depending on compact status
+  if ($compact_format) {
+    $output .= drupal_render(drupal_get_form('chatblock_format_infos_form'));
+  }
+  else {
+    $output .= '<div id="chatblock-infopage">' . chatblock_format_infos_table() . '</div>';
+  }
+
+  return $output;
+}
+
+/**
+ * Form API helper function
+ *
+ * Passes the text replacement info table through the
+ * form API in order to add standardized collapsed properties
+ *
+ * @param $content
+ *   The rendered replacement table.
+ *
+ * @return string
+ *   The rendered collapsible form.
+ *
+ *
+ * @see chatblock_format_infos()
+ */
+
+function chatblock_format_infos_form() {
+  return array(
+    'infos' => array(
+      '#type' => 'fieldset',
+      '#collapsible' => TRUE,
+      '#collapsed' => TRUE,
+      '#title' => t('Replacements'),
+      'replacements' => array(
+        '#markup' => chatblock_format_infos_table(TRUE),
+      ),
+    ),
+  );
+}
+
+/**
+ * Build the replacement table.
+ *
+ * @param $compact_format
+ *   If true, render the content in a more compact way
+ *   (in order to better fit into narrow blocks)
+ *
+ * @return string
+ *   The rendered replacement table.
+ *
+ * @see chatblock_format_infos()
+ * @see _chatblock_format_infos_form()
+ */
+function chatblock_format_infos_table($compact_format = FALSE) {
+
+  $output = "";
+
+  // We only want a true true. Just because.
+  $compact_format = $compact_format === TRUE;
+
+  $path = drupal_get_path('module', 'chatblock') . "/images/";
+
+  $rows = array();
+
+  if (variable_get('chatblock_add_smileys', 1)) {
+    foreach (_chatblock_get_smileys() as $code => $smiley) {
+      $rows[] = array(
+        $code,
+        theme(
+          'image',
+          array(
+            'path' => $path . $smiley . ".gif",
+            'alt' => ":$smiley:",
+          )
+        )
+      );
+    }
+  }
+
+  if (variable_get('chatblock_detect_urls', 1)) {
+    $url = 'http://' . ($compact_format ? 'URL' : 'example.com');
+    $rows[] = array(
+      $url,
+      '<a href="' . $url . '" onclick="return false">' . $url . '</a>'
+    );
+    $url = $compact_format ? 'www.URL' : 'www.example.com';
+    $rows[] = array(
+      $url,
+      '<a href="http://' . $url . '" onclick="return false">' . $url . '</a>'
+    );
+  }
+
+  if (trim(strip_tags($output)) == '' && empty($rows)) {
+    $output = '<p>' . t('Currently, no information is available.') . '</p>';
+  }
+  elseif (!empty($rows)) {
+    $header = array(t('Text'), $compact_format ? t('Result') : t('Replacement'));
+    $output .= '<p>' . t('See below how your input will be modified.') . '</p>';
+    $output .= theme(
+      'table',
+      array(
+        'header' => $header,
+        'rows' => $rows,
+        'attributes' => array(
+          'id' => 'chatblock-infopage-replacements',
+        ),
+      )
+    );
+  }
+
+  return $output;
+}
+
+/**
+ * Implements hook_help().
+ */
+function chatblock_help($path, $arg) {
+  switch ($path) {
+    case 'admin/help#chatblock':
+      return t(
+        'Chatblock provides an easy-to-set-up Ajax chat for your site. Just activate the module, configure the <a href="!configure_block_url">block settings and permissions</a> as well as the <a href="!configure_permissions_url">user permissions</a> and start over.',
+        array(
+          '!configure_block_url' => url(CHATBLOCK_BLOCK_ADMIN_URL),
+          '!configure_permissions_url' => url(
+            CHATBLOCK_PERMISSIONS_ADMIN_URL,
+            array(
+              'fragment' => 'module-chatblock',
+            )
+          ),
+        )
+      ) . '<br />' . t(
+        'If your site has more than a few visitors, you should install the <a href="!js_module_url">JS callback handler</a> as described there. It is also recommended to activate the <a href="!apc_url">PHP APC extension</a>. The chatblock module does not need to be configured for either extension; it will integrate automatically with both.',
+        array(
+          '!js_module_url' => 'http://drupal.org/project/js_callback',
+          '!apc_url' => 'http://pecl.php.net/package/apc',
+        )
+      );
+      break;
+  }
+}
+
+/**
+ * Implements hook_js().
+ *
+ * Integrates the js callback module, if installed (which is strongly encouraged).
+ *
+ * @see http://drupal.org/project/js
+ */
+function chatblock_js() {
+  return array(
+    'view' => array(
+      'callback' => 'chatblock_chat_callback',
+      'includes' => array('unicode'),
+      'dependencies' => array('user', 'filter'),
+      'bootstrap' => DRUPAL_BOOTSTRAP_LANGUAGE,
+    ),
+    'update' => array(
+      'callback' => 'chatblock_chat_update_callback',
+      'includes' => array('unicode'),
+      'dependencies' => array('user', 'filter'),
+      'bootstrap' => DRUPAL_BOOTSTRAP_LANGUAGE,
+    ),
+  );
+}
+
+/**
+ * View the chat logs.
+ *
+ * @return
+ *   Chat logs as paged HTML content.
+ */
+function chatblock_logs() {
+  drupal_set_title(
+    t(
+      '@chat_title logs',
+      array(
+        '@chat_title' => variable_get(
+          'chatblock_default_title',
+          t('Chat')
+        ),
+      )
+    )
+  );
+  $messages = _chatblock_database('logs');
+  $output = _chatblock_create_output(
+    $messages,
+    check_plain(
+      variable_get('chatblock_timestamp_format_logs', 'm/d/y H:i:s')
+    )
+  );
+  $output .= theme('pager', array('tags' => array()));
+  if (trim($output) == '') {
+    $output = '<p>' . t('The messages archive is empty.') . '</p>';
+  }
+  return $output;
+}
+
+/**
+ * Implements hook_menu().
+ */
+function chatblock_menu() {
+  global $user;
+  $items = array();
+
+  $items['js/chatblock/view'] = array(
+    'page callback' => 'chatblock_chat_callback',
+    'access arguments' => array('view chats'),
+    'type' => MENU_CALLBACK
+  );
+  $items['js/chatblock/update'] = array(
+    'page callback' => 'chatblock_chat_update_callback',
+    'access arguments' => array('view chats'),
+    'type' => MENU_CALLBACK
+  );
+  $items[CHATBLOCK_ADMIN_URL] = array(
+    'title' => 'Chatblock',
+    'description' => 'Configure the on site chat block.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('chatblock_settings_form'),
+    'access arguments' => array('configure chatblock'),
+    'type' => MENU_NORMAL_ITEM,
+    'file' => 'chatblock.admin.inc',
+  );
+  $items[CHATBLOCK_ADMIN_URL . '/settings'] = array(
+    'title' => 'Settings',
+    'description' => 'Configure the on site chat block.',
+    'type' => MENU_DEFAULT_LOCAL_TASK,
+    'context' => MENU_CONTEXT_PAGE | MENU_CONTEXT_INLINE,
+  );
+  $items['chatblock/info'] = array(
+    'title' => 'Chatblock information',
+    'description' => 'Information on this chat (e.g. how parts of your chat messages will be filtered).',
+    'access arguments' => array('join chats'),
+    'page callback' => 'chatblock_format_infos',
+    'type' => MENU_SUGGESTED_ITEM,
+    'context' => MENU_CONTEXT_PAGE | MENU_CONTEXT_INLINE,
+  );
+  $items['chatblock/info/display'] = array(
+    'title' => 'Information',
+    'description' => 'Information on this chat (e.g. how parts of your chat messages will be filtered).',
+    'type' => MENU_DEFAULT_LOCAL_TASK,
+    'context' => MENU_CONTEXT_PAGE | MENU_CONTEXT_INLINE,
+  );
+  $items['chatblock/logs'] = array(
+    'title' => 'Chatblock logs',
+    'description' => 'On site chat logs.',
+    'access arguments' => array('view chat logs'),
+    'page callback' => 'chatblock_logs',
+    'type' => MENU_SUGGESTED_ITEM,
+  );
+  $items['chatblock/logs/view'] = array(
+    'title' => 'View logs',
+    'description' => 'View the on site chat logs.',
+    'access arguments' => array('view chat logs'),
+    'page callback' => 'chatblock_logs',
+    'type' => MENU_DEFAULT_LOCAL_TASK,
+    'context' => MENU_CONTEXT_PAGE | MENU_CONTEXT_INLINE,
+  );
+  $items['chatblock/logs/cleanup'] = array(
+    'title' => 'Clean up',
+    'description' => 'Delete chat logs.',
+    'access arguments' => array('administer chat logs'),
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('chatblock_cleanup_form'),
+    'file' => 'chatblock.admin.inc',
+    'weight' => 10,
+    'type' => MENU_LOCAL_TASK
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_perm().
+ */
+function chatblock_permission() {
+  return array(
+    'configure chatblock' => array(
+      'title' => t('Configure chatblock settings'),
+      'description' => t('Set up basic chatblock properties and performance.'),
+      'restrict access' => TRUE,
+    ),
+    'administer chat logs' => array(
+      'title' => t('Administer chat logs'),
+      'description' => t('Set up how long logs are available and manually clean them up.'),
+      'restrict access' => TRUE,
+    ),
+    'view chats' => array(
+      'title' => t('View chats'),
+      'description' => t('See the chat. Does not include permission to send messages into it. Before granting this permission to anonymous users, you should consider your server\'s performance.'),
+    ),
+    'join chats' => array(
+      'title' => t('Join chats'),
+      'description' => t('Send messages to the chat window. Before granting this permission to anonymous users, you should consider your server\'s performance.'),
+    ),
+    'view chat logs' => array(
+      'title' => t('View chat logs'),
+    ),
+  );
+}
+
+/**
+ * Implements hook_theme().
+ */
+function chatblock_theme() {
+  // Only needed to somehow pimp the cron cleanup settings form parts.
+  return array(
+    'chatblock_cron_form' => array(
+      'render element' => 'form',
+    ),
+  );
+}
+
+/**
+ * Implements hook_user_login().
+ */
+function chatblock_user_login(&$edit, &$account) {
+  if (variable_get('chatblock_show_logins', 0) == 1) {
+    _chatblock_database(
+      'system',
+      t(
+        '@user has just logged in.',
+        array(
+          '@user' => $account->name,
+        )
+      )
+    );
+  }
+  // Delete a guest ID cookie, if there is one.
+  user_cookie_delete('chatblock_guest_id');
+}
+
+/**
+ * Implements hook_user_logout().
+ */
+function chatblock_user_logout($account) {
+  if (variable_get('chatblock_show_logouts', 0) == 1) {
+    _chatblock_database(
+      'system',
+      t(
+        '@user has just logged out.',
+        array(
+          '@user' => $account->name,
+        )
+      )
+    );
+  }
+}
+
+/**
+ * Implements hook_user_update().
+ */
+function chatblock_user_update(&$edit, &$account, $category = NULL) {
+  // Check whether the user's roles have changed.
+  $old = array_keys($account->roles);
+  if (!isset($edit['roles']) || !$new = $edit['roles']) {
+    $new = array();
+  }
+  $new = array_keys($new);
+  sort($old);
+  sort($new);
+  if (strcmp(implode(',', $old), implode(',', $new)) !== 0) {
+    _chatblock_get_token(TRUE);
+  }
+}
+
+/**
+ * Theme implementation for the cron related part of the admin form.
+ *
+ * @see chatblock.admin.inc
+ * @see chatblock_settings_form()
+ */
+function theme_chatblock_cron_form($form) {
+  $ret = array(
+    '#theme' => 'table',
+    '#header' => array(),
+    '#rows' => array(
+      array(
+        t('Clean up messages older than'),
+        drupal_render($form['form']['chatblock_autodelete_value']),
+        drupal_render($form['form']['chatblock_autodelete_unit']),
+      ),
+    ),
+    '#attributes' => array(
+      'style' => 'width: auto',
+    ),
+  );
+  return drupal_render($ret);
+}
+/**
+ * Create initial chat block content.
+ *
+ * Callback function for hook_block() to generate initial
+ * content that will be modified dynamically afterwards.
+ *
+ * @return string|NULL
+ *   The block content (chat window, message form etc),
+ *   if the user has access. Otherwise nothing.
+ */
+function _chatblock_contents() {
+
+  $output = '';
+  $is_contextual = FALSE;
+
+  // make sure the current user is allowed to see chats
+  if (
+    user_access('view chats')
+    ||
+    user_access('join chats')
+  ) {
+
+    // Add the messages.
+    $output .= _chatblock_messages();
+
+    // If the user is allowed to chat, show the form.
+    if (user_access('join chats')) {
+      $chatform = drupal_get_form('chatblock_chatform');
+      $output .= drupal_render($chatform);
+    }
+    else {
+      if ($tip = variable_get('chatblock_permission_hint', '')) {
+        $output .= '<div id="chatblock-permission-warning">' . check_plain($tip) . '</div>';
+      }
+    }
+    // Conditionally add the help page and logs link unless
+    // the contextual links module is active.
+    if (CHATBLOCK_LINKS_DISPLAY_SETTING > CHATBLOCK_LINKS_SHOW_NEVER) {
+      $links = array();
+      if (user_access('configure chatblock')) {
+        $links[] = '<a href="' . url(CHATBLOCK_ADMIN_URL)
+          . '" title="' . t('Configure chat options')
+          . '">' . t('settings') . '</a>'
+        ;
+      }
+      if (
+        user_access('join chats')
+        &&
+        (
+          variable_get('chatblock_add_smileys', 1)
+          ||
+          variable_get('chatblock_detect_urls', 1)
+        )
+      ) {
+        $links[] = '<a href="' . url('chatblock/info')
+          . '" title="' . t('Information about this chat')
+          . '">' . t('info') . '</a>'
+        ;
+      }
+      if (user_access('view chat logs')) {
+        $links[] = '<a href="' . url('chatblock/logs')
+          . '" title="' . t('View the chat logs')
+          . '">' . t('logs') . '</a>'
+        ;
+      }
+      if (!empty($links)) {
+        $output .= '<div id="chatblock-links">'
+          . implode(' ', $links) . '</div>'
+        ;
+      }
+      // Prepare Settings for conditional JS removal of these links
+      $is_contextual = CHATBLOCK_LINKS_DISPLAY_SETTING == CHATBLOCK_LINKS_SHOW_CONDITIONAL && module_exists('contextual');
+    }
+
+
+
+    // JS client-data.
+
+    // Transport the document root relative module path to chatblock.php.
+    $path_details = preg_replace('#^' . $_SERVER['DOCUMENT_ROOT'] . base_path() . '#', '', dirname(__FILE__));
+
+    // Check whether both the chatblock callback handler in the
+    // Drupal root directory and the cache paths exist and if so,
+    // set the callback path for polls.
+    // file_exists() looks up relatively to Drupal's index.php.
+    $poll_callback =
+      file_exists('chatblock.php') && is_dir($path_details . '/cache')
+      ?
+      base_path() . 'chatblock.php'
+      :
+      url('js/chatblock/view')
+    ;
+
+    // Request cache token, if one exists. Otherwise create one.
+    $token_data = _chatblock_get_token();
+
+    // Set up JS variables.
+    $settings = array(
+      'chatblock' => array(
+        'cid' => variable_get('chatblock_cache_id', 'ErrorNoCacheIdWasFound'),
+        'pathDetails' => $path_details,
+        'pollRateDefault' => variable_get(
+          'chatblock_poll_rate_default',
+          CHATBLOCK_POLL_RATE_DEFAULT
+        ) * 1000,
+        'pollRateMax' => variable_get(
+          'chatblock_poll_rate_max',
+          CHATBLOCK_POLL_RATE_MAX_DEFAULT
+        ),
+        // Remove the context links if contextual links exist
+        'removeLinks' => $is_contextual,
+        // Client must be able to pass the Drupal session name as chatblock.php
+        // will not run any Drupal bootstrap in APC enabled mode.
+        // This will help validating his token with his sessionid and the
+        // server token.
+        'session' => session_name(),
+        'showTimestamps' => variable_get(
+          'chatblock_show_timestamps', 1
+        ),
+        'smartPollStepwidth' => (int) variable_get(
+          'chatblock_smart_poll_stepwidth',
+          2
+        ),
+        'timestampFormat' => variable_get(
+          'chatblock_timestamp_format',
+          'G:i:s'
+        ),
+        'timestampTooltip' => variable_get('chatblock_timestamp_tooltip', 0),
+        'tokenData' => $token_data,
+        'updateUrl' => url('js/chatblock/update'),
+        'viewUrl'   => $poll_callback,
+      ),
+    );
+    drupal_add_js($settings, 'setting');
+
+    // Add CSS and JS
+    $path = drupal_get_path('module', 'chatblock');
+    drupal_add_css($path . '/css/chatblock.css');
+    drupal_add_js($path . '/js/chatblock.js');
+
+    return $output;
+  }
+}
+
+/**
+ * Adds formatted time strings to a message array.
+ *
+ * @param $messages
+ *   An array with DB result rows.
+ * @param $timestamp_format
+ *   Use a this instead of the default timestamp format.
+ *
+ * @return array
+ *   The original array, but each row extended with a
+ *   'time_string' column.
+ *
+ * @see _chatblock_messages()
+ */
+function _chatblock_create_time_strings($messages = array(), $timestamp_format = NULL) {
+  global $user;
+
+  if (isset($timestamp_format)) {
+    // We have to add the alternative format to the JS settings for consistent
+    // timestamp translation.
+    drupal_add_js(
+      array(
+        'chatblock' => array(
+          'timestampFormatAlternative' => $timestamp_format,
+        ),
+      ),
+      'setting'
+    );
+
+    // No tooltip on alternative formats. Full stop.
+    $as_tooltip = FALSE;
+    $css_class = 'chatblock-servertime-alternative';
+  }
+  else {
+    $timestamp_format = check_plain(
+      variable_get('chatblock_timestamp_format', 'G:i:s')
+    );
+    $as_tooltip = variable_get('chatblock_timestamp_tooltip', 0);
+    $css_class = 'chatblock-servertime';
+  }
+
+  // Adding a server-side timestamp to the initial message while calculating
+  // later timestamps at the client side could cause odds. Thus, in order to
+  // as well HAVE a fallback timestamp for non-JS users as having consistent
+  // JS-generated timestamps, we preserve the original timestamp value hidden
+  // in the timestamp's CSS id. This way, it can be recalculated on any JS
+  // capable client.
+  foreach ($messages as $message) {
+    if ($as_tooltip) {
+      $message->m = '<span class="chatblock-timestamp-tooltip '
+        . $css_class . '" id="chatblock-timestamp-'
+        . $message->t
+        . '" title="' . format_date(
+          $message->t,
+          'custom',
+          $timestamp_format
+        ) . '">' . $message->m . '</span>'
+      ;
+    }
+    else {
+      $message->local_timestamp = '<span class="chatblock-timestamp '
+        . $css_class . '" id="chatblock-timestamp-'
+        . $message->t
+        . '">['
+        . format_date(
+          $message->t,
+          'custom',
+          $timestamp_format
+        )
+        . ']</span> '
+      ;
+    }
+  }
+  return $messages;
+}
+
+/**
+ * Generate chat messages for chat window or logs.
+ *
+ * Creates HTML based on the current display/filter configuration
+ * containing the content for chat logs or the REST based chat window.
+ *
+ * @param $messages
+ *   Array of messages as output by _chatblock_database()
+ *   or _chatblock_process_messages().
+ * @param $timestamp_format
+ *   Use a this instead of the default timestamp format.
+ *
+ * @return string
+ *   A list of styled HTML messages.
+ *
+ * @see _chatblock_messages()
+ * @see _chatblock_database()
+ * @see _chatblock_process_messages()
+ */
+function _chatblock_create_output($messages = array(), $timestamp_format = NULL) {
+
+  $output = '';
+
+  if (!empty($messages)) {
+
+    // Prepare formatted timestamps in one bunch
+    // to save function calls.
+    if (isset($timestamp_format) || variable_get('chatblock_show_timestamps', 1)) {
+      $messages = _chatblock_create_time_strings($messages, $timestamp_format);
+    }
+
+    foreach ($messages as $message) {
+
+      // Prepare CSS classes for user and message, depending on
+      // the message type (system or user).
+      if ($message->n != '') {
+        $message->m = '<span class="chatblock-user-message">'
+          . $message->m . '</span>'
+        ;
+        $user_info = '<span class="chatblock-username">'
+          . $message->n
+          . ': </span> '
+        ;
+      }
+      else {
+        $message->m = '<span class="chatblock-system-message">'
+          . $message->m . '</span>'
+        ;
+        $user_info = '';
+      }
+      // Build the current message.
+      $output .= '<div class="chatblock-message">'
+        . $message->local_timestamp
+        . $user_info
+        . $message->m
+        . '</div>'
+      ;
+    }
+  }
+  return $output;
+}
+
+/**
+ * Database operations.
+ *
+ * Generic callback for several DB operations.
+ *
+ * @param $op
+ *   Action to be performed.
+ * @param $message
+ *   Message to be set (if applying).
+ * @param $max_id
+ *   Most recent existing clientside ID for filtering (if applying).
+ *
+ * @return array|NULL
+ *   An array with messages (if applying), otherwise NULL.
+ */
+function _chatblock_database($op, $message = '', $max_id = 0) {
+  // Get the user information.
+  global $user;
+  $cache_success = NULL;
+  $last_timestamp = NULL;
+
+  // which database operation are we doing?
+  switch ($op) {
+    case 'view':
+      $limit = variable_get('chatblock_number_messages', CHATBLOCK_STARTUP_MESSAGES_DEFAULT);
+    case 'cache_rebuild':
+    case 'poll':
+
+      // Prepare return values.
+      $messages = array();
+      $ret = array(
+        'messages' => array(),
+      );
+
+      $do_rebuild = $op == 'cache_rebuild';
+
+      // Unless this is a rebuild call, try to fetch data from the RAM cache.
+      if (!$do_rebuild && function_exists('apc_fetch')) {
+        require_once(dirname(__FILE__) . '/cache/apc.inc');
+        if ($last_rebuild = chatblock_cache_get('mc_last_built')) {
+          // Never start from below the oldest cached message.
+          $min_id = (int) chatblock_cache_get('min_id');
+          // But also not from lower than one after the client's max.
+          $start = max($min_id, $max_id + 1);
+          $last = (int) chatblock_cache_get('max_id');
+          if ($last < $start) {
+            // This may happen if, whysoever, max_id is NULL.
+            // (Which, of course, must never happen, except if
+            // both min and max are NULL in cache after
+            // a database cleanup.
+            if ($min_id > 0) {
+              $last = $start;
+            }
+            else {
+              $start = $last;
+            }
+          }
+          if ($start > 0) {
+            $cache_success = TRUE;
+            $messages_cached = array();
+            for ($i = $start; $i <= $last; $i++) {
+              $row = chatblock_cache_get('msg_' . $i);
+              if ($row !== FALSE) {
+                $messages_cached[] = $row;
+
+                // Remember latest timestamp.
+                if ($i == $last) {
+                  $last_timestamp = $row->t;
+                }
+              }
+              elseif (!empty($messages_cached)) {
+                // If a message is not in the cache while within the
+                // current id limits, this would indicate a cache problem
+                // and the need to force a rebuild.
+                $cache_success = FALSE;
+                break;
+              }
+              else {
+                // min_id cannot be smaller than the next higher id.
+                // May happen by ttl timeout of messages.
+                $new_start = $i+1;
+              }
+            }
+          }
+          if (isset($new_start) && $new_start > $min_id) {
+            chatblock_cache_set('min_id', $new_start);
+          }
+        }
+        if ($cache_success) {
+          return array(
+            'maxId'    => $last,
+            'lastTimestamp' => $last_timestamp,
+            'messages' => $messages_cached,
+          );
+        }
+        else {
+          // Indicate that we need a new cache build and a DB query.
+          $do_rebuild = TRUE;
+        }
+      }
+
+      if ($do_rebuild || !$cache_success) {
+        // Calculate the minimum timestamp for backlook, if applying.
+        $retrospect = (int) variable_get('chatblock_maximum_retrospect', CHATBLOCK_RETROSPECT_DEFAULT);
+        if ($retrospect) {
+          $retrospect = REQUEST_TIME - $retrospect * 60;
+        }
+
+        $query = db_select('chatblock', 'c')
+          ->fields('c')
+          ->condition('messageid', $max_id, '>')
+          ->condition('timestamp', $retrospect, '>=')
+          ->orderBy('messageid', 'DESC')
+        ;
+
+        if (isset($limit)) {
+          $query->range(0, $limit);
+        }
+
+        $result = $query->execute()->fetchAll();
+
+        // First collect all result lines.
+        foreach ($result as $row) {
+
+          // This clause is bound to the query above having "latest first" order!
+          if (!isset($ret['maxId'])) {
+            $ret['maxId'] = $row->messageid;
+            $ret['lastTimestamp'] = $row->timestamp;
+          }
+
+          $messages[] = $row;
+        }
+
+        // Then process them in a bunch.
+        if (!empty($messages) || $do_rebuild) {
+          // As we have retrieved the messages "latest first" but the JS needs
+          // "latest last", we have to reverse that here.
+          $ret['messages'] = array_reverse(
+            _chatblock_process_messages($messages, FALSE, $do_rebuild)
+          );
+        }
+      }
+      return $ret;
+      break;
+
+    case 'update':
+      // Update means a user has typed something.
+      // So we set the user ID to other than NULL.
+      $uid = $user->uid;
+      // Determine the username. If guests are permitted to chat
+      // we need some half-way unique pseudonyme.
+      // We take it from the sessionid then.
+      if ($user->uid) {
+        $username = $user->name;
+      }
+      else {
+        $username = trim(variable_get('chatblock_guest_prefix', t('Guest') . '-')) . _chatblock_guest_id();
+      }
+      ;
+      // Further process is identical to 'system'.
+      // Thus: No break; statement.
+    case 'system':
+      // Without $uid set (===NULL) this will be recognized
+      // as a system message.
+
+      // We will not save empty messages at all!
+      $message = substr(trim($message), 0, 255);
+      if (!empty($message)) {
+        $data = new stdClass();
+        $data->timestamp = REQUEST_TIME;
+        $data->message = $message;
+        if (!empty($username)) {
+          $data->username = $username;
+        }
+        if (isset($uid)) {
+          $data->uid = $uid;
+        }
+        if (drupal_write_record('chatblock', $data) == SAVED_NEW) {
+          require_once(dirname(__FILE__) . '/cache/apc.inc');
+          chatblock_cache_set(
+            'max_id',
+            (int) $data->messageid,
+            TRUE
+          );
+          $data = _chatblock_process_messages($data, TRUE);
+          chatblock_cache_set_ttl(
+            'msg_' . $data->i,
+            $data,
+            variable_get('chatblock_maximum_retrospect', CHATBLOCK_RETROSPECT_DEFAULT) * 60
+          );
+          return true;
+        }
+      }
+      return false;
+      break;
+
+    case 'logs':
+      $messages = array();
+
+      $result = db_select('chatblock', 'c')
+        ->fields('c')
+        ->extend('PagerDefault')
+        ->limit(variable_get('chatblock_log_messages_per_page', 72))
+        ->execute()
+      ;
+
+      // First collect all result lines.
+      foreach ($result as $row) {
+        $messages[] = $row;
+      }
+      // Then process them in a bunch.
+      $messages = _chatblock_process_messages($messages);
+
+      return $messages;
+  }
+}
+
+/**
+ * Prepares and returns a smiley array.
+ *
+ * @return array
+ *   A keyed array; keys are the emoticons and
+ *   values are the corresponding filenames (without extension).
+ */
+function _chatblock_get_smileys() {
+  return array(
+    ">:>" => "twisted",
+    "?:)" => "think",
+    "N:)" => "naughty",
+    "O:)" => "angel",
+    ":D"  => "biggrin",
+    ":-D"  => "biggrin",
+    ":P"  => "tongue",
+    ":o"  => "impressed",
+    ":|"  => "neutral",
+    "8-)" => "cool",
+    "%)"  => "confused",
+    ":["  => "ashamed",
+    "oO"  => "eh",
+    "^^"  => "kidding",
+    ">:{" => "mad",
+    ":applause:" => "applause",
+    "!:{" => "silenced",
+    "8)"  => "rolleyes",
+    ":S"  => "sick",
+    ":IW:" => "whistle",
+    ":)"  => "smile",
+    ":-)"  => "smile",
+    ":("  => "sad",
+    ":-("  => "sad",
+  );
+}
+
+/**
+ * Create a client token for the current user.
+ *
+ * The client has to identify himself for direct APC access
+ * with an individual permission token. This token calculates
+ * from the uid and the current server token.
+ *
+ * @param $force_new
+ *   TRUE, if we need a new token in any way; e.g. after changing
+ *   role/block permissions or user roles.
+ *
+ * @return array
+ *   An array with the (new) token and its creation time.
+ *   If APC is inactive, these are dummy values.
+ */
+function _chatblock_get_token($force_new = FALSE) {
+  require_once(dirname(__FILE__) . '/cache/apc.inc');
+  if (CHATBLOCK_IS_APC) {
+    if ($force_new) {
+      chatblock_cache_delete(array('servertoken', 'servertokentime'), FALSE);
+    }
+    else {
+      $token = chatblock_cache_get('servertoken');
+      $token_time = chatblock_cache_get('servertokentime');
+    }
+
+    // If no token exists, create one.
+    if (!isset($token) || !$token) {
+      $token = rand(1, 9999);
+      $token_time = REQUEST_TIME;
+      chatblock_cache_set_ttl(
+        array(
+          'servertoken' => $token,
+          'servertokentime' => $token_time,
+        ),
+        '',
+        CHATBLOCK_CACHE_TOKEN_TTL
+      );
+    }
+
+    return array(
+      'usertoken' => md5($token + session_id()),
+      'usertokentime' => $token_time,
+    );
+  }
+  else {
+    // We need to return *something* so the JS won't complain about
+    // NULL value when composing the Ajax poll.
+    return array(
+      'usertoken' => '-1',
+      'usertokentime' => '-1',
+    );
+  }
+}
+
+/**
+ * Create the guest ID for anonymous users.
+ *
+ * Checks whether the user already has had a guest ID cookie.
+ * If yes, the cookie will be returned. If not, a new
+ * ID will be generated, stored statically and returned.
+ *
+ * @return string
+ *   A guest ID.
+ */
+function _chatblock_guest_id() {
+  static $guestid;
+  global $user;
+  // Only create a guest ID if the user is anonymous
+  if (!$user->uid && user_access('join chats')) {
+    if (!isset($guestid)) {
+      if (!empty($_COOKIE['Drupal_visitor_chatblock_guest_id'])) {
+        $guestid = $_COOKIE['Drupal_visitor_chatblock_guest_id'];
+        $guestid = preg_replace('/\s/', '', $guestid);
+      }
+      if (strlen($guestid) != 5) {
+        $guestid = substr(md5(rand(1,999999999)), 0, 5);
+        user_cookie_save(array('chatblock_guest_id' => $guestid));
+      }
+    }
+  }
+  return $guestid;
+}
+
+/**
+ * Get the current messages and display them.
+ *
+ * @param $is_js
+ *   Flagged true if this is an Ajax call.
+ *
+ * @return string
+ *   The chat window HTML.
+ */
+function _chatblock_messages($is_js = FALSE) {
+
+  // start the output
+  $output = '';
+
+  $max_id = isset ($_POST['maxId']) ? (int)$_POST['maxId'] : 0;
+
+  if ($is_js) {
+
+    // Only get into the DB if necessary or if no cache entry exists.
+    require_once(dirname(__FILE__) . '/cache/apc.inc');
+    $server_max_id = chatblock_cache_get('max_id', TRUE);
+    if (
+      $server_max_id === FALSE
+      ||
+      $server_max_id > $max_id
+    ) {
+      $response = _chatblock_database('poll', '', $max_id);
+    }
+    else {
+      $response = array();
+    }
+    // Refresh or set token, if necessary.
+    if (!isset($_POST['token'])) {
+      $response['tokenData'] = _chatblock_get_token();
+    }
+    // Indicate that the request was allowed.
+    $response['ok'] = TRUE;
+
+    // Send back the response.
+    drupal_json_output($response);
+  }
+  else {
+
+    // Get the current messages from the database.
+    $db_result = _chatblock_database('view');
+
+    // Add the container.
+    $height = variable_get('chatblock_chat_height', '');
+    $css = $height != '' ? ' style="height: ' . $height . '"' : '';
+    $output .= '<div id="chatblock-chatcontent"' . $css . '>';
+
+    if (!empty($db_result['messages'])) {
+      $output .= _chatblock_create_output($db_result['messages']);
+    }
+
+    // End of the container.
+    $output .= '</div>';
+
+    // Add the most recent message's timestamp to the JS settings,
+    // if there are any.
+    drupal_add_js(
+      array(
+        'chatblock' => array(
+          'lastTimestamp' => isset ($db_result['lastTimestamp']) ? $db_result['lastTimestamp'] : NULL,
+          'maxId' => isset ($db_result['maxId']) ? $db_result['maxId'] : NULL,
+        ),
+      ),
+      'setting'
+    );
+
+    // send back the output
+    return $output;
+  }
+}
+
+/**
+ * Conditionally (re)builds the message RAM cache.
+ *
+ * @param $messages
+ *   Array of objects as created in _chatblock_process_messages
+ * @param $force_rebuild
+ *   Do the rebuild with the given messages in any case.
+ *
+ * @see _chatblock_process_messages()
+ */
+function _chatblock_messages_cache_rebuild($messages = array(), $force_rebuild = FALSE) {
+
+  $min_id = $max_id = NULL;
+
+  // Prepare RAM caching.
+  if (function_exists('apc_fetch')) {
+    require_once(dirname(__FILE__) . '/cache/apc.inc');
+    if (
+      $force_rebuild
+      ||
+      FALSE === chatblock_cache_get('mc_last_built')
+    ) {
+      $cache_build_timestamp = REQUEST_TIME;
+
+      // Delete all existing message cache entries
+      if ($cache_data = apc_cache_info('user')) {
+        foreach ($cache_data['cache_list'] as $item) {
+          if (strpos($item['info'], 'chatblock_' . CHATBLOCK_CACHE_ID . '_msg_') === 0) {
+            apc_delete($item['info']);
+          }
+        }
+      }
+
+      $cache_min_timestamp = $cache_build_timestamp - (int) variable_get('chatblock_maximum_retrospect', CHATBLOCK_RETROSPECT_DEFAULT) * 60;
+      foreach ($messages as $message) {
+        // Store message in RAM cache
+        $ttl = $message->t - $cache_min_timestamp;
+        if ($ttl) {
+          chatblock_cache_set_ttl('msg_' . $message->i, $message, $ttl);
+          $min_id = !isset($min_id) ? $message->i : min($min_id, $message->i);
+          $max_id = max((int) $max_id, $message->i);
+        }
+      }
+      if ($force_rebuild) {
+        // The APC entry may still exist.
+        chatblock_cache_delete('mc_last_built');
+      }
+      chatblock_cache_set(
+        array(
+          'mc_last_built' => $cache_build_timestamp,
+          'min_id' => $min_id,
+          'max_id' => $max_id,
+        ),
+        '',
+        TRUE
+      );
+    }
+  }
+}
+
+/**
+ * Submission callback for permissions form.
+ *
+ * @see chatblock_form_user_admin_perm_alter()
+ */
+function _chatblock_permission_form_submit() {
+  // Simply reset tokens.
+  _chatblock_get_token(TRUE);
+}
+
+/**
+ * Prepare raw DB data for display/response.
+ *
+ * The returned object has shorter property names in order
+ * to have the response json string as short as possible.
+ *
+ * @param $rows
+ *   Array containing objects, each representing one DB row.
+ * @param $is_update
+ *   Indicates that the call does come from an Ajax message update
+ *   and cache rebuilding will be handled by the calling function itself.
+ * @param $force_rebuild
+ *   Do the rebuild with the given messages in any case.
+ *
+ * @return array
+ *   Array of objects, each with the properties:
+ *   i => The messageid
+ *   n => Guest pseudonym or registered user name linked to his profile
+ *   m => The sanitized and smiley/URL filtered message
+ *   t => The message's timestamp
+ *   u => The userid
+ */
+function _chatblock_process_messages(
+  $rows = array(), $is_update = FALSE, $force_rebuild = FALSE
+) {
+  static $add_smileys, $smileys;
+
+  if ($is_update) {
+    $rows = array($rows);
+  }
+  $ret = array();
+
+  foreach ($rows as $data) {
+    $new_row = new stdClass();
+
+    // Preset some unchanging but rekeyed data.
+    $new_row->i = $data->messageid;
+    $new_row->t = $data->timestamp;
+    if (isset($data->uid)) {
+      $new_row->u = $data->uid;
+
+      // == Part 1: Username
+
+      // Link registered users with their profiles if configured,
+      // otherwise set username to '' if this is a system message
+      // such as "user logged in".
+      $new_row->n = variable_get("chatblock_link_users", 1) && $data->uid ?
+        l($data->username, 'user/' . $data->uid)
+        :
+        $data->username
+      ;
+    }
+    else {
+      $new_row->n = '';
+    }
+
+    // == Part 2: Message content
+    $message = $data->message;
+    if (!isset($add_smileys)) {
+      $add_smileys = variable_get('chatblock_add_smileys', 1);
+    }
+
+    if ($add_smileys) {
+      // Remember the smiley array also statically.
+      if (!isset($smileys)) {
+        $smileys = _chatblock_get_smileys();
+      }
+
+      // Preserve all valid smiley codes as tokens before checking plain.
+      foreach ($smileys as $code => $name) {
+        $message = str_replace($code, "[cb_smiley::$name]", $message);
+      }
+    }
+    // Sanitize message
+    $message = check_plain($message);
+
+    // Replace tokens with smileys images.
+    // No theming here as this would cost many function calls on a busy site.
+    if ($add_smileys) {
+      $path = base_path() . drupal_get_path('module', 'chatblock') . "/images/";
+      $path = '<img src="' . $path . '$1.gif" alt=":$1:" title="" />';
+      $message = preg_replace(
+        "/\[cb_smiley::([^\]]+)\]/",
+        $path,
+        $message
+      );
+    }
+
+    if (variable_get('chatblock_detect_urls', 1)) {
+      // Full links.
+      $message = preg_replace(
+        '`\b((https?|ftp)://)([a-zA-Z0-9@:%_+*~#?&=\.,/;-]*[a-zA-Z0-9@:%_+*~#&=/;-])([.,?!]*?)(?=($|[ \n\r\t\)]))`i',
+        '<a href="$1$3">$1$3</a>$4',
+        $message
+      );
+      // www. prefixed links.
+      $message = preg_replace(
+        '`\b(www\.[a-zA-Z0-9@:%_+*~#?&=\.,/;-]*[a-zA-Z0-9@:%_+*~#&=/;-])([.,?!]*?)(?=($|[ \n\r\t\)]))`i',
+        '<a href="http://$1">$1</a>$2',
+        $message
+      );
+    }
+
+    $new_row->m = $message;
+
+    $ret[] = $new_row;
+  }
+  // If called with a single line, this comes from the "update" callback.
+  // Instead of rebuilding the cache, we return the single row.
+  if ($is_update) {
+    return $new_row;
+  }
+  _chatblock_messages_cache_rebuild($ret, $force_rebuild);
+  return $ret;
+}
+
+/**
+ * Additional submit callback for the admin settings form.
+ *
+ * Checks whether the defined max poll interval is longer than
+ * the retrospect limit and, if so, warns about possible
+ * incomplete missing message poll results.
+ */
+function _chatblock_settings_check_max_poll($form, &$form_state) {
+  if (
+    $form_state['values']['chatblock_poll_rate_max'] > 0
+    &&
+    $form_state['values']['chatblock_maximum_retrospect'] > 0
+    &&
+    $form_state['values']['chatblock_poll_rate_max'] > $form_state['values']['chatblock_maximum_retrospect']
+  ) {
+    drupal_set_message(
+      t('You have set the maximum poll interval to be longer than the allowed retrospect time. This will work, but in certain cases not all new messages may be sent to an active client.'),
+      'warning'
+    );
+  }
+  // Force RAM message cache cleanup on changed settings.
+  require_once(dirname(__FILE__) . '/cache/apc.inc');
+  chatblock_cache_delete('mc_last_built');
+}
+
+/**
+ * Validation callback for settings form.
+ *
+ * @see chatblock_settings_form()
+ */
+function _chatblock_settings_validate($form, &$form_state) {
+
+  // Validate all fields requiring a positive integer.
+  $positive_integer_fields = array(
+    'chatblock_poll_rate_default' => 'Default poll interval',
+    'chatblock_smart_poll_stepwidth' => 'Smart poll stepwidth',
+    'chatblock_log_messages_per_page' => 'Messages per page',
+  );
+  // These values may be empty; add them conditionally
+  if ($form_state['values']['chatblock_number_messages'] != '') {
+    $positive_integer_fields['chatblock_number_messages'] = 'Startup message count';
+  }
+  if ($form_state['values']['chatblock_maximum_retrospect'] != '') {
+    $positive_integer_fields['chatblock_maximum_retrospect'] = 'Maximum retrospect time';
+  }
+  foreach ($positive_integer_fields as $el_name => $label) {
+    _chatblock_settings_validate_positive_integers($form, $form_state, $el_name, $label);
+  }
+
+  // Max poll rate validation.
+  if (
+    $form_state['values']['chatblock_poll_rate_max'] < 1
+    ||
+    $form_state['values']['chatblock_poll_rate_max'] * 60 < $form_state['values']['chatblock_poll_rate_default']
+  ) {
+    form_set_error(
+      'chatblock_poll_rate_max',
+      t('The maximum poll interval must be longer than the default poll interval.')
+    );
+  }
+
+  // Validate timestamp settings.
+  if (
+    $form_state['values']['chatblock_show_timestamps']
+    &&
+    trim($form_state['values']['chatblock_timestamp_format']) == ''
+  ) {
+    form_set_error(
+      'chatblock_timestamp_format',
+      t('If timestamps are enabled, a timestamp format must be defined.')
+    );
+  }
+
+  // CSS value validation.
+  if (
+    preg_match(
+      '/^(auto|[0-9.]*[0-9]+(px|em|pt|pc|in|mm|cm|ex|%))*$/',
+      $form_state['values']['chatblock_chat_height']
+    ) !== 1
+  ) {
+    form_set_error(
+      'chatblock_chat_height',
+      t('Please enter a valid CSS dimension or leave the field blank.')
+    );
+  }
+}
+
+/**
+ * Positive integer validation helper function.
+ *
+ * @see _chatblock_settings_validate()
+ */
+function _chatblock_settings_validate_positive_integers($form, &$form_state, $el_name, $label) {
+  if (
+    abs(intval($form_state['values'][$el_name])) != $form_state['values'][$el_name]
+  ) {
+    form_set_error(
+      $el_name,
+      t(
+        'Please provide a positive integer value for %field_name!',
+        array('%field_name' => t($label))
+      )
+    );
+  }
+}
+
+/**
+ * Validation callback for clean-up form.
+ *
+ * @see chatblock_cleanup_form()
+ */
+function _chatblock_settings_validate_cleanup($form, &$form_state) {
+  if (
+    preg_match('/\D/', $form_state['values']['chatblock_autodelete_value'])
+  ) {
+    form_set_error(
+      'chatblock_autodelete_value',
+      t('Please enter an integer value.')
+    );
+  }
+}

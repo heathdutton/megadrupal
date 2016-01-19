@@ -1,0 +1,270 @@
+<?php
+
+/**
+ * @file
+ * Handle Mandrill incoming webhooks.
+ */
+
+define('MANDRILL_INCOMING_HANDLED', 1);
+define('MANDRILL_INCOMING_UNHANDLED', 0);
+define('MANDRILL_INCOMING_ERROR', -1);
+
+/**
+ * Implements hook_menu().
+ *
+ * Provides an administrative page for Mandrill Incoming.
+ */
+function mandrill_incoming_menu() {
+  $items['admin/config/services/mandrill_incoming'] = array(
+    'title' => 'Mandrill Incoming',
+    'description' => 'Incoming email via Mandrill',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('mandrill_incoming_admin_settings_form'),
+    'access arguments' => array('administer services'),
+    'weight' => 20,
+  );
+  return $items;
+}
+
+/**
+ * Implements hook_services_resources().
+ */
+function mandrill_incoming_services_resources() {
+  $message_receive = array(
+    'callback' => 'mandrill_incoming_event',
+    'access callback' => 'mandrill_incoming_access_callback',
+    'args' => array(
+      array(
+        'name' => 'mandrill_events',
+        'source' => 'data',
+        'description' => 'Incoming event data',
+        'type' => 'array',
+        'optional' => 'false',
+      ),
+    ),
+    'return' => 'bool',
+    'help' => t('Returns TRUE if the message sending was a success.'),
+  );
+
+  $head = array(
+    'callback' => 'mandrill_incoming_event',
+    'access callback' => 'mandrill_incoming_access_callback',
+    'return' => 'bool',
+    'help' => t('Unconditionally returns TRUE.'),
+    'debug' => TRUE,
+  );
+
+  $resources = array(
+    '#api_version' => 3001,
+    'mandrill_events' => array(
+      'operations' => array(
+        'index' => $head,
+        'create' => $message_receive,
+      ),
+    ),
+  );
+  return $resources;
+}
+
+/**
+ * Form providing admin menu options.
+ *
+ * @return array
+ *   An array of form elements for the admin page.
+ */
+function mandrill_incoming_admin_settings_form($form, &$form_state) {
+  $form['mandrill_incoming_canonical_url'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Mandrill incoming webhook URL'),
+    '#description' => t("Must be exactly the same as the webhook URL you provided to Mandrill"),
+    '#default_value' => variable_get('mandrill_incoming_canonical_url', ''),
+  );
+
+  $form['mandrill_incoming_webhook_key'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Mandrill incoming webhook key'),
+    '#description' => t("Key provided by Mandrill to validate webhook"),
+    '#default_value' => variable_get('mandrill_incoming_webhook_key', ''),
+  );
+
+  $form['mandrill_incoming_failure_forward_email'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Email address to which to forward unhandled emails'),
+    '#description' => t('If this is not empty, any emails which do not get successfully handled by hook_mandrill_incoming_event() will be forwarded to this email address'),
+    '#default_value' => variable_get('mandrill_incoming_failure_forward_email', ''),
+  );
+
+  $form['mandrill_incoming_validation_ignore'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Continue processing even if Mandrill signature validation fails'),
+    '#description' => t('When receiving data from Mandrill, we generate a signature from the received data to compare against the signature sent by Mandrill. By checking this box, processing of event data will proceed even if the signature validation fails.'),
+    '#default_value' => variable_get('mandrill_incoming_validation_ignore', TRUE),
+  );
+
+  $form = system_settings_form($form);
+  return $form;
+}
+
+/**
+ * Generates a base64-encoded signature for a Mandrill webhook request.
+ *
+ * @param string $webhook_key
+ *   The webhook's authentication key.
+ * @param string $url
+ *   The webhook url.
+ * @param array $params
+ *   The request's POST parameters.
+ *
+ * @see http://help.mandrill.com/entries/23704122-Authenticating-webhook-requests
+ *
+ * @return string
+ *   The base64 encoded-signature for the request.
+ */
+function mandrill_incoming_generate_signature($webhook_key, $url, array $params) {
+  $signed_data = $url;
+  ksort($params);
+  foreach ($params as $key => $value) {
+    $signed_data .= $key;
+    $signed_data .= $value;
+  }
+
+  return base64_encode(hash_hmac('sha1', $signed_data, $webhook_key, TRUE));
+}
+
+/**
+ * Process the incoming item.
+ *
+ * The events array is described at http://help.mandrill.com/entries/22092308-What-is-the-format-of-inbound-email-webhooks-
+ *
+ * @param string $events
+ *   A JSON encoded array of events received from Mandrill.
+ *
+ * @return array
+ *   Mandrill needs to know if we received the events. We always
+ *   return array('success') to indicate that we've received the data.
+ */
+function mandrill_incoming_event($events) {
+
+  // The official URL at which we are to receive events. Please try to have
+  // only one!
+  $canonical_url = variable_get('mandrill_incoming_canonical_url', 'https://www.warmshowers.org/services/rest/mandrill_events');
+
+  // Mandrill webhook key corresponding to canonical URL.
+  $key = variable_get('mandrill_incoming_webhook_key', '');
+
+  // This is the simple HEAD access request that mandrill uses to check to
+  // see if anybody is home.
+  if (empty($events)) {
+    return array('success');
+  }
+
+  $calculated_signature = mandrill_incoming_generate_signature($key, $canonical_url, $_POST);
+  $received_signature = $_SERVER['HTTP_X_MANDRILL_SIGNATURE'];
+
+  if ($received_signature != $calculated_signature) {
+    watchdog('mandrill_incoming', 'Failed mandrill signature validation, probable message truncation, calculated="%calculated", received="%received", md5(mandrill_events)="%md5", strlen(mandrill_events)=%length, url="%url", webhook_key="%webhook_key", post=<pre>@post</pre>', array(
+      '%calculated' => $calculated_signature,
+      '%received' => $received_signature,
+      '%length' => strlen($_POST['mandrill_events']),
+      '%md5' => md5($_POST['mandrill_events']),
+      '%url' => $canonical_url,
+      '%webhook_key' => $key,
+      '@post' => print_r($_POST, TRUE),
+    ), WATCHDOG_ERROR);
+    // Validation failed. Check to see what the site preference is (ignore
+    // validation failure or continue).
+    if (!variable_get('mandrill_incoming_validation_ignore', TRUE)) {
+      // Bail out.
+      return array('success');
+    }
+  }
+
+  // Dump the actual inbound info from mandrill
+  if (variable_get('mandrill_incoming_debug', 0) > 0) {
+    watchdog('mandrill_incoming', 'raw json incoming events, mandrill_events=@string', array('@string' => urlencode($events['mandrill_events'])), WATCHDOG_DEBUG);
+  }
+
+  $events = json_decode($events['mandrill_events']);
+
+  if (variable_get('mandrill_incoming_debug', 0) > 0) {
+    watchdog('mandrill_incoming', '@num incoming events=<pre>@events</pre>', array(
+      '@num' => count($events),
+      '@events' => print_r($events, TRUE)
+    ));
+  }
+
+  foreach ($events as $event) {
+
+    // Each hook implementation receives $event (as described at
+    // http://help.mandrill.com/entries/22092308-What-is-the-format-of-inbound-email-webhooks-)
+    // and must return
+    // - MANDRILL_INCOMING_HANDLED if it handled the message successfully
+    // - MANDRILL_INCOMING_UNHANDLED if no error but not handled
+    // - array(MANDRILL_INCOMING_ERROR => $failure_description) if an error
+    //   occurred processing the message.
+    $results = module_invoke_all('mandrill_incoming_event', $event);
+
+    if (variable_get('mandrill_incoming_debug', 0) > 0) {
+      watchdog('mandrill_incoming', 'Results from hook_mandrill_incoming_event invocation=@result', array('@result' => print_r($results, TRUE)));
+    }
+    // If no module handled this event, resend the email to an admin.
+    if (!in_array(MANDRILL_INCOMING_HANDLED, $results)) {
+      $failure_description = "";
+      foreach ($results as $code => $desc) {
+        ($failure_description .= "$code:$desc, ");
+      }
+      watchdog('mandrill_incoming', 'Failed to handle incoming email (subject=%subject, description=%failure)',
+        array(
+          '%subject' => $event->msg->subject,
+          '%failure' => $failure_description,
+        ),
+        WATCHDOG_WARNING);
+
+
+      // If a forwarding email is configured for this failure, send it on.
+      $failure_forward_email = variable_get('mandrill_incoming_failure_forward_email', '');
+      if (!empty($failure_forward_email)) {
+        $message = array(
+          'id' => 'mandrill_incoming_mandrill_incoming_failure',
+          'to' => $failure_forward_email,
+          'subject' => "[MANDRILL FAILED: $failure_description]" . preg_replace('/\[mid[:.].*\]/', '', $event->msg->subject),
+          'body' => array(
+            t('MANDRILL FAILED TO HANDLE: @failure_description', array('@failure_description' => $failure_description)) . "\r\nOriginal Subject:" . $event->msg->subject . "\r\n\r\n" . $event->msg->text . "\r\n\r\n------\r\n" . $event->msg->raw_msg,
+          ),
+          'headers' => array(
+            'From' => $event->msg->from_email,
+            'Sender' => $event->msg->from_email,
+            'Return-Path' => $event->msg->from_email,
+          ),
+        );
+        $mail_system = drupal_mail_system('mandrill_incoming', 'mandrill_incoming_failure');
+        // The format function must be called before calling the mail function.
+        $message = $mail_system->format($message);
+
+        if (!$mail_system->mail($message)) {
+          // There was an error sending the message.
+          watchdog('mandrill_incoming', 'Failed to drupal_mail_system mandrill_incoming bail message. Message: <pre>%message</pre>',
+            array(
+              '%message' => print_r($message, TRUE),
+            ), WATCHDOG_ERROR);
+        }
+      }
+    }
+    else {
+      variable_set('mandrill_incoming_last_success_timestamp', REQUEST_TIME);
+    }
+  }
+
+  // Return to Mandrill indicating we handled the incoming data.
+  return array('success');
+}
+
+/**
+ * Simple access callback required by the Service definition.
+ *
+ * @return bool
+ *   Always return TRUE.
+ */
+function mandrill_incoming_access_callback() {
+  return TRUE;
+}

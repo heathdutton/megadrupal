@@ -1,0 +1,549 @@
+<?php
+/**
+ * @file
+ * Commerce Credits Transaction module file.
+ */
+
+
+/**
+ * Implements hook_entity_info().
+ */
+function commerce_credits_transaction_entity_info() {
+  $info = array();
+
+  $info['commerce_credits_transaction'] = array(
+    'label' => 'Commerce Credits Transaction',
+    'plural_label' => 'Commerce Credits Transactions',
+    'entity class' => 'Entity',
+    'controller class' => 'CommerceCreditsTransactionController',
+    'metadata controller class' => 'CommerceCreditsTransactionMetadataController',
+    'views controller class' => 'CommerceCreditsTransactionViewsController',
+    'base table' => 'commerce_credits_transaction',
+    'entity keys' => array(
+      'id' => 'transaction_id',
+      'label' => 'transaction',
+    ),
+    'bundles' => array(
+      'commerce_credits_transaction' => array(
+        'label' => t('Commerce Credits Transaction'),
+        'admin' => array(
+          'path' => 'admin/commerce/credits/transaction/manage',
+          'real path' => 'admin/commerce/credits/transaction/manage',
+          'access arguments' => array('administer commerce credits'),
+        ),
+      ),
+    ),
+    'fieldable' => FALSE,
+    'access callback' => 'commerce_credits_transaction_access',
+    'module' => 'commerce_credits_transaction',
+    'view modes' => array(
+      'full' => array(
+        'label' => t('Transaction'),
+        'custom settings' => FALSE,
+      ),
+    ),
+  );
+
+  return $info;
+}
+
+/**
+ * Implements hook_entity_info_alter().
+ */
+function commerce_credits_transaction_entity_info_alter(&$info) {
+  // Add a new controller class to commerce_credits entity because the default
+  // class is terrible.
+  $info['commerce_credits']['controller class'] = 'CommerceCreditsTransactionCreditsController';
+}
+
+/**
+ * Implements hook_menu().
+ */
+function commerce_credits_transaction_menu() {
+  $items = array();
+
+  $items['credits/transaction/%/%/%/%ctools_js'] = array(
+    'title' => 'Credits Transaction',
+    'description' => 'Transfer credits from one entity to another.',
+    'page callback' => 'commerce_credits_transaction_page',
+    'page arguments' => array(2, 3, 4, 5, 6, 7),
+    'access callback' => 'commerce_credits_transaction_page_access',
+    'access arguments' => array(3, 4, 6, 7),
+    'type' => MENU_CALLBACK,
+    'file' => 'commerce_credits_transaction.pages.inc',
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_permission().
+ */
+function commerce_credits_transaction_permission() {
+  return array(
+    'manage commerce credits transaction' => array(
+      'title' => t('Manage Commerce Credits Transactions'),
+      'description' => t('Administer commerce credits transaction which allows basic CRUD. All other actions are based on Commerce Credits permissions.'),
+    ),
+  );
+}
+
+/**
+ * Implements hook_cron_queue_info().
+ */
+function commerce_credits_transaction_cron_queue_info() {
+  return array(
+    'commerce_credits_transaction_reverse' => array(
+      'worker callback' => 'commerce_credits_transaction_reverse_queue',
+      'time' => 60,
+    ),
+  );
+}
+
+/**
+ * Implements hook_action_info().
+ */
+function commerce_credits_transaction_action_info() {
+  return array(
+    'commerce_credits_transaction_grant_user_credits' => array(
+      'type' => 'user',
+      'label' => t('Grant Commerce Credits to User'),
+      'configurable' => TRUE,
+      'trigger' => array('any'),
+    ),
+  );
+}
+
+/**
+ * Implements hook_entity_delete().
+ */
+function commerce_credits_transaction_entity_delete($entity, $entity_type) {
+  if ($entity_type == 'commerce_credits') {
+    // Do nothing for commerce credits entities.
+    return;
+  }
+
+  $info = entity_get_info($entity_type);
+
+  // Complete all pending transactions from this entity quickly.
+  $num = db_update('commerce_credits_transaction')
+    ->condition('from_entity_id', $entity->{$info['entity keys']['id']})
+    ->condition('from_entity_type', $entity_type)
+    ->condition('status', 'pending')
+    ->fields(array(
+      'status' => 'complete',
+    ))
+    ->execute();
+  watchdog('commerce_credits', 'Completed %num transactions from %type-%id', array('%num' => $num, '%type' => $entity_type, '%id' => $entity->{$info['entity keys']['id']}));
+
+  // Queue up reversals for all transactions TO this entity.
+  $to = db_select('commerce_credits_transaction')
+    ->fields('commerce_credits_transaction', array('transaction_id'))
+    ->condition('to_entity_id', $entity->{$info['entity keys']['id']})
+    ->condition('to_entity_type', $entity_type)
+    ->condition('status', 'pending')
+    ->execute()
+    ->fetchAllKeyed(0, 0);
+
+  if (!empty($to)) {
+    $transactions = commerce_credits_transaction_load_multiple(array_keys($to));
+
+    $queues = 0;
+    $queue = DrupalQueue::get('commerce_credits_transaction_reverse');
+
+    $total = count($transactions);
+    while (!empty($transactions)) {
+      // Create queue items with 50 transactions at a time.
+      $to_queue = array_splice($transactions, 0, 50);
+
+      $data = array(
+        'transactions' => $to_queue,
+      );
+
+      $queue->createItem($data);
+      $queues++;
+    }
+
+    $plural = format_plural(count($to), '1 transaction', '@count transactions');
+    $queue_plural = format_plural($queues, '1 queue item', '@count queue items');
+    watchdog('commerce_credits_transaction', 'Queued !plural to reverse in !queue_plural', array('!plural' => $plural, '!queue_plural' => $queue_plural));
+  }
+}
+
+/**
+ * Implements hook_views_api().
+ */
+function commerce_credits_transaction_views_api() {
+  return array(
+    'api' => 3,
+    'path' => drupal_get_path('module', 'commerce_credits_transaction') . '/views',
+  );
+}
+
+/**
+ * Implements hook_ctools_plugin_directory()
+ */
+function commerce_credits_transaction_ctools_plugin_directory($module, $plugin) {
+ if ($module == 'ctools') {
+    return 'plugins/' . $plugin;
+  }
+}
+
+/**
+ * Commerce Credits Transaction Access Callback
+ *
+ * @param $op
+ *   THe CRUD operation performed.
+ * @param $transaction
+ *   CommerceCreditsTransaction entity.
+ * @param $account
+ *   An optional user account to specify. Otherwise the current user.
+ * @return boolean
+ *   TRUE if the user account has access to the operation or FALSE if not.
+ */
+function commerce_credits_transaction_access($op, $transaction = NULL, $account = FALSE) {
+  global $user;
+
+  if (!$account) {
+    $account = $user;
+  }
+
+  if (user_access('manage commerce credits transaction', $account)) {
+    return TRUE;
+  }
+
+  return FALSE;
+}
+
+/**
+ * Load a commerce credits transaction entity.
+ *
+ * @return CommerceCreditsTransaction
+ *   An entity object or FALSE.
+ */
+function commerce_credits_transaction_load($transaction_id, $reset = FALSE) {
+  $items = commerce_credits_transaction_load_multiple(array($transaction_id), NULL, $reset);
+  return !empty($items) ? array_shift($items) : FALSE;
+}
+
+/**
+ * Load multiple commerce credits transaction entities.
+ */
+function commerce_credits_transaction_load_multiple($ids, $conditions = array(), $reset = FALSE) {
+  return entity_load('commerce_credits_transaction', $ids, $conditions, $reset);
+}
+
+/**
+ * Load multiple commerce credits transaction entities by entity.
+ *
+ * @param $credits
+ *   The commerce credits entity.
+ * @param $direction
+ *   The direction from or to.
+ * @param $status
+ *   An option status to restrict to.
+ * @return array
+ *   An array of transaction ids.
+ */
+function commerce_credits_transaction_load_by_credit_entity($credits, $direction = '', $status = '') {
+
+  $query = db_select('commerce_credits_transaction', 'cct');
+  $query
+    ->fields('cct', array('transaction_id', 'credits'))
+    ->orderBy('transaction_id');
+
+  if (empty($direction)) {
+    // Add an or condition to get all transactions if direction not provided.
+    $or = db_or()->condition('cct.to_cid', $credits->cid)->condition('cct.from_cid', $credits->cid);
+    $query->condition($or);
+  }
+  elseif ($direction == 'to') {
+    $query->condition('cct.to_cid', $credits->cid);
+  }
+  elseif ($direction == 'from') {
+    $query->condition('cct.from_cid', $credits->cid);
+  }
+
+  if ($status) {
+    $query->condition('cct.status', $status);
+  }
+
+  return $query->execute()->fetchAllKeyed(0, 1);
+}
+
+/**
+ * Delete commerce credits transaction entity.
+ */
+function commerce_credits_transaction_delete(CommerceCreditsTransaction $transaction) {
+  $transaction->delete();
+}
+
+/**
+ * Save commerce credits transaction entity.
+ */
+function commerce_credits_transaction_save(CommerceCreditsTransaction $transaction) {
+  return $transaction->save();
+}
+
+/**
+ * Create commerce credits transaction entity from values.
+ */
+function commerce_credits_transaction_create(array $values) {
+  return new CommerceCreditsTransaction($values);
+}
+
+/**
+ * List of transaction directions - From or To keyed by machine name.
+ *
+ * @return array
+ *   A list of directions keyed by machine name.
+ */
+function commerce_credits_transaction_get_directions() {
+  return array(
+    'gave' => t('Entity gave'),
+    'has' => t('Entity has'),
+  );
+}
+
+/**
+ * List of transaction types.
+ *
+ * @return mixed
+ *   Either an array of key/value transaction types and labels or the type
+ *   label of the passed in key.
+ */
+function commerce_credits_transaction_get_transaction_types($name = '') {
+  $options = array(
+    'in' => t('In'),
+    'out' => t('Out'),
+    'transfer' => t('Transfer'),
+  );
+
+  return ($name && isset($options[$name])) ? $options[$name] : $options;
+}
+
+/**
+ * List of status options
+ *
+ * @return array
+ *   An array of status options keyed by machine name and value of the human
+ *   readable name.
+ */
+function commerce_credits_transaction_get_status_options() {
+  return array(
+    'pending' => t('Pending'),
+    'complete' => t('Complete'),
+    'canceled' => t('Canceled'),
+  );
+}
+
+/**
+ * A dumb function to get all the entity types that should be in entity core
+ * or something.
+ *
+ * @return array
+ *   An array of entity type labels keyed by entity type machine name.
+ */
+function commerce_credits_transaction_get_entity_types() {
+  $info = entity_get_info();
+  $keys = array_keys($info);
+
+  $types = array_reduce($keys, function(&$result, $item) use ($info) {
+    $result[$item] = $info[$item]['label'];
+    return $result;
+  });
+
+  return $types;
+}
+
+/**
+ * Entity Metadata Getter for commerce credits entity entity.
+ *
+ * @return Entity
+ *   An entity object or NULL.
+ */
+function commmerce_credits_transaction_get_entity($transaction, array $options, $name, $type, $info) {
+
+  if ($name == 'from') {
+    $id_key = 'from_entity_id';
+    $type_key = 'from_entity_type';
+  }
+  else {
+    $id_key = 'to_entity_id';
+    $type_key = 'to_entity_type';
+  }
+
+  try {
+    $entity = entity_get_controller($transaction->{$type_key})->load(array($transaction->{$id_key}));
+  }
+  catch (Exception $e) {
+    watchdog_exception('commerce_credits', $e, $e->getMessage(), NULL, WATCHDOG_NOTICE);
+    return NULL;
+  }
+
+  return isset($entity) ? reset($entity) : NULL;
+}
+
+/**
+ * Queue processor for Commerce Credits Transaction reversals.
+ *
+ * @param $item
+ *   The Drupal Queue item, which will contain multiple transactions to reverse.
+ */
+function commerce_credits_transaction_reverse_queue($item) {
+  $count = 0;
+  $total = count($item['transactions']);
+
+  foreach (element_children($item['transactions']) as $n) {
+    try {
+      $transaction = &$item['transactions'][$n];
+      $original_transaction = entity_get_controller('commerce_credits_transaction')->reverse($transaction);
+      $original_transaction->save();
+      $count++;
+    }
+    catch (Exception $e) {
+      watchdog_exception('commerce_credits_transaction', $e, 'An error occurred trying to reverse transaction: %message', array('%message' => $e->getMessage(), WATCHDOG_CRITICAL));
+      $count--;
+    }
+  }
+
+  $plural = format_plural($total, '@done/1 transaction', '@done/@count transactions', array('@done' => $count));
+  watchdog('commerce_credits_transaction', 'Reverse !plural', array('!plural' => $plural), ($total > $count) ? WATCHDOG_ERROR : WATCHDOG_INFO);
+}
+
+/**
+ * Commerce Credits Transaction page access callback
+ */
+function commerce_credits_transaction_page_access($entity_type, $entity_id, $from_type = FALSE, $from_id = FALSE) {
+
+  if (!entity_get_info($entity_type)) {
+    throw new Exception(t('An error occurred attempting to transfer to an entity type that does not exist.'));
+  }
+
+  $entity = entity_load($entity_type, array($entity_id));
+
+  if (!$entity) {
+    throw new Exception(t('An error occurred attempting to transfer to an entity that does not exist.'));
+  }
+
+  if ($from_type && $from_id && entity_get_info($from_type)) {
+    // Only allow managers to pay from another entity than themselves.
+    return user_access('manage commerce credits transaction');
+  }
+
+  // Pop the entity from the array because entity_load is dumb.
+  $entity = array_shift($entity);
+
+  // Allow modules to deny/grant access.
+  $access_results = module_invoke_all('commerce_credits_transaction_transfer_access', $entity, $entity_type, $entity_id);
+  $access = array_reduce($access_results, 'commerce_credits_transaction_reduce_access_array');
+
+  if ($access == NODE_ACCESS_DENY) {
+    // Another module has explicitly denied access.
+    return FALSE;
+  }
+  elseif ($access == NODE_ACCESS_ALLOW) {
+    // Another module has explicitly granted access.
+    return TRUE;
+  }
+
+  // Only allow authenticated users.
+  return user_is_logged_in();
+}
+
+/**
+ * Reduce commerce credits transaction access hooks to one value.
+ *
+ * @param &$result
+ *   The result array.
+ * @param $item
+ *   The current node access constant to reduce.
+ * @return integer
+ *   One of the node access constants.
+ */
+function commerce_credits_transaction_reduce_access_array(&$result, $item) {
+  if ($item == NODE_ACCESS_ALLOW || $result == NODE_ACCESS_ALLOW) {
+    return NODE_ACCESS_ALLOW;
+  }
+  elseif ($item == NODE_ACCESS_DENY || $result == NODE_ACCESS_DENY) {
+    return NODE_ACCESS_DENY;
+  }
+  else {
+    return NODE_ACCESS_IGNORE;
+  }
+}
+
+/**
+ * Commerce Credits Transaction Grant Credits to User action form.
+ */
+function commerce_credits_transaction_grant_user_credits_form($context) {
+  $form['credits'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Credits'),
+    '#description' => t('Provide the number of credits to grant the user. A negative number will attempt to remove credits from the user.'),
+    '#default_value' => 1,
+    '#required' => TRUE,
+  );
+
+  $form['type'] = array(
+    '#type' => 'select',
+    '#title' => t('Credit Type'),
+    '#description' => t('Please choose the credit type.'),
+    '#options' => commerce_credits_types_list(),
+    '#required' => TRUE,
+  );
+
+  return $form;
+}
+
+/**
+ * Commerce Credits Transaction Grant Credits to User action validate.
+ */
+function commerce_credits_transaction_grant_user_credits_validate($form, &$form_state) {
+  if (!is_numeric($form_state['values']['credits'])) {
+    form_error($form['credits'], t('Illegal value for credits.'));
+  }
+  elseif ($form_state['values']['credits'] == 0) {
+    form_error($form['credits'], t('A positive or negative value is required.'));
+  }
+  else {
+    form_set_value($form['credits'], (integer) $form_state['values']['credits'], $form_state);
+  }
+}
+
+/**
+ * Commerce Credits Transaction Grant Credits to User action submit.
+ */
+function commerce_credits_transaction_grant_user_credits_submit($form, &$form_state) {
+  return array(
+    'credits' => $form_state['values']['credits'],
+    'type' => $form_state['values']['type'],
+  );
+}
+
+/**
+ * Commerce Credits Transaction Grant Credits to User action.
+ */
+function commerce_credits_transaction_grant_user_credits($account, $context) {
+  try {
+    $credits = entity_get_controller('commerce_credits')->loadByEntity($account->uid, 'user', $context['type']);
+    $credits = is_array($credits) ? array_shift($credits) : FALSE;
+
+    if (!$credits) {
+      // Create if not found.
+      $credits = entity_get_controller('commerce_credits')->createByEntity($account->uid, 'user', $context['type']);
+    }
+
+    if ($context['credits'] > 0) {
+      entity_get_controller('commerce_credits')->addCredits($credits, $context['credits']);
+      watchdog('commerce_credits', 'Increased credits by @count', array('@count' => $context['credits']));
+    }
+    else {
+      entity_get_controller('commerce_credits')->removeCredits($credits, $context['credits']);
+      watchdog('commerce_credits', 'Reduced credits by @count', array('@count' => $context['credits']));
+    }
+  }
+  catch (Exception $e) {
+    watchdog_exception('commerce_credits', $e, 'An error occurred trying to grant credits to user %name: %message.', array('%name' => $account->name, '%message' => $e->getMessage()), WATCHDOG_ERROR);
+  }
+}

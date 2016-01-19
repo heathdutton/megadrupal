@@ -1,0 +1,569 @@
+<?php
+/**
+ * @file
+ * Provides API integration with Fitbit
+ */
+
+define('QD_FITBIT_SERVICE_NAME', 'Fitbit');
+
+define('QD_FITBIT_BASEURL', 'https://api.fitbit.com/');
+
+define('QD_FITBIT_APIVER', '1');
+
+define('QD_FITBIT_REQUESTTOKENURL', QD_FITBIT_BASEURL . 'oauth/request_token');
+define('QD_FITBIT_ACCESSTOKENURL', QD_FITBIT_BASEURL . 'oauth/access_token');
+define('QD_FITBIT_AUTHORIZEURL', QD_FITBIT_BASEURL . 'oauth/authorize');
+
+define('QD_FITBIT_DATAURL', QD_FITBIT_BASEURL . QD_FITBIT_APIVER . '/user/-/');
+
+define('QD_FITBIT_USERPROFILE', 'profile');
+
+define('QD_FITBIT_WEIGHT_ENDPOINT', 'body/log/weight');
+define('QD_FITBIT_BODYFAT_ENDPOINT', 'body/log/fat');
+define('QD_FITBIT_STEP_ENDPOINT', 'activities/steps');
+define('QD_FITBIT_DISTANCE_ENDPOINT', 'activities/distance');
+define('QD_FITBIT_FLOORS_ENDPOINT', 'activities/floors');
+define('QD_FITBIT_ELEVATION_ENDPOINT', 'activities/elevation');
+define('QD_FITBIT_MINSEDENTARY_ENDPOINT', 'activities/minutesSedentary');
+define('QD_FITBIT_MINLIGHTLYACTIVE_ENDPOINT', 'activities/minutesLightlyActive');
+define('QD_FITBIT_MINFAIRLYACTIVE_ENDPOINT', 'activities/minutesFairlyActive');
+define('QD_FITBIT_MINVERYACTIVE_ENDPOINT', 'activities/minutesVeryActive');
+
+define('QD_FITBIT_1D', '1d');
+define('QD_FITBIT_7D', '7d');
+define('QD_FITBIT_30D', '30d');
+define('QD_FITBIT_1W', '1w');
+define('QD_FITBIT_1M', '1m');
+
+define('QD_FITBIT_FEATURE_WEIGHT', 'weight');
+define('QD_FITBIT_FEATURE_STEPS', 'steps');
+define('QD_FITBIT_FEATURE_ELEVATION', 'elevation');
+define('QD_FITBIT_FEATURE_DISTANCE', 'distance');
+define('QD_FITBIT_FEATURE_SEDENTARY', 'sedentary');
+
+
+module_load_include('inc', 'qd_fitbit', 'qd_fitbit.admin');
+module_load_include('inc', 'qd_fitbit', 'qd_fitbit.debug');
+module_load_include('inc', 'qd_fitbit', 'qd_fitbit.oauth');
+module_load_include('inc', 'qd_fitbit', 'qd_fitbit.queue');
+module_load_include('inc', 'qd_fitbit', 'qd_fitbit.debug');
+module_load_include('inc', 'qd_fitbit', 'qd_fitbit.cron');
+
+/**
+ * Implements hook_menu().
+ */
+function qd_fitbit_menu() {
+  $items = array();
+
+  $items['qd_fitbit/oauth'] = array(
+    'title' => 'QD Fitbit',
+    'access callback' => TRUE,
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('qd_fitbit_oauth_callback'),
+    'type' => MENU_CALLBACK,
+  );
+
+  $items['admin/config/services/qd_fitbit'] = array(
+    'type' => MENU_NORMAL_ITEM,
+    'title' => 'QD Fitbit ',
+    'description' => 'Settings for integrating with the API for fitbit',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('qd_fitbit_admin'),
+    'file' => 'qd_fitbit.admin.inc',
+    'access arguments' => array('administer qd_fitbit api settings'),
+  );
+
+  return $items;
+}
+
+
+/**
+ * Makes a call to the fitbit service.
+ *
+ * @param Object $client
+ *   The call object to make the call with.
+ * @param string $endpoint
+ *   The endpoint name to call.
+ * @param string $start_date
+ *   The timestamp to start the import from.
+ * @param string $end_date
+ *   The timestamp to end the import.
+ *
+ * @return Object
+ *   The web service call response.
+ */
+function qd_fitbit_make_call($client, $endpoint, $start_date, $end_date) {
+  $start_date = date('Y-m-d', $start_date);
+  $end_date = date('Y-m-d', $end_date);
+
+  $url = QD_FITBIT_DATAURL . $endpoint . '/date';
+  $url .= '/' . $start_date . '/' . $end_date;
+  $url .= '.json';
+
+  if (variable_get('qd_core_use_cached_calls')) {
+    $response = qd_fitbit_debug_cachedcall($url, $endpoint);
+  }
+  else {
+    $response = $client->get($url);
+    $response = json_decode(json_encode($response));
+  }
+
+  // @TODO: record how many WS calls are left before being rate limited.
+
+  return $response;
+}
+
+
+/**
+ * Get the tid of the service taxonomy term for 'Fitbit'. Creates if not found.
+ *
+ * @return int
+ *   The tid of the service taxonomy term.
+ */
+function qd_fitbit_get_service_id() {
+  // Look up the term id.
+  $terms = taxonomy_get_term_by_name(QD_FITBIT_SERVICE_NAME, QD_SERVICES_VOCABULARY);
+
+  if (count($terms) > 0) {
+    $term = array_pop($terms);
+    $tid = $term->tid;
+  }
+  else {
+    // No term exists yet, create it.
+    // Find the vocabulary id (for QC_SERVICES_VOCABULARY).
+    $vocabulary = taxonomy_vocabulary_machine_name_load(QD_SERVICES_VOCABULARY);
+
+    $term = new stdClass();
+    $term->name = QD_FITBIT_SERVICE_NAME;
+    $term->vid = $vocabulary->vid;
+    taxonomy_term_save($term);
+    $tid = $term->tid;
+  }
+
+  return $tid;
+}
+
+
+/**
+ * Get the fitbit profile for the specified user.
+ *
+ * @param Object $client
+ *   The client object to make the authorized web service call with.
+ *
+ * @return Object
+ *   The user profile object from fitbit.
+ */
+function qd_fitbit_get_user_info($client) {
+  $url = QD_FITBIT_DATAURL . QD_FITBIT_USERPROFILE . '.json';
+
+  if (variable_get('qd_core_use_cached_calls')) {
+    $response = qd_fitbit_debug_cachedcall($url, QD_FITBIT_USERPROFILE);
+  }
+  else {
+    $response = $client->get($url);
+    $response = json_decode(json_encode($response));
+  }
+
+  return $response->user;
+}
+
+
+/**
+ * Executes save on all the entity objects in the array.
+ *
+ * @param array $entities
+ *   An array of entity objects.
+ * @param string $entity_type
+ *   The typename of entities in the array.
+ */
+function qd_fitbit_save_entities($entities, $entity_type) {
+  foreach ($entities as $entity) {
+    $success = $entity->save();
+
+    // If a save fails, stop importing and return false;
+    if (!$success) {
+      return FALSE;
+    }
+  }
+
+  return TRUE;
+}
+
+
+/**
+ * Checks to see if a Fitbit feature is enabled by a user.
+ *
+ * @param object $account
+ *   The account object of the user to check.
+ * @param string $feature
+ *   The feature constant to check.
+ *
+ * @return bool
+ *   The settings value.
+ */
+function qd_fitbit_feature_is_enabled($account, $feature) {
+  $feature_setting = $account->data['qd_fitbit_settings'][$feature];
+
+  if ($feature_setting === 0) {
+    return FALSE;
+  }
+
+  return TRUE;
+}
+
+
+function qd_fitbit_get_latest_import($uid, $endpoint) {
+  $retval;
+  $service_id = qd_fitbit_get_service_id();
+
+  switch ($endpoint) {
+    case QD_FITBIT_MINSEDENTARY_ENDPOINT:
+      $retval = qd_core_activitylevel_get_latest_entry($uid, $service_id);
+      break;
+
+    case QD_FITBIT_BODYFAT_ENDPOINT:
+      $retval = qd_core_bodyfat_get_latest_entry($uid, $service_id);
+      break;
+
+    case QD_FITBIT_DISTANCE_ENDPOINT:
+      $retval = qd_core_distance_get_latest_entry($uid, $service_id);
+      break;
+
+    case QD_FITBIT_ELEVATION_ENDPOINT:
+      $retval = qd_core_elevation_get_latest_entry($uid, $service_id);
+      break;
+
+    case QD_FITBIT_STEP_ENDPOINT:
+      $retval = qd_core_steps_get_latest_entry($uid, $service_id);
+      break;
+
+    case QD_FITBIT_WEIGHT_ENDPOINT:
+      $retval = qd_core_weight_get_latest_entry($uid, $service_id);
+      break;
+
+  }
+
+  return $retval;
+}
+
+
+function qd_fitbit_get_default_sync_start($account, $endpoint) {
+  $latest = qd_fitbit_get_latest_import($account->uid, $endpoint);
+
+  if ($latest) {
+    $date = $latest->timestamp;
+    $sync_start = date('U', $date);
+  }
+  else {
+    $fitbit_profile = $account->data['qd_fitbit_profile'];
+    $sync_start = date('U', strtotime($fitbit_profile->memberSince));
+  }
+
+  return $sync_start;
+}
+
+
+/**
+ * Retrieves data from the Fitbit service.
+ */
+function qd_fitbit_retrieve_data($account, $endpoint, $endpoint_property,
+  $entity_type, $start_date, $end_date) {
+
+  // Get some standard info.
+  $client = qd_fitbit_get_access_client($account->uid);
+  $fitbit_profile = $account->data['qd_fitbit_profile'];
+  $utc_offset = $fitbit_profile->offsetFromUTCMillis / 1000;
+
+  $latest_entry = qd_fitbit_get_latest_import($account->uid, $endpoint);
+  // If there are existing entries, we'll need to know when for later.
+  if ($latest_entry) {
+    $timestamp = $latest_entry->timestamp;
+  }
+
+  // Make the web service call for data.
+  $ws_values = qd_fitbit_make_call($client, $endpoint, $start_date, $end_date);
+
+  // Loop through the results and sync or create a new entity.
+  $entities = array();
+  foreach ($ws_values->$endpoint_property as $ws_value) {
+    $ws_date = qd_fitbit_get_timestamp($ws_value);
+    $ws_id = qd_fitbit_get_id($ws_value);
+
+    // @TODO: Load/compare any records in this range, not just latest.
+    if ($latest_entry && $latest_entry->source_id == $ws_id) {
+      // If a latest record exists & it matches the date, sync.
+      $entity = entity_load($entity_type, array($latest_entry->id));
+      $entity = array_pop($entity);
+    }
+    else {
+      // This is a new record, create a new entity.
+      $entity = qd_fitbit_create_entity(
+        $entity_type,
+        $account->uid,
+        $ws_date,
+        $utc_offset,
+        $ws_id);
+    }
+    qd_fitbit_map_values($ws_value, $entity, $entity_type);
+
+    // Put the entity in an array for saving later.
+    $entities[$ws_date] = $entity;
+  }
+
+  // Special case: activity levels need to be mashed into one record.
+  if ($endpoint == QD_FITBIT_MINSEDENTARY_ENDPOINT) {
+    qd_fitbit_process_activitylevel($entities, $client, $start_date, $end_date);
+  }
+
+  // Make sure there's more to do for next time.
+  qd_fitbit_check_queues($account);
+
+  return $entities;
+}
+
+
+function qd_fitbit_get_timestamp($ws_value) {
+  if (isset($ws_value->dateTime)) {
+    $timestamp = strtotime($ws_value->dateTime . ' 12:00:00');
+  }
+  else {
+    $timestamp = strtotime($ws_value->date . ' ' . $ws_value->time);
+  }
+
+  return $timestamp;
+}
+
+
+function qd_fitbit_get_id($ws_value) {
+  $logId = -1;
+
+  if (isset($ws_value->logId)) {
+    $logId = $ws_value->logId;
+  }
+  else {
+    $logId = qd_fitbit_get_timestamp($ws_value);
+  }
+
+  return $logId;
+}
+
+
+function qd_fitbit_create_entity($entity_type, $uid, $date, $utc_offset, $source_id) {
+  $entity = '-1';
+  $service_id = qd_fitbit_get_service_id();
+
+  switch ($entity_type) {
+    case 'qd_core_activitylevel':
+      $entity = qd_core_activitylevel_create(
+        $uid, $date, $utc_offset, $source_id, NULL, $service_id);
+      break;
+
+    case 'qd_core_bmi':
+      // Placeholder. BMI piggybacks on the weight creation.
+      break;
+
+    case 'qd_core_bodyfat':
+      $entity = qd_core_bodyfat_create(
+        $uid, $date, $utc_offset, $source_id, NULL, $service_id);
+      break;
+
+    case 'qd_core_distance':
+      $entity = qd_core_distance_create(
+        $uid, $date, $utc_offset, $source_id, NULL, $service_id);
+      break;
+
+    case 'qd_core_elevation':
+      $entity = qd_core_elevation_create(
+        $uid, $date, $utc_offset, $source_id, NULL, $service_id);
+      break;
+
+    case 'qd_core_steps':
+      $entity = qd_core_steps_create(
+        $uid, $date, $utc_offset, $source_id, NULL, $service_id);
+      break;
+
+    case 'qd_core_weight':
+      $entity = qd_core_weight_create(
+        $uid, $date, $utc_offset, $source_id, NULL, $service_id);
+      break;
+  }
+
+  return $entity;
+}
+
+
+function qd_fitbit_map_values($ws_object, &$entity, $entity_type) {
+  switch ($entity_type) {
+    case 'qd_core_activitylevel':
+      $entity->min_sedentary = $ws_object->value;
+      break;
+
+    case 'qd_core_bmi':
+      // Placeholder. BMI piggybacks on the weight creation.
+      break;
+
+    case 'qd_core_bodyfat':
+      $entity->bodyfat = $ws_object->fat;
+      break;
+
+    case 'qd_core_distance':
+      $entity->distance = $ws_object->value;
+      break;
+
+    case 'qd_core_elevation':
+      $entity->elevation = $ws_object->value;
+      break;
+
+    case 'qd_core_steps':
+      $entity->total_steps = $ws_object->value;
+      break;
+
+    case 'qd_core_weight':
+      $entity->weight = $ws_object->weight;
+      $entity->bmi = $ws_object->bmi;
+      qd_fitbit_process_bmi($ws_object, $entity);
+      break;
+
+  }
+}
+
+
+function qd_fitbit_process_bmi($ws_object, $weight_entity) {
+  $entity = qd_core_bmi_create(
+    $weight_entity->uid,
+    $weight_entity->timestamp,
+    $weight_entity->utc_offset,
+    $weight_entity->source_id,
+    $ws_object->bmi,
+    $weight_entity->service_id);
+
+  $wrapper = entity_metadata_wrapper('qd_core_bmi', $entity);
+  $wrapper->save();
+}
+
+
+function qd_fitbit_process_activitylevel(&$entities, $client, $start_date, $end_date) {
+
+  // Merge in lightly active values.
+  $ws_lightly_active = qd_fitbit_make_call(
+    $client, QD_FITBIT_MINLIGHTLYACTIVE_ENDPOINT, $start_date, $end_date);
+
+  $prop = 'activities-minutesLightlyActive';
+  $ws_lightly_active = $ws_lightly_active->$prop;
+  qd_fitbit_activity_merge_values($entities, $ws_lightly_active, 'min_lightlyactive');
+
+  // Merge in fairly active values.
+  $ws_fairly_active = qd_fitbit_make_call(
+    $client, QD_FITBIT_MINFAIRLYACTIVE_ENDPOINT, $start_date, $end_date);
+
+  $prop = 'activities-minutesFairlyActive';
+  $ws_fairly_active = $ws_fairly_active->$prop;
+  qd_fitbit_activity_merge_values($entities, $ws_fairly_active, 'min_fairlyactive');
+
+  // Merge in very active values.
+  $ws_very_active = qd_fitbit_make_call(
+    $client, QD_FITBIT_MINVERYACTIVE_ENDPOINT, $start_date, $end_date);
+
+  $prop = 'activities-minutesVeryActive';
+  $ws_very_active = $ws_very_active->$prop;
+  qd_fitbit_activity_merge_values($entities, $ws_very_active, 'min_veryactive');
+}
+
+
+/**
+ * Merges activity data together into one entity record.
+ *
+ * @param array $entities
+ *   The array of target entity objects.
+ * @param array $ws_objects
+ *   The array of objects from the WS call to merge into the entities.
+ * @param string $property
+ *   The property name to merge in (assumes source is always called 'value').
+ *
+ * @return array
+ *   The resultant array of entities.
+ */
+function qd_fitbit_activity_merge_values(&$entities, $ws_objects, $property) {
+  foreach ($ws_objects as $ws_value) {
+    $datetime = qd_fitbit_get_timestamp($ws_value);
+    if (array_key_exists($datetime, $entities)) {
+      $entities[$datetime]->$property = $ws_value->value;
+    }
+  }
+
+  return $entities;
+}
+
+
+function qd_fitbit_get_properties_for_endpoint($endpoint) {
+  $values = array();
+
+  switch ($endpoint) {
+    case QD_FITBIT_WEIGHT_ENDPOINT:
+      $values['endpoint_property'] = 'weight';
+      $values['entity_type'] = 'qd_core_weight';
+      break;
+
+    case QD_FITBIT_BODYFAT_ENDPOINT:
+      $values['endpoint_property'] = 'fat';
+      $values['entity_type'] = 'qd_core_bodyfat';
+      break;
+
+    case QD_FITBIT_STEP_ENDPOINT:
+      $values['endpoint_property'] = 'activities-steps';
+      $values['entity_type'] = 'qd_core_steps';
+      break;
+
+    case QD_FITBIT_DISTANCE_ENDPOINT:
+      $values['endpoint_property'] = 'activities-distance';
+      $values['entity_type'] = 'qd_core_distance';
+      break;
+
+    // case QD_FITBIT_FLOORS_ENDPOINT:
+    //   $values['endpoint_property'] = '';
+    //   $values['entity_type'] = 'qd_core_floors';
+    //   break;
+
+    case QD_FITBIT_ELEVATION_ENDPOINT:
+      $values['endpoint_property'] = 'activities-elevation';
+      $values['entity_type'] = 'qd_core_elevation';
+      break;
+
+    case QD_FITBIT_MINSEDENTARY_ENDPOINT:
+      $values['endpoint_property'] = 'activities-minutesSedentary';
+      $values['entity_type'] = 'qd_core_activitylevel';
+      break;
+
+    case QD_FITBIT_MINLIGHTLYACTIVE_ENDPOINT:
+      $values['endpoint_property'] = 'activities-minutesLightlyActive';
+      $values['entity_type'] = 'qd_core_activitylevel';
+      break;
+
+    case QD_FITBIT_MINFAIRLYACTIVE_ENDPOINT:
+      $values['endpoint_property'] = 'activities-minutesFairlyActive';
+      $values['entity_type'] = 'qd_core_activitylevel';
+      break;
+
+    case QD_FITBIT_MINVERYACTIVE_ENDPOINT:
+      $values['endpoint_property'] = 'activities-minutesVeryActive';
+      $values['entity_type'] = 'qd_core_activitylevel';
+      break;
+  }
+
+  return $values;
+}
+
+
+function qd_fitbit_get_all_connected_accounts() {
+  // Get all users.
+  $key = variable_get('qd_fitbit_key');
+
+  $query = "SELECT uid ";
+  $query .= "FROM oauth_common_token ";
+  $query .= "WHERE csid = 1 AND uid != 0"; // @TODO: remove hardcoded csid
+
+  $result = db_query($query, array(':key' => $key));
+  $records = $result->fetchAll();
+
+  return $records;
+}

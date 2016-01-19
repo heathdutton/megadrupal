@@ -1,0 +1,553 @@
+<?php
+
+/**
+ * @file
+ * Drupal Commerce Interkassa payment method.
+ *
+ * This module contains basic integration with Interkassa
+ * for Drupal Commerce.
+ */
+
+/**
+ * Implements hook_commerce_payment_method_info().
+ */
+function commerce_interkassa_commerce_payment_method_info() {
+  $payment_methods = array();
+
+  $payment_methods['commerce_interkassa'] = array(
+    'title' => t('Interkassa'),
+    'description' => t('Provides the payment method for Interkassa service.'),
+    'active' => TRUE,
+    'terminal' => FALSE,
+    'offsite' => TRUE,
+    'offsite_autoredirect' => TRUE,
+  );
+
+  return $payment_methods;
+}
+
+/**
+ * Implements hook_menu().
+ */
+function commerce_interkassa_menu() {
+  $items['commerce_interkassa/%commerce_interkassa_pm/status'] = array(
+    'title' => 'Payment status',
+    'page callback' => 'commerce_interkassa_status',
+    'page arguments' => array(1),
+    'access callback' => TRUE,
+    'type' => MENU_CALLBACK,
+  );
+
+  $items['commerce_interkassa/%commerce_interkassa_pm/interaction'] = array(
+    'title' => 'Interkassa interaction',
+    'page callback' => 'commerce_interkassa_interaction',
+    'page arguments' => array(1),
+    'access callback' => TRUE,
+    'type' => MENU_CALLBACK,
+  );
+
+  return $items;
+}
+
+/**
+ * Payment method loader.
+ *
+ * Load payment method with settings from url arg to support multiple payment
+ * method instance if need.
+ *
+ * @param string $instance_id
+ *   Variable part of payment method instance.
+ *
+ * @return bool
+ *   Payment method instance.
+ */
+function commerce_interkassa_pm_load($instance_id) {
+  $instance_id = 'commerce_interkassa|commerce_payment_' . $instance_id;
+  return commerce_payment_method_instance_load($instance_id);
+}
+
+/**
+ * Page callback: commerce_interkassa/%commerce_interkassa_pm/status.
+ *
+ * Fallback call interaction menu callback because IK bug on payment
+ * processing
+ * Q: If must the interaction url call when result fail or panding ?
+ *    Or this statuses must be processed in Return Form callback?
+ * A: Now request is sent to Interaction URL only in case of success
+ *    payment, we working on this now.
+ *
+ * @param mixed $payment_method
+ *   Drupal commerce payment method instance passed via url param.
+ */
+function commerce_interkassa_status($payment_method) {
+  $data = $_POST;
+
+  if (isset($data['ik_inv_st']) && $data['ik_inv_st'] != 'success') {
+    commerce_interkassa_interaction($payment_method, FALSE);
+  }
+
+  if (isset($data['ik_pm_no'])) {
+    $transaction = commerce_payment_transaction_load($data['ik_pm_no']);
+    if ($transaction) {
+      $order = commerce_order_load($transaction->order_id);
+      if ($order) {
+        $fail_statuses = array('fail','canceled');
+        if (in_array($data['ik_inv_st'], $fail_statuses)) {
+          drupal_set_message(t('Payment failed at the payment server. Please review your information and try again.'), 'error');
+        }
+        drupal_goto(commerce_checkout_order_uri($order));
+      }
+    }
+  }
+
+  drupal_exit();
+}
+
+/**
+ * Helper to validate IK $_POST data.
+ *
+ * @param mixed $data
+ *   $_POST to be validated.
+ * @param mixed $payment_method
+ *   Drupal commerce payment method instance passed via url param.
+ * @param bool $is_interaction
+ *   Fallback call flag.
+ *
+ * @return bool|mixed
+ *   Transaction according to POST data or due.
+ */
+function _commerce_interkassa_validate_post($data, $payment_method = FALSE, $is_interaction = TRUE) {
+  // Exit now if the $_POST was empty.
+  if (empty($data)) {
+    watchdog('commerce_interkassa', 'Interaction URL accessed with no POST data submitted.', array(), WATCHDOG_WARNING);
+    drupal_exit();
+  }
+
+  // Exit now if any required keys are not exists in $_POST.
+  $required_keys = array('ik_co_id','ik_inv_id','ik_inv_st','ik_inv_crt',
+    'ik_inv_prc','ik_pm_no','ik_pw_via','ik_am','ik_cur',
+    'ik_ps_price','ik_desc',
+  );
+  $unavailable_required_keys = array_diff_key(array_flip($required_keys), $data);
+  if (!empty($unavailable_required_keys)) {
+    watchdog('commerce_interkassa', 'Missing POST keys. POST data: <pre>!data</pre>', array('!data' => print_r($unavailable_required_keys, TRUE)), WATCHDOG_WARNING);
+    drupal_exit();
+  }
+
+  $settings = (isset($payment_method['settings']) ? $payment_method['settings'] : commerce_interkassa_default_settings());
+  // Exit now if missing Checkout ID.
+  if (empty($settings['ik_co_id']) || $data['ik_co_id'] != $settings['ik_co_id']) {
+    $info = array(
+      '!settings' => print_r($payment_method, 1),
+      '!data' => print_r($data, TRUE),
+    );
+    watchdog('commerce_interkassa !data', 'Missing Checkout ID.  POST data: <pre>!data</pre> <pre>!settings</pre>',
+        $info, WATCHDOG_WARNING);
+    drupal_exit();
+  }
+
+  if ($is_interaction) {
+    if ($payment_method && !isset($data['ik_sign'])) {
+      watchdog('commerce_interkassa', 'Missing sign. POST data: !data', array('!data' => print_r($data, TRUE)), WATCHDOG_WARNING);
+      drupal_exit();
+    }
+    if ($payment_method) {
+      // Interkassa Signature.
+      $ik_sign = $data['ik_sign'];
+      unset($data['ik_sign']);
+
+      // Create own Signature.
+      $secretkey = (isset($data['ik_pw_via']) && $data['ik_pw_via'] == 'test_interkassa_test_xts') ? $settings['test_key'] : $settings['sign_key'];
+      ksort($data, SORT_STRING);
+      array_push($data, $secretkey);
+      $sign_string = implode(':', $data);
+      $sign = base64_encode(md5($sign_string, TRUE));
+
+      // Exit now if missing Signature.
+      if ($ik_sign != $sign) {
+        watchdog('commerce_interkassa', 'Missing Signature.  POST data: !data', array('!data' => print_r($data, TRUE)), WATCHDOG_WARNING);
+        drupal_exit();
+      }
+    }
+  }
+
+  $transaction = commerce_payment_transaction_load($data['ik_pm_no']);
+  if (!$transaction) {
+    watchdog('commerce_interkassa', 'Missing transaction id.  POST data: !data', array('!data' => print_r($data, TRUE)), WATCHDOG_WARNING);
+    drupal_exit();
+  }
+
+  return $transaction;
+}
+
+/**
+ * Page callback: commerce_interkassa/%commerce_interkassa_pm/interaction.
+ *
+ * I do not use default payment method redirect_validate  because
+ * in checkout/' . $order->order_id . '/payment/return/' .
+ *       $order->data['payment_redirect_key']
+ * and checkout/ ' . $order->order_id . '/payment/back/' .
+ *       $order->data['payment_redirect_key']
+ * callbacks that calls CALLBACK_redirect_validate payment transaction
+ * processing and user redirect are combined.
+ * So delayed payment processing is impossible also all payment systems
+ * (and IK) require change order\transaction statuses only in
+ * interaction\process\ipn callbacks not in success\fail\panding page
+ * callbacks.
+ *
+ * @param mixed $payment_method
+ *   Drupal payment method passed via url arg.
+ * @param bool $is_interaction
+ *   Fallback call flag.
+ */
+function commerce_interkassa_interaction($payment_method, $is_interaction = TRUE) {
+// Retrieve the SCI from $_POST if the caller did not supply an SCI array.
+// Note that Drupal has already run stripslashes() on the contents of the
+// $_POST array at this point, so we don't need to worry about them.
+  $data = $_POST;
+  $transaction = _commerce_interkassa_validate_post($data, $payment_method, $is_interaction);
+
+  $transaction->message = 'Payment method: @method';
+  $transaction->message_variables = array('@method' => $data['ik_pw_via']);
+  $transaction->remote_id = (isset($data['ik_trn_id']) ? $data['ik_trn_id'] : 0);
+  $transaction->remote_status = $data['ik_inv_st'];
+  $transaction->payload = $data;
+  $order = commerce_order_load($transaction->order_id);
+  $order->data['active_transaction_status'] = $data['ik_inv_st'];
+
+  switch ($data['ik_inv_st']) {
+    case 'success':
+      $transaction->status = COMMERCE_PAYMENT_STATUS_SUCCESS;
+      commerce_payment_redirect_pane_next_page($order);
+      break;
+
+    case 'fail':
+    case 'canceled':
+      $transaction->status = COMMERCE_PAYMENT_STATUS_FAILURE;
+      commerce_payment_redirect_pane_previous_page($order);
+      break;
+
+    case 'new':
+    case 'waitAccept':
+    case 'process':
+      $transaction->status = COMMERCE_PAYMENT_STATUS_PENDING;
+      commerce_payment_redirect_pane_next_page($order);
+      break;
+  }
+  commerce_payment_transaction_save($transaction);
+}
+
+/**
+ * Returns the default value for the checkout completion message settings form.
+ *
+ * @return array
+ *   Prepared default wait message.
+ */
+function commerce_interkassa_wait_message_default() {
+  // If the Filtered HTML text format is available, use a default value with
+  // links in it.
+  if (filter_format_load('filtered_html')) {
+    $value = 'Your order number is [commerce-order:order-number]. Payment gateway will process your payment shortly and notify us.  You can <a href="[commerce-order:url]">view your order</a> status on your account page when logged in.'
+      . "\n\n" . '<a href="[site:url]">Return to the front page.</a>';
+    $format = 'filtered_html';
+  }
+  else {
+    // Otherwise select a fallback format and use a plaint text default value.
+    $value = 'Your order number is [commerce-order:order-number]. Payment gateway will process your payment shortly and notify us.  You can view your order status on your account page when logged in.';
+    $format = filter_fallback_format();
+  }
+
+  return array('value' => $value, 'format' => $format);
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function commerce_interkassa_form_commerce_checkout_form_complete_alter(&$form, &$form_state, $form_id) {
+  if ($form['checkout_completion_message']['message']) {
+
+    $order = $form_state['order'];
+    $wait_statuses = array('new','waitAccept', 'process');
+    $active_transaction_status = (isset($order->data['active_transaction_status']) ? $order->data['active_transaction_status'] : '');
+    if (in_array($active_transaction_status, $wait_statuses)) {
+      $wait_message = variable_get('commerce_interkassa_wait_message', commerce_interkassa_wait_message_default());
+      $wait_message['value'] = token_replace($wait_message['value'], array('commerce-order' => $order), array('clear' => TRUE));
+      $wait_message['value'] = check_markup($wait_message['value'], $wait_message['format']);
+      $form['checkout_completion_message']['message']['#markup'] = '<div class="checkout-completion-message">' . $wait_message['value'] . '</div>';
+    }
+  }
+}
+
+/**
+ * Default IK settings getter.
+ *
+ * @return array
+ *   Default settings array.
+ */
+function commerce_interkassa_default_settings() {
+  return array(
+    'ik_co_id' => '',
+    'action_url' => 'https://sci.interkassa.com',
+    'ik_cur' => '',
+    'sign_key' => '',
+    'test_key' => '',
+    'ik_changeurl' => '',
+    'show_interkassa_fee_message' => TRUE,
+    'wait_message' => variable_get('commerce_interkassa_wait_message', commerce_interkassa_wait_message_default()),
+  );
+}
+
+/**
+ * Helper for getting IK supported currencies.
+ *
+ * @return array
+ */
+function _commerce_interkassa_get_supported_currencies() {
+  return array(
+    'USD' => t('USD'),
+    'EUR' => t('EUR'),
+    'UAH' => t('UAH'),
+    'RUB' => t('RUB'),
+  );
+}
+
+/**
+ * Payment method callback: settings form.
+ *
+ * @param mixed $settings
+ *   Payment method instance settings.
+ *
+ * @return array
+ *   Settings form array.
+ */
+function commerce_interkassa_settings_form($settings = NULL) {
+  $form = array();
+
+  $settings = (array) $settings + commerce_interkassa_default_settings();
+
+  $form['ik_co_id'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Checkout ID'),
+    '#default_value' => $settings['ik_co_id'],
+    '#maxlength' => 256,
+    '#required' => TRUE,
+  );
+
+  $form['ik_cur'] = array(
+    '#type' => 'checkboxes',
+    '#title' => t('Currencies'),
+    '#default_value' => (empty($settings['ik_cur'])) ? array('USD') : $settings['ik_cur'],
+    '#options' => _commerce_interkassa_get_supported_currencies(),
+    '#required' => TRUE,
+  );
+
+  $form['ik_cur_default'] = array(
+    '#type' => 'select',
+    '#title' => t('Default currency'),
+    '#default_value' => (empty($settings['ik_cur_default'])) ? 'USD' : $settings['ik_cur_default'],
+    '#options' => _commerce_interkassa_get_supported_currencies(),
+    '#required' => TRUE,
+  );
+
+  $form['action_url'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Action URL'),
+    '#default_value' => $settings['action_url'],
+    '#description' => t('Default action url !action_url', array('!action_url' => 'https://sci.interkassa.com')),
+    '#maxlength' => 256,
+    '#required' => TRUE,
+  );
+
+  $form['sign_key'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Sign Key'),
+    '#default_value' => $settings['sign_key'],
+    '#maxlength' => 256,
+    '#required' => TRUE,
+  );
+
+  $form['test_key'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Test Key'),
+    '#default_value' => $settings['test_key'],
+    '#maxlength' => 256,
+    '#required' => TRUE,
+  );
+
+  $form['ik_changeurl'] = array(
+    '#type' => 'select',
+    '#title' => t('Override Success/Fail URLs to default (with multilingual support)'),
+    '#default_value' => (empty($settings['ik_changeurl'])) ? 'no' : $settings['ik_changeurl'],
+    '#options' => array(
+      'no' => t('No'),
+      'yes' => t('Yes'),
+    ),
+    '#required' => TRUE,
+  );
+
+  $form['wait_message'] = array(
+    '#type' => 'text_format',
+    '#title' => t('Wait message'),
+    '#default_value' => $settings['wait_message']['value'],
+    '#format' => $settings['wait_message']['format'],
+  );
+
+  $form['show_interkassa_fee_message'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Show Interkassa fee message'),
+    '#default_value' => $settings['show_interkassa_fee_message'],
+  );
+
+  return $form;
+}
+
+/**
+ * Payment method validate: settings form.
+ */
+function commerce_interkassa_settings_form_validate($settings = NULL) {
+  if (valid_url($settings['action_url'])) {
+    form_set_error(t('Action URL'), t('You must enter a valid url.'));
+  }
+}
+
+/**
+ * Payment method callback: adds a message and CSS to the submission form.
+ */
+function commerce_interkassa_submit_form($payment_method, $pane_values, $checkout_pane, $order) {
+  // @todo add payways list and show payment gateway price per payways
+  global $language;
+  $logo_path = drupal_get_path('module', 'commerce_interkassa') . '/images/logo-' . $language->language . '.png';
+  $image = array(
+    '#theme' => 'image',
+    '#path' => $logo_path,
+    '#alt' => 'Interkassa',
+    '#title' => 'Interkassa',
+  );
+  $form['interkassa_logo'] = array(
+    '#markup' => '<div class="commerce-interkassa-logo">' . render($image) . '</div>',
+  );
+  if ($payment_method['settings']['show_interkassa_fee_message']) {
+    $form['interkassa_fee_message'] = array(
+      '#markup' => '<div class="commerce-interkassa-fee-message">' . t('In addition to the order amount Interkassa fee can be charged.') . '</div>',
+    );
+  }
+
+  return $form;
+}
+
+/**
+ * Payment method callback: redirect form, building a interkassa form.
+ */
+function commerce_interkassa_redirect_form($form, &$form_state, $order, $payment_method) {
+  // Return an error if the enabling action's settings haven't been configured.
+  if (empty($payment_method['settings']['ik_co_id']) || empty($payment_method['settings']['action_url'])) {
+    drupal_set_message(t('Interkassa is not configured for use.'), 'error');
+    return array();
+  }
+
+  return commerce_interkassa_order_form($form, $form_state, $order, $payment_method['settings']);
+}
+
+
+/**
+ * Builds a Interkassa form from an order object.
+ */
+function commerce_interkassa_order_form($form, &$form_state, $order, $settings) {
+  $form['#action'] = $settings['action_url'];
+  $form['#attributes'] = array(
+    'name' => 'payment',
+    'accept-charset' => 'UTF-8',
+  );
+  $form['#method'] = 'post';
+
+  $transaction = $order->data['active_transaction'];
+  $settings['ik_pm_no'] = $transaction->transaction_id;
+  $settings['ik_am'] = commerce_currency_amount_to_decimal($transaction->amount, $transaction->currency_code);
+
+  if ($settings['ik_changeurl']) {
+    // @todo add change urls possibility via settings
+    // $settings['ik_suc_u'] = url('checkout/' . $order->order_id .
+    // '/payment/return/' . $order->data['payment_redirect_key'],
+    // array('absolute' => TRUE));
+    // $settings['ik_fal_u'] = url('checkout/' . $order->order_id .
+    // '/payment/back/' . $order->data['payment_redirect_key'],
+    // array('absolute' => TRUE));
+    // $settings['ik_pnd_u'] = url('checkout/' . $order->order_id .
+    // '/payment/return/' . $order->data['payment_redirect_key'],
+    // array('absolute' => TRUE));
+  }
+
+  $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+  $currency_code = $order_wrapper->commerce_order_total->currency_code->value();
+  $form['ik_cur'] = array(
+    '#type' => 'hidden',
+    '#value' => (in_array($currency_code, $settings['ik_cur']) ? $currency_code : $settings['ik_cur_default']),
+  );
+
+  unset($settings['ik_changeurl']);
+  unset($settings['action_url']);
+  unset($settings['ik_cur_default']);
+  unset($settings['wait_message']);
+  unset($settings['ik_cur']);
+
+  foreach ($settings as $name => $value) {
+    if (!empty($value) && $name != 'sign_key' && $name != 'test_key') {
+      $form[$name] = array('#type' => 'hidden', '#value' => $value);
+    }
+  }
+
+  $form['ik_desc'] = array(
+    '#type' => 'hidden',
+    '#value' => t('Order ID: !orderid, User mail: !mail',
+      array('!orderid' => $order->order_id, '!mail' => $order_wrapper->mail->value())),
+  );
+
+  $form['process'] = array(
+    '#type' => 'submit',
+    '#value' => t('Proceed to Interkassa'),
+  );
+
+  return $form;
+}
+
+/**
+ * Payment method callback: submit form submission.
+ *
+ * Pass transaction to redirect form as value for ik_pm_no key and track
+ * https://www.drupal.org/project/commerce_partial_payment because
+ * interkassa SCI can send payment notification in other order that
+ * users really pay on site.
+ *
+ * There is no transaction object in redirect form callback so pass
+ * it via $order->data property for proper IK ik_pm_no using. Why
+ * all payment method callbacks gets only $order object and not active
+ * transaction.
+ */
+function commerce_interkassa_submit_form_submit($payment_method, $pane_form, $pane_values, $order, $charge) {
+  $order->data['commerce_interkassa'] = $pane_values;
+  $order->data['active_transaction'] = commerce_interkassa_transaction($payment_method, $order, $charge);
+}
+
+/**
+ * Creates an payment transaction for the specified charge amount.
+ *
+ * @param mixed $payment_method
+ *   Drupal commerce payment method instance.
+ * @param object $order
+ *   Drupal commerce order object.
+ * @param mixed $charge
+ *   Amount to be charged.
+ *
+ * @return mixed
+ *   Created transaction.
+ */
+function commerce_interkassa_transaction($payment_method, $order, $charge) {
+  $transaction = commerce_payment_transaction_new('commerce_interkassa', $order->order_id);
+  $transaction->instance_id = $payment_method['instance_id'];
+  $transaction->amount = $charge['amount'];
+  $transaction->currency_code = $charge['currency_code'];
+  $transaction->status = COMMERCE_PAYMENT_STATUS_PENDING;
+  $transaction->message = 'User redirected to Interkassa';
+  commerce_payment_transaction_save($transaction);
+  return $transaction;
+}
