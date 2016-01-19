@@ -1,3 +1,0 @@
-<?php
-
-?>Payment failed.

@@ -1,1 +1,0 @@
-For up to date readme please take a look at the module page at http://drupal.org/project/wysiwyg_grammar_checker
