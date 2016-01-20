@@ -1,1 +1,0 @@
-This module provides Norway VAT rates for the Comerce VAT module

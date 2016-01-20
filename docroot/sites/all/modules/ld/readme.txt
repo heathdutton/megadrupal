@@ -1,1 +1,0 @@
-Provides Ladybug PHP Dumper integration.
