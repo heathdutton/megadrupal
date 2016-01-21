@@ -1,0 +1,213 @@
+<?php
+
+/**
+ * @file
+ * Helper module for advanced queuing.
+ */
+
+/**
+ * Status indicating item was added to the queue.
+ */
+define('ADVANCEDQUEUE_STATUS_QUEUED', -1);
+
+/**
+ * Status indicating item is currently being processed.
+ */
+define('ADVANCEDQUEUE_STATUS_PROCESSING', 0);
+
+/**
+ * Status indicating item was processed successfuly.
+ */
+define('ADVANCEDQUEUE_STATUS_SUCCESS', 1);
+
+/**
+ * Status indicating item processing failed.
+ */
+define('ADVANCEDQUEUE_STATUS_FAILURE', 2);
+
+/**
+ * Status indicating item processing failed, and should be retried.
+ */
+define('ADVANCEDQUEUE_STATUS_FAILURE_RETRY', 3);
+
+/**
+ * Implements hook_advancedqueue_entity_info().
+ */
+function advancedqueue_entity_info() {
+  $entity_info['advancedqueue_item'] = array(
+    'label' => t('Advanced queue item'),
+    'controller class' => 'DrupalDefaultEntityController',
+    'base table' => 'advancedqueue',
+    'module' => 'advancedqueue',
+    'entity keys' => array(
+      'id' => 'item_id',
+      'label' => 'title',
+    ),
+  );
+  return $entity_info;
+}
+
+/**
+ * Implements hook_cron().
+ */
+function advancedqueue_cron() {
+  if (!variable_get('advancedqueue_use_cron', FALSE)) {
+    return;
+  }
+
+  if (!$queues = advancedqueue_get_queues_info()) {
+    return;
+  }
+
+  // @todo: Add variable to set interval?
+  $end = time() + 60;
+  foreach ($queues as $queue_name => $queue_info) {
+    $queue = DrupalQueue::get($queue_name);
+
+    while ($item = $queue->claimItem()) {
+      if (time() > $end) {
+        // We've reached max execution time.
+        return;
+      }
+      advancedqueue_process_item($queue, $queue_name, $queue_info, $item, $end);
+    }
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * Add Advanced queue setting to use cron, to the cron settings page.
+ */
+function advancedqueue_form_system_cron_settings_alter(&$form, $form_state, $form_id) {
+  $form['advancedqueue_use_cron'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Process Advanced Queue via Cron'),
+    '#multiple' => TRUE,
+    '#description' => t('Enable to allow queue items to to be processed using Cron. This is a "poor man\'s" option that allows processing the queue, as the better solution would be to execute the Drush command via the command line.'),
+    '#default_value' => variable_get('advancedqueue_use_cron', FALSE),
+  );
+}
+
+/**
+ * Return queue(s) info.
+ *
+ * @params $queue_names
+ *   Optional; Array with the queue names. If empty, return all the queues.
+ */
+function advancedqueue_get_queues_info($queue_names = array()) {
+  $queues_info = &drupal_static(__FUNCTION__, array());
+
+  if (empty($queues_info)) {
+    $queues_info = module_invoke_all('advanced_queue_info');
+
+    // Add default values.
+    foreach ($queues_info as &$queue_info) {
+      $queue_info += array(
+        'delete when completed' => TRUE,
+      );
+    }
+    drupal_alter('advanced_queue_info', $queues_info);
+    uasort($queues_info, 'drupal_sort_weight');
+  }
+
+  if ($queue_names) {
+    return array_intersect_key($queues_info, $queue_names);
+  }
+
+  return $queues_info;
+}
+
+/**
+ * Process a queue item.
+ *
+ * @param $queue
+ *   The queue object.
+ * @param $queue_name
+ *   The queue name.
+ * @param $queue_info
+ *   The queue info.
+ * @param $item
+ *   The item to process.
+ * @param $end_time
+ *   (Optional) The time the process should end.
+ */
+function advancedqueue_process_item($queue, $queue_name, $queue_info, $item, $end_time = FALSE) {
+  $function = $queue_info['worker callback'];
+  $params =  array(
+    '@queue' => $queue_name,
+    '@id' => $item->item_id,
+    '@title' => !empty($item->title) ? $item->title : 'untitled',
+  );
+  advancedqueue_log_message(format_string('[@queue:@id] Starting processing item @title.', $params));
+
+  try {
+    // Pass the claimed item itself and end date along to the worker
+    // callback.
+    $output = $function($item, $end_time);
+    if (is_array($output)) {
+      $item->status = $output['status'];
+      $item->result = $output['result'];
+    }
+    else {
+      $item->status = $output ? ADVANCEDQUEUE_STATUS_SUCCESS : ADVANCEDQUEUE_STATUS_FAILURE;
+    }
+  }
+  catch (Exception $e) {
+    $item->status = ADVANCEDQUEUE_STATUS_FAILURE;
+    $params['!message'] = (string) $e;
+    advancedqueue_log_message(format_string('[@queue:@id] failed processing: !message', $params));
+  }
+
+  $params['@status'] = $item->status;
+  advancedqueue_log_message(format_string('[@queue:@id] Processing ended with result @status.', $params));
+
+  // Requeue in case of failure.
+  if ($item->status == ADVANCEDQUEUE_STATUS_FAILURE_RETRY && !empty($queue_info['retry after'])) {
+    $item->data['advancedqueue_attempt'] = isset($item->data['advancedqueue_attempt']) ? $item->data['advancedqueue_attempt'] + 1 : 1;
+    $item->created = time() + $queue_info['retry after'];
+
+    // "max attempts" is optional, skip the attempts check if it's missing.
+    $max_attempts = isset($queue_info['max attempts']) ? $queue_info['max attempts'] : 0;
+    if (!$max_attempts || $item->data['advancedqueue_attempt'] <= $max_attempts) {
+      $queue->requeueItem($item);
+      advancedqueue_log_message(format_string('[@queue:@id] failed processing and has been requeued.', $params));
+      return;
+    }
+    else {
+      $item->status = ADVANCEDQUEUE_STATUS_FAILURE;
+      advancedqueue_log_message(format_string('[@queue:@id] The maximum number of attempts has been reached, aborting.', $params));
+    }
+  }
+
+  if ($queue_info['delete when completed']) {
+    // Item was processed, so we can "delete" it. This is not removing the
+    // item from the database, but rather updates it with the status.
+    $queue->deleteItem($item);
+  }
+}
+
+/**
+ * Helper function to log message. In CLI we use Drush Log, otherwise watchdog.
+ *
+ * @param $message
+ *   The message to log.
+ */
+function advancedqueue_log_message($message) {
+  if (drupal_is_cli()) {
+    drush_log($message);
+  }
+  else {
+    watchdog('advancedqueue', $message);
+  }
+}
+
+/**
+ * Implements hook_views_api().
+ */
+function advancedqueue_views_api() {
+  return array(
+    'api' => 2,
+    'path' => drupal_get_path('module', 'advancedqueue') . '/views',
+  );
+}

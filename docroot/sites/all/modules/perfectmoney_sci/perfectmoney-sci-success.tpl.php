@@ -1,0 +1,3 @@
+<?php
+
+?>Payment was successfull.

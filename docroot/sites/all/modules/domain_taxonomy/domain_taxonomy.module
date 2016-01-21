@@ -1,0 +1,704 @@
+<?php
+// $Id$
+
+function _domain_taxonomy_is_debug() {
+  return variable_get('domain_taxonomy_debug', 0);
+}
+
+function domain_taxonomy_menu() {
+  $items = array();
+  $items['admin/structure/domain/taxonomy'] = array(
+    'title' => 'Taxonomy',
+    'access arguments' => array('administer domains'),
+    'type' => MENU_LOCAL_TASK,
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('domain_taxonomy_configure_form'),
+    'file' => 'domain_taxonomy.admin.inc',
+    'weight' => -10
+  );
+  return $items;
+}
+
+
+function domain_taxonomy_load_term(&$term) {
+  if (!isset($term->tid)) {
+    return;
+  }
+  // Append the domain grants to the term for editing.
+  $term->domains = array();
+  $term->domain_site = FALSE;
+  $result = db_query("SELECT gid, realm FROM {domain_taxonomy_access} WHERE tid = :tid AND (realm = 'domain_id' OR realm = 'domain_site')",
+  array(':tid' => $term->tid));
+  foreach ($result as $data) {
+    // Transform the 0 to -1, since {domain_access} is unsigned.
+    ($data->gid == 0) ? $gid = -1 : $gid = $data->gid;
+    if ($data->realm == 'domain_id') {
+      $term->domains[$gid] = $gid;
+      if ($gid > 0) {
+        $domain = domain_lookup($gid);
+        $term->subdomains[] = $domain['sitename'];
+      }
+      else {
+        $term->subdomains[] = variable_get('domain_sitename', variable_get('site_name', 'Drupal'));
+      }
+    }
+    elseif ($data->realm == 'domain_site') {
+      $term->domain_site = TRUE;
+      $term->subdomains[] = t('All affiliates');
+    }
+  }
+
+  if ($term->tid) {
+    $source = array();
+    $source = db_query("SELECT domain_id FROM {domain_taxonomy_source} WHERE tid = :tid", array(':tid' => $term->tid))->fetchAssoc();
+  }
+  if (empty($source)) {
+    $term->domain_source = variable_get('domain_default_source', 0);
+  }
+  else {
+    $term->domain_source = $source['domain_id'];
+  }
+}
+
+function domain_taxonomy_form_alter(&$form, &$form_state, $form_id) {
+  global $_domain, $user;
+
+  // There are forms that we never want to alter, and they are passed here.
+  $forms = module_invoke_all('domainignore');
+  if (in_array($form_id, $forms)) {
+    return;
+  }
+
+  // Apply to all node editing forms
+  if (isset($form['#node']) && isset($form['#node_edit_form'])) {
+    $form['#submit'][] = 'domain_taxonomy_form_node_submit';
+    $parent_vid = variable_get('domain_inherit_type_voc_' . $form['#node']->type, 0);
+    if ($parent_vid) {
+      $vocs = taxonomy_get_vocabularies();
+      if (user_access('set domain access')) {
+        $form['domain']['domain_load_fromparent'] = array(
+          '#type' => 'checkbox',
+          '#prefix' => '<b>' . t('Actions on form submit') . ':</b>',
+          '#title' => t('Load domain access options for node from parent term'),
+          '#description' => t('This option overrides domain access options below (except <em>Source domain</em>). Parent vocabulary @v', array('@v' => drupal_strtoupper($vocs[$parent_vid]->name))),
+          '#default_value' => TRUE,
+          '#weight' => -3,
+        );
+      }
+      else {
+        $form['domain']['domain_load_fromparent'] = array(
+          '#type' => 'value',
+          '#value' => TRUE,
+        );
+      }
+    }
+  }
+
+
+  // Apply to all term editing forms
+  if (in_array($form['#id'], array('taxonomy-form-term', 'forum-form-forum', 'forum-form-container'))) {
+    if (!isset($form['tid']))
+      return;
+
+    $term = taxonomy_term_load($form['tid']['#value']);
+    
+    if (!isset($form['vid']))
+      return;
+    
+    $vocabulary = taxonomy_vocabulary_load($form['vid']['#value']);
+
+    $disabled_vocs = _domain_taxonomy_get_disabled_vocabulares();
+    if (in_array($vocabulary->vid, $disabled_vocs)) return;
+
+    domain_taxonomy_load_term($term);
+
+    $form['#submit'][] = 'domain_taxonomy_form_term_submit';
+
+    // By default, the requesting domain is assigned.
+    $default = array($_domain['domain_id']);
+    // How is core content handled for this site?
+    $behavior = variable_get('domain_taxonomy_behavior', DOMAIN_INSTALL_RULE);
+
+    if ($_domain['domain_id'] == 0) {
+      $default[] = -1;
+    }
+
+    // Some options will be passed as hidden values, we need to run some checks on those.
+    if (isset($term->tid)) {
+      $raw = $term->domains;
+    }
+    else {
+      $raw = $default;
+    }
+
+    $options = array();
+    foreach (domain_domains() as $data) {
+      // Cannot pass zero in checkboxes.
+      ($data['domain_id'] == 0) ? $key = -1 : $key = $data['domain_id'];
+      // The domain must be valid.
+      if ($data['valid'] || user_access('administer domains')) {
+        $options[$key] = $data['sitename'];
+        $source_options[$data['domain_id']] = $data['sitename'];
+      }
+    }
+
+    // If the user is a site admin, show the form, otherwise pass it silently.
+    if (user_access('set domain access')) {
+
+      $form['domain'] = array(
+        '#type' => 'fieldset',
+        '#title' => t('Domain access options'),
+        '#collapsible' => TRUE,
+        '#collapsed' => FALSE,
+        '#weight' => 0,
+      );
+
+      $dt_edit_id = 'domain-taxonomy-term-edit-' . (isset($term->tid) ? $term->tid : '');
+
+      $form['domain']['domain_update_subterm'] = array(
+        '#type' => 'checkbox',
+        '#prefix' => '<strong>'.t('Actions on form submit').':</strong>',
+        '#title' => t('Override all child terms'),
+        '#description' => t('This option is not for saving: it only processes subterms when this form is submitted.'),
+        '#default_value' => FALSE,
+      );
+      $form['domain']['domain_update_subnodes'] = array(
+        '#type' => 'checkbox',
+        '#title' => t('Override all child nodes'),
+        '#description' => t('This option is not for saving: it only processes child nodes when this form is submitted.'),
+        '#default_value' => FALSE,
+      );
+      $form['domain']['domain_load_fromparent'] = array(
+        '#type' => 'checkbox',
+        '#title' => t('Load domain access options for terms from parent term'),
+        '#description' => t('This option overrides the domain access options below. It is not for saving: the inherit action is applied only when this form is submitted.'),
+        '#default_value' => isset($term->tid) ? FALSE:TRUE,
+        '#attributes' => array('onclick' => 'jQuery(this).is(":checked") ? jQuery(\'#' . $dt_edit_id . '\').hide():jQuery(\'#' . $dt_edit_id . '\').show();'),
+      );
+
+      $form['domain']['domain_site'] = array(
+        '#type' => 'checkbox',
+        '#prefix' => '<div id="' . $dt_edit_id . '" ' . (!isset($term->tid) ? 'style="display:none;"':'') . '><strong>' . t('Publishing options') . ':</strong>',
+        '#title' => t('Send to all affiliates'),
+        '#required' => FALSE,
+        '#description' => t('Select if this term can be shown to all affiliates. This setting will override the options below.'),
+        '#default_value' => (isset($term->tid)) ? $term->domain_site : variable_get('domain_share_voc_' . $vocabulary->vid, $behavior),
+      );
+      $form['domain']['domains'] = array(
+        '#type' => 'checkboxes',
+        '#title' => t('Publish to'),
+        '#options' => $options,
+        '#required' => TRUE,
+        '#description' => t('Select which affiliates can access this term.'),
+        '#default_value' => (isset($term->tid)) ? $term->domains : $default,
+      );
+      $form['domain']['domain_source'] = array(
+        '#type' => 'select',
+        '#suffix' => '</div>',
+        '#title' => t('Term source domain'),
+        '#options' => $source_options,
+        '#default_value' => (isset($term->tid)) ? $term->domain_source : $_domain['domain_id'],
+        '#description' => t('This affiliate will be used to write links to this term from other affiliates, as needed.')
+      );
+
+    }
+    // If the user has limited permissions, show that form or obey the settings.
+    else {
+
+      $form['domain']['domain_load_fromparent'] = array(
+        '#type' => 'value',
+        '#value' => $term->tid ? false:true,
+      );
+
+      if (user_access('view domain publishing')) {
+        // hook_user() has not run, so get the domain data for this user.
+        $user->domain_user = domain_get_user_domains($user);
+        $action = variable_get('domain_options', 0);
+        $user_domains = array();
+        $default_options = array();
+        $user_options = array();
+        if (!empty($user->domain_user)) {
+          foreach ($user->domain_user as $key => $value) {
+            if (abs($value) > 0) {
+              $user_domains[] = $value;
+            }
+          }
+          $first_domain = current($user_domains);
+          foreach ($options as $key => $value) {
+            if (in_array($key, $user_domains)) {
+              $user_options[$key] = $value;
+            }
+          }
+        }
+        // Raw data checks for published term.
+        foreach ($raw as $key => $value) {
+          if (in_array($value, $user_domains)) {
+            $default_options[] = $value;
+          }
+          // This is only used in case 3, below.  It means that some options
+          // are present that the user cannot access but that must be preserved.
+          else {
+            $raw_options[] = $value;
+          }
+        }
+        // Act on the behavior desired by the site admin.
+        switch ($action) {
+          // 1 == go to the default domain.
+          case 1:
+            $root = domain_default();
+            if ($root['domain_id'] != $_domain['domain_id']) {
+              domain_goto($root);
+            }
+            break;
+            // 2 == go to the user's assigned domain.
+          case 2:
+            $domain = domain_lookup($first_domain);
+            // If the domain is invalid, go to the primary domain.
+            if ($domain == -1 || $domain['valid'] == 0) {
+              domain_goto(domain_default());
+            }
+            elseif ($domain['domain_id'] != $_domain['domain_id']) {
+              domain_goto($domain);
+            }
+            break;
+            // 3 == show checkboxes of available domains.
+          case 3:
+            // If the user has no available domains, then they cannot post.
+            if (empty($user_options)) {
+              $form = array();
+              return drupal_access_denied();
+            }
+            $form['domain'] = array(
+              '#type' => 'fieldset',
+              '#title' => t('Affiliate publishing options'),
+              '#collapsible' => TRUE,
+              '#collapsed' => FALSE,
+              '#weight' => $weight,
+            );
+            // We must preserve publishing options that the user cannot access, but only for
+            // existing terms.
+            if ($term->tid) {
+              $raw = $raw_options;
+            }
+            else {
+              $raw = array();
+            }
+            // If the raw options are being passed, then no input is technically required.
+            (empty($raw)) ? $required = TRUE : $required = FALSE;
+
+            $form['domain']['domains'] = array(
+             '#type' => 'checkboxes',
+              '#title' => t('Publish to'),
+              '#options' => $user_options,
+              '#required' => $required,
+              '#description' => t('Select which affiliates can access this term.'),
+              '#default_value' => (isset($term->tid)) ? $term->domains : $default_options,
+            );
+
+            // Show the options that cannot be changed.
+            $list = array();
+            if ($term->domain_site) {
+              $list[]['data'] = t('All affiliates');
+            }
+            if (!empty($raw)) {
+              foreach ($raw as $did) {
+                ($did == -1) ? $id = 0 : $id = $did;
+                $raw_domains = domain_lookup($id);
+                $list[]['data'] = $raw_domains['sitename'];
+              }
+            }
+            if (!empty($list)) {
+              $form['domain']['domains_notes'] = array(
+               '#value' => '<label><strong>' . t('Publishing status') . ':</strong></label>' . theme('item_list', $list) . '<div class="description">' . t('This term has also been published to these affiliates.') . '</div>',
+              );
+            }
+            break;
+        }
+      }
+      // These form elements are hidden from non-privileged users, by design.
+      $form['domain_site'] = array(
+        '#type' => 'value',
+        '#value' => (isset($term->tid)) ? $term->domain_site : variable_get('domain_share_voc_' . $vocabulary->vid, $behavior),
+      );
+      // Domains that have been assigned and cannot be changed.
+      $form['domains_raw'] = array(
+        '#type' => 'value',
+        '#value' => $raw,
+      );
+    }
+  }
+}
+
+function _domain_taxonomy_store_grants($tid, $grants = array()) {
+  if ($tid > 0 && !empty($grants)) {
+    db_delete('domain_taxonomy_access')->condition('tid', $tid)->execute();
+    foreach ($grants as $grant) {
+      db_insert('domain_taxonomy_access')->fields(array(
+        'tid'  => $tid,
+        'gid' => $grant['gid'],
+        'realm' => $grant['realm'],
+        'grant_view' => $grant['grant_view'],
+        'grant_update' => $grant['grant_update'],
+        'grant_delete' => $grant['grant_delete'],
+      ))
+      ->execute();
+    }
+  }
+}
+
+function _domain_taxonomy_update_source($term) {
+  db_delete('domain_taxonomy_source')->condition('tid', $term->tid)->execute();
+  db_insert('domain_taxonomy_source')->fields(array(
+    'tid' => $term->tid,
+    'domain_id' => $term->domain_source,
+  ))
+  ->execute();
+}
+
+function domain_taxonomy_save_term($term) {
+  // Define the $grants array.
+  $grants = array();
+
+  // If the form is hidden, we are passed the 'domains_raw' variable.
+  // We need to append unique values from this variable to the existing
+  // stored values.  See the logic for 'view domain publshing' in domain_form_alter().
+  if (!empty($term->domains_raw)) {
+    if (!isset($term->domains)) {
+      $term->domains = array();
+    }
+    foreach ($term->domains_raw as $value) {
+      // Only add this if it is not present already.
+      if (!in_array($value, $term->domains)) {
+        $term->domains[$value] = $value;
+      }
+    }
+  }
+
+  // If set, grant access to the core site, otherwise
+  // The grant must be explicitly given to a domain.
+  if (!empty($term->domain_site)) {
+    $grants[] = array(
+      'realm' => 'domain_site',
+      'gid' => 0,
+      'grant_view' => 1,
+      'grant_update' => 0,
+      'grant_delete' => 0,
+      'priority' => 0,         // If this value is > 0, then other grants will not be recorded
+    );
+  }
+  // Set the domain-specific grants.
+  if (!empty($term->domains)) {
+    foreach ($term->domains as $key => $value) {
+      // We can't use a 0 value in an $options list, so convert -1 to 0.
+      if (abs($value) > 0) {
+        ($key == -1) ? $key = 0 : $key = $key;
+        $grants[] = array(
+          'realm' => 'domain_id',
+          'gid' => $key,
+          'grant_view' => 1,
+          'grant_update' => 1,
+          'grant_delete' => 1,
+          'priority' => 0,
+        );
+      }
+    }
+  }
+  // At least one option must be present, and it is the default site
+  // this prevents null values in the form.
+  // If we are enabling the module for the first time, we set the
+  // default domain of all existing nodes to the root domain.
+  if (empty($grants)) {
+    $grants[] = array(
+    'realm' => 'domain_id',
+    'gid' => 0,
+    'grant_view' => 1,
+    'grant_update' => 1,
+    'grant_delete' => 1,
+    'priority' => 0,
+    );
+  }
+
+  // Store our records in the {domain_access} table.
+  _domain_taxonomy_store_grants($term->tid, $grants);
+  _domain_taxonomy_update_source($term);
+}
+
+function domain_taxonomy_form_node_submit($form, &$form_state) {
+
+  if (isset($form_state['values']['domain_load_fromparent']) && $form_state['values']['domain_load_fromparent']) {
+    $parent_vid = variable_get('domain_inherit_type_voc_' . $form['#node']->type, NULL);
+    if ($parent_vid>0) {
+      $fields = field_info_fields();
+      $field_name = '';
+      foreach ($fields as $field) {
+        if($field['type'] == 'taxonomy_term_reference') {
+          $voc = taxonomy_vocabulary_machine_name_load($field['settings']['allowed_values'][0]['vocabulary']);
+          if($parent_vid == $voc->vid) {
+            $field_name = $field['field_name'];
+          }
+        }
+      }
+      if (count($form_state['values'][$field_name]['und'])) {
+        $parent_tids = $form_state['values'][$field_name]['und'];
+        if (is_array($parent_tids)) {
+          $parent_tid = array_shift($parent_tids);
+        }
+        else {
+          $parent_tid = $parent_tids;
+        }
+        $parent_term = taxonomy_term_load($parent_tid['tid']);
+        if (!$parent_term) return ;
+        domain_taxonomy_load_term($parent_term);
+        if ($parent_term) {
+          $form_state['values']['domains'] = $parent_term->domains;
+          $form_state['values']['domain_site'] = $parent_term->domain_site;
+          //$form_state['values']['domain_source'] = $parent_term->domain_source;
+        }
+      }
+    }
+  }
+
+}
+
+function domain_taxonomy_form_term_submit($form, $form_state) {
+
+  $term = (object)$form_state['values'];
+
+  // inherit access from parent term
+  if ($form_state['values']['domain_load_fromparent']) {
+    $parent_tids = $form_state['values']['parent'];
+    if (is_array($parent_tids)) {
+      $parent_tid= array_shift($parent_tids);
+    }
+    else {
+      $parent_tid = $parent_tids;
+    }
+    $parent_term = taxonomy_term_load($parent_tid);
+    if ($parent_term) {
+      domain_taxonomy_load_term($parent_term);
+      if ($parent_term) {
+        $term->domains = $parent_term->domains;
+        $term->domain_site = $parent_term->domain_site;
+        $term->domain_source = $parent_term->domain_source;
+      }
+    }
+  }
+
+  if (_domain_taxonomy_is_debug()) {
+    drupal_set_message(t('Saving term with options:'));
+    drupal_set_message(_domain_taxonomy_get_access_info(($term->domains?$term->domains:$term->domains_raw), $term->domain_site, $term->domain_source));
+  }
+
+  // save term access
+  domain_taxonomy_save_term($term);
+
+  // update subterms access
+  if ($term->domain_update_subterm) {
+    if (_domain_taxonomy_is_debug()) {
+      drupal_set_message(t('Domain rules inheritance applied from current term to child terms'), 'status');
+    }
+    $terms = taxonomy_get_tree($term->vid, $term->tid);
+    if (count($terms)>0) {
+      foreach ($terms as $subterm) {
+        if (_domain_taxonomy_is_debug()) {
+          drupal_set_message(t('Saving domain rules for child term @name', array('@name' => $subterm->name)));
+        }
+        $subterm->domains = $term->domains;
+        $subterm->domain_site = $term->domain_site;
+        $subterm->domain_source = $term->domain_source;
+        domain_taxonomy_save_term($subterm);
+      }
+    }
+  }
+
+  // update subnodes access
+  if ($term->domain_update_subnodes) {
+    if (_domain_taxonomy_is_debug()) {
+      drupal_set_message(t('Domain rules inheritance applied from current term to child nodes'), 'status');
+    }
+    $nodes = domain_taxonomy_select_nodes(array($term->tid), 'all');
+    foreach ($nodes as $node) {
+      if (_domain_taxonomy_is_debug()) {
+        drupal_set_message(t('Saving domain rules for child node @nid: @title', array('@nid' => $node->nid, '@title' => $node->title)));
+      }
+      $node->domains = $term->domains;
+      $node->domain_site = $term->domain_site;
+      $node->domain_source = $term->domain_source;
+      node_access_acquire_grants($node);
+    }
+  }
+
+}
+
+function _domain_taxonomy_get_access_info($domains, $domain_site, $domain_source) {
+  $all_domains = domain_domains();
+  $domains_text = '';
+  $out = '';
+  foreach ($domains as $did => $v) {
+    if ($did==-1) $did=0 ;
+    if (!$v || !$all_domains[$did]) continue;
+    $domains_text .='<br /> - ' . $all_domains[$did]['sitename'];
+  }
+  $out .= t('Term published to all affiliates: @yes_no', array('@yes_no' => ($domain_site?t('yes') : t('no')))) . '<br />';
+  $out .= t('Term source domain') . ': ' . $all_domains[$domain_source]['sitename'] . '<br />';
+  $out .= t('Term published on this domains') . ': ' . $domains_text . '<br />';
+  return $out;
+}
+
+function _domain_taxonomy_get_disabled_vocabulares() {
+  $vocs = taxonomy_get_vocabularies();
+  $items = array();
+  if (count($vocs)>0) {
+    foreach ($vocs as $voc) {
+      if (variable_get('domain_disable_voc_' . $voc->vid, FALSE)) {
+        $items[$voc->vid] = $voc->vid;
+      }
+    }
+  }
+  return $items;
+}
+
+function domain_taxonomy_query_term_access_alter($query) {
+  if (path_is_admin(current_path()) && arg(0) != 'node') {
+    return;
+  }
+  $tables = $query->getTables();
+  $query->getMetaData('vid');
+  foreach ($tables as $alias => $tableinfo) {
+    $table = $tableinfo['table'];
+    if ($table == 'taxonomy_term_data') {
+      $query->leftJoin('domain_taxonomy_access', 'dta', $alias . '.tid = dta.tid');
+
+      global $user, $_domain;
+      static $_modules;
+
+      $grants = array();
+      $grants_list = array();
+      $account = $user;
+
+      if ($_domain['site_grant']) $grants['domain_site'][] = 0;
+      $grants['domain_id'][] = $_domain['domain_id'];
+
+      $or = db_or();
+      foreach ($grants as $realm => $gids) {
+        foreach ($gids as $gkey => $gid) {
+          $or->condition(db_and()->condition('dta.gid', $gid)->condition('dta.realm', $realm));
+        }
+      }
+
+      $condition = db_and()->condition('dta.grant_view', 1)->condition($or);
+
+      $disabled_vocs = _domain_taxonomy_get_disabled_vocabulares();
+      if (count($disabled_vocs)) {
+        $condition = db_or()->condition($alias . '.vid', $disabled_vocs, 'IN')->condition($condition);
+      }
+
+      $query->condition($condition);
+    }
+  }
+  $query->distinct();
+}
+
+function domain_taxonomy_select_nodes($tids = array(), $depth = 0) {
+  if (count($tids) > 0) {
+    // For each term ID, generate an array of descendant term IDs to the right depth.
+    $descendant_tids = array();
+    if ($depth === 'all') {
+      $depth = NULL;
+    }
+    foreach ($tids as $index => $tid) {
+      $child_terms = taxonomy_get_children($tid);
+      $descendant_tids = array_merge(array($tid), array_map('_taxonomy_get_tid_from_term', $child_terms), $descendant_tids);
+    }
+
+    $result = db_query('SELECT ti.nid FROM {taxonomy_index} ti WHERE ti.tid in (:tid)', array(':tid' => implode(',', $descendant_tids)));
+    $nids = $result->fetchAllAssoc('nid');
+    $nodes = node_load_multiple(array_keys($nids));
+  }
+  return $nodes;
+}
+
+function domain_taxonomy_url_rewrite_outbound(&$path, &$options, $original_path) {
+  global $_domain;
+
+  // If the domain_id is not set, then the Domain module is not active, and we cannot run this function.
+  if (!isset($_domain['domain_id'])) {
+    return;
+  }
+
+  // Set static variables for the node lookups, to remove redundant queries.
+  static $domain_site, $domain, $nodepaths, $path_rewrite;
+
+  $check = domain_grant_all();
+  $seo = variable_get('domain_taxonomy_seo', 0);
+  $use_source = TRUE;
+
+  if ($check || $seo || $use_source) {
+    $pattern = explode('/', $original_path);
+
+    // Advanced pattern matching, we find the term id based on token %t in the path string.
+    if (!isset($nodepaths)) {
+      $pathdata = variable_get('domain_taxonomy_paths', "taxonomy/term/%t\r\ntaxonomy/edit/term/%t\r\nforum/%t");
+      $path_match = preg_replace('/(\r\n?|\n)/', '|', $pathdata);
+      $nodepaths = explode("|", $path_match);
+    }
+    $tid = FALSE;
+    foreach ($nodepaths as $match) {
+      $match_array = explode('/', $match);
+      $placeholder = array_search('%t', $match_array);
+      if (isset($pattern[$placeholder])) {
+        $match_array[$placeholder] = $pattern[$placeholder];
+        if (is_numeric($pattern[$placeholder]) && $match_array == $pattern) {
+          $tid = (int) $pattern[$placeholder];
+          break;
+        }
+      }
+    }
+    $target_domain_id = $_domain['domain_id'];
+    // This path has matched a term id, so it may need to be rewritten.
+    if ($tid) {
+      $root = domain_lookup(variable_get('domain_default_source', 0));
+      // Remove redundancy from the domain_site check.
+      if (!isset($domain_site[$tid])) {
+        // If this check works, we don't need to rewrite the path unless SEO rules demand it.
+        $domain_site[$tid] = db_result(db_query("SELECT grant_view FROM {domain_taxonomy_access} WHERE tid = %d AND gid = 0 AND realm = '%s'", $tid, 'domain_site'));
+      }
+      if (!$domain_site[$tid] || $use_source) {
+        // Remove rendundancy from the domain_id check.
+        if (!isset($domain[$tid])) {
+          // The Domain Source module is optional, and allows nodes to be assigned to specific domains for the
+          // purpose of this check.
+          if ($use_source) {
+            $source = db_result(db_query("SELECT domain_id FROM {domain_taxonomy_source} WHERE tid = %d", $tid));
+            $domain[$tid] = domain_lookup($source);
+          }
+          else {
+            // Load the domain data for this node -- but only take the first match.
+            $id = db_result(db_query_range("SELECT gid FROM {domain_taxonomy_access} WHERE tid = %d AND realm = '%s' AND grant_view = 1 ORDER BY gid", $tid, 'domain_id', 0, 1));
+            $domain[$tid] = domain_lookup($id);
+          }
+        }
+        // Can we and do we need to rewrite this path?
+        if ($domain[$tid] != -1 && $domain[$tid]['domain_id'] != $_domain['domain_id']) {
+          $options['absolute'] = TRUE;
+          // In this case, the $base_url cannot have a trailing slash
+          $options['base_url'] = rtrim($domain[$tid]['path'], '/');
+          // Domain Source trumps the seo rules below.
+          if (isset($source)) {
+            $seo = FALSE;
+          }
+          $target_domain_id = $domain[$tid]['domain_id'];
+        }
+      }
+      // If strict SEO rules are enabled, we set "all affiliate" links to the root domain.
+      // Only needed if we are not on the default source domain.
+      elseif ($root != -1 && $seo && $_domain['domain_id'] != $root['domain_id']) {
+        $options['absolute'] = TRUE;
+        // In this case, the $base_url cannot have a trailing slash
+        $options['base_url'] = rtrim($root['path'], '/');
+        $target_domain_id = $root['domain_id'];
+      }
+    }
+  }
+
+}

@@ -1,0 +1,253 @@
+<?php
+
+/**
+ * @file
+ * The UBB integration module.
+ */
+
+/**
+ * Implements hook_permission().
+ */
+function ubb_permission() {
+  return array(
+    'automatically login to ubb.threads' => array(
+      'title' => t('Automatically login to UBB'),
+      'description' => t('The user will be simultaneously logged into UBB when logging in to Drupal'),
+    ),
+  );
+}
+
+/**
+ * Implements hook_menu().
+ */
+function ubb_menu() {
+  $items = array();
+  $items['admin/config/people/ubb'] = array(
+    'title' => 'UBB integration',
+    'description' => 'Configure and enable user account synchronization with a UBB instance.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('ubb_settings_form'),
+    'access arguments' => array('administer site configuration'),
+    'file' => 'ubb.admin.inc',
+  );
+  $items['admin/config/people/ubb/settings'] = array(
+    'title' => 'Settings',
+    'type' => MENU_DEFAULT_LOCAL_TASK,
+    'weight' => -10,
+  );
+  $items['admin/config/people/ubb/import'] = array(
+    'title' => 'Import',
+    'description' => 'Import existing UBB users into Drupal.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('ubb_importer_form'),
+    'access arguments' => array('administer users'),
+    'type' => MENU_LOCAL_TASK,
+    'file' => 'ubb.admin.inc',
+  );
+  $items['admin/config/people/ubb/export'] = array(
+    'title' => 'Export',
+    'description' => 'Export existing Drupal users to UBB.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('ubb_exporter_form'),
+    'access arguments' => array('administer users'),
+    'type' => MENU_LOCAL_TASK,
+    'file' => 'ubb.admin.inc',
+  );
+  return $items;
+}
+
+/**
+ * Implements hook_help().
+ */
+function ubb_help($path, $arg) {
+  switch ($path) {
+    case 'admin/help#ubb':
+      return '<p>' . t('Creates UBB accounts for Drupal users and synchronizes login/logout.') . '</p>';
+  }
+}
+
+/**
+ * Implements hook_user_insert().
+ */
+function ubb_user_insert(&$edit, $account, $category) {
+  ubb_save_user_to_ubb($account, FALSE);
+}
+
+/**
+ * Implements hook_user_update().
+ */
+function ubb_user_update(&$edit, $account, $category) {
+  ubb_save_user_to_ubb($account);
+}
+
+/**
+ * Implements hook_user_login().
+ */
+function ubb_user_login(&$edit, $account) {
+  if (variable_get('ubb_enable', FALSE) && user_access('automatically login to ubb.threads', $account)) {
+    $cookie_prefix = variable_get('ubb_cookie_prefix', '');
+    $cookie_path   = variable_get('ubb_cookie_path', '/');
+
+    $lifetime = (int) ini_get('session.cookie_lifetime');
+    $cookie_expire = time() + $lifetime;
+
+    // Switch to the UBB database.
+    db_set_active('ubb');
+
+    // See if there is a matching UBB user.
+    $ubb_user = db_query('SELECT USER_ID, USER_SESSION_ID FROM {USERS} WHERE USER_LOGIN_NAME = :name', array(':name' => $account->name))->fetchAssoc();
+    // If there is, log the user into UBB.
+    if (!empty($ubb_user)) {
+      // If no UBB session currently exists for this user, create one using the PHP session ID.
+      if (empty($ubb_user['USER_SESSION_ID'])) {
+        $ubb_user['USER_SESSION_ID'] = session_id();
+        db_update('USERS')
+          ->fields(array(
+            'USER_SESSION_ID' => $ubb_user['USER_SESSION_ID'],
+          ))
+          ->condition('USER_ID', $ubb_user['USER_ID'])
+          ->execute();
+      }
+
+      // Delete the key cookie.
+      setcookie($cookie_prefix . 'ubbt_key', '', time() - 3600, $cookie_path);
+      // Set the user and session cookies.
+      setcookie($cookie_prefix . 'ubbt_myid', $ubb_user['USER_ID'], $cookie_expire, $cookie_path);
+      setcookie($cookie_prefix . 'ubbt_mysess', $ubb_user['USER_SESSION_ID'], $cookie_expire, $cookie_path);
+    }
+
+    // Back to the default database.
+    db_set_active();
+  }
+}
+
+/**
+ * Implements hook_user_logout().
+ */
+function ubb_user_logout($account) {
+  if (variable_get('ubb_enable', FALSE)) {
+    $cookie_prefix = variable_get('ubb_cookie_prefix', '');
+    $cookie_path   = variable_get('ubb_cookie_path', '/');
+
+    if (user_access('automatically login to ubb.threads')) {
+      // Delete user and session cookies.
+      setcookie($cookie_prefix . 'ubbt_myid', '', time() - 3600, $cookie_path);
+      setcookie($cookie_prefix . 'ubbt_mysess', '', time() - 3600, $cookie_path);
+    }
+  }
+}
+
+/**
+ * Creates or updates a Drupal user's account in UBB.
+ *
+ * @param $account
+ *   A Drupal user object.
+ * @param $update
+ *   Boolean indicating whether to update UBB if a matching user exists.
+ *   Set to FALSE to ensure that only new UBB accounts are created; existing
+ *   accounts will not be changed. Defaults to TRUE, meaning that the matching
+ *   UBB user will be updated to match the given Drupal user.
+ *
+ * @return
+ *   If the record insert or update failed, returns FALSE. If it succeeded,
+ *   returns SAVED_NEW or SAVED_UPDATED, depending on the operation performed.
+ */
+function ubb_save_user_to_ubb($account, $update = TRUE) {
+  $return = FALSE;
+
+  if (variable_get('ubb_enable', FALSE)) {
+    $group_name = variable_get('ubb_group_name', 'Users');
+
+    // Detect whether the user's login name was changed.
+    $original_name = empty($account->original) ? $account->name : $account->original->name;
+
+    // Switch to the UBB database.
+    db_set_active('ubb');
+
+    // See if a matching UBB user exists.
+    $ubb_id = db_query('SELECT USER_ID FROM {USERS} WHERE USER_LOGIN_NAME = :name', array(':name' => $original_name))->fetchField();
+    if (empty($ubb_id)) {
+      // Create a new UBB user.
+      db_insert('USERS')
+        ->fields(array(
+          'USER_LOGIN_NAME' => $account->name,
+          'USER_DISPLAY_NAME' => $account->name,
+          // @todo Can't directly send passwords because Drupal doesn't use straight MD5 anymore.
+          'USER_PASSWORD' => $account->pass,
+          'USER_MEMBERSHIP_LEVEL' => 'User',
+          'USER_REGISTERED_ON' => empty($account->created) ? time() : $account->created,
+          'USER_REGISTRATION_EMAIL' => $account->mail,
+          'USER_REGISTRATION_IP' => $_SERVER['REMOTE_ADDR'],
+          'USER_IS_APPROVED' => 'yes',
+          'USER_IS_BANNED' => isset($account->status) ? empty($account->status) : 0,
+          'USER_IS_UNDERAGE' => 0,
+        ))
+        ->execute();
+
+      // Get the new UBB user's ID.
+      $ubb_id = db_query('SELECT USER_ID FROM {USERS} WHERE USER_LOGIN_NAME = :name', array(':name' => $account->name))->fetchField();
+      // Get the title for a new user.
+      $title = db_query('SELECT USER_TITLE_NAME FROM {USER_TITLES} WHERE USER_TITLE_POST_COUNT = 0')->fetchField();
+      // Get the group ID that should be assigned to the new user.
+      if (!empty($group_name)) {
+        $group = db_query('SELECT GROUP_ID FROM {GROUPS} WHERE GROUP_NAME = :name', array(':name' => $group_name))->fetchField();
+      }
+
+      // Add related user information for the new UBB user.
+      db_insert('USER_PROFILE')
+        ->fields(array(
+          'USER_ID' => $ubb_id,
+          'USER_FLOOD_CONTROL_OVERRIDE' => -1,
+          'USER_REAL_EMAIL' => $account->mail,
+          'USER_TITLE' => $title,
+        ))
+        ->execute();
+      db_insert('USER_DATA')
+        ->fields(array(
+          'USER_ID' => $ubb_id,
+          'USER_LAST_VISIT_TIME' => time(),
+        ))
+        ->execute();
+      if (!empty($group)) {
+        // @todo Need to confirm the column names for the USER_GROUPS table.
+        db_insert('USER_GROUPS')
+          ->fields(array(
+            'USER_ID' => $ubb_id,
+            'GROUP_ID' => $group,
+          ))
+          ->execute();
+      }
+
+      $return = SAVED_NEW;
+    }
+    elseif ($update && $ubb_id > 1) {
+      // Update the existing UBB user (excluding user 1).
+      db_update('USERS')
+        ->fields(array(
+          'USER_LOGIN_NAME' => $account->name,
+          'USER_DISPLAY_NAME' => $account->name,
+          // @todo Can't directly send passwords because Drupal doesn't use straight MD5 anymore.
+          'USER_PASSWORD' => $account->pass,
+          'USER_REGISTRATION_EMAIL' => $account->mail,
+          'USER_IS_BANNED' => isset($account->status) ? empty($account->status) : 0,
+        ))
+        ->condition('USER_ID', $ubb_id)
+        ->execute();
+      db_update('USER_PROFILE')
+        ->fields(array(
+          'USER_REAL_EMAIL' => $account->mail,
+        ))
+        ->condition('USER_ID', $ubb_id)
+        ->execute();
+
+      $return = SAVED_UPDATED;
+    }
+
+    // @todo Need to add syncing of status/USER_IS_BANNED
+
+    // Back to the default database.
+    db_set_active();
+  }
+
+  return $return;
+}

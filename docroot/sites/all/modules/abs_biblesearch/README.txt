@@ -1,0 +1,7 @@
+Thank you for providing a means for the study of the Bible on your web site.  We appreciate the opportunity to help you in that regard, and hope that this module fulfills your needs.  The module and data are provided free of charge in the hopes that more people will provide a means of Bible study.  If you find any errors, or have recommendations for updates, please contact us at http://www.americanbible.org/about/contact.
+
+To install the module simply copy the module contents in sites/all/modules/abs_biblesearch, and visit the module admin page and enable the module.  NOTE that the module WILL NOT WORK until you provide an American Bible Society Bible Search API Key.  The key is free, and signup is simple.  Signup by going to http://biblesearch.americanbible.org/pages/api/signup.  If you'd like additional information about the API you can find that at http://biblesearch.americanbible.org/pages/api.
+
+The api key should be entered in the ABS Biblesearch Settings admin page, after which your module will be active.
+
+The module provides two new blocks that you can display anywhere on your site that accepts blocks.  The blocks are called ABS Bible Search Form and ABS Bible Search Results.  They can be placed on the same page, or on different pages.  If you would like you can make sure that all results are only shown on one page, by providing a results page path in the module settings page.

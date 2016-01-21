@@ -1,0 +1,348 @@
+<?php
+
+/**
+ * @file attach.module
+ *
+ * A filter allow user to embed everything attach with a simple tag.
+ *
+ * The purpose is to provide a "light" presentation, and link to heavy content
+ * (ie., with attach_node, then link to full node view, with attach_flash or
+ * attach_audio, then link to a lightbox style popup...)
+ *
+ * This module and its syntax is extensible.
+ *
+ * Syntax:
+ *   - Node attach: [attach_node|nid=%nid|...]
+ *   - Flash attach: [attach_flv|file=%url|...]
+ *   - ...
+ * An array of parameters are available. For example:
+ *   [attach_node|nid=12|title=This title overrides the node title]
+ *   [attach_flv|file=sites/default/files/movie.flv|title=My movie|width=500|height=300]
+ *
+ * You can customize the output by making your own attach-node-NODETYPE.tpl.php
+ * or attach-flash.tpl.php... within your theme or your module.
+ */
+
+/**
+ * Implements hook_menu().
+ */
+function attach_menu() {
+  $items['attach/node/%node'] = array(
+    'title' => 'Attach node AJAX',
+    'page callback' => 'attach_node_ajax_render',
+    'page arguments' => array(2),
+    'access callback' => 'node_access',
+    'access arguments' => array('view', 2),
+    'file' => 'plugins/attach.node.inc',
+    'type' => MENU_CALLBACK,
+  );
+
+  $items['admin/config/attach'] = array(
+    'title' => 'Attach',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('attach_admin_settings'),
+    'access arguments' => array('administer site configuration'),
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_filter_info().
+ */
+function attach_filter_info() {
+  $filters['attach'] = array(
+    'title' => t('Attach filter'),
+    'description' => t('Attach data inside a node content.'),
+    'process callback' => '_attach_filter_attach_process',
+    'settings callback' => '_attach_filter_attach_settings',
+  );
+  return $filters;
+}
+
+/**
+ * Implements hook_preprocess_node().
+ */
+function attach_preprocess_node(&$vars) {
+  if (($vars['view_mode'] === 'attach' || $vars['view_mode'] === 'attach_ajax') && variable_get('attach_theme', 1)) {
+    $vars['theme_hook_suggestions'][] = 'node____attach';
+    $vars['theme_hook_suggestions'][] = 'node__' . $vars['type'] . '__attach';
+    if (variable_get('attach_utm_source', FALSE)) {
+      $options = array('query' => array('utm_source' => 'attach'));
+    }
+    else {
+      $options = array();
+    }
+    $vars['attach_link'] = l($vars['node']->attach['default_title'], 'node/'. $vars['node']->nid, $options);
+  }
+}
+
+/**
+ * Implements hook_entity_info_alter().
+ */
+function attach_entity_info_alter(&$entity_info) {
+  $entity_info['node']['view modes']['attach'] = array(
+    'label' => t('Attach'),
+    'custom settings' => TRUE,
+  );
+  $entity_info['node']['view modes']['attach_ajax'] = array(
+    'label' => t('Attach AJAX'),
+    'custom settings' => TRUE,
+  );
+}
+
+/**
+ * Implements hook_theme_registry_alter().
+ */
+function attach_theme_registry_alter(&$theme_registry) {
+  $path = drupal_get_path('module', 'attach') . '/themes';
+  $theme_registry_copy = $theme_registry;
+  _theme_process_registry($theme_registry_copy, 'phptemplate', 'theme_engine', 'pow', $path);
+  $theme_registry += array_diff_key($theme_registry_copy, $theme_registry);
+  if (!isset($theme_registry['node']['theme paths'])) {
+    $theme_registry['node']['theme paths'] = array();
+  }
+  if (is_array($theme_registry['node']['theme paths'])) {
+    $first_element = array_shift($theme_registry['node']['theme paths']);
+    if ($first_element) {
+      array_unshift($theme_registry['node']['theme paths'], $first_element, $path);
+    }
+    else {
+      array_unshift($theme_registry['node']['theme paths'], $path);
+    }
+  }
+}
+
+/**
+ * Global settings form.
+ */
+function attach_admin_settings($form, &$form_state) {
+  $form = array();
+
+  $form['attach_theme'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Use attach theme'),
+    '#description' => t('Attach module is ship with a minimal template to use in <em>attach</em> mode. If you don\'t want to use it and you don\'t want either to create your own attach-node-NODETYPE.tpl.php, you can disable this feature. In your normal node.tpl.php, use <em>build_mode</em> to check if a node is prepared to be attached (build_mode == \'attach\').'),
+    '#default_value' => variable_get('attach_theme', 1),
+  );
+
+  return system_settings_form($form);
+}
+
+/**
+ * The form for configuring the attach Filter.
+ */
+function _attach_filter_attach_settings($form, &$form_state, $filter, $format, $defaults) {
+  $filter->settings += $defaults;
+
+  $settings['plugins'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Choose which plugins are enabled in attach filter'),
+  );
+
+  $plugins = attach_get_plugins();
+  foreach ($plugins as $key => $value) {
+    $settings['plugins'][$key] = array(
+      '#type' => 'checkbox',
+      '#title' => t($value['title']),
+      '#description' => t($value['description']),
+      '#default_value' => !empty($filter->settings['plugins'][$key]),
+    );
+  }
+
+  return $settings;
+}
+
+/**
+ * Callback for attach filter.
+ */
+function _attach_filter_attach_process($text, $filter) {
+  _attach_filter_attach_callback(NULL, $filter);
+  return preg_replace_callback('/\[attach_([a-z0-9]+)\|(.+?)\]/s', '_attach_filter_attach_callback', $text);
+
+
+}
+
+/**
+ * Processes the attach filter replacement.
+ *
+ * Use _attach_filter_attach_callback(NULL, $filter) to pass the filter.
+ */
+function _attach_filter_attach_callback($matches, $flag = NULL) {
+  static $filter;
+
+  if ($flag) {
+    $filter = $flag;
+    if (! $matches) {
+      return;
+    }
+  }
+
+  $inputs = explode('|', $matches[2]);
+  $params = array();
+
+  foreach ($inputs as $input) {
+    // if no match, or "=" at the begin, continue
+    if (!$pos = strpos($input, '=')) {
+      continue;
+    }
+    $params[preg_replace('/[^a-zA-Z0-9\-_]/', '', substr($input, 0, $pos))] = substr($input, $pos + 1);
+  }
+  $params += array(
+    'suffix' => strtolower($matches[1]),
+    'simple' => 0,
+    'uid' => uniqid('attach-'),
+    'class' => '',
+  );
+
+  $plugins = attach_get_plugins();
+  foreach ($plugins as $key => $settings) {
+    if (in_array($params['suffix'], $settings['suffixes'])) {
+      // If this plugin is disable, returns the original text
+      if (!$filter->settings['plugins'][$key]) {
+        return $matches[0];
+      }
+
+      // Else, does the filter process
+      if ($settings['file']) {
+        require_once DRUPAL_ROOT . '/' . $settings['path'] . '/' . $settings['file'];
+      }
+
+      if (! $result = call_user_func($settings['callback'], $params + $settings['options'])) {
+        $result = t('Error');
+      }
+
+      // Wrap with SPAN tag in simple mode and DIV tag in full mode
+      $class = 'attach-' . $params['suffix'] . ($params['class'] ? ' ' . $params['class'] : '');
+      if ($params['simple']) {
+        $result = '<span class="attach-simple ' . $class . '">' . $result . '</span>';
+      }
+      else {
+        $result = '<div class="attach-wrapper ' . $class . '">' . $result . '</div>';
+      }
+
+      return $result;
+    }
+  }
+}
+
+/**
+ * Returns all implemented plugins
+ *
+ * @todo: this can be extended by a hook-like implementation
+ */
+function attach_get_plugins() {
+  static $plugins;
+
+  if (!isset($plugins)) {
+    $plugins = array();
+    foreach (module_implements('attach_plugin', TRUE) as $module) {
+      $function = $module . '_attach_plugin';
+      $plugins += $function();
+    }
+    drupal_alter('attach_plugin', $plugins);
+  }
+
+  return $plugins;
+}
+
+/**
+ * Implements hook_attach_plugin().
+ */
+function attach_attach_plugin() {
+  $plugins = array(
+    'node' => array(
+      'title' => 'Attach node inline',
+      'description' => '',
+      'callback' => '_attach_node_process',
+      'file' => 'attach.node.inc',
+      'path' => drupal_get_path('module', 'attach') . '/plugins',
+      'options' => array(),
+      'suffixes' => array('node'),
+    ),
+    'user' => array(
+      'title' => 'Attach user profile inline',
+      'description' => '',
+      'callback' => 'attach_user_process',
+      'file' => 'attach.user.inc',
+      'path' => drupal_get_path('module', 'attach') . '/plugins',
+      'options' => array(),
+      'suffixes' => array('user'),
+    ),
+    'taxonomy' => array(
+      'title' => 'Attach taxonomy term inline',
+      'description' => '',
+      'callback' => 'attach_taxonomy_process',
+      'file' => 'attach.taxonomy.inc',
+      'path' => drupal_get_path('module', 'attach') . '/plugins',
+      'options' => array('count' => 5),
+      'suffixes' => array('term'),
+    ),
+    'flash' => array(
+      'title' => 'Attach flash inline',
+      'description' => '',
+      'callback' => 'attach_flash_process',
+      'file' => 'attach.flash.inc',
+      'path' => drupal_get_path('module', 'attach') . '/plugins',
+      'options' => array(
+        'width' => 400,
+        'height' => 300,
+      ),
+      'suffixes' => array('flv', 'swf'),
+    ),
+    'slideshare' => array(
+      'title' => 'Attach slideshare inline',
+      'description' => '',
+      'callback' => 'attach_slideshare_process',
+      'file' => 'attach.slideshare.inc',
+      'path' => drupal_get_path('module', 'attach') . '/plugins',
+      'options' => array(
+        'width' => 400,
+        'height' => 300,
+      ),
+      'suffixes' => array('slideshare'),
+    ),
+    'iframe' => array(
+      'title' => 'Attach iframe inline',
+      'description' => '',
+      'callback' => 'attach_iframe_process',
+      'file' => 'attach.iframe.inc',
+      'path' => drupal_get_path('module', 'attach') . '/plugins',
+      'options' => array(
+        'width' => '100%',
+        'height' => 300,
+        'scrolling' => 'auto',
+      ),
+      'suffixes' => array('iframe'),
+    ),
+    'twitter' => array(
+      'title' => 'Attach tweet inline',
+      'description' => '',
+      'callback' => 'attach_twitter_process',
+      'file' => 'attach.twitter.inc',
+      'path' => drupal_get_path('module', 'attach') . '/plugins',
+      'options' => array(
+        'width' => 'auto',
+        'height' => 'auto',
+        'lang' => 'en',
+      ),
+      'suffixes' => array('twitter'),
+    ),
+  );
+
+  if (file_exists('sites/all/libraries/MediaWrapper/MediaWrapper/MediaWrapper.php')) {
+    $plugins['media'] = array(
+      'title' => 'Attach external media (YouTube, Vimeo...)',
+      'description' => '',
+      'callback' => 'attach_media_process',
+      'file' => 'attach.media.inc',
+      'path' => drupal_get_path('module', 'attach') . '/plugins',
+      'options' => array(
+      ),
+      'suffixes' => array('media'),
+    );
+  }
+
+  return $plugins;
+}
+

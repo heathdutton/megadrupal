@@ -1,0 +1,994 @@
+<?php
+
+/**
+ * @file
+ * Integrates with the Sunlight service to
+ *  - provide API to get information about CDs, legislators, contacts, users and how they all
+ *    interrelate.
+ *
+ * @glossary
+ *  cd or CD - Congressional District ex. 'NY17'.
+ *  district - The numerical portion of a CD ex. 17.
+ *    single digit districts shall have no leading zeros.
+ *  zone - A region: either 'state' or 'cd'.
+ *
+ * @todo _cd_sunlight_validate* functions should be split into validate and clean functions.
+ */
+
+/**
+ * Implements hook_permission().
+ */
+function cd_sunlight_permission() {
+  return array(
+    'search congressional districts by zip' => array(
+      'title' => t('search congressional districts by zip'),
+      'description' => t('Search congressional districts by zip.'),
+    ),
+  );
+}
+
+/**
+ * Implements hook_menu().
+ *
+ * @ingroup hooks
+ */
+function cd_sunlight_menu() {
+  $items = array();
+  $items['admin/config/services/cd_sunlight'] = array(
+    'title' => 'Sunlight congressional district',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('cd_sunlight_settings_form'),
+    'access arguments' => array('administer site configuration'),
+    'file' => 'cd_sunlight.admin.inc',
+  );
+  $items['admin/config/services/cd_sunlight/settings'] = array(
+    'title' => 'Settings',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('cd_sunlight_settings_form'),
+    'access arguments' => array('administer site configuration'),
+    'type' => MENU_DEFAULT_LOCAL_TASK,
+    'weight' => '0',
+    'file' => 'cd_sunlight.admin.inc',
+  );
+  $items['admin/config/services/cd_sunlight/batch'] = array(
+    'title' => 'Batch process',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('cd_sunlight_batch_confirm'),
+    'access arguments' => array('administer site configuration'),
+    'type' => MENU_LOCAL_TASK,
+    'weight' => '3',
+    'file' => 'cd_sunlight.admin.inc',
+  );
+  $items['admin/reports/cd_sunlight'] = array(
+    'title' => 'Sunlight congressional district lookup queue',
+    'page callback' => 'cd_sunlight_log',
+    'access arguments' => array('access site reports'),
+    'file' => 'cd_sunlight.admin.inc',
+  );
+  $items['admin/reports/cd_sunlight/log'] = array(
+    'title' => 'Log',
+    'page callback' => 'cd_sunlight_log',
+    'access arguments' => array('access site reports'),
+    'type' => MENU_DEFAULT_LOCAL_TASK,
+    'weight' => '0',
+    'file' => 'cd_sunlight.admin.inc',
+  );
+  $items['admin/reports/cd_sunlight/summary'] = array(
+    'title' => 'Summary',
+    'page callback' => 'cd_sunlight_log_summary',
+    'access arguments' => array('access site reports'),
+    'type' => MENU_LOCAL_TASK,
+    'weight' => '2',
+    'file' => 'cd_sunlight.admin.inc',
+  );
+  if (function_exists('views_get_view') && $congress_view = views_get_view('congress')) {
+    if ($congress_view->type == t('Overridden')) {
+      watchdog('cd_sunlight', 'The "congress" view has been overridden.  The Congress Search form ' .
+        'depends on the default arguments to create its results.  If you have modified the ' .
+        'arguments, the search form might not display correct results.', WATCHDOG_WARNING);
+    }
+    $items['congress-search'] = array(
+      'title' => 'Search for members of Congress',
+      'page callback' => 'drupal_get_form',
+      'page arguments' => array('cd_sunlight_search_form'),
+      'access arguments' => array('search congressional districts by zip'),
+      'type' => MENU_SUGGESTED_ITEM,
+      'file' => 'cd_sunlight.pages.inc',
+    );
+  }
+  return $items;
+}
+
+/**
+ * Implements hook_block_info().
+ */
+function cd_sunlight_block_info() {
+  $blocks['congress_search'] = array(
+    'info' => t('Congress search by zip form'),
+    'cache' => DRUPAL_CACHE_GLOBAL,
+    'pages' => 'congress-search',
+  );
+  return $blocks;
+}
+
+/**
+ * Implements hook_block_view().
+ */
+function cd_sunlight_block_view($delta) {
+  if ($delta == 'congress_search' && user_access('search congressional districts by zip')) {
+    module_load_include('pages.inc', 'cd_sunlight');
+    $block = array(
+      'subject' => t('Search for members of Congress'),
+      'content' => drupal_get_form('cd_sunlight_search_form'),
+    );
+    return $block;
+  }
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function cd_sunlight_form_alter(&$form, $form_state, $form_id) {
+  if (
+    $form_id == 'views_exposed_form' &&
+    $form_state['view']->name == 'Congress' &&
+    user_access('search congressional districts by zip')
+  ) {
+    $form['#suffix'] = '<p>' . t('Or <a href="!url">search for members of Congress by zip</a>.',
+      array('!url' => url('congress-search')));
+  }
+}
+
+/**
+ * Implements hook_cron().
+ *
+ * @ingroup hooks
+ */
+function cd_sunlight_cron() {
+
+  // Only run under low server load.
+  if (function_exists('sys_getloadavg')) {
+    list($load) = sys_getloadavg();
+    $limit = variable_get('cd_sunlight_cron_load_limit', 6);
+    if (is_numeric($load) && !empty($limit) && $load > $limit) {
+      watchdog('cd_sunlight', 'System load is higher than @limit, cd_sunlight_cron will not be run.',
+        array('@limit' => $limit), WATCHDOG_WARNING);
+      return;
+    }
+  }
+
+  // Test connection.
+  if (!_cd_sunlight_connection_test()) {
+    watchdog('cd_sunlight', 'A connection cannot be made to Sunlight, ' .
+      'cd_sunlight_cron will not be run.', array(), WATCHDOG_ERROR);
+    return;
+  }
+
+  // Make sure that we won't hit MySQL connection timeouts.
+  _cd_sunlight_mysql_wait_timeout();
+
+  // Refresh all info for stored CDs once every 24hrs.
+  $last_run = variable_get('cd_sunlight_last_process_new_regions', 0);
+  $time = $_SERVER['REQUEST_TIME'];
+  $day_ago = ($time - 60 * 60 * 24);
+  $has_been_populated = _cd_sunlight_legislators_exist();
+  if (!$has_been_populated || $last_run < $day_ago) {
+    _cd_sunlight_congress_update_all();
+  }
+
+  // Cleanup old values from the cron table.
+  // @see dblog_cron()
+  $row_limit = variable_get('dblog_row_limit', 1000);
+  if ($row_limit > 0) {
+    $min_row = db_select('cd_sunlight_cron', 'csc')
+      ->fields('csc', array('cd_sunlight_cron_id'))
+      ->orderBy('cd_sunlight_cron_id', 'DESC')
+      ->range($row_limit - 1, 1)
+      ->condition('processed', TRUE)
+      ->execute()->fetchField();
+    if ($min_row) {
+      db_delete('cd_sunlight_cron')
+      ->condition('cd_sunlight_cron_id', $min_row, '<')
+      ->condition('processed', TRUE)
+      ->execute();
+    }
+  }
+
+}
+
+/**
+ * Implements hook_views_api().
+ *
+ * @ingroup hooks
+ */
+function cd_sunlight_views_api() {
+  return array(
+    'api' => '2.0',
+    'path' => drupal_get_path('module', 'cd_sunlight') . '/views',
+  );
+}
+
+/**
+ * @category API
+ */
+
+/**
+ * Queue a contact to have its CD retrieved from Sunlight on the next cron run.
+ *
+ * @param string $storage_system
+ *  ex. 'civicrm'.
+ * @param $contact_id
+ *  Conact ID for the given storage engine.
+ */
+function cd_sunlight_contact_enqueue($storage_system, $contact_id) {
+  // If the contact is already queued, bail.
+  $query = db_select('cd_sunlight_cron')
+    ->condition('storage_system', $storage_system)
+    ->condition('contact_id', $contact_id)
+    ->condition('processed', FALSE);
+  $query->addExpression('1');
+  if ($query->execute()->fetchField()) {
+    if (variable_get('cd_sunlight_debug', FALSE)) {
+      watchdog('cd_sunlight', 'Contact @contact_id re-queued before being processed.',
+        array('@contact_id' => $contact_id), WATCHDOG_DEBUG);
+    }
+    return;
+  }
+
+  // Queue the contact.
+  db_insert('cd_sunlight_cron')
+    ->fields(array(
+      'storage_system' => $storage_system,
+      'contact_id' => $contact_id,
+      'request_uri' => request_uri(),
+      'backtrace' => variable_get('cd_sunlight_debug', FALSE) ? _cd_sunlight_backtrace() : '',
+      'insert_time' => REQUEST_TIME,
+      'processed' => 0,
+    ))
+    ->execute();
+}
+
+/**
+ * Dequeue a contact from CD Lookup.
+ *
+ * @param string $storage_system
+ *  ex. 'civicrm'.
+ * @param $contact_id
+ *  Conact ID for the given storage engine.
+ */
+function cd_sunlight_contact_dequeue($storage_system, $contact_id) {
+  db_update('cd_sunlight_cron')
+    ->fields(array('processed' => TRUE))
+    ->condition('storage_system', $storage_system)
+    ->condition('contact_id', $contact_id)
+    ->condition('processed', FALSE)
+    ->execute();
+
+  // Clear any block cache for our views.
+  $function = '_cd_' . $storage_system . 'contact_id_get_uid';
+  if (db_table_exists('cache_block') && function_exists($function)) {
+    $uid = $function($contact_id);
+    // Can't use the API here because we need a wildcard in the middle.
+    db_delete('cache_block')
+      ->condition('cid', 'views:Congress%:u.' . $uid, 'LIKE')
+      ->execute();
+  }
+}
+
+/**
+ * Given the CD, extract the characters for state
+ *
+ * @param string $cd
+ *  ex. 'NY17'.
+ * @return string
+ *  ex. 'NY'
+ */
+function cd_sunlight_cd_parse_state($cd) {
+  if ($cd == 'not found') {
+    return '';
+  }
+  return drupal_substr($cd, 0, 2);
+}
+
+/**
+ * Given the CD, extract the characters for district
+ *
+ * @param string $cd
+ *  ex. 'NY17'.
+ * @return int
+ *  ex. 17
+ */
+function cd_sunlight_cd_parse_district($cd) {
+  if ($cd == 'not found') {
+    return '';
+  }
+  // Note that we can't use substr($cd, -2) because the district might only be one digit.
+  return drupal_substr($cd, 2);
+}
+
+/**
+ * Generate the url of the bioguide image for the given Bioguide ID.
+ *
+ * @param string $bioguide_id
+ *
+ * @return the image path.  Local if we could save it, otherwise remote (http://...).
+ */
+function cd_sunlight_bioguide_image_url($bioguide_id) {
+  $letter = drupal_substr($bioguide_id, 0, 1);
+  $image_url = "http://bioguide.congress.gov/bioguide/photo/$letter/$bioguide_id.jpg";
+  if ($local_url = _cd_sunlight_remote_image_fetch($image_url)) {
+    return $local_url;
+  }
+  return $image_url;
+}
+
+/**
+ * Query the Sunlight API
+ *
+ * Only use this when querying for something other than legislators or CDs (use those functions
+ * instead).
+ *
+ * @param string $method
+ *  What Sunlight API method to use.
+ * @param array $params
+ *  Paramaters to pass to the API.
+ * @param string &$error_message = ''
+ *  On error this will be populated with an error message.  Useful for debugging.
+ *  This string should be treated as unsafe and run through check_plain and the like before display.
+ *
+ * @return mixed
+ *  array of data or FALSE on error.
+ */
+function cd_sunlight_api_lookup($method, $params, &$error_message = '') {
+
+  // Sanity checking.
+  if (!is_array($params) || !count($params)) {
+    $error_message = 'Attempting to query Sunlight with no params. ';
+    watchdog('cd_sunlight', '@error_message', array('@error_message' => $error_message),
+      WATCHDOG_ERROR);
+    return FALSE;
+  }
+
+  // Call the URL and check for errors.
+  $params['apikey'] = variable_get('cd_sunlight_api_key', '');
+  $url = url('http://services.sunlightlabs.com/api/' . $method . '.json', array('query' => $params));
+  $response = drupal_http_request($url);
+
+  // Increment our counter.
+  $total_lookups = variable_get('cd_sunlight_total_lookups', 0);
+  variable_set('cd_sunlight_total_lookups', ++$total_lookups);
+
+  if ($response->code == 400) {
+    // The connection was successful, but Sunlight encountered an error.
+    // When Sunlight encounters an error it sends code 400 and an error message in the data.
+    // We don't watchdog here because we gracefully handle errors in the calling function.
+    $error_message = $response->data;
+    return FALSE;
+  }
+  elseif (!empty($response->error) || $response->code != 200) {
+    // The connection was unsuccessful for whatever reason.
+    watchdog('cd_sunlight', 'Connection to Sunlight was unsuccessful.  The connection may have ' .
+      'timed out or your key may be disabled.: @code : @data',
+      array('@data' => $response->error, '@code' => $response->code), WATCHDOG_ERROR);
+    $error_message = t('Connection to Sunlight was unsuccessful: @code', array('@code' => $response->code));
+    return FALSE;
+  }
+
+  // Parse the JSON.
+  $result = json_decode($response->data, TRUE);
+  if (empty($result)) {
+    $error_message = 'Sunlight did not return JSON data. ';
+    watchdog('cd_sunlight', '@error_message', array('@error_message' => $error_message),
+      WATCHDOG_ERROR);
+    return FALSE;
+  }
+
+  // Make this deep array easier to work with.
+  $result = current(current($result));
+
+  // If there are no results for our query $result will just be an empty array.
+  $new_array = array();
+  foreach ($result as $key => $value) {
+    $new_array[$key] = current($value);
+  }
+
+  return $new_array;
+
+}
+
+/**
+ * Query the Sunlight API service and lookup the CD for the contact.
+ *
+ * Only call this directly if your contact is not stored in a "storage_system".
+ *
+ * @param array $contact
+ *  Must have keys for zip (zip5 only)
+ *  latitude and longitude are highly recommended (some zips have more than one CD).
+ *  contact_id, storage_system are recommended (will be included in logs for easier debugging).
+ *
+ * @return mixed
+ *  FALSE on error (already logged)
+ *  NULL if there was not enough data passed in to perform a lookup
+ *  else a $cd_data array which may be empty if no CD was found:
+ *    array(
+ *      'state' => 'NY',
+ *      'district' => '17',
+ *    );
+ */
+function cd_sunlight_api_lookup_contact($contact) {
+
+  $zip = !empty($contact['postal_code']) ? $contact['postal_code'] : '';
+  $zip = empty($zip) && !empty($contact['zip']) ? $contact['zip'] : '';
+  $latitude = !empty($contact['latitude']) ? $contact['latitude'] : '';
+  $longitude = !empty($contact['longitude']) ? $contact['longitude'] : '';
+  $contact_id = !empty($contact['contact_id']) ? $contact['contact_id'] : '';
+  $storage_system = !empty($contact['storage_system']) ? $contact['storage_system'] : '';
+
+  // Get a link to the contact.
+  if ($contact_link = $contact_id) {
+    $function = 'cd_' . $storage_system . '_contact_link';
+    if (function_exists($function)) {
+      $contact_link = $function('view', $contact_id);
+    }
+  }
+
+  $params = array(
+    'contact_id' => $contact_id,
+    'storage_system' => $storage_system,
+  );
+
+  // Decide what method to call based on what paramaters we have.
+  // Lat/Long is preferred.
+  if (!empty($latitude) && !empty($longitude)) {
+
+    $params['latitude'] = $latitude;
+    $params['longitude'] = $longitude;
+    $error_message = '';
+    $cd_data = cd_sunlight_api_lookup('districts.getDistrictFromLatLong', $params, $error_message);
+
+    // We have a special edge case where sometimes, if a point is on the edge of the country
+    // (usually an ocean) it may lie outside of the polygon.  In these cases we will re-run the
+    // lookup but only use the zip.
+    if (
+      $cd_data === FALSE && (
+        strpos($error_message, 'Point not within a congressional district') !== FALSE ||
+        strpos($error_message, 'Invalid Parameter') !== FALSE
+      )
+    ) {
+      if (empty($zip)) {
+        return array();
+      }
+      watchdog('cd_sunlight',
+        'Point not within a congressional district, trying again with only zip: @params',
+        array('@params' => var_export($params, TRUE)), WATCHDOG_NOTICE, $contact_link);
+      unset($contact['latitude'], $contact['longitude']);
+      return cd_sunlight_api_lookup_contact($contact);
+    }
+
+  }
+  elseif (!empty($zip)) {
+    $params['zip'] = $zip;
+    $cd_data = cd_sunlight_api_lookup('districts.getDistrictsFromZip', $params);
+  }
+  else {
+    watchdog('cd_sunlight',
+      'This contact does not have enough address info to do a lookup: @contact',
+      array('@contact' => var_export($contact, TRUE)), WATCHDOG_NOTICE, $contact_link);
+    return NULL;
+  }
+
+  // Sanity checking.
+  if ($cd_data === FALSE) {
+    watchdog('cd_sunlight', 'Error from Sunlight for CD lookup: @query',
+      array('@query' => var_export($params, TRUE)), WATCHDOG_ERROR);
+    return FALSE;
+  }
+  if (empty($cd_data)) {
+    return array();
+  }
+
+  // @todo: There may be more than one CD per zip.
+  //        Right now we are just going to take the first one.  We might consider doing something
+  //        else later.
+  $cd_data = reset($cd_data);
+
+  // Sunlight is inconsistent with its naming.  This is the only place that it uses the term
+  // "number" rather than "district".  We'll change it to be more consistent.
+  if (isset($cd_data['number'])) {
+    $cd_data['district'] = $cd_data['number'];
+    unset($cd_data['number']);
+  }
+
+  return $cd_data;
+}
+
+/**
+ *  @category INTERNAL PRIVATE FUNCTIONS
+ */
+
+/**
+ * Build a CD from the given State and district.
+ *
+ * @param string $state
+ * @param mixed $district
+ *  Can be an int or a number as a string.
+ *
+ * @return mixed
+ *  A CD or FALSE if things went terribly wrong.
+ */
+function _cd_sunlight_build_cd($state, $district) {
+
+  // Remove non-alphanumerics.
+  $state = preg_replace("/[^a-zA-Z]/", '', $state);
+  $district = preg_replace("/[^0-9]/", '', $district);
+
+  if (_cd_sunlight_validate_state($state) === FALSE) {
+    return FALSE;
+  }
+  elseif (_cd_sunlight_validate_district($state, $district) === FALSE) {
+    return FALSE;
+  }
+
+  return $state . $district;
+}
+
+/**
+ * Validate a CD (only the format, not if it actually exists).
+ *
+ * We ignore NULL CDs.  All other empty values are converted to ''.
+ *
+ * @param string $cd
+ * @return boolean
+ *  TRUE on success (and $cd may be manipulated to fit our format) else FALSE.
+ */
+function _cd_sunlight_validate_cd(&$cd) {
+
+  // A NULL CD is valid.
+  if ($cd === NULL) {
+    return TRUE;
+  }
+  // Other empties are valid, but change to ZLS for consistency.
+  if (empty($cd)) {
+    $cd = '';
+    return TRUE;
+  }
+  // Our "not found" placeholder.
+  if ($cd == 'not found') {
+    return TRUE;
+  }
+
+  // Remove non-alphanumerics.
+  $cd = preg_replace("/[^a-zA-Z0-9]/", '', $cd);
+
+  // We have to split things up so that state gets forced to be upper case.
+  $state = cd_sunlight_cd_parse_state($cd);
+  $district = cd_sunlight_cd_parse_district($cd);
+
+  if (_cd_sunlight_validate_state($state) === FALSE) {
+    return FALSE;
+  }
+  elseif (_cd_sunlight_validate_district($state, $district) === FALSE) {
+    return FALSE;
+  }
+
+  $cd = $state . $district;
+  return TRUE;
+}
+
+/**
+ * Validate a state (only the format, not if it actually exists).
+ *
+ * @param string $state
+ *
+ * @return boolean
+ *  TRUE on success (and $state may be manipulated to fit our format) else FALSE.
+ */
+function _cd_sunlight_validate_state(&$state) {
+  $state = drupal_strtoupper($state);
+  return ctype_alpha($state) && drupal_strlen($state) === 2;
+}
+
+/**
+ * Validate a district (only the format, not if it actually exists).
+ * Removes leading zeros.
+ *
+ * @param string $state
+ * @param string &$district
+ *
+ * @return boolean
+ *  TRUE on success (and $district may be manipulated to fit our format) else FALSE.
+ */
+function _cd_sunlight_validate_district($state, &$district) {
+  if (in_array($state, _cd_sunlight_state_list_at_large())) {
+    $district = 0;
+    return TRUE;
+  }
+  $district = ltrim($district, '0');
+  $district_len = drupal_strlen($district);
+  return ctype_digit((string) $district) && ($district_len === 2 || $district_len === 1);
+}
+
+/**
+ * Delete the legislator(s) that match the given parameters.
+ *
+ * @param array $param
+ *  A set of field => value pairs
+ *  ex.
+ *  array(
+ *    'title' => 'Rep',
+ *    'state' => 'NY',
+ *    'district' => '17',
+ *  );
+ */
+function _cd_sunlight_legislator_delete($params) {
+  if (empty($params) || !is_array($params)) {
+    return FALSE;
+  }
+  $query = db_delete('cd_sunlight_legislators');
+  foreach ($params as $field => &$value) {
+    $query->condition($field, $value);
+  }
+  $query->execute();
+}
+
+/**
+ * Save the legislator.
+ *
+ * @param array $legislator
+ *  A set of field => value pairs as returned by the Sunlight API
+ *  ex.
+ *  array(
+ *    'title' => 'Rep',
+ *    'state' => 'NY',
+ *    'district' => '17',
+ *    'firstname' => 'Jane',
+ *    'lastname' => 'Doe',
+ *    ...
+ *  );
+ * @return boolean
+ *  TRUE on success, else FALSE.
+ */
+function _cd_sunlight_legislator_save(array $legislator) {
+  return (bool) drupal_write_record('cd_sunlight_legislators', $legislator);
+}
+
+/**
+ * Query the Sunlight API service and retrieve legislators that match the given parameters.
+ *
+ * You shouldn't use this function.  Use Views (or your own queries) to pull from the DB instead.
+ *
+ * @param array $params
+ *  should look something like:
+ *    array(
+ *      'title' => 'Rep',
+ *      'state' => 'NY',
+ *      'district' => '17',
+ *    );
+ *
+ * @return array or FALSE on error
+ *  ex.
+ *    array(
+ *      0 => array(
+ *        'title' => 'Rep',
+ *        'state' => 'NY',
+ *        'district' => '17',
+ *        'firstname' => 'Jane',
+ *        'lastname' => 'Doe',
+ *        ...
+ *      ),
+ *      1 => array(
+ *        'title' => 'Sen',
+ *        'state' => 'NY',
+ *        'firstname' => 'John',
+ *        'lastname' => 'Doe',
+ *        ...
+ *      ),
+ *    );
+ */
+function _cd_sunlight_legislators_apilookup($params) {
+  $error_message = '';
+  $result = cd_sunlight_api_lookup('legislators.getList', $params, $error_message);
+  if ($result === FALSE) {
+    watchdog('cd_sunlight', 'Error from Sunlight: @data.  For legislator lookup: @query',
+      array('@data' => $error_message, '@query' => var_export($params, TRUE)), WATCHDOG_ERROR);
+  }
+  return $result;
+}
+
+/**
+ * Update the info for all legislators.
+ *
+ * Cron calls this, perhaps nightly.  This should take < 10 seconds to complete.
+ *
+ * @return boolean
+ *  TRUE on success, else FALSE.
+ */
+function _cd_sunlight_congress_update_all() {
+  watchdog('cd_sunlight', 'Updating all members of congress', array(), WATCHDOG_INFO);
+
+  // Update all Senators.
+  $params = array(
+    'in_office' => TRUE,
+  );
+  $query = drupal_http_build_query($params);
+  $legislators = _cd_sunlight_legislators_apilookup($params);
+  if ($legislators === FALSE) {
+    watchdog('cd_sunlight', 'Could not lookup legislators for %query',
+      array('%query' => $query), WATCHDOG_ERROR);
+    return FALSE;
+  }
+  if (empty($legislators)) {
+    watchdog('cd_sunlight', 'There are currently no legislators for %query',
+      array('%query' => $query), WATCHDOG_NOTICE);
+  }
+
+  // Because we only care about current legislators, delete any previous matching records.
+  _cd_sunlight_legislator_delete($params);
+
+  if (empty($legislators)) {
+    return FALSE;
+  }
+
+  // Save our new legislators.
+  $error = FALSE;
+  foreach ($legislators as $legislator) {
+    if (!_cd_sunlight_legislator_save($legislator)) {
+      $error = TRUE;
+    }
+  }
+
+  // Return something.
+  if ($error) {
+    watchdog('cd_sunlight', 'Could not save new legislator data for %query',
+      array('%query' => $query), WATCHDOG_ERROR);
+    return FALSE;
+  }
+  else {
+    watchdog('cd_sunlight', "Updated data for @count in office members of Congress.",
+      array('@count' => count($legislators)), WATCHDOG_INFO);
+    variable_set('cd_sunlight_last_process_new_regions', $_SERVER['REQUEST_TIME']);
+    return TRUE;
+  }
+}
+
+/**
+ * Return a list of all states that contain only one CD.
+ *
+ * @return array
+ *  simple array of state abbreviations.
+ */
+function _cd_sunlight_state_list_at_large() {
+  static $states = array(
+    'AK', 'DE', 'MT', 'ND', 'SD', 'VT', 'WY',
+    'AA', 'AE', 'AP', 'UM', 'XX',       // _cd_sunlight_state_list_with_no_congresspersons()
+    'AS', 'DC', 'GU', 'MP', 'VI', 'PR', // _cd_sunlight_state_list_with_non_voting_congresspersons()
+  );
+  return $states;
+}
+
+/**
+ * Return a list of all states that have no congresspersons.
+ *
+ * @return array
+ *  simple array of state abbreviations.
+ */
+function _cd_sunlight_state_list_with_no_congresspersons() {
+  // 'XX' is our special "non-us citizen" state.
+  static $states = array('AA', 'AE', 'AP', 'UM', 'XX');
+  return $states;
+}
+
+/**
+ * Return a list of all states that have no voting congresspersons,
+ * These special positions come under a variety of titles.
+ * Hence when updating these states we search only by state and not title.
+ *
+ * @return array
+ *  simple array of state abbreviations.
+ */
+function _cd_sunlight_state_list_with_non_voting_congresspersons() {
+  static $states = array('AS', 'DC', 'GU', 'MP', 'VI', 'PR');
+  return $states;
+}
+
+/**
+ * See if Sunlight is responding and our API key is correct.
+ *
+ * @return TRUE on success, else FALSE.
+ */
+function _cd_sunlight_connection_test() {
+  $test_data = cd_sunlight_api_lookup('districts.getDistrictsFromZip', array('zip' => '94111'));
+  if ($test_data == FALSE || !isset($test_data[0]['state']) || $test_data[0]['state'] != 'CA') {
+    return FALSE;
+  }
+  return TRUE;
+}
+
+/**
+ * Used when performing bulk actions against sunlight to avoid clobbering their infrastructure.
+ */
+function _cd_sunlight_sleep() {
+  usleep(100000); // 100,000 microseconds == 0.1 seconds
+}
+
+/**
+ * Check to see if there's any legislators in the table.
+ *
+ * @return boolean
+ */
+function _cd_sunlight_legislators_exist() {
+  $query = db_select('cd_sunlight_legislators');
+  $query->addExpression('1');
+  $result = $query->range(0, 1)
+    ->execute()
+    ->fetchField();
+  return !empty($result);
+}
+
+/**
+ * Get some backtrace info as a string suitable for watchdogging.
+ *
+ * @return string
+ *  Send through check_plain and wrap in <pre></pre> .
+ */
+function _cd_sunlight_backtrace() {
+  $backtrace = debug_backtrace(FALSE);
+  $info = array();
+
+  foreach ($backtrace as $trace) {
+
+    // Add args to our trace, placeholders for non-scalars.
+    $arg_scalars = array();
+    $arg_string = '';
+    if (!empty($trace['args'])) {
+      foreach ($trace['args'] as $arg) {
+        if (!is_scalar($arg)) {
+          $arg_scalars[] = '#non-scalar#';
+        }
+        else {
+          $arg_scalars[] = $arg;
+        }
+      }
+      $arg_string = '(' . implode(', ', $arg_scalars) . ')';
+    }
+    $info[] = @"$trace[file]($trace[line]): $trace[function]$arg_string";
+  }
+  return var_export($info, TRUE);
+}
+
+/**
+ * Increase MySQL timeouts.
+ *
+ * Use this if you are running into "MySQL has gone away" errors.  These can happen especially
+ * during cron and anything else that takes more than 90 seconds.
+ *
+ * @param int $timeout = 900
+ *  The timeout to set in seconds.
+ */
+function _cd_sunlight_mysql_wait_timeout($timeout = 900) {
+  global $db_url;
+
+  // Set in Drupal.
+  if (is_array($db_url)) {
+    $old_db = db_set_active();
+    foreach ($db_url as $db_name => $connection_string) {
+      db_set_active($db_name);
+      db_query('SET SESSION wait_timeout = ' . (int) $timeout);
+    }
+    if ($old_db && $old_db != $db_name) {
+      db_set_active($old_db);
+    }
+  }
+  else {
+    db_query('SET SESSION wait_timeout = ' . (int) $timeout);
+  }
+
+  // Set in CiviCRM.
+  if (function_exists('civicrm_initialize')) {
+    civicrm_initialize();
+    require_once DRUPAL_ROOT . '/' . drupal_get_path('module', 'civicrm') . '/../CRM/Core/DAO.php';
+    $params = array(1 => array($timeout, 'Integer'));
+    CRM_Core_DAO::executeQuery('SET SESSION wait_timeout = %1', $params);
+  }
+
+}
+
+/**
+ * Given the URL of a remote image, fetch it locally and cache.
+ *
+ * @param string $url
+ *
+ * @return string
+ *  the path of the local file (relative to the Drupal files directory). Or FALSE on error.
+ */
+function _cd_sunlight_remote_image_fetch($url) {
+  static $images = array();
+  static $retries = 0;
+  $key = 'cd_sunlight_image_' . md5($url);
+  if (isset($images[$key])) {
+    $local_url = $images[$key];
+  }
+  else {
+    $cache = cache_get($key);
+    if (isset($cache->data)) {
+      $local_url = $cache->data;
+    }
+    else {
+      $local_url = FALSE;
+      if ($image = _cd_sunlight_is_url_an_image($url)) {
+        $path = parse_url($url, PHP_URL_PATH);
+        $extension = substr($path, strrpos($path, '.') + 1);
+        $local_url = _cd_sunlight_save_data_locally($image, $key . '.' . $extension);
+      }
+      cache_set($key, $local_url);
+    }
+    $images[$key] = $local_url;
+  }
+  if ($images[$key] && !file_exists($images[$key])) {
+    if ($retries++) {
+      watchdog('cd_sunlight', 'Preventing infinite loop due to file not saving', array(), WATCHDOG_ERROR);
+      $retries == 0;
+      return FALSE;
+    }
+    unset($images[$key]);
+    cache_clear_all($key, 'cache');
+    _cd_sunlight_remote_image_fetch($url);
+  }
+  return $images[$key];
+}
+
+/**
+ * Tests if the URL is likely to point to an image.  Not 100% accurate.
+ *
+ * @param string $url
+ *
+ * @return mixed
+ *  The image data if the URL points to an image, else FALSE.
+ */
+function _cd_sunlight_is_url_an_image($url) {
+
+  // Shorten the default timeout - we don't want the page to hang because we're waiting on favicons.
+  $response = drupal_http_request($url, array('max_redirects' => 2, 'timeout' => 4));
+
+  // Is it a valid response?
+  if ($response->code != 200 && $response->code != 301 || empty($response->data)) {
+    return FALSE;
+  }
+
+  // Normalize case of headers.
+  $headers = array();
+  foreach ($response->headers as $header => $header_value) {
+    $headers[drupal_strtolower($header)] = drupal_strtolower($header_value);
+  }
+
+  // Is it an image?
+  if (
+    !isset($headers['content-type']) ||
+    strpos($headers['content-type'], 'image') === FALSE &&
+    strpos($headers['content-type'], 'application/octet-stream') === FALSE
+  ) {
+    return FALSE;
+  }
+
+  return $response->data;
+}
+
+/**
+ * Save a remote file on the local filesystem.
+ *
+ * @param string $data
+ *  The contents of the file.
+ * @param string $filename
+ *  The name to save it to.  It is the callers responsibility to ensure that this file has a safe
+ *  extension (i.e. no PHP files).
+ *
+ * @return mixed
+ *  A string with the path of the resulting file, or FALSE on error.
+ */
+function _cd_sunlight_save_data_locally($data, $filename) {
+  $directory = 'public://cd_sunlight';
+  if (!file_prepare_directory($directory, FILE_CREATE_DIRECTORY | FILE_MODIFY_PERMISSIONS)) {
+    return FALSE;
+  }
+  return file_unmanaged_save_data($data, $directory . '/' . $filename, FILE_EXISTS_REPLACE);
+}

@@ -1,0 +1,528 @@
+<?php
+
+/**
+ * @file
+ *  Module to make multiple content access modules work together in the expected way.
+ *
+ *  Module Grants takes over node_access() and _node_query_node_access_alter with its
+ *  own functions which operate identically to node_access() with these exception:
+ *  o when two or more content access modules are at play, access to the node
+ *    is granted only if ALL (rather than ANY) of the modules say yes.
+ *  This amounts to a more natural behaviour.
+ */
+
+require_once (dirname(__FILE__) . '/module_grants.node.inc');
+
+/**
+ * Implementation of hook_help().
+ */
+function module_grants_help($path, $arg) {
+  switch ($path) {
+    case 'admin/help#module_grants':
+      $s = t('For help and full documentation see the <a href="@module_grants">Module Grants project page</a>',
+        array('@module_grants' => url('http://drupal.org/project/module_grants')));
+      break;
+  }
+  return empty($s) ? '' : '<p>'. $s .'</p>';
+}
+
+/**
+ * Implementation of hook_menu().
+ */
+function module_grants_menu() {
+  $items = array();
+  $items['admin/config/system/module_grants'] = array(
+    'title' => 'Module grants',
+    'description' => 'Configure how node access modules interact and customise the <em>Accessible-content</em> page.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('module_grants_admin_configure'),
+    'access arguments' => array('administer site configuration'),
+    'file' => 'module_grants.admin.inc'
+  );
+  return $items;
+}
+
+/**
+ * Implement hook_module_implements_alter:
+ * 1. Save other modules' hook_node_access, remove them so that only our hook is left
+ * 2. Remove node.module's hook_query_alter
+ */
+function module_grants_module_implements_alter(&$implementations, $hook) {
+  if ($hook == 'node_access') {
+    $mg_name = 'module_grants';
+    $mg_group = $implementations[$mg_name];
+    unset($implementations[$mg_name]);
+    module_grants_set_node_access_implementations($implementations);
+    foreach ($implementations as $module => $group) {
+      unset($implementations[$module]);
+    }
+    $implementations[$mg_name] = $mg_group;
+  }
+  else if ($hook == 'query_node_access_alter') {
+    unset($implementations['node']);
+  }
+  else if ($hook == 'query_entity_field_access_alter') {
+    unset($implementations['node']);
+  }
+}
+
+/**
+ * Get/Set node access implementations in static and cache
+ * @see module_implements()
+ */
+function module_grants_set_node_access_implementations($implements = NULL) {
+  $implementations = &drupal_static(__FUNCTION__);
+
+  if (isset($implements)) {
+    cache_set('module_implements_node_access', $implements, 'cache_bootstrap');
+  }
+
+  // Fetch implementations from cache.
+  if (empty($implementations)) {
+    $implementations = cache_get('module_implements_node_access', 'cache_bootstrap');
+    if ($implementations === FALSE) {
+      $implementations = array();
+    }
+    else {
+      $implementations = $implementations->data;
+    }
+  }
+  return $implementations;
+}
+
+/**
+ * Replicate node.module's $access = module_invoke_all('node_access', $node, $op, $account),
+ * using the hook_node_access() saved in module_grants_set_node_access_implementations()
+ * @see node_access()
+ * @see module_invoke_all()
+ */
+function module_grants_invoke_node_access($node, $op, $account) {
+  $hook = 'node_access';
+  $modules = array_keys(module_grants_set_node_access_implementations());
+
+  $return = array();
+  foreach ($modules as $module) {
+    $result = module_invoke($module, $hook, $node, $op, $account);
+    if (isset($result) && is_array($result)) {
+      $return = array_merge_recursive($return, $result);
+    }
+    elseif (isset($result)) {
+      $return[] = $result;
+    }
+  }
+
+  return $return;
+}
+
+/**
+ * Check if we should enable module grants' alternations
+ */
+function module_grants_is_disabled() {
+  return variable_get('module_grants_OR_modules', FALSE) || count(module_implements('node_grants')) <= 1;
+}
+
+/**
+ * Implement hook_node_access() to override default node_access() logic, we have ensured
+ * this hook will be the last one to be called, it will not return NODE_ACCESS_IGNORE,
+ * thus effectively skipped all the logic in node_access() after line 3032
+ */
+function module_grants_node_access($node, $op, $account) {
+  return _module_grants_node_access($op, $node, $account) ? NODE_ACCESS_ALLOW : NODE_ACCESS_DENY;
+}
+
+/**
+ * Implements hook_query_TAG_alter(), replaces node.module's query alter hook.
+ */
+function module_grants_query_node_access_alter(QueryAlterableInterface $query) {
+  if (module_grants_is_disabled()) {
+    _node_query_node_access_alter($query, 'node');
+  }
+  else {
+    _module_grants_node_query_node_access_alter($query, 'node');
+  }
+}
+
+/**
+ * Implements hook_query_TAG_alter(), replaces node.module's query alter hook.
+ */
+function module_grants_query_entity_field_access_alter(QueryAlterableInterface $query) {
+  if (module_grants_is_disabled()) {
+    _node_query_node_access_alter($query, 'entity');
+  }
+  else {
+    _module_grants_node_query_node_access_alter($query, 'entity');
+  }
+}
+
+/**
+ * Implements hook_node_access_records_alter to clear node_access related cache since
+ * a change is about to be written to the node_access table
+ */
+function module_grants_node_access_records_alter(&$grants, $node) {
+  module_grants_clear_node_access_cache();
+}
+
+/**
+ * Helper function to add condition for all realm
+ */
+function _module_grants_apply_node_access_grants_conditions($module, $grants, $grants_conditions, $nalias = NULL) {
+  $grants_conditions->condition(db_and()
+    ->condition('gid', 0)
+    ->condition('realm', 'all')
+  );
+  $nalias = isset($nalias) ? $nalias.'.' : '';
+  foreach ($grants as $realm => $gids) {
+    foreach ($gids as $gid) {
+      /*
+      $grants_conditions->condition(db_and()
+          ->condition('gid', $gid)
+          ->condition('realm', $realm)
+      );
+      */
+      // Use direct sql since # of realm/gids may be large, and DatabaseCondition::compile takes some time to run
+      $grants_conditions->where($nalias.'gid='.$gid.' AND '.$nalias.'realm=\''.$realm.'\'');
+    }
+  }
+}
+
+/**
+ * The core function of this module, calculate result for node_access()
+ */
+function module_grants_get_node_access_result($node, $op, $account) {
+  $module_grants = module_grants_by_module($op, $account);
+  if (count(array_filter($module_grants)) == 0) {
+    // if no module has any grants, we'll just add gid = 0 and realm = all condition
+    $query = _module_grants_get_node_access_query($node, $op);
+    $query->condition(db_and()
+        ->condition('gid', 0)
+        ->condition('realm', 'all')
+    );
+    return (bool) $query
+      ->execute()
+      ->fetchField();
+  }
+  else {
+    foreach ($module_grants as $module => $grants) {
+      if (variable_get('module_grants_lenient', TRUE)
+        && count(module_grants_get_node_access_realms_for_module($module, $node)) == 0) {
+        // if a module did not have any grant for this node in node_access table, and we're in lenient mode, then skip this module.
+        continue;
+      }
+      // query copied from node_access(), need to run this for every module
+      $query = _module_grants_get_node_access_query($node, $op);
+      $grant_conditions = db_or();
+      _module_grants_apply_node_access_grants_conditions($module, $grants, $grant_conditions);
+      $query->condition($grant_conditions);
+      $result =  (bool) $query
+        ->execute()
+        ->fetchField();
+
+      if (!$result) {
+        return false; // AND module grants together: break as soon as one fails
+      }
+    }
+    return true;
+  }
+}
+
+function _module_grants_get_node_access_query($node, $op) {
+  $query = db_select('node_access');
+  $query->addExpression('1');
+  $query->condition('grant_' . $op, 1, '>=');
+  $nids = db_or()->condition('nid', $node->nid);
+  if ($node->status) {
+    $nids->condition('nid', 0);
+  }
+  $query->condition($nids);
+  $query->range(0, 1);
+  return $query;
+}
+
+/**
+ * The core function of this module, calculate result for node_access_view_all_nodes()
+ */
+function module_grants_get_node_access_view_all_nodes_result($account) {
+  $op = 'view';
+  $module_grants = module_grants_by_module($op, $account);
+  if (count(array_filter($module_grants)) == 0) {
+    // if no module has any grants, we'll just add gid = 0 and realm = all condition
+    $query = _module_grants_get_node_access_view_all_nodes_query();
+    $query->condition(db_and()
+        ->condition('gid', 0)
+        ->condition('realm', 'all')
+    );
+    return (bool) $query
+      ->execute()
+      ->fetchField();
+  }
+  else {
+    foreach ($module_grants as $module => $grants) {
+      if (variable_get('module_grants_lenient', TRUE)
+        && count(module_grants_get_node_access_realms_for_module($module)) == 0) {
+        // if a module did not give any grant in node_access, and we're in lenient mode, then skip this module.
+        continue;
+      }
+      // query copied from node_access_view_all_nodes(), need to run this for every module
+      $query = _module_grants_get_node_access_view_all_nodes_query();
+
+      $grant_conditions = db_or();
+      _module_grants_apply_node_access_grants_conditions($module, $grants, $grant_conditions);
+      $query->condition($grant_conditions);
+      $result = $query
+        ->execute()
+        ->fetchField();
+
+      if (!$result) {
+        return false; // AND module grants together: break as soon as one fails
+      }
+    }
+    return true;
+  }
+}
+
+function _module_grants_get_node_access_view_all_nodes_query() {
+  $query = db_select('node_access');
+  $query->addExpression('COUNT(*)');
+  $query
+    ->condition('nid', 0)
+    ->condition('grant_view', 1, '>=');
+  return $query;
+}
+
+/**
+ * The core function of this module, applies node access grants condition to the node access query alter
+ */
+function module_grants_apply_subquery_for_node_query_node_access_alter($query, $type, $base_table, $op, $account) {
+  $tables = $query->getTables();
+  $all_grants = module_grants_by_module($op, $account);
+  if ($type == 'entity') {
+    // The original query looked something like:
+    // @code
+    //  SELECT nid FROM sometable s
+    //  INNER JOIN node_access na ON na.nid = s.nid
+    //  WHERE ($node_access_conditions)
+    // @endcode
+    //
+    // Our query will look like:
+    // @code
+    //  SELECT entity_type, entity_id
+    //  FROM field_data_something s
+    //  LEFT JOIN node_access na ON s.entity_id = na.nid
+    //  WHERE (entity_type = 'node' AND $node_access_conditions) OR (entity_type <> 'node')
+    // @endcode
+    //
+    // So instead of directly adding to the query object, we need to collect
+    // all of the node access conditions in a separate db_and() object and
+    // then add it to the query at the end.
+    $node_conditions = db_and();
+  }
+  foreach ($tables as $nalias => $tableinfo) {
+    $table = $tableinfo['table'];
+    if (!($table instanceof SelectQueryInterface) && $table == $base_table) {
+      $subquery_condition = db_and(); // AND all the module subqueries together
+      $module_grants_na_count = 0;
+      foreach ($all_grants as $module => $grants) {
+        $module_na_realms = module_grants_get_node_access_realms_for_module($module);
+        if (variable_get('module_grants_lenient', TRUE) && empty($module_na_realms)) {
+          // if a module did not give any grant in node_access, and we're in lenient mode, then skip this module.
+          continue;
+        }
+        $module_grants_na_count++;
+        $module_grants_na_alias = 'mgna'.$module_grants_na_count;
+
+        // Set the subquery.
+        $subquery = db_select('node_access', $module_grants_na_alias)
+        ->fields($module_grants_na_alias, array('nid'));
+
+        $grant_conditions = db_or();
+        if (variable_get('module_grants_lenient', TRUE)) {
+          $lenient_na_alias = 'mglna'.$module_grants_na_count;
+          $lenient_subquery = db_select('node_access', $lenient_na_alias)
+          ->fields($lenient_na_alias, array('gid'))
+          // If there is only an access all grant (nid = 0) for a realm, then this node will not be handled leniently on this realm,
+          // which means user needs to have that access all grant in order to access the node.
+          ->condition(db_or()
+              ->where("$lenient_na_alias.nid = $module_grants_na_alias.nid")
+              ->condition("$lenient_na_alias.nid", 0)
+          )
+          ->condition("$lenient_na_alias.realm", $module_na_realms, 'IN');
+          $grant_conditions->notExists($lenient_subquery);
+        }
+        _module_grants_apply_node_access_grants_conditions($module, $grants, $grant_conditions, $module_grants_na_alias);
+        $subquery->condition($grant_conditions);
+
+        $subquery->condition("$module_grants_na_alias.grant_" . $op, 1, '>=');
+        $field = 'nid';
+        // Now handle entities.
+        if ($type == 'entity') {
+          // Set a common alias for entities.
+          $base_alias = $nalias;
+          $field = 'entity_id';
+        }
+        $subquery->condition(db_or()
+          ->where("$nalias.$field = $module_grants_na_alias.nid")
+          // Need to add this here, since module_grants_get_node_access_view_all_nodes_result()
+          // only covers the case where user has all the view all grants from all realms, we need
+          // to handle the case where user has view all grants on a particular realm here.
+          ->condition("$module_grants_na_alias.nid", 0)
+        );
+
+        $subquery_condition->exists($subquery);
+      }
+
+      if (count($subquery_condition)) {
+        // For an entity query, attach the subquery to entity conditions.
+        if ($type == 'entity') {
+          $node_conditions->condition($subquery_condition);
+        }
+        // Otherwise attach it to the node query itself.
+        else {
+          $query->condition($subquery_condition);
+        }
+      }
+    }
+  }
+
+  if ($type == 'entity' && count($node_conditions)) {
+    // All the node access conditions are only for field values belonging to
+    // nodes.
+    $node_conditions->condition("$base_alias.entity_type", 'node');
+    $or = db_or();
+    $or->condition($node_conditions);
+    // If the field value belongs to a non-node entity type then this function
+    // does not do anything with it.
+    $or->condition("$base_alias.entity_type", 'node', '<>');
+    // Add the compiled set of rules to the query.
+    $query->condition($or);
+  }
+}
+
+/**
+ * Return a map, keyed by module name, of grant arrays (keys are realms, values are array of
+ * grants) associated with the module, as returned by that module's hook_node_grants().
+ *
+ * This is similar to node.module's node_access_grants(), but returns the grants by module
+ * instead of all at once.
+ *
+ * @param $op
+ *   The operation, i.e 'view', 'update' or 'delete'
+ * @param $account
+ *   User account object
+ * @param $nid
+ *   Optional. If passed in, only modules with at least one row in the
+ *   node_acces table for the supplied nid are included (lenient interpretation
+ *   of absence of node grants). If not passed in, then all modules implementing
+ *   hook_node_grants() will be included (strict).
+ * @return
+ *   An array of module grants, keyed by module name. If a module implements hook_node_grants
+ *   but didn't return any grants for this op/account/node, we still return it as a key with
+ *   empty array as value.
+ */
+function module_grants_by_module($op, $account = NULL) {
+  if (!isset($account)) {
+    $account = $GLOBALS['user'];
+  }
+
+  // Fetch node access grants from other modules.
+  $grants = module_invoke_all('node_grants', $account, $op);
+  // Allow modules to alter the assigned grants.
+  drupal_alter('node_grants', $grants, $account, $op);
+
+  // Now we need to assign each realm in the grants to its module
+  $all_grants = array();
+  foreach (module_implements('node_grants') as $module) {
+    $module_grants = array();
+    foreach ($grants as $realm => $gids) {
+      if (module_grants_is_realm_by_module($realm, $module)) {
+        $module_grants[$realm] = $gids;
+        unset($grants[$realm]);
+      }
+    }
+    $all_grants[$module] = $module_grants;
+  }
+  return $all_grants;
+}
+
+/**
+ * Check if realm belongs to module, copied from module_access
+ */
+function module_grants_is_realm_by_module($realm, $module) {
+  $realm_functions = &drupal_static(__FUNCTION__);
+
+  if (!isset($realm_functions)) {
+    $realm_functions = array();
+    $access_modules = module_implements('node_grants');
+    // register realm identification function per module
+    foreach ($access_modules as $module_name) {
+      $realm_functions[$module_name] = function ($realm) use ($module_name) { return _modules_grants_prefix_match($module_name, $realm); };
+    }
+    // call the custom hook to register realm identification functions
+    drupal_alter('module_grants_realm_function_register', $realm_functions);
+  }
+  return isset($realm_functions[$module]) ? $realm_functions[$module]($realm) : false;
+}
+
+/* default claim_realm function - groups realms to modules by prefix */
+function _modules_grants_prefix_match($prefix, $realm) {
+  return strncmp($prefix, $realm, strlen($prefix)) == 0;
+}
+
+/**
+ * Check if a module has node_access record for a node or for access all
+ * This is used in lenient mode, where if there's no node_access record from
+ * a module, then we skip the access checking for this module.
+ * @return array of realms
+ */
+function module_grants_get_node_access_realms_for_module($module, $node = NULL) {
+  $node_access_realms_for_module = &drupal_static(__FUNCTION__);
+
+  $nid = $node ? $node->nid : 0;
+  if (!isset($node_access_realms_for_module[$module][$nid])) {
+    $node_access_realms = module_grants_get_node_access_realms($node);
+    $node_access_realms_for_module[$module][$nid] = array();
+    foreach ($node_access_realms as $realm => $count) {
+      if (module_grants_is_realm_by_module($realm, $module)) {
+        $node_access_realms_for_module[$module][$nid] []= $realm;
+      }
+    }
+  }
+  return $node_access_realms_for_module[$module][$nid];
+}
+
+/**
+ * Get the realms and # of records in node_access table for a node or for access all
+ * @param  $node
+ * @return array of record counts, keyed by realm.
+ */
+function module_grants_get_node_access_realms($node = NULL) {
+  $node_access_realms = &drupal_static(__FUNCTION__);
+
+  $nid = $node ? $node->nid : 0;
+  if (!isset($node_access_realms[$nid])) {
+    $query = db_select('node_access', 'na')
+      ->fields('na', array('realm'));
+    $query->addExpression('COUNT(na.gid)', 'gid_count');
+
+    if ($node) {
+      $nid_condition = db_or()
+        ->condition('na.nid', $node->nid)
+        // If node is published, and there is only an access all grant (nid = 0) for a realm, then this node
+        // will not be handled leniently on this realm, which means user needs to have that access all grant
+        // in order to access the node.
+        // This condition should be the same for unpublished node. For unpublished nodes, node_access()
+        // will not consider all grant, but will only consider node specific grant. If we allow unpublished
+        // node to be handled leniently in a realm with only all grant, it would allow user without the
+        // all grant to access the unpublished node, which is bad.
+        ->condition('na.nid', 0);
+      $query->condition($nid_condition);
+    }
+    $query->groupBy('na.realm');
+    $node_access_realms[$nid] = $query->execute()->fetchAllKeyed();
+  }
+  return $node_access_realms[$nid];
+}
+
+function module_grants_clear_node_access_cache() {
+  drupal_static_reset('module_grants_get_node_access_realms');
+  drupal_static_reset('module_grants_get_node_access_realms_for_module');
+}
