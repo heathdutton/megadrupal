@@ -1,1 +1,0 @@
-Visit our premium themes for a top notch solution.

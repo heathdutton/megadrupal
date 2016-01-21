@@ -1,0 +1,269 @@
+<?php
+/**
+ * @file
+ * Installation file for Cache Consistent.
+ */
+
+/**
+ * Implements hook_requirements().
+ */
+function cache_consistent_requirements($phase) {
+  $response = array();
+  $t = get_t();
+  switch ($phase) {
+    case 'install':
+      if (!interface_exists('DrupalTransactionalCacheInterface', FALSE)) {
+        $response['title'] = 'Cache Consistent';
+        $response['severity'] = REQUIREMENT_ERROR;
+        $response['description'] = $t('The interface %class is not present. Have you applied the core patch bundled with Cache Consistent?. Please refer to the documentation.', array('%class' => 'DrupalTransactionalCacheInterface'));
+      }
+      return array('cache_consistent' => $response);
+
+    case 'runtime':
+      $response['title'] = 'Cache Consistent';
+      $deprecated = class_exists('ConsistentCacheLookup', FALSE);
+      $core_patch = interface_exists('DrupalTransactionalCacheInterface', FALSE);
+      $response['value'] = array();
+      $response['description'] = array();
+      $check_isolation = FALSE;
+      $bins = _cache_consistent_get_bin_configuration();
+
+      $configured = FALSE;
+      $chains = array();
+      foreach ($bins as $bin => $object) {
+        $configured = $configured || $object instanceof DrupalTransactionalCacheInterface;
+        $chains[$bin] = _cache_consistent_get_cache_chain($object);
+      }
+
+      if ($deprecated) {
+        $response['severity'] = REQUIREMENT_WARNING;
+        $response['value'][] = $t('Deprecated configuration');
+        $response['description'][] = $t('The class %class has been deprecated. Please refer to the documentation.', array('%class' => 'ConsistentCacheLookup'));
+        $check_isolation = TRUE;
+      }
+      elseif (!$core_patch) {
+        $response['severity'] = REQUIREMENT_WARNING;
+        $response['value'][] = $t('Missing core patch');
+        $response['description'][] = $t('The interface %class is not present. Have you applied the core patch bundled with Cache Consistent?. Please refer to the documentation.', array('%class' => 'DrupalTransactionalCacheInterface'));
+        $check_isolation = TRUE;
+      }
+      elseif ($configured) {
+        $response['severity'] = REQUIREMENT_OK;
+        $check_isolation = TRUE;
+      }
+      else {
+        $response['severity'] = REQUIREMENT_OK;
+        $response['value'][] = $t('Not configured');
+      }
+
+      if ($check_isolation) {
+        if ($level = _cache_consistent_determine_isolation_level()) {
+          $response['description'][] = $t('Database isolation level has %level like capabilities.', array('%level' => $level));
+          $safe = variable_get('consistent_cache_default_safe', TRUE);
+          switch (TRUE) {
+            case !$safe && $level == 'REPEATABLE-READ':
+            case !$safe && $level == 'SERIALIZABLE':
+              $response['description'][] = $t('Safe mode is currently not on. You should enable safe mode for maximum consistency when using this isolation level.<br><br>Add to settings.php:');
+              $response['description'][] = '<code>$conf["consistent_cache_default_safe"] = TRUE;</code>';
+              $response['severity'] = REQUIREMENT_WARNING;
+              $response['value'][] = $t('Sub-optimal consistency');
+              break;
+
+            case $safe && $level == 'READ-UNCOMMITTED':
+            case $safe && $level == 'READ-COMMITTED':
+              $response['description'][] = $t('Safe mode is currently on. You should disable safe mode for maximum performance when using this isolation level.<br><br>Add to settings.php:');
+              $response['description'][] = '<code>$conf["consistent_cache_default_safe"] = FALSE;</code>';
+              $response['severity'] = REQUIREMENT_WARNING;
+              $response['value'][] = $t('Sub-optimal performance');
+              break;
+          }
+        }
+        else {
+          $response['description'][] = $t('Could not estimate database isolation level');
+        }
+      }
+
+      // Add bin configuration to description.
+      $rows = array();
+      $maybe_poorly_configured = FALSE;
+
+      foreach ($bins as $bin => $object) {
+        $classes = array();
+        $is_transactional = FALSE;
+        foreach ($chains[$bin] as $chained_object) {
+          $is_transactional = $is_transactional || strpos(get_class($chained_object), 'DrupalDatabaseCache') === 0 || ($chained_object instanceof DrupalTransactionalCacheInterface && !$chained_object instanceof HeuristicCache);
+          $classes[] = get_class($chained_object);
+        }
+        $maybe_poorly_configured = $maybe_poorly_configured || !$is_transactional;
+        $classes = implode(' => ', $classes);
+        $bin = isset($rows[$classes]) && $rows[$classes][0] === 'default' ? 'default' : $bin;
+        $type = $is_transactional ? 'status' : 'warning';
+        $title = $is_transactional ? $t('This cache bin should be transactionally safe') : $t('This cache bin may not be transactionally safe');
+        $message = '<div class="status-icon ' . $type . '" title="' . $title . '"></div>';
+        $rows[$classes] = array($bin, $classes, $message);
+      }
+      $response['description'][] = theme('table', array(
+        'header' => array($t('Cache bin'), $t('Classes'), $t('Transactional')),
+        'rows' => $rows,
+        'attributes' => array('class' => array('cache-consistent')),
+      ));
+
+      if ($maybe_poorly_configured) {
+        $response['value'][] = $t('Some cache bins may not be configured properly for transactional use');
+        $response['severity'] = REQUIREMENT_WARNING;
+      }
+
+      // Compose result.
+      $response['value'] = $response['value'] ? $response['value'] : array($t('OK'));
+      $response['value'] = implode('<br/>', $response['value']);
+      $response['description'] = implode('<br/>', $response['description']);
+      return array('cache_consistent' => $response);
+  }
+}
+
+/**
+ * Determine the database current isolation level.
+ *
+ * @return string
+ *   Type of isolation level (READ-UNCOMMITTED, READ-COMMITTED, REPEATABLE-READ)
+ */
+function _cache_consistent_determine_isolation_level() {
+  $info = Database::getConnectionInfo();
+  Database::addConnectionInfo('default', 'isolation_level_check', $info['default']);
+
+  $conn1 = Database::getConnection();
+  $conn2 = Database::getConnection('isolation_level_check');
+
+  // 99.9% use MySQL anyways. Let's not leave them hanging, just in case they're
+  // using SERIALIZABLE isolation level.
+  if ($conn1->databaseType() == 'mysql') {
+    try {
+      $conn1->query("SET SESSION innodb_lock_wait_timeout=2");
+      $conn2->query("SET SESSION innodb_lock_wait_timeout=2");
+    }
+    catch (PDOException $e) {
+      // Just ignore. Assume because innodb is not available.
+    }
+
+    // Set isolation level (for testing purposes).
+    // $check = 'READ-UNCOMMITTED';
+    // $check = 'READ-COMMITTED';
+    // $check = 'REPEATABLE-READ';
+    // $check = 'SERIALIZABLE';
+    if (!empty($check)) {
+      $conn1->query("SET SESSION tx_isolation='$check'");
+      $conn2->query("SET SESSION tx_isolation='$check'");
+
+    }
+  }
+
+  $key = 'cache_consistent_isolation_level_check_' . uniqid();
+
+  // Set initial value of test variable.
+  $conn1->merge('variable')
+    ->key(array(
+      'name' => $key,
+    ))
+    ->fields(array(
+      'value' => serialize('init'),
+    ))
+    ->execute();
+
+  // Start transactions.
+  $tx1 = $conn1->startTransaction();
+  $tx2 = $conn2->startTransaction();
+
+  // Create snapshot via select.
+  $init = $conn2->query("SELECT value FROM {variable} WHERE name = ?", array($key))->fetchField();
+
+  try {
+    // Update test variable.
+    $conn1->update('variable')
+      ->fields(array(
+        'value' => serialize('updated'),
+      ))
+      ->condition('name', $key)
+      ->execute();
+
+    $uncommitted = $conn2->query("SELECT value FROM {variable} WHERE name = ?", array($key))->fetchField();
+    unset($tx1);
+    $committed = $conn2->query("SELECT value FROM {variable} WHERE name = ?", array($key))->fetchField();
+    unset($tx2);
+  }
+  catch (PDOException $e) {
+    // Queries failed. Assume deadlock caused by SERIALIZABLE isolation level.
+    $uncommitted = NULL;
+    $committed = NULL;
+    unset($tx1);
+    unset($tx2);
+  }
+  $init = @unserialize($init);
+  $uncommitted = @unserialize($uncommitted);
+  $committed = @unserialize($committed);
+
+  if (!$uncommitted) {
+    $level = 'SERIALIZABLE';
+  }
+  elseif ($uncommitted == 'updated') {
+    $level = 'READ-UNCOMMITTED';
+  }
+  elseif ($committed == 'updated') {
+    $level = 'READ-COMMITTED';
+  }
+  elseif ($committed == 'init') {
+    $level = 'REPEATABLE-READ';
+  }
+  else {
+    $level = NULL;
+  }
+
+  $conn1->delete('variable')
+    ->condition('name', $key)
+    ->execute();
+
+  return $level;
+}
+
+/**
+ * Get current cache bin configuration.
+ *
+ * @return array
+ *   Class names keyed by bin.
+ */
+function _cache_consistent_get_bin_configuration() {
+  global $conf;
+  $bins = array();
+  foreach ($conf as $key => $value) {
+    if (preg_match('/^.*(cache_default_class|_cache_class_(.*))$/', $key, $matches)) {
+      $bin = isset($matches[2]) ? $matches[2] : 'default';
+      $bins[$bin] = $bin;
+    }
+  }
+  foreach ($bins as $bin => &$object) {
+    $object = _cache_get_object($bin === 'default' ? 'cache' : $bin);
+  }
+  return $bins;
+}
+
+/**
+ * Get cache chain of bin.
+ *
+ * @param object $object
+ *   The cache object to check.
+ *
+ * @return array
+ *   Cache objects in chain.
+ */
+function _cache_consistent_get_cache_chain($object, $stack = array()) {
+  $stack[] = $object;
+  if ($object instanceof HeuristicCache || $object instanceof ConsistentCache) {
+    $reflection = new ReflectionClass($object);
+    $property = $reflection->getProperty('backend');
+    $property->setAccessible(TRUE);
+    $backend = $property->getValue($object);
+    $property->setAccessible(FALSE);
+    return _cache_consistent_get_cache_chain($backend, $stack);
+  }
+
+  return $stack;
+}

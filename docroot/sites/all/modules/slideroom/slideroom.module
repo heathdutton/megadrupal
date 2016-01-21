@@ -1,0 +1,310 @@
+<?php
+/**
+ * @file
+ * SlideRoom API integration module.
+ */
+
+/**
+ * Implements hook_libraries_info().
+ */
+function slideroom_libraries_info() {
+  $libraries['slideroom'] = array(
+    'name' => 'SlideRoom API',
+    'vendor url' => 'https://api.slideroom.com/',
+    'download url' => 'https://github.com/thinkshout/slideroom-api-php',
+    'path' => 'src',
+    'version arguments' => array(
+      'file' => 'composer.json',
+      'pattern' => '/\"version": \"((\d+)\.(\d+)\.(\d+))\",/',
+    ),
+    'files' => array(
+      'php' => array('SlideRoomClient.php'),
+    ),
+  );
+
+  return $libraries;
+}
+
+/**
+ * Implements hook_menu().
+ */
+function slideroom_menu() {
+  $items['admin/config/services/slideroom'] = array(
+    'title' => 'SlideRoom',
+    'description' => 'Manage SlideRoom Settings.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('slideroom_admin_settings'),
+    'access arguments' => array('administer slideroom'),
+    'file' => 'includes/slideroom.admin.inc',
+    'type' => MENU_NORMAL_ITEM,
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_permission().
+ */
+function slideroom_permission() {
+  return array(
+    'administer slideroom' => array(
+      'title' => t('Administer SlideRoom'),
+      'description' => t('Access the SlideRoom configuration options.'),
+    ),
+  );
+}
+
+/**
+ * Get a SlideRoom API object for exporting data out of your organization's SlideRoom account.
+ *
+ * @return SlideRoomClient
+ */
+function slideroom_get_api_object() {
+  $slideroom = &drupal_static(__FUNCTION__);
+
+  if (!isset($slideroom)) {
+    $library = libraries_load('slideroom');
+    if (!$library['installed']) {
+      $msg = t('Failed to load SlideRoom PHP library. Please refer to the installation requirements.');
+      watchdog('slideroom', $msg, array(), WATCHDOG_ERROR);
+      drupal_set_message($msg, 'error');
+      return NULL;
+    }
+
+    $oauth_token = variable_get('slideroom_oauth_token', '');
+    if (!$oauth_token) {
+      watchdog('slideroom', 'SlideRoom Error: OAuth token cannot be blank.', array(), WATCHDOG_ERROR);
+      return NULL;
+    }
+
+    $slideroom = new SlideRoomClient($oauth_token);
+  }
+
+  return $slideroom;
+}
+
+/**
+ * Creates or updates slideroom_result data.
+ *
+ * @param array $result
+ *    SlideRoom result data.
+ *
+ * @return bool|int
+ *    FALSE, SAVED_NEW, or SAVED_UPDATED.
+ */
+function slideroom_result_save(&$result) {
+  $primary_keys = array();
+
+  if (empty($result['result_id'])) {
+    $result['created'] = REQUEST_TIME;
+  }
+  else {
+    $primary_keys[] = 'result_id';
+  }
+
+  $result['changed'] = REQUEST_TIME;
+
+  return drupal_write_record('slideroom_result', $result, $primary_keys);
+}
+
+/**
+ * Loads slideroom_result data.
+ *
+ * @param array $conditions
+ *    SlideRoom result filters.
+ *
+ * @return array
+ *    SlideRoom results, filtered by conditions.
+ */
+function slideroom_results_load($conditions = array()) {
+  $query = db_select('slideroom_result')
+    ->fields('slideroom_result');
+
+  foreach ($conditions as $field => $value) {
+    $query->condition($field, $value);
+  }
+
+  $results = $query->execute()
+    ->fetchAllAssoc('result_id', PDO::FETCH_ASSOC);
+
+  return array_map(function($result) {
+    $result['request_data'] = unserialize($result['request_data']);
+    $result['response_data'] = unserialize($result['response_data']);
+    return $result;
+  }, $results);
+}
+
+/**
+ * Implements hook_cron().
+ */
+function slideroom_cron() {
+  $slideroom = slideroom_get_api_object();
+  if (!$slideroom) {
+    return;
+  }
+
+  _slideroom_handle_pending_exports($slideroom);
+
+  _slideroom_handle_new_exports($slideroom);
+}
+
+/**
+ * @param SlideRoomClient $slideroom
+ */
+function _slideroom_handle_new_exports(SlideRoomClient $slideroom) {
+  $last_new_export_time = variable_get('slideroom_last_new_export_time', 0);
+  $throttle_seconds = 60 * 60 * intval(variable_get('slideroom_request_throttle', 0));
+
+  if (REQUEST_TIME < $last_new_export_time + $throttle_seconds) {
+    // Not time for a new export yet.
+    return;
+  }
+
+  $exports = module_invoke_all('slideroom_application_export');
+
+  foreach ($exports as $name => $params) {
+    $application_result = array(
+      'name' => $name,
+      'type' => 'application',
+      'request_data' => $params,
+    );
+
+    try {
+      $data = $slideroom->application->requestExport($params);
+
+      $application_result['response_data'] = $data;
+      $application_result['status'] = isset($data['token']) ? 'pending' : 'error';
+    }
+    catch (SlideRoomApiErrorException $e) {
+      $application_result['response_data'] = $e->getMessage();
+      $application_result['status'] = 'error';
+    }
+
+    slideroom_result_save($application_result);
+
+    switch ($application_result['status']) {
+      case 'error':
+        watchdog('slideroom', print_r($application_result['response_data'], TRUE), array(), WATCHDOG_ERROR);
+        break;
+    }
+  }
+
+  variable_set('slideroom_last_new_export_time', REQUEST_TIME);
+}
+
+/**
+ * @param SlideRoomClient $slideroom
+ */
+function _slideroom_handle_pending_exports(SlideRoomClient $slideroom) {
+  $application_results = slideroom_results_load(array(
+    'type' => 'application',
+    'status' => 'pending',
+  ));
+
+  foreach ($application_results as $application_result) {
+    $name = $application_result['name'];
+    $token = $application_result['response_data']['token'];
+
+    $export_result = array(
+      'name' => $name,
+      'type' => 'export',
+      'request_data' => $token,
+    );
+
+    try {
+      $data = $slideroom->export->get($token);
+
+      $export_result['response_data'] = $data;
+      $export_result['status'] = isset($data['status']) ? strtolower($data['status']) : 'error';
+    }
+    catch (SlideRoomApiErrorException $e) {
+      $export_result['response_data'] = $e->getMessage();
+      $export_result['status'] = 'error';
+    }
+
+    slideroom_result_save($export_result);
+
+    switch ($export_result['status']) {
+      case 'complete':
+        $application_result['status'] = 'complete';
+        slideroom_result_save($application_result);
+
+        module_invoke_all('slideroom_application_export_complete', $application_result, $export_result);
+        break;
+
+      case 'error':
+        watchdog('slideroom', print_r($export_result['response_data'], TRUE), array(), WATCHDOG_ERROR);
+        break;
+    }
+  }
+}
+
+/**
+ * Parse export result data in a particular format.
+ *
+ * @param string $format
+ * @param array $response_data
+ *
+ * @return array
+ */
+function slideroom_parse_exported_files($format, $response_data) {
+  $parsed_data = array();
+
+  foreach ($response_data['file_urls'] as $file_url) {
+    $file_data = NULL;
+
+    switch ($format) {
+      case 'csv':
+        $file_data = array();
+        if (($handle = fopen($file_url, 'r')) !== FALSE) {
+          $csv_header = NULL;
+          while (($csv_row = fgetcsv($handle, 0, ',')) !== FALSE) {
+            if (!$csv_header) {
+              $csv_header = $csv_row;
+            }
+            else {
+              $file_data[] = array_combine($csv_header, $csv_row);
+            }
+          }
+          fclose($handle);
+        }
+        break;
+
+      // TODO: Add more format handlers.
+    }
+
+    $parsed_data[] = $file_data;
+  }
+
+  return $parsed_data;
+}
+
+/**
+ * Implements hook_variable_group_info().
+ */
+function slideroom_variable_group_info() {
+  $groups['slideroom'] = array(
+    'title' => t('SlideRoom'),
+    'description' => t('Settings related to SlideRoom.'),
+    'access' => 'administer slideroom',
+    'path' => array('admin/config/services/slideroom'),
+  );
+  return $groups;
+}
+
+/**
+ * Implements hook_variable_info().
+ */
+function slideroom_variable_info($options) {
+  $variable['slideroom_oauth_token'] = array(
+    'title' => t('SlideRoom Oauth Token', array(), $options),
+    'group' => 'slideroom',
+  );
+
+  $variable['slideroom_request_throttle'] = array(
+    'title' => t('SlideRoom API Request Throttle', array(), $options),
+    'group' => 'slideroom',
+  );
+
+  return $variable;
+}

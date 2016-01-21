@@ -1,0 +1,206 @@
+<?php
+
+/**
+ * Creates a BitPay invoice.
+ *
+ * Note that $pos_data has an approximately 32-character max length (depending
+ * how many characters are required to serialize the $pos_data variable), and
+ * each field in the $options array has a 100-character max length.
+ */
+function bitpay_create_invoice($order_id, $price, $pos_data, $options = array()) {
+  bitpay_initialize();
+  $invoice = bpCreateInvoice($order_id, $price, $pos_data, $options = array());
+  if ($invoice = bitpay_handle_error($invoice)) {
+    $record['order_id'] = $order_id;
+    $record['created'] = REQUEST_TIME;
+    $record['btc_price'] = $invoice['btcPrice'];
+    $record['status'] = $invoice['status'];
+    bitpay_write_record($record, $invoice['id']);
+  }
+  return $invoice;
+}
+
+/**
+ * Gets a BitPay invoice.
+ */
+function bitpay_get_invoice($invoice_id) {
+  bitpay_initialize();
+  $invoice = bpGetInvoice($invoice_id);
+  if ($invoice = bitpay_handle_error($invoice)) {
+    $record['btc_price'] = $invoice['btcPrice'];
+    $record['status'] = $invoice['status'];
+    bitpay_write_record($record, $invoice_id);
+  }
+  return $invoice;
+}
+
+/**
+ * Gets BitPay invoice payment info.
+ *
+ * @param $invoice_id
+ *   A string containing the BitPay invoice ID.
+ *
+ * @return array
+ *   - id: The invoice ID (string).
+ *   - alert: 1 if the invoice was overpaid, -1 if the invoice was underpaid.
+ *   - btc_paid: The amount paid in BTC (string).
+ */
+function bitpay_get_payment($invoice_id) {
+  // There is apparently no API to get payment info, so we screen scrape.
+  $curl = curl_init();
+  $curl_options = array(
+    CURLOPT_URL => url('https://bitpay.com/invoice', array('query' => array('id' => $invoice_id))),
+    CURLOPT_FOLLOWLOCATION => TRUE,
+    CURLOPT_RETURNTRANSFER => TRUE,
+    CURLOPT_SSL_VERIFYPEER => TRUE,
+    CURLOPT_SSL_VERIFYHOST => TRUE,
+  );
+  curl_setopt_array($curl, $curl_options);
+  $content = curl_exec($curl);
+  $invoice = array('invoice_id' => $invoice_id, 'alert' => NULL, 'btc_paid' => NULL);
+  if (!$content) {
+    watchdog('bitpay', 'Error while requesting invoice payment status from BitPay.', WATCHDOG_ERROR);
+  }
+  else {
+    if (preg_match('/Paid: ([0-9.]+) BTC/', $content, $matches)) {
+      $invoice['btc_paid'] = $matches[1];
+      $invoice['alert'] = 0;
+    }
+    if (substr_count($content, 'This invoice has been overpaid.') > 1) {
+      $invoice['alert'] = 1;
+    }
+    if (substr_count($content, 'This invoice expired before it was fully paid.') > 1) {
+      $invoice['alert'] = -1;
+    }
+    bitpay_write_record($invoice, $invoice_id);
+  }
+  return $invoice;
+}
+
+/**
+ * Helper function to handle errors. Returns FALSE on error.
+ */
+function bitpay_handle_error($response) {
+  if (variable_get('bitpay_debug', FALSE)) {
+    watchdog('debug', 'Receiving BitPay API response: %response.', array('%response' => print_r($response, TRUE)), WATCHDOG_DEBUG);
+  }
+  $errors = array();
+  if (is_string($response)) {
+    $errors[] = array('type' => 'unknown', 'message' => $response);
+  }
+  elseif (isset($response['error']) && is_string($response['error'])) {
+    $errors[] = array('type' => 'bpCurl', 'message' => $response['error']);
+  }
+  elseif (isset($response['error']) && is_array($response['error'])) {
+    if (empty($response['error']['messages'])) {
+      $errors[] = array('type' => $response['error']['type'], 'message' => $response['error']['message']);
+    }
+    else {
+      foreach ($response['error']['messages'] as $field => $message) {
+        $errors[] = array('type' => $response['error']['type'], 'message' => "{$response['error']['message']} ($field $message).");
+      }
+    }
+  }
+  if ($errors) {
+    foreach ($errors as $error) {
+      watchdog('bitpay', 'BitPay error (type: %type): %message.', array('%type' => $error['type'], '%message' => $error['message']), WATCHDOG_ERROR);
+    }
+    return FALSE;
+  }
+  return $response;
+}
+
+/**
+ * Helper function to load BitPay default settings.
+ */
+function bitpay_initialize() {
+  global $bpOptions;
+  static $initialized;
+  if (!$initialized) {
+    module_load_include('php', 'bitpay', 'php-client/bp_lib');
+    $bpOptions['apiKey'] = variable_get('bitpay_api_key', '');
+    $bpOptions['verifyPos'] = TRUE;
+    $bpOptions['notificationEmail'] = variable_get('bitpay_notification_email', variable_get('site_mail', ini_get('sendmail_from')));
+    $bpOptions['notificationURL'] = url('bitpay/callback', array('absolute' => TRUE, 'https' => TRUE));
+    $bpOptions['redirectURL'] = url(variable_get('bitpay_redirect_url', ''), array('absolute' => TRUE));
+    $bpOptions['currency'] = variable_get('bitpay_currency', 'BTC');
+    $bpOptions['physical'] = (bool) variable_get('bitpay_physical', TRUE);
+    $bpOptions['fullNotifications'] = FALSE;
+    $bpOptions['transactionSpeed'] = variable_get('bitpay_transaction_speed', 'low');
+    $initialized = TRUE;
+  }
+}
+
+/**
+ * Returns a renderable array for the BitPay invoice iframe.
+ */
+function bitpay_invoice_iframe($invoice_id) {
+  $element['#type'] = 'html_tag';
+  $element['#tag'] = 'iframe';
+  $element['#attributes']['class'] = 'bitpay-invoice';
+  $element['#attributes']['src'] = bitpay_invoice_url($invoice_id, 'iframe');
+  $element['#value'] = '';
+  return $element;
+}
+
+/**
+ * Generates BitPay invoice URL.
+ */
+function bitpay_invoice_url($invoice_id, $view = '') {
+  return url('https://bitpay.com/invoice', array('query' => array('id' => $invoice_id, 'view' => $view)));
+}
+
+/**
+ * Implements hook_menu().
+ */
+function bitpay_menu() {
+  $items['admin/config/services/bitpay'] = array(
+    'title' => 'BitPay',
+    'description' => 'Configure the BitPay settings.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('bitpay_settings'),
+    'access arguments' => array('administer site configuration'),
+    'file' => 'bitpay.admin.inc',
+  );
+  $items['bitpay/callback'] = array(
+    'title' => 'BitPay callback',
+    'description' => 'Handles BitPay invoice status updates.',
+    'page callback' => 'bitpay_callback',
+    'access callback' => TRUE,
+    'file' => 'bitpay.pages.inc',
+  );
+  return $items;
+}
+
+/**
+ * Implements hook_theme().
+ */
+function bitpay_theme($existing, $type, $theme, $path) {
+  return array(
+    'bitpay_invoice_iframe' => array(
+      'variables' => array(
+        'iframe' => NULL,
+        'invoice_id' => NULL,
+      ),
+      'template' => 'bitpay-invoice-iframe',
+    ),
+  );
+}
+
+/**
+ * Stores a record of the BitPay invoice in the local database.
+ */
+function bitpay_write_record($invoice, $invoice_id) {
+  $invoice['changed'] = REQUEST_TIME;
+  db_merge('bitpay')
+    ->key(array('invoice_id' => $invoice_id))
+    ->fields($invoice)
+    ->execute();
+}
+
+/**
+ * Preprocess variables for bitpay-invoice-iframe.tpl.php
+ */
+function template_preprocess_bitpay_invoice_iframe(&$variables) {
+  $variables['iframe'] = bitpay_invoice_iframe($variables['invoice_id']);
+}

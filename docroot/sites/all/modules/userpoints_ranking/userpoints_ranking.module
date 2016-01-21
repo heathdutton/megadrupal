@@ -1,0 +1,667 @@
+<?php 
+
+/**
+ * @file
+ * This module can build a rankings over users depending on userpoints. 
+ */
+
+
+/**
+ * The cron percentage defines how long, of the available time the
+ * cron can take for the processing of the rankings in the period. Default
+ * 80, so other application get also a chance to process anything. 
+ * 
+ * @var integer
+ */
+define('USERPOINTS_RANKING_DEFAULT_CRON_PERCENTAGE', 80);
+
+/**
+ * This constant defines the default batch size during the
+ * cron. 
+ * 
+ * @var integer
+ */
+define('USERPOINTS_RANKING_DEFAULT_CRON_BATCH_SIZE', 100);
+
+
+/**
+ * Implementation of hook_views_api().
+ */
+function userpoints_ranking_views_api() {
+  return array(
+    'api' => '3.0-alpha1',
+  );
+}
+
+
+/**
+ * Implementation of hook_menu()
+ */
+function userpoints_ranking_menu() {
+
+
+  $items['admin/config/people/userpoints/ranking'] = array(
+    'title' => 'Ranking',
+    'description' => strtr('Configure here the ranking of users depending on !points.', userpoints_translation()),
+    'page callback' => 'drupal_get_form',
+    'access arguments' => array('administer userpoints ranking'),
+    'page arguments' => array('userpoints_ranking_settings_form'),
+    'type' => MENU_LOCAL_TASK,
+    'file' => 'userpoints_ranking.admin.inc',
+    'weight' => 10,
+  );
+
+
+  return $items;
+}
+
+
+function userpoints_ranking_permission() {
+  return array(
+    'administer userpoints ranking' => array(
+      'title' => t('administer userpoints ranking'),
+      'description' => t('Administer the userpoints ranking settings.'),
+    ),
+  );
+}
+
+
+
+
+
+function userpoints_ranking_cron() {
+
+  // The cron percentage defines how long, of the available time the
+  // cron can take for the processing. Default
+  // 80, so other application get also a chance to process anything.
+  $cron_percentage = variable_get('userpoints_ranking_cron_percentage', USERPOINTS_RANKING_DEFAULT_CRON_PERCENTAGE);
+  
+  // The batch size for the copying of the points
+  $batch_size = variable_get('userpoints_ranking_cron_batch_size', USERPOINTS_RANKING_DEFAULT_CRON_BATCH_SIZE);
+  
+  
+  $total_seconds = ini_get('max_execution_time');
+  if (empty($total_seconds)) {
+    // If we can't get any max execution time, then we set it to 30 seconds.
+    // because this is the default max execution time.
+    $total_seconds = 30;
+  }
+
+  $lost_seconds = timer_read('page')/1000;
+  $available_seconds = $total_seconds - $lost_seconds;
+
+  // Get the real usable time for processing. We give other application at least 5 seconds
+  // to process anything. This ensures that any user input wont hurt the application.
+  $usable_seconds = min(array($available_seconds - 5, $total_seconds*$cron_percentage/100));
+  
+  $any_categories_to_schedule = TRUE;
+  
+  // Process as long as we have enough time.
+  // Schedule the periods
+  while ($any_categories_to_schedule && (timer_read('page')/1000 < $lost_seconds + $usable_seconds)) {
+  
+    
+    $categories = array('total' => t('Total'));
+    $any_categories_to_schedule = FALSE;
+    
+    // Categories will only appear if the taxonomy module is enabled as
+    // the module is required for this functionality but not necessarily
+    // a requirement for the module.
+    if (module_exists('taxonomy')) {
+      $categories += userpoints_get_categories();
+    }
+    
+    foreach($categories as $tid => $category_name) {
+      
+      $query = db_select('userpoints_ranking_period', 'p');
+  
+      $query
+        ->condition('p.state', 'scheduled', '=')
+        ->fields('p')
+        ->orderBy('period_start_date', 'DESC')
+        ->range(0, 1);
+      if ($tid === 'total') {
+        $query->isNull('p.tid');
+      }
+      else {
+        $query->condition('p.tid', $tid, '=');
+      }
+      
+      $scheduled_period = $query->execute()->fetchAssoc();
+      
+      $query = db_select('userpoints_ranking_period', 'p');
+      
+      $query
+        ->fields('p')
+        ->orderBy('period_start_date', 'DESC')
+        ->range(0, 1);
+      if ($tid === 'total') {
+        $query->isNull('p.tid');
+      }
+      else {
+        $query->condition('p.tid', $tid, '=');
+      }
+        
+      $last_period = $query->execute()->fetchAssoc();
+      
+      if (empty($last_period) || !isset($last_period['period_end_date'])) {
+        $period_start = REQUEST_TIME;
+      }
+      else {
+        // Add one second to the last periods end, because we need to ensure that we have 
+        // no overlapping periods
+        $period_start = $last_period['period_end_date'] + 1;
+      }
+      
+      
+      // If we got a date in the future, then take care about the starting
+      // point of the period
+      $date = date_create(variable_get('userpoints_ranking_tid__' . $tid . '__start_on', '0'));
+      if (is_object($date) && (!isset($last_period['period_end_date']) || $last_period['period_end_date'] < $date->getTimestamp())) {
+        $period_start = $date->getTimestamp();
+      }
+  
+      $period_end = $period_start + variable_get('userpoints_ranking_tid__' . $tid . '__length', '24') * 3600;
+          
+      if ($tid === 'total') {
+        $tid_db = NULL;
+      }
+      else {
+        $tid_db = (int)$tid;
+      }
+      
+      // No period for this term is scheduled, so we need to add one.
+      if (empty($scheduled_period)) {
+        db_insert('userpoints_ranking_period')
+          ->fields(array(
+            'period_start_date' => $period_start,
+            'period_end_date' => $period_end,
+            'period_created' => REQUEST_TIME,
+            'state' => 'scheduled',
+            'tid' => $tid_db,
+          ))
+          ->execute();
+        $any_categories_to_schedule = TRUE;
+      }
+    }
+    
+  }
+  
+  # If periods are scheduled we can now add the sums of the
+  # transaction points
+  $any_period_to_process = TRUE;
+  
+  while ($any_period_to_process && timer_read('page')/1000 < $lost_seconds + $usable_seconds) {
+    $any_period_to_process = FALSE;
+    
+    // Pick a scheduled and a in the past period item
+    $query = db_select('userpoints_ranking_period', 'p');
+
+    $query
+      ->condition('p.state', 'scheduled', '=')
+      ->condition('p.period_end_date', REQUEST_TIME, '<')
+      ->fields('p')
+      ->range(0, 1);
+    $scheduled_period = $query->execute()->fetchAssoc();
+
+    if (isset($scheduled_period['period_id'])) {
+      
+      if ($scheduled_period['tid'] === NULL) {
+        $tid = 'total';
+      }
+      else {
+        $tid = $scheduled_period['tid'];
+      }
+      
+      $any_period_to_process = TRUE;
+      
+      $period_view = variable_get('userpoints_ranking_tid__' . $tid . '__view', '');
+      if (module_exists('views') && !empty($period_view)) {  
+        $splits = explode(':', $period_view);
+        $view_id = $splits[0];
+        $display_id = $splits[1];
+        
+        $view = views_get_view($view_id);
+        
+    
+        // Make sure the query is not cached
+        $view->is_cacheable = FALSE;
+    
+        // Try to load the display
+        if (!$view->set_display($display_id)) {
+          watchdog('mass_messaging', "Can't load display '" . $display_id . "'.");
+          return;
+        }
+    
+        $no_users_left_in_view = FALSE;
+          
+        // Limit result set size by the batch_size
+        $view->display_handler->set_option('pager', array('type' => 'some', 'options' => array('items_per_page' => $batch_size)));
+        
+        $view->display_handler->set_option('userpoints_ranking_period_id', $scheduled_period['period_id']);
+    
+        // Make sure the query is not cached
+        $view->is_cacheable = FALSE;
+    
+        // Get the messages
+        $users = $view->execute_display($display_id);
+      }
+      else {
+        $query = db_select('users', 'u');
+         
+        $query->leftJoin(
+          'userpoints_ranking', 
+          'userpoints_ranking', 
+          'u.uid = userpoints_ranking.uid AND userpoints_ranking.period_id = :period_id', 
+          array(':period_id' => $scheduled_period['period_id'])
+        );
+        
+        $query->condition('u.uid', 0, '<>')
+          ->condition('u.status', 0, '<>')
+          ->fields('u', array('uid'))
+          ->isNull('ranking_id')
+          ->range(0, $batch_size);
+         
+        $users = array_keys($query->execute()->fetchAllKeyed('uid'));    
+            
+      }
+      
+      $number_of_users = count($users);
+            
+      // Check if there is time left for processing. This is required, because
+      // complex queries can lead to long loading times. Especially when the batch
+      // size is too big.
+      if (!(timer_read('page')/1000 < $lost_seconds + $usable_seconds)) {
+          return;
+      }
+      
+      
+      if (empty($users) || $number_of_users <= 0) {
+        $no_users_left_in_view = TRUE;
+        
+        // Update the period, set next processing state
+        db_update('userpoints_ranking_period')
+        ->fields(array(
+          'state' => 'aggregated',
+        ))
+      
+        ->condition('period_id', $scheduled_period['period_id'], '=')
+        ->execute();        
+      }
+      else {
+        
+        $i = 0;
+        while($number_of_users > $i && (timer_read('page')/1000 < $lost_seconds + $usable_seconds)) {
+          $uid = $users[$i];
+          
+          if ($scheduled_period['tid'] === NULL) {
+            $tid = 'total';
+          }
+          else {
+            $tid = $scheduled_period['tid'];
+          }
+                    
+          // Get Sum of transactions for lifetime
+          if ($tid === 'total') {
+            $sql = "SELECT SUM(points) AS sum 
+              FROM 
+                {userpoints_txn}
+              WHERE 
+                status = 0
+                AND points > 0
+                AND time_stamp < :end
+                AND uid = :uid
+              GROUP BY uid";
+            $replacment = array(
+              ':uid' => $uid,
+              ':end' => $scheduled_period['period_end_date'],
+            );
+            
+          }
+          else {
+            $sql = 'SELECT SUM(points) AS sum 
+              FROM 
+                {userpoints_txn}
+              WHERE 
+                status = 0
+                AND points > 0
+                AND time_stamp < :end AND uid = :uid AND tid = :tid
+              GROUP BY uid';
+            $replacment = array(
+              ':end' => $scheduled_period['period_end_date'],
+              ':uid' => $uid,
+              ':tid' => $tid,
+            );
+          }
+          
+          $result = db_query($sql, $replacment)->fetchAssoc();
+          $lifetime_points = (float)$result['sum'];
+          
+          
+          // Get Sum of transactions for period
+          if ($tid === 'total') {
+            $sql = "SELECT SUM(points) AS sum 
+              FROM 
+                {userpoints_txn}
+              WHERE 
+                status = 0
+                AND points > 0
+                AND time_stamp < :end
+                AND time_stamp >= :start
+                AND uid = :uid
+              GROUP BY uid";
+            $replacment = array(
+              ':uid' => $uid,
+              ':end' => $scheduled_period['period_end_date'],
+              ':start' => $scheduled_period['period_start_date'],
+            );
+          }
+          else {
+            $sql = "SELECT SUM(points) AS sum 
+              FROM 
+                {userpoints_txn}
+              WHERE 
+                status = 0
+                AND points > 0
+                AND time_stamp < :end
+                AND time_stamp >= :start
+                AND uid = :uid
+                AND tid = :tid
+              GROUP BY uid";
+            $replacment = array(
+              ':uid' => $uid,
+              ':tid' => $tid,
+              ':end' => $scheduled_period['period_end_date'],
+              ':start' => $scheduled_period['period_start_date'],
+            );
+            
+          }
+          
+          $result = db_query($sql, $replacment)->fetchAssoc();
+          $period_points = (float)$result['sum'];
+          
+          
+          // Get Balanced Sum of transactions for period
+          if ($tid === 'total') {
+            $sql = "SELECT SUM(points) AS sum 
+              FROM 
+                {userpoints_txn}
+              WHERE 
+                status = 0
+                AND time_stamp < :end
+                AND time_stamp >= :start
+                AND uid = :uid
+              GROUP BY uid";
+            $replacment = array(
+              ':uid' => $uid,
+              ':end' => $scheduled_period['period_end_date'],
+              ':start' => $scheduled_period['period_start_date'],
+            );
+            
+          }
+          else {
+            $sql = "SELECT SUM(points) AS sum 
+              FROM 
+                {userpoints_txn}
+              WHERE 
+                status = 0
+                AND time_stamp < :end
+                AND time_stamp >= :start
+                AND uid = :uid
+                AND tid = :tid
+              GROUP BY uid";
+            $replacment = array(
+              ':uid' => $uid,
+              ':tid' => $tid,
+              ':end' => $scheduled_period['period_end_date'],
+              ':start' => $scheduled_period['period_start_date'],
+            );
+            
+            
+          }
+          $result = db_query($sql, $replacment)->fetchAssoc();
+          $period_points_balanced = (float)$result['sum'];
+          
+          $transaction = db_transaction();
+          try {
+              
+            db_insert('userpoints_ranking')
+            ->fields(array(
+              'period_id' => $scheduled_period['period_id'],
+              'lifetime_points' => $lifetime_points,
+              'period_points' => $period_points,
+              'period_points_balanced' => $period_points_balanced,
+              'uid' => $uid,
+              'tid' => $scheduled_period['tid'],
+            ))
+            ->execute();              
+              
+          } catch (Exception $e) {
+            $transaction->rollback();
+            watchdog('mass_messaging', $e->getMessage(), array(), WATCHDOG_ERROR);
+          }
+  
+          // Force Commit
+          $transaction->__destruct();
+  
+          unset($transaction);
+          $i++;
+        }
+      }
+      
+    }
+    
+  }
+  
+  $any_period_to_rank = TRUE;
+  
+  while ($any_period_to_rank && timer_read('page')/1000 < $lost_seconds + $usable_seconds) {
+    
+    $any_period_to_rank = FALSE;
+    
+    // Pick an aggregated and a in the past period item
+    $query = db_select('userpoints_ranking_period', 'p');
+
+    $query
+      ->condition('p.state', 'aggregated', '=')
+      ->fields('p')
+      ->range(0, 1);
+      
+    $aggregated_period = $query->execute()->fetchAssoc();
+    if (isset($aggregated_period['period_id'])) {
+      
+      $any_period_to_rank = TRUE;
+      
+      $transaction = db_transaction();
+      
+      // Calculate the lifetime rank:
+      $query = db_select('userpoints_ranking', 'r');
+
+      $result = $query
+        ->condition('r.period_id', $aggregated_period['period_id'], '=')
+        ->fields('r', array('ranking_id', 'lifetime_points'))
+        ->orderBy('lifetime_points', 'DESC')
+        ->execute()->fetchAllAssoc('ranking_id');
+
+      $rank = 0;
+      $last_points = 0;
+      foreach($result as $item) {
+        if ($item->lifetime_points != $last_points) {
+          $rank++;
+        }
+        
+        // Update the ranking
+        db_update('userpoints_ranking')
+        ->fields(array(
+          'lifetime_ranking' => $rank,
+        ))
+        ->condition('ranking_id', $item->ranking_id, '=')
+        ->execute();
+                
+        $last_points = $item->lifetime_points;        
+      }
+      
+      
+      // Calculate the lifetime rank:
+      $query = db_select('userpoints_ranking', 'r');
+
+      $result = $query
+        ->condition('r.period_id', $aggregated_period['period_id'], '=')
+        ->fields('r', array('ranking_id', 'period_points'))
+        ->orderBy('period_points', 'DESC')
+        ->execute()->fetchAllAssoc('ranking_id');
+
+      $rank = 0;
+      $last_points = 0;
+      foreach($result as $item) {
+        if ($item->period_points != $last_points) {
+          $rank++;
+        }
+        
+        // Update the ranking
+        db_update('userpoints_ranking')
+        ->fields(array(
+          'period_ranking' => $rank,
+        ))
+        ->condition('ranking_id', $item->ranking_id, '=')
+        ->execute();
+                
+        $last_points = $item->period_points;        
+      }
+      
+      
+      // Calculate the period rank balanced:
+      $query = db_select('userpoints_ranking', 'r');
+
+      $result = $query
+        ->condition('r.period_id', $aggregated_period['period_id'], '=')
+        ->fields('r', array('ranking_id', 'period_points_balanced'))
+        ->orderBy('period_points', 'DESC')
+        ->execute()->fetchAllAssoc('ranking_id');
+
+      $rank = 0;
+      $last_points = 0;
+      foreach($result as $item) {
+        if ($item->period_points_balanced != $last_points) {
+          $rank++;
+        }
+        
+        // Update the ranking
+        db_update('userpoints_ranking')
+        ->fields(array(
+          'period_ranking_balanced' => $rank,
+        ))
+        ->condition('ranking_id', $item->ranking_id, '=')
+        ->execute();
+                
+        $last_points = $item->period_points_balanced;        
+      }
+      
+      
+      // Update the period, set next processing state
+      db_update('userpoints_ranking_period')
+      ->fields(array(
+        'state' => 'ranked',
+      ))
+    
+      ->condition('period_id', $aggregated_period['period_id'], '=')
+      ->execute();        
+      
+      
+      // Force Commit
+      $transaction->__destruct();
+      unset($transaction);  
+    }
+  }
+  
+}
+
+
+
+/**
+ * Provides a list of views with a userpoint ranking display inside.
+ * This function is used to provide the list for the rules
+ * argument selection.
+ */
+function userpoints_ranking_view_list() {
+  $views = views_get_all_views();
+
+  $list = array();
+  $entity_info = entity_get_info('user');
+  
+
+  foreach($views as $view => $view_object) {
+    foreach($view_object->display as $display => $display_object) {
+      if ($display_object->display_plugin == 'userpoints_ranking' && $view_object->base_table == $entity_info['base table']) {
+        $list[$view . ':' . $display] = $view_object->human_name . ': ' . $display_object->display_title;
+      }
+    }
+  }
+
+  return $list;
+}
+
+
+/**
+ * This function returns the last ranked periods.
+ */
+function userpoints_ranking_get_last_periods() {
+  static $periods;
+  
+  if (count($periods) > 0) {
+    return $periods;
+  }
+  else {
+    // Pick a scheduled and a in the past period item
+    $query = db_select('userpoints_ranking_period', 'p');
+  
+    $query
+      ->condition('p.state', 'ranked', '=')
+      ->condition('p.period_end_date', REQUEST_TIME, '<')
+      ->fields('p')
+      ->groupBy('p.tid');
+    $periods = $query->execute()->fetchAllAssoc('period_id');
+    return $periods;
+  }
+}
+
+
+function userpoints_ranking_theme() {
+  return array(
+    'userpoints_ranking_view_preview' => array(
+      'variables' => array('view' => NULL, 'results' => array()),
+    ),
+  );
+}
+
+
+function theme_userpoints_ranking_view_preview($vars) {
+  $results = $vars['results'];
+  $view = $vars['view'];
+  
+
+  $header = array(
+    'uid' => t('User ID'),
+  );
+
+  $rows = array();
+
+  foreach ($results as $uid) {
+    $cells = array();
+    $cells['uid'] = $uid;        
+    $rows[] = $cells;
+  }
+
+  return theme_table(array(
+    'rows' => $rows, 
+    'header' => $header, 
+    'attributes' => array(), 
+    'caption' => '', 
+    'colgroups' => array(), 
+    'sticky' => false, 
+    'empty' => t('No matching entry found.'),
+  ));  
+}
+
+
+

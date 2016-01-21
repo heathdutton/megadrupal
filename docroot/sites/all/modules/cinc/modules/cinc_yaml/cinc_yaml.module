@@ -1,0 +1,350 @@
+<?php
+/**
+ * Implements hook_libraries_info().
+ */
+function cinc_yaml_libraries_info() {
+  return array(
+    'spyc' => array(
+      'name' => 'Spyc',
+      'version' => '0.5.1',
+      'vendor url' => 'https://github.com/mustangostang/spyc',
+      'download url' => 'https://raw2.github.com/mustangostang/spyc/master/Spyc.php',
+      'version arguments' => array(
+        'file' => 'Spyc.php',
+        'pattern' => '@version\s+([0-9a-zA-Z\.-]+)@',
+      ),
+      'files' => array(
+        'php' => array('Spyc.php'),
+      ),
+    ),
+  );
+}
+
+/**
+ * Parses a yaml file using php_yaml or the spyc library.
+ */
+function cinc_yaml_from_yaml($yaml) {
+  if (function_exists('yaml_parse')) {
+    return yaml_parse($yaml);
+  }
+  if (($library = libraries_load('spyc')) && !empty($library['loaded'])) {
+    return spyc_load($yaml);
+  }
+  return array();
+}
+
+/**
+ * Returns a yaml representation using php_yaml or the spyc library.
+ */
+function cinc_yaml_to_yaml($yaml) {
+  if (function_exists('yaml_parse')) {
+    return yaml_emit($yaml);
+  }
+  if (($library = libraries_load('spyc')) && !empty($library['loaded'])) {
+    return Spyc::YAMLDump($yaml, 4, 60);
+  }
+  return '';
+}
+
+/**
+ * Implements hook_modules_enabled().
+ */
+function cinc_yaml_modules_enabled($modules) {
+  cache_clear_all('cinc_yaml:regex_to_class', 'cache');
+  cache_clear_all('cinc_yaml:field_type_to_class', 'cache');
+  cinc_yaml_check_for_yaml_files($modules);
+}
+
+/**
+ * Checks modules for CINC YAML files.
+ */
+function cinc_yaml_check_for_yaml_files($modules) {
+
+  $yaml_files = array();
+
+  foreach ($modules as $module) {
+
+    $module_path = drupal_get_path('module', $module);
+
+    foreach (file_scan_directory($module_path . '/config/install', '#(.*)\.yml(\.inc|)$#') as $filepath => $file) {
+
+      $yaml = file_get_contents($file->uri);
+      $yaml_files[$filepath] = array(
+        'yaml' => cinc_yaml_from_yaml($yaml),
+        'file' => $file,
+      );
+
+    }
+
+  }
+
+  cinc_yaml_apply_yaml_files($yaml_files);
+  if (function_exists('drush_log') && count($yaml_files)) {
+    drush_log(t('Applied CINC YAML configuration from @count.', array(
+      '@count' => format_plural(count($yaml_files), '1 file', '@count files')
+    )), 'ok');
+  }
+  module_invoke_all('cinc_yaml_applied', $yaml_files);
+}
+
+/**
+ * Appliess YAML files config ordered by dependencies.
+ */
+function cinc_yaml_apply_yaml_files($yaml_files) {
+
+  $dependency_free_yaml_files = array_filter($yaml_files, 'cinc_yaml_has_no_dependencies');
+
+  if (count($dependency_free_yaml_files)) {
+
+    foreach ($dependency_free_yaml_files as $filepath => $yaml_file) {
+
+      if (cinc_yaml_apply_yaml_file($yaml_file['yaml'], $yaml_file['file'])) {
+
+        // Remove this as a dependency from anything else.
+
+        $filename_parts = explode('.', $yaml_file['file']->filename);
+
+        if (end($filename_parts) === 'inc') {
+          array_pop($filename_parts);
+        }
+        if (end($filename_parts) === 'yml') {
+          array_pop($filename_parts);
+        }
+
+        $filename = implode('.', $filename_parts);
+
+        foreach ($yaml_files as $dependency_filepath => $dependency_yaml_file) {
+
+          if (
+            (isset($dependency_yaml_file['yaml']['dependencies']['entity'])) &&
+            (is_array($dependency_yaml_file['yaml']['dependencies']['entity']))
+          ) {
+
+            $index = array_search($filename, $dependency_yaml_file['yaml']['dependencies']['entity']);
+
+            if ($index !== FALSE) {
+              array_splice($yaml_files[$dependency_filepath]['yaml']['dependencies']['entity'], $index, 1);
+            }
+
+          }
+
+        }
+
+
+      }
+
+      unset($yaml_files[$filepath]);
+
+    }
+
+    return cinc_yaml_apply_yaml_files($yaml_files);
+
+  }
+  else {
+
+    return;
+
+  }
+
+}
+
+function cinc_yaml_has_no_dependencies($yaml_file) {
+
+  if (
+    (isset($yaml_file['yaml']['dependencies']['entity'])) &&
+    (is_array($yaml_file['yaml']['dependencies']['entity'])) &&
+    (count($yaml_file['yaml']['dependencies']['entity']))
+  ) {
+
+    return FALSE;
+
+  }
+
+  return TRUE;
+
+}
+
+/**
+ * Returns CINC object based on file name (or YAML content).
+ */
+function cinc_yaml_object_from_file_name($file_name, $yaml = FALSE) {
+
+  $regex_to_class = cinc_yaml_regex_to_class();
+  $field_type_to_class = cinc_yaml_field_type_to_class();
+
+  foreach ($regex_to_class as $regex => $class) {
+
+    if (preg_match($regex, $file_name, $matches)) {
+
+      $object = FALSE;
+
+      switch ($class) {
+
+        case 'Field':
+          if ($yaml && isset($field_type_to_class[$yaml['type']])) {
+            $object = CINC::init($field_type_to_class[$yaml['type']]);
+          }
+          break;
+
+        case 'FieldInstance':
+          if ($yaml && isset($yaml['field_name'])) {
+            $field_object = CINC::init('Field')->machine_name($yaml['field_name']);
+            if ($field_object->exists()) {
+              $type = $field_object->read()->get('type');
+              if (isset($field_type_to_class[$type])) {
+                $field_object = CINC::init($field_type_to_class[$type]);
+                $object = $field_object->instance;
+              }
+            }
+          }
+          break;
+
+      }
+
+      if (!$object) {
+        $object = CINC::init($class);
+      }
+
+      if ($object) {
+        $file_name_suffix = str_replace($matches[0], '', $file_name);
+        if (method_exists($object, 'yaml_parse_machine_name')) {
+          $machine_name = $object->yaml_parse_machine_name($file_name_suffix);
+        }
+        else {
+          $file_name_parts = array_values(array_filter(explode('.', $file_name_suffix)));
+          $machine_name = $file_name_parts[0];
+        }
+
+        $object->machine_name($machine_name);
+        return $object;
+      }
+
+    }
+
+  }
+
+  return FALSE;
+
+}
+
+/**
+ * Applies configuration from YAML declarations.
+ */
+function cinc_yaml_apply_yaml_file($yaml, $file) {
+
+  if ($object = cinc_yaml_object_from_file_name($file->name, $yaml)) {
+
+    // Update any properties that need updating.
+
+    $updates = FALSE;
+
+    if ($object->exists()) {
+      $object->read();
+    }
+
+    foreach ($yaml as $property => $value) {
+
+      if ($object->get($property) != $value) {
+        $updates = TRUE;
+        $object->set($property, $value);
+      }
+
+    }
+
+    // Create or update, as needed.
+
+    try {
+
+      if (!$object->exists()) {
+        $object->create();
+      }
+      elseif ($updates) {
+        $object->update();
+      }
+
+      return TRUE;
+
+    }
+    catch (Exception $e) {
+
+      if (PHP_SAPI === 'cli') {
+        echo $file->name . ' failed to load, with error message:' . "\n";
+        echo strip_tags($e->getMessage()) . "\n";
+      }
+
+      return FALSE;
+
+    }
+
+  }
+  else {
+
+    return FALSE;
+
+  }
+
+}
+
+/**
+ * Returns regex to class mapping.
+ */
+function cinc_yaml_regex_to_class() {
+  $cache = cache_get('cinc_yaml:regex_to_class');
+
+  if (!$cache || $cache->expire < REQUEST_TIME) {
+
+    // Refresh cache.
+
+    $regex_to_class = array();
+    $classes = cinc_available_classes();
+
+    foreach ($classes as $class) {
+
+      $object = new $class;
+      $regex = $object->yaml_regex();
+      if ($regex) {
+        $regex_to_class[$regex] = substr($class, 5);
+      }
+
+    }
+
+    cache_set('cinc_yaml:regex_to_class', $regex_to_class);
+
+  }
+  else {
+    $regex_to_class = $cache->data;
+  }
+
+  return $regex_to_class;
+}
+
+/**
+ * Returns field type to class mapping.
+ */
+function cinc_yaml_field_type_to_class() {
+  $cache = cache_get('cinc_yaml:field_type_to_class');
+
+  if (!$cache || $cache->expire < REQUEST_TIME) {
+
+    // Refresh cache.
+
+    $field_type_to_class = array();
+    $classes = cinc_available_classes();
+
+    foreach ($classes as $class) {
+      if (isset($class::$field_types) && is_array($class::$field_types)) {
+        foreach ($class::$field_types as $type) {
+          $field_type_to_class[$type] = substr($class, 5);
+        }
+      }
+    }
+
+    cache_set('cinc_yaml:field_type_to_class', $field_type_to_class);
+
+  }
+  else {
+    $field_type_to_class = $cache->data;
+  }
+
+  return $field_type_to_class;
+}

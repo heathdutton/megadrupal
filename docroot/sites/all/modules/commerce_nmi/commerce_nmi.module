@@ -1,0 +1,305 @@
+<?php
+/**
+ * @file
+ * API functions for the Commerce NMI module.
+ *
+ * @todo Remove composer manage autoloader once it is automatically registered.
+ * 
+ * @link https://drupal.org/node/1955386
+ */
+
+use AllPlayers\NMI\Model\Shipping;
+use AllPlayers\NMI\Model\Order;
+use AllPlayers\NMI\Model\Address;
+use AllPlayers\NMI\Model\Billing;
+use AllPlayers\NMI\Request\Sale;
+
+/**
+ * Response code for successful transactions.
+ */
+const COMMERCE_NMI_RESPONSE_CODE_SUCCESS = 100;
+
+// If the composer manager module exists then register its autloader.
+if (module_exists('composer_manager')) {
+  if (!function_exists('composer_manager_register_autoloader')) {
+    module_load_include('module', 'composer_manager');
+  }
+  
+  composer_manager_register_autoloader();
+}
+
+/**
+ * Implements hook_hook_info().
+ */
+function commerce_nmi_hook_info() {
+  return array(
+    'commerce_nmi_description_alter' => array(
+      'group' => 'commerce',
+    ),
+  );
+}
+
+/**
+ * Encrypts the merchant account password to be stored in the database.
+ *
+ * @param string $password
+ *   The plain text password to be encrypted.
+ *
+ * @return string
+ *   The encrypted password.
+ */
+function commerce_nmi_encrypt_password($password) {
+  return encrypt($password, array(), 'mcrypt_rij_256');
+}
+
+/**
+ * Decrypts the merchant account password so that it can be used to make a
+ * request.
+ *
+ * @param string $password
+ *   The encrypted password to decrypt.
+ *
+ * @return string
+ *   The decrupted password.
+ */
+function commerce_nmi_decrypt_password($password) {
+  return decrypt($password, array(), 'mcrypt_rij_256');
+}
+
+/**
+ * Determines whether or not the AllPlayers\NMI lbrary has been installed.
+ *
+ * @return boolean
+ *   Whether or not the library has been installed.
+ */
+function commerce_nmi_library_installed() {
+  return class_exists('AllPlayers\\NMI\\Client');
+}
+
+/**
+ * Builds a sales request to be used by one of the payment method modules.
+ *
+ * @param array $payment_method
+ *   The payment method that is being used to make the request,
+ * @param array $charge
+ *   The amount and currency code of the transaction.
+ * @param stdClass $order
+ *   The commerce order entity that the transaction is being made against.
+ *
+ * @return \AllPlayers\NMI\Request\Sale
+ *   The sale request.
+ */
+function commerce_nmi_create_sale_request($payment_method, $charge, $order) {
+  $request = new Sale();
+
+  // Build a description for the order.
+  $description = array();
+  $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+  foreach ($order_wrapper->commerce_line_items as $delta => $line_item_wrapper) {
+    if (in_array($line_item_wrapper->type->value(), commerce_product_line_item_types())) {
+      $description[] = round($line_item_wrapper->quantity->value(), 2) . 'x ' . $line_item_wrapper->line_item_label->value();
+    }
+  }
+
+  // Allow other modules to alter the description.
+  drupal_alter('commerce_nmi_description', $description, $order);
+
+  // If the order has a billing profile then add it to the request.
+  if (!empty($order_wrapper->commerce_customer_billing) && !empty($order_wrapper->commerce_customer_billing->commerce_customer_address)) {
+    $billing_address = $order_wrapper->commerce_customer_billing->commerce_customer_address->value();
+
+    if (empty($billing_address['first_name'])) {
+      $name_parts = explode(' ', $billing_address['name_line']);
+      $billing_address['first_name'] = array_shift($name_parts);
+      $billing_address['last_name'] = implode(' ', $name_parts);
+    }
+
+    $address = new Address();
+    $address->street1 = $billing_address['thoroughfare'];
+    $address->street2 = $billing_address['sub_premise'];
+    $address->city = $billing_address['locality'];
+    $address->state = $billing_address['administrative_area'];
+    $address->postalCode = $billing_address['postal_code'];
+    $address->country = $billing_address['country'];
+
+    $billing = new Billing();
+    $billing->firstName = $billing_address['first_name'];
+    $billing->lastName = $billing_address['last_name'];
+    $billing->company = $billing_address['organisation_name'];
+    $billing->setAddress($address);
+    $billing->email = $order->mail;
+
+    $request->setBillingDetails($billing);
+  }
+
+  // If the order has a shipping profile then add it to the request.
+  if (!empty($order_wrapper->commerce_customer_shipping) && !empty($order_wrapper->commerce_customer_shipping->commerce_customer_address)) {
+    $shipping_address = $order_wrapper->commerce_customer_shipping->commerce_customer_address->value();
+
+    if (empty($shipping_address['first_name'])) {
+      $name_parts = explode(' ', $shipping_address['name_line']);
+      $shipping_address['first_name'] = array_shift($name_parts);
+      $shipping_address['last_name'] = implode(' ', $name_parts);
+    }
+
+    $address = new Address();
+    $address->street1 = $shipping_address['thoroughfare'];
+    $address->street2 = $shipping_address['sub_premise'];
+    $address->city = $shipping_address['locality'];
+    $address->state = $shipping_address['administrative_area'];
+    $address->postalCode = $shipping_address['postal_code'];
+    $address->country = $shipping_address['country'];
+
+    $shipping = new Shipping();
+    $shipping->firstName = $shipping_address['first_name'];
+    $shipping->lastName = $shipping_address['last_name'];
+    $shipping->company = $shipping_address['organisation_name'];
+    $shipping->setAddress($address);
+
+    $request->setShippingDetails($shipping);
+  }
+
+  $nmi_order = new Order();
+  $nmi_order->id = $order->order_number;
+  $nmi_order->setDate(new DateTime('@' . $order->created));
+  $nmi_order->description = (is_array($description) ? implode(', ', $description) : $description);
+
+  $request->setOrder($nmi_order);
+  $request->amount = commerce_currency_amount_to_decimal($charge['amount'], $charge['currency_code']);
+  $request->currency = $charge['currency_code'];
+  $request->ipAddress = ip_address();
+  $request->username = $payment_method['settings']['username'];
+  $request->password = commerce_nmi_decrypt_password($payment_method['settings']['password']);
+  $request->processorId = $payment_method['settings']['processor'];
+
+  return $request;
+}
+
+/**
+ * Retrieves the description for an AVS response based on its code.
+ *
+ * @param string $code
+ *   The response code to retrieve the description for.
+ *
+ * @return string
+ *   The response description.
+ */
+function commerce_nmi_avs_response($code) {
+  $response = '-';
+  switch ($code) {
+    case 'A':
+      $response = t('Address match only');
+      break;
+
+    case 'B':
+      $response = t('Street address matches; ZIP not verified');
+      break;
+
+    case 'C':
+      $response = t('Street address and ZIP do not match');
+      break;
+
+    case 'D':
+    case 'M':
+      $response = t('Street address and postal code match');
+      break;
+
+    case 'E':
+      $response = t('Not a mail/phone order');
+      break;
+
+    case 'G':
+      $response = t('Non-U.S. Issuer does not participate');
+      break;
+
+    case 'I':
+      $response = t('Address not verified');
+      break;
+
+    case 'L':
+      $response = t("Card member's name and billing postal code match; billing address does not match");
+      break;
+
+    case 'N':
+      $response = t('No address or ZIP match');
+      break;
+
+    case 'O':
+      $response = t("Card member's name and billing address match;, ZIP does not match");
+      break;
+
+    case 'P':
+      $response = t('ZIP matches; street address not verified');
+      break;
+
+    case 'R':
+      $response = t('Issuer system unavailable');
+      break;
+
+    case 'S':
+      $response = t('Service not supported');
+      break;
+
+    case 'U':
+      $response = t('Address unavailable');
+      break;
+
+    case 'W':
+      $response = t('9-character numeric ZIP match only');
+      break;
+
+    case 'X':
+      $response = t('Exact match; 9-character numeric ZIP');
+      break;
+
+    case 'Y':
+      $response = t('Exact match; 5-character numeric ZIP');
+      break;
+
+    case 'Z':
+      $response = t('5-character Zip match only');
+      break;
+
+    case '0':
+      $response = t('AVS Not Available');
+      break;
+  }
+
+  return $response;
+}
+
+/**
+ * Retrieves the description for a CVV response based on its code.
+ *
+ * @param string $code
+ *   The response code to retrieve the description for.
+ *
+ * @return string
+ *   The response description.
+ */
+function commerce_nmi_cvv_response($code) {
+  $response = '-';
+  switch ($code) {
+    case 'M':
+      $response = t('CVV2/CVC2 Match');
+      break;
+
+    case 'N':
+      $response = t('CVV2/CVC2 No Match');
+      break;
+
+    case 'P':
+      $response = t('Not Processed');
+      break;
+
+    case 'S':
+      $response = t('Merchant has indicated that CVV2/CVC2 is not present on card');
+      break;
+
+    case 'U':
+      $response = t('Issuer is not certified and/or has not provided Visa encryption keys');
+      break;
+  }
+
+  return $response;
+}

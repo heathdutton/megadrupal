@@ -1,0 +1,4 @@
+<?php
+
+?>
+Payment failed.

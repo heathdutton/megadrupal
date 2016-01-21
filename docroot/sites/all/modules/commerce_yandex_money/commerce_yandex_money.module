@@ -1,0 +1,335 @@
+<?php
+
+/**
+ * Implements hook_menu().
+ */
+function commerce_yandex_money_menu() {
+  $items = array();
+
+  $items['commerce/yandex-money/authorization'] = array(
+    'page callback' => 'commerce_yandex_money_authorization',
+    'access arguments' => array('access content'),
+    'type' => MENU_CALLBACK,
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_commerce_payment_method_info().
+ */
+function commerce_yandex_money_commerce_payment_method_info() {
+  return array(
+    'commerce_yandex_money' => array(
+      'title' => t('Yandex.Money'),
+      'description' => t('Yandex.Money payment method'),
+      'terminal' => FALSE,
+      'offsite' => TRUE,
+      'offsite_autoredirect' => TRUE,
+      'active' => TRUE,
+    ),
+  );
+}
+
+/**
+ * Payment method callback: settings form.
+ */
+function commerce_yandex_money_settings_form($settings = NULL) {
+  $settings = (array)$settings + array(
+    'client_id' => '',
+    'purse_number' => '',
+    'information' => '',
+    'commission' => 0,
+    'test_mode' => 0,
+  );
+  $form = array();
+
+  $form['client_id'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Client ID'),
+    '#description' => t('Client id from @site', array('@site' => 'https://sp-money.yandex.ru/myservices/new.xml')),
+    '#default_value' => $settings['client_id'],
+    '#required' => TRUE,
+    '#size' => 77,
+  );
+
+  $form['purse_number'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Purse number'),
+    '#description' => t('Your Yandex.Money purse number.'),
+    '#default_value' => $settings['purse_number'],
+    '#required' => TRUE,
+    '#size' => 15,
+  );
+
+  $form['commission'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Take commission from the customer'),
+    '#description' => t('Check this option if you want to take commission from the customer. Leave uncheck if you want to take commission from the seller.'),
+    '#default_value' => $settings['commission'],
+  );
+
+  $form['test_mode'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Test mode'),
+    '#description' => t('Check this option if you want test this payment method.'),
+    '#default_value' => $settings['test_mode'],
+  );
+
+  $form['information'] = array(
+    '#type' => 'textarea',
+    '#title' => t('Information'),
+    '#description' => t('Information you would like to be shown to users when they select this payment method.'),
+    '#default_value' => $settings['information'],
+  );
+
+  return $form;
+}
+
+/**
+ * Payment method callback: checkout form.
+ */
+function commerce_yandex_money_submit_form($payment_method, $pane_values, $checkout_pane, $order) {
+  $form = array();
+
+  if (!empty($payment_method['settings']['information'])) {
+    $form['commerce_yandex_money_description'] = array(
+      '#markup' => $payment_method['settings']['information']
+    );
+  }
+
+  // http://drupal.org/node/1705862
+  $form['dummy'] = array(
+    '#type' => 'hidden',
+    '#value' => 'dummy'
+  );
+
+  return $form;
+}
+
+/**
+ * Payment method callback: checkout form submission.
+ */
+function commerce_yandex_money_submit_form_submit($payment_method, $pane_form, $pane_values, $order, $charge) {
+  $order->data['commerce_yandex_money'] = $pane_values;
+}
+
+/**
+ * Payment method callback: payment redirect form.
+ */
+function commerce_yandex_money_redirect_form($form, &$form_state, $order, $payment_method) {
+  $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+  $amount = $order_wrapper->commerce_order_total->amount->value();
+  $currency_code = $order_wrapper->commerce_order_total->currency_code->value();
+
+  $form['#action'] = 'https://sp-money.yandex.ru/oauth/authorize';
+
+  $form['client_id'] = array(
+    '#type' => 'hidden',
+    '#value' => $payment_method['settings']['client_id'],
+  );
+
+  $form['response_type'] = array(
+    '#type' => 'hidden',
+    '#value' => 'code',
+  );
+
+  $form['redirect_uri'] = array(
+    '#type' => 'hidden',
+    '#value' => url('commerce/yandex-money/authorization', array(
+      'absolute' => TRUE,
+      'query' => array('order_id' => $order->order_id),
+    )),
+  );
+
+  $form['scope'] = array(
+    '#type' => 'hidden',
+    '#value' => 'payment.to-account("' . $payment_method['settings']['purse_number'] . '").limit(,' . _commerce_yandex_money_convert_amount_to_rubles($amount, $currency_code) . ')',
+  );
+
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Pay via Yandex.Money'),
+  );
+
+  return $form;
+}
+
+/**
+ * Menu callback.
+ */
+function commerce_yandex_money_authorization() {
+  $code              = isset($_GET['code'])              ? $_GET['code']              : '';
+  $error             = isset($_GET['error'])             ? $_GET['error']             : '';
+  $error_description = isset($_GET['error_description']) ? $_GET['error_description'] : '';
+  $order_id          = isset($_GET['order_id'])          ? (int)$_GET['order_id']     : '';
+
+  $order = commerce_order_load($order_id);
+
+  // Error handling
+  if (!$order) {
+    return t('The order does not exist.');
+  }
+  if (!$code) {
+    commerce_yandex_money_error_handler($order, $error, $error_description);
+  }
+
+  $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+  $amount = $order_wrapper->commerce_order_total->amount->value();
+  $currency_code = $order_wrapper->commerce_order_total->currency_code->value();
+  $payment_method = commerce_payment_method_instance_load($order->data['payment_method']);
+
+  // STEP 1: Get token
+  $token_result = commerce_yandex_money_request('https://sp-money.yandex.ru/oauth/token', array(
+    'code' => $code,
+    'client_id' => trim($payment_method['settings']['client_id']),
+    'grant_type' => 'authorization_code',
+    'redirect_uri' => url('commerce/yandex-money/authorization', array('absolute' => TRUE)),
+  ));
+
+  // Error handling
+  if (!$token_result) {
+    commerce_yandex_money_error_handler($order, '', t('Unknown error in attempts to obtain a token.'));
+  }
+  if (isset($token_result->error)) {
+    commerce_yandex_money_error_handler($order, $token_result->error);
+  }
+
+  // STEP 2: Call method request-payment
+  $ammount_type = $payment_method['settings']['commission'] ? 'amount_due' : 'amount';
+  $request_data = array(
+    'pattern_id' => 'p2p',
+    'to' => trim($payment_method['settings']['purse_number']),
+    $ammount_type => _commerce_yandex_money_convert_amount_to_rubles($amount, $currency_code),
+    'comment' => t('Pay for order @order_id', array('@order_id' => $order_id)),
+    'message' => t('Pay for order @order_id', array('@order_id' => $order_id)),
+  );
+  if ($payment_method['settings']['test_mode']) {
+    $request_data += array(
+      'test_payment' => 'true',
+      'test_result' => 'success',
+    );
+  }
+  $request_result = commerce_yandex_money_request('https://money.yandex.ru/api/request-payment', $request_data, $token_result->access_token);
+
+  // Error handling
+  if (!$request_result) {
+    commerce_yandex_money_error_handler($order, '', t('Unknown error in call request-payment.'));
+  }
+  if (isset($request_result->error)) {
+    if ($request_result->error == 'ext_action_required') {
+      $error_message = t('For payment, you must pass the identification. Go to <a href="@url" target="_blank">identification page</a>, submit your data, and try to pay again.', array('@url' => $request_result->ext_action_uri));
+      commerce_yandex_money_error_handler($order, '', $error_message);
+    }
+    else {
+      commerce_yandex_money_error_handler($order, $request_result->error);
+    }
+  }
+  if ($request_result->status != 'success') {
+    commerce_yandex_money_error_handler($order);
+  }
+
+  // STEP 3: Call method process-payment
+  $process_data = array('request_id' => $request_result->request_id);
+  if ($payment_method['settings']['test_mode']) {
+    $process_data += array(
+      'test_payment' => 'true',
+      'test_result' => 'success',
+    );
+  }
+  $process_result = commerce_yandex_money_request('https://money.yandex.ru/api/process-payment', $process_data, $token_result->access_token);
+
+  // Error handling
+  if (!$process_result) {
+    commerce_yandex_money_error_handler($order, '', t('Unknown error in call process-payment.'));
+  }
+  if (isset($process_result->error)) {
+    commerce_yandex_money_error_handler($order, $process_result->error);
+  }
+  if ($process_result->status != 'success') {
+    commerce_yandex_money_error_handler($order);
+  }
+
+  // Create transaction
+  $transaction = commerce_payment_transaction_new('commerce_yandex_money', $order_id);
+  $transaction->instance_id = $order->data['payment_method'];
+  $transaction->amount = $amount;
+  $transaction->currency_code = $currency_code;
+  $transaction->status = COMMERCE_PAYMENT_STATUS_SUCCESS;
+  $transaction->message = t('The payment has completed.');
+  if ($payment_method['settings']['test_mode']) {
+    $transaction->message .= ' (Test mode)';
+  }
+  commerce_payment_transaction_save($transaction);
+
+  // Redirect
+  commerce_payment_redirect_pane_next_page($order);
+  drupal_goto(commerce_checkout_order_uri($order));
+}
+
+/**
+ * Send request to Yandex.Money server.
+ */
+function commerce_yandex_money_request($url, $data, $token = '') {
+  $headers = array('Content-Type' => 'application/x-www-form-urlencoded');
+  if ($token) {
+    $headers['Authorization'] = 'Bearer ' . $token;
+  }  
+
+  $result = drupal_http_request($url, array(
+    'headers' => $headers,
+    'method' => 'POST',
+    'data' => drupal_http_build_query($data),
+  ));
+
+  if ($result->code == 200) {
+    return json_decode($result->data);
+  }
+  else {
+    watchdog('commerce_yandex_money', 'Error request to @url. Dump: <pre>@dump</pre>', array('@url' => $url, '@dump' => print_r($result, TRUE)));
+  }
+
+  return FALSE;
+}
+
+/**
+ * Return error description by error code.
+ */
+function commerce_yandex_money_error_description($error_code = '') {
+  switch ($error_code) {
+    case 'invalid_request':            return t('The request missing required parameters or parameters are incorrect or invalid values.');
+    case 'invalid_scope':              return t('<code>scope</code> is missing or has an invalid value or is logical contradictions.');
+    case 'unauthorized_client':        return t('Invalid <code>client_id</code>, or the application does not have the right to request authorization (such as its <code>client_id</code> locked system "Yandex.Money").');
+    case 'access_denied':              return t('User rejected authorization request.');
+    case 'invalid_grant':              return t('Denie create access_token. Temporary token is not create by the system or has expired, or on the temporary token is create access_token (second request authorization tokens with the same time token).');
+    case 'illegal_params':             return t('The required payment parameters are missing or are not valid value.');
+    case 'illegal_param_label':        return t('Invalid <code>label</code> param.');
+    case 'limit_exceeded':             return t('One of the limits is exceeded.');
+    case 'contract_not_found':         return t('There is no contract with the specified <code>request_id</code> exhibited.');
+    case 'not_enough_funds':           return t('Not enough funds on the account of the payer. You must fund your account and a new payment.'); 
+    case 'money_source_not_available': return t('The requested method of payment (<code>money_source</code>) is not available for this payment.');
+    case 'payment_refused':            return t('Shop for some reason refused to accept payment.');
+    case 'authorization_reject':       return t('The payment authorization refused.');
+    default:                           return t('Unknown error.') . ($error_code ? ' Code: ' . $error_code : '');
+  }
+}
+
+/**
+ * Show error message and redirect to checkout page.
+ */
+function commerce_yandex_money_error_handler($order, $error_code = '', $error_description = '') {
+  $message = ($error_code || !$error_description) ? commerce_yandex_money_error_description($error_code) : $error_description;
+  watchdog('commerce_yandex_money', $message, NULL, WATCHDOG_ERROR);
+  drupal_set_message($message, 'warning');
+  commerce_payment_redirect_pane_previous_page($order);
+  drupal_goto(commerce_checkout_order_uri($order));
+}
+
+/**
+ * Convert commerce amount to russian rubles.
+ */
+function _commerce_yandex_money_convert_amount_to_rubles($amount, $currency_code) {
+  $amount = commerce_currency_convert($amount, $currency_code, 'RUB');
+  $amount = commerce_currency_amount_to_decimal($amount, 'RUB');
+  return $amount;
+}

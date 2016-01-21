@@ -1,0 +1,334 @@
+<?php
+
+/**
+ * @file
+ * Taxonomy Machine Name Module File.
+ */
+
+require_once dirname(__FILE__) . '/taxonomy_machine_name.api.inc';
+require_once dirname(__FILE__) . '/taxonomy_machine_name.views.inc';
+require_once dirname(__FILE__) . '/taxonomy_machine_name.token.inc';
+
+// Only if Migrate is enabled.
+if (module_exists('migrate')) {
+  require_once dirname(__FILE__) . '/taxonomy_machine_name.migrate.inc';
+}
+
+/**
+ * Implements hook_views_api().
+ */
+function taxonomy_machine_name_views_api() {
+  return array(
+    'api' => 3,
+  );
+}
+
+/**
+ * Implements hook_migrate_api().
+ */
+function taxonomy_machine_name_migrate_api() {
+  return array(
+    'api'                  => 2,
+    'destination handlers' => array(
+      'MigrateTaxonomyTermMachineNameHandler',
+    ),
+    'field handlers' => array(
+      'MigrateTaxonomyTermReferenceMachineNameFieldHandler',
+    ),
+  );
+}
+
+/**
+ * Implements hook_entity_property_info_alter().
+ */
+function taxonomy_machine_name_entity_property_info_alter(&$infos) {
+  $infos['taxonomy_term']['properties']['machine_name'] = array(
+    'label'              => t('Machine name'),
+    'type'               => 'text',
+    'required'           => FALSE,
+    'description'        => 'The taxonomy term machine name.',
+    'schema field'       => 'machine_name',
+    'getter callback'    => 'entity_property_verbatim_get',
+    'setter callback'    => 'entity_property_verbatim_set',
+    'entity views field' => TRUE,
+    'entity token'       => TRUE,
+  );
+}
+
+/**
+ * Provides a case-insensitive and trimmed matching.
+ *
+ * @param string     $machine_name
+ *   Machine name of the term to search for.
+ * @param int|object $vocabulary
+ *   Vocabulary machine name to limit the search.
+ *
+ * @return object|bool
+ *   Matching term object or FALSE if not found.
+ */
+function taxonomy_term_machine_name_load($machine_name, $vocabulary) {
+  $conditions = array('machine_name' => trim($machine_name));
+
+  // Support for machine_name form callback.
+  $args = func_get_args();
+  if (isset($args[2]['term']) && is_object($args[2]['term'])) {
+    $vocabulary = $args[2]['term']->vocabulary_machine_name;
+  }
+
+  // Load vocabulary from its machine name.
+  if (is_string($vocabulary)) {
+    $vocabularies = &drupal_static(__FUNCTION__);
+
+    if (NULL === $vocabularies) {
+      $vocabularies = taxonomy_vocabulary_get_names();
+    }
+
+    $vocabulary = $vocabularies[$vocabulary];
+  }
+
+  if (is_object($vocabulary)) {
+    $conditions['vid'] = $vocabulary->vid;
+  }
+  elseif (is_numeric($vocabulary)) {
+    $conditions['vid'] = (int) $vocabulary;
+  }
+  else {
+    return FALSE;
+  }
+
+  $term = taxonomy_term_load_multiple(array(), $conditions);
+
+  return $term ? reset($term) : FALSE;
+}
+
+/**
+ * Implements hook_taxonomy_term_presave().
+ */
+function taxonomy_machine_name_taxonomy_term_presave($term) {
+  // Set default value based on current name term.
+  if (empty($term->machine_name)) {
+    $term->machine_name = taxonomy_machine_name_clean_name($term->name);
+
+    watchdog(
+      'taxonomy',
+      'Add default machine name for term: %name => %machine_name',
+      array(
+        '%name'         => $term->name,
+        '%machine_name' => $term->machine_name,
+      ),
+      WATCHDOG_DEBUG
+    );
+  }
+  else {
+    // Clean by security.
+    $term->machine_name = taxonomy_machine_name_clean_name($term->machine_name);
+  }
+
+  // If the alias already exists, generate a new,
+  // hopefully unique, variant.
+  $original_machine_name = $machine_name = $term->machine_name;
+  taxonomy_machine_name_uniquify($machine_name, $term);
+
+  if ($original_machine_name != $machine_name) {
+    $term->machine_name = $machine_name;
+
+    // Alert the user why this happened.
+    watchdog(
+      'taxonomy',
+      'Duplicate machine name for term: %original_machine_name => %machine_name',
+      array(
+        '%original_machine_name' => $original_machine_name,
+        '%machine_name'          => $term->machine_name,
+      ),
+      WATCHDOG_DEBUG
+    );
+  }
+}
+
+/**
+ * Clean name to generate machine name.
+ *
+ * @param string $name
+ *   Name to clean.
+ * @param bool $force
+ *   Force new machine name.
+ *
+ * @return string
+ *   Cleaned name.
+ */
+function taxonomy_machine_name_clean_name($name, $force = FALSE) {
+  if (!preg_match('/^[a-z0-9\_]+$/i', $name) || $force) {
+    if (module_exists('pathauto')) {
+      // Better sluggify code including transliteration.
+      module_load_include('inc', 'pathauto');
+
+      $machine_name = pathauto_cleanstring(str_replace('_', variable_get('pathauto_separator', '-'), $name));
+      $machine_name = str_replace(variable_get('pathauto_separator', '-'), '_', $machine_name);
+    }
+    elseif (module_exists('token')) {
+      // Avoid duplicate code.
+      module_load_include('module', 'token');
+
+      $machine_name = token_clean_token_name($name);
+      $machine_name = str_replace('-', '_', drupal_strtolower($machine_name));
+    }
+    else {
+      // Final fallback.
+      $machine_name = drupal_strtolower(str_replace('_', '-', $name));
+    }
+
+    // Remove remaining accents.
+    $machine_name = preg_replace('/[^a-z0-9\_]/i', '_', $machine_name);
+    $machine_name = trim($machine_name, '_');
+  }
+  else {
+    $machine_name = trim(drupal_strtolower($name));
+  }
+
+  drupal_alter('taxonomy_machine_name_clean_name', $machine_name, $name, $force);
+
+  return $machine_name;
+}
+
+/**
+ * Check and alter machine name to generate a unique value.
+ *
+ * @param string $machine_name
+ *   Machine name to uniquify.
+ * @param object $term
+ *   Taxonomy term of reference.
+ */
+function taxonomy_machine_name_uniquify(&$machine_name, $term) {
+  if (!taxonomy_machine_name_exists($machine_name, $term)) {
+    return;
+  }
+
+  // If the machine name already exists, generate a new, variant.
+  $maxlength             = _taxonomy_machine_name_get_schema_machine_name_maxlength();
+  $separator             = '_';
+  $original_machine_name = $machine_name;
+
+  $i = 0;
+  do {
+    // Append an incrementing numeric suffix until we find a unique value.
+    $unique_suffix = $separator . $i;
+    $machine_name  = truncate_utf8(
+        $original_machine_name,
+        $maxlength - drupal_strlen($unique_suffix, TRUE)
+      ) . $unique_suffix;
+    $i++;
+  } while (taxonomy_machine_name_exists($machine_name, $term));
+}
+
+/**
+ * Check to see if there is already a machine name used by a different term.
+ *
+ * @param string $machine_name
+ *   A machine name.
+ * @param object $term
+ *   Current term.
+ *
+ * @return bool
+ *   TRUE if an machine name exists, FALSE if not.
+ */
+function taxonomy_machine_name_exists($machine_name, $term) {
+  $pid = db_query_range(
+    "SELECT tid
+     FROM {taxonomy_term_data}
+     WHERE vid = :vid
+       AND machine_name = :machine_name
+       AND tid <> :tid",
+    0,
+    1,
+    array(
+      ':vid'          => $term->vid,
+      ':machine_name' => $machine_name,
+      ':tid'          => isset($term->tid) ? $term->tid : 0,
+    )
+  )->fetchField();
+
+  return !empty($pid);
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function taxonomy_machine_name_form_alter(&$form, &$form_state, $form_id) {
+  if ($form_id == 'taxonomy_overview_terms') {
+    foreach (element_children($form) as $key) {
+      if (isset($form[$key]['#term'])) {
+        $term        = & $form[$key];
+        $term_object = isset($term['tid']['#value']) ? taxonomy_term_load($term['tid']['#value']) : taxonomy_term_load(
+          $term['#term']['tid']
+        );
+
+        // Override name value by adding 'machine_name' property.
+        $term['view']['#title'] = format_string(
+          '@name (@machine_name)',
+          array('@name' => $term_object->name, '@machine_name' => $term_object->machine_name)
+        );
+      }
+    }
+  }
+  elseif ($form_id == 'taxonomy_form_term') {
+    $op = isset($form_state['input']['op']) ? $form_state['input']['op'] : '';
+
+    if ($op != t('Delete')) {
+      $term = $form_state['term'];
+
+      $form['machine_name'] = array(
+        '#type'          => 'machine_name',
+        '#default_value' => '',
+        '#maxlength'     => 255,
+        '#machine_name'  => array(
+          'exists' => 'taxonomy_term_machine_name_load',
+        ),
+        '#weight'        => -4,
+      );
+
+      $form['old_machine_name'] = array(
+        '#type'  => 'value',
+        '#value' => '',
+      );
+
+      $form['#validate'][] = 'taxonomy_machine_name_form_vocabulary_validate';
+
+      if (NULL !== $term->tid) {
+        $form['machine_name']['#default_value']     = $term->machine_name;
+        $form['old_machine_name']['#default_value'] = $term->machine_name;
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_form_validate().
+ */
+function taxonomy_machine_name_form_vocabulary_validate($form, &$form_state) {
+  // During the deletion there is no 'machine_name' key.
+  if (isset($form_state['values']['machine_name'])) {
+    // Do not allow machine names to conflict with taxonomy path arguments.
+    $machine_name = $form_state['values']['machine_name'];
+    $disallowed   = array('add', 'list');
+    if (in_array($machine_name, $disallowed)) {
+      form_set_error('machine_name', t('The machine-readable name cannot be "add" or "list".'));
+    }
+  }
+}
+
+/**
+ * Fetch the maximum length of the machine_name field from the schema.
+ *
+ * @return int
+ *   An integer of the maximum URL alias length allowed by the database.
+ */
+function _taxonomy_machine_name_get_schema_machine_name_maxlength() {
+  $maxlength = & drupal_static(__FUNCTION__);
+
+  if (!isset($maxlength)) {
+    $schema    = drupal_get_schema('taxonomy_term_data');
+    $maxlength = $schema['fields']['machine_name']['length'];
+  }
+
+  return $maxlength;
+}

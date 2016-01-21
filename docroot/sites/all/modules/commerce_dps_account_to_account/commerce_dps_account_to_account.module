@@ -1,0 +1,328 @@
+<?php
+
+/**
+ * @file
+ * Integrates the DPS Account 2 Account gateway with Drupal Commerce.
+ */
+
+define('COMMERCE_DPS_ACCOUNT_TO_ACCOUNT_PXPAY_USERID', 'Sample User');
+define('COMMERCE_DPS_ACCOUNT_TO_ACCOUNT_PXPAY_KEY', 'Sample Key');
+define(
+  'COMMERCE_DPS_ACCOUNT_TO_ACCOUNT_PXPAY_SERVER',
+  'https://sec.paymentexpress.com/pxaccess/pxa2a.aspx'
+);
+define('COMMERCE_DPS_ACCOUNT_TO_ACCOUNT_PXPAY_CURRENCY', 'NZD');
+define('COMMERCE_DPS_ACCOUNT_TO_ACCOUNT_PXPAY_CANCEL_RETURN_URL', 'cart');
+define('COMMERCE_DPS_ACCOUNT_TO_ACCOUNT_PXPAY_REFPREFIX', 'Website Order');
+
+/**
+ * Implements hook_menu().
+ */
+function commerce_dps_account_to_account_menu() {
+  $items['commerce_dps_account_to_account_pxpay/fprn'] = array(
+    'page callback' => 'commerce_dps_account_to_account_process_fprn',
+    'access callback' => TRUE,
+    'type' => MENU_CALLBACK,
+  );
+
+  return $items;
+}
+
+/**
+ * Processes a normal payment or FPRN.
+ */
+function commerce_dps_account_to_account_process_fprn() {
+  module_load_include('inc', 'commerce_dps_account_to_account', 'commerce_dps_account_to_account');
+
+  $order = commerce_order_load(arg(2));
+
+  if (!$order) {
+    return MENU_NOT_FOUND;
+  }
+
+  $payment_method = $order->data['payment_method'];
+  $payment_data = commerce_payment_method_instance_load($payment_method);
+
+  $transaction = array(
+    'server' => COMMERCE_DPS_ACCOUNT_TO_ACCOUNT_PXPAY_SERVER,
+    'PxPayUserId' => $payment_data['settings']['commerce_dps_account_to_account_userid'],
+    'PxPayKey' => $payment_data['settings']['commerce_dps_account_to_account_key'],
+    'log' => $payment_data['settings']['commerce_dps_account_to_account_log_transactions'],
+  );
+
+  // Make sure result is set from DPS.
+  if (isset($_GET['result'])) {
+    $transaction['result'] = $_GET['result'];
+  }
+  else {
+    watchdog('commerce_dps_account_to_account', 'Transaction result data not found.', array(), WATCHDOG_ERROR);
+    if (preg_match('/(\?|\&)result=/', request_uri())) {
+
+      watchdog(
+        'commerce_dps_account_to_account',
+        'Please see !link for how to configure your webserver to accept DPS return requests.',
+        array('!link' => l(t('drupal.org #1799294'), 'https://drupal.org/node/1799294')),
+        WATCHDOG_WARNING
+      );
+
+      drupal_set_message(t('Server configuration prevented DPS transaction completion. Please advise site administrator to check Drupal logs for details.'), 'error');
+      drupal_goto($payment_data['settings']['commerce_dps_account_to_account_cancel_return_url']);
+    }
+    return;
+  }
+
+  $response = commerce_dps_account_to_account_process_response($transaction);
+  commerce_dps_account_to_account_fprn_process($order, $response, $payment_data['settings']);
+}
+
+/**
+ * Payment method callback: process an payment once it's been validated.
+ *
+ * @param object $order
+ *   The order object being processed.
+ * @param array $response
+ *   Response details from DPS.
+ * @param string $settings
+ *   User defined settings.
+ */
+function commerce_dps_account_to_account_fprn_process($order, &$response, $settings) {
+  // Make sure there is a transaction id.
+  if (empty($response['TxnId'])) {
+    return FALSE;
+  }
+
+  $remote_ids = commerce_dps_account_to_account_get_remote_ids($order->order_id);
+
+  // Exit when we don't get a payment status we recognize.
+  if (!isset($response['Success']) OR $response['Success'] == 0) {
+
+    if (!in_array($response['TxnId'], $remote_ids)) {
+      // Write transaction information if payment failed.
+      commerce_dps_account_to_account_order_transaction($order, $response, COMMERCE_PAYMENT_STATUS_FAILURE);
+
+      watchdog('commerce_dps_account_to_account', 'DPS Account 2 Account transaction failed validation. Cart order ID: @cart_order', array('@cart_order' => $order->order_number), WATCHDOG_NOTICE);
+      drupal_set_message(t('The transaction failed validation. Please contact us for assistance. Reference Order Id: @orderid', array('@orderid' => $order->order_number)));
+    }
+
+    drupal_goto($settings['commerce_dps_account_to_account_cancel_return_url']);
+  }
+
+  // Local validation.
+  $merchant_reference = commerce_dps_account_to_account_merchant_reference($order, $settings);
+
+  if ($merchant_reference != $response['MerchantReference']) {
+    watchdog('commerce_dps_account_to_account', 'DPS Account 2 Account details do not match order details! Cart order ID: @cart_order', array('@cart_order' => $order->order_number), WATCHDOG_NOTICE);
+
+    drupal_set_message(
+      t('The details of your DPS Account 2 Account payment do not match your order. Please contact us for assistance. Reference Order Id: @orderid', array('@orderid' => $order->order_number))
+    );
+
+    // Write transaction information if payment details do not match order.
+    commerce_dps_account_to_account_order_transaction($order, $response, COMMERCE_PAYMENT_STATUS_FAILURE);
+    drupal_goto($settings['commerce_dps_account_to_account_cancel_return_url']);
+  }
+
+  // Only add the transaction if we do not have the TxnId stored.
+  if (!in_array($response['TxnId'], $remote_ids)) {
+
+    watchdog('commerce_dps_account_to_account', 'DPS Account 2 Account transaction succeeded. Cart order ID: @cart_order', array('@cart_order' => $order->order_number), WATCHDOG_NOTICE);
+
+    drupal_set_message(t('Transaction succeeded. Reference Order Id: @orderid', array('@orderid' => $order->order_number)));
+
+    // Write transaction information when payment was successful.
+    commerce_dps_account_to_account_order_transaction($order, $response, COMMERCE_PAYMENT_STATUS_SUCCESS);
+    commerce_payment_redirect_pane_next_page($order);
+  }
+
+  drupal_goto('checkout/' . $order->order_number . '/complete');
+}
+
+/**
+ * Implements hook_commerce_payment_method_info().
+ */
+function commerce_dps_account_to_account_commerce_payment_method_info() {
+  return array(
+    'commerce_dps_account_to_account' => array(
+      'title' => t('Commerce Payment Account 2 Account (A2A)'),
+      'short_title' => t('DPS A2A'),
+      'display_title' => t('Bank Transfer (Account 2 Account)'),
+      'description' => t('Provides integration with the DPS Account 2 Account payment gateway.'),
+      'terminal' => FALSE,
+      'offsite' => TRUE,
+      'active' => TRUE,
+    ),
+  );
+}
+
+/**
+ * Implements hook_redirect_form().
+ */
+function commerce_dps_account_to_account_redirect_form($form, &$form_state, $order, $payment_method) {
+  // Return error if DPS payment gateway userid and key unconfigured.
+  if (empty($payment_method['settings']['commerce_dps_account_to_account_userid']) ||
+    empty($payment_method['settings']['commerce_dps_account_to_account_key'])
+  ) {
+    drupal_set_message(t('The DPS payment gateway cannot be used at this time'), 'error');
+    return array();
+  }
+
+  $settings = array(
+    'cancel_return' => url('checkout/' . $order->order_id . '/payment/back/' . $order->data['payment_redirect_key'], array('absolute' => TRUE)),
+    'return' => url('commerce_dps_account_to_account_pxpay/fprn/' . $order->order_id . '/payment/return/' . $order->data['payment_redirect_key'], array('absolute' => TRUE)),
+    'payment_method' => $payment_method['instance_id'],
+  );
+
+  return commerce_dps_account_to_account_order_form($form, $form_state, $order, $payment_method['settings'] + $settings);
+}
+
+/**
+ * Payment method callback: settings form.
+ */
+function commerce_dps_account_to_account_settings_form($settings = NULL) {
+  module_load_include('inc', 'commerce_dps_account_to_account', 'commerce_dps_account_to_account');
+  $form = array();
+
+  $settings = (array) $settings + array(
+    'commerce_dps_account_to_account_userid' => COMMERCE_DPS_ACCOUNT_TO_ACCOUNT_PXPAY_USERID,
+    'commerce_dps_account_to_account_key' => COMMERCE_DPS_ACCOUNT_TO_ACCOUNT_PXPAY_KEY,
+    'commerce_dps_account_to_account_server' => COMMERCE_DPS_ACCOUNT_TO_ACCOUNT_PXPAY_SERVER,
+    'commerce_dps_account_to_account_currency' => COMMERCE_DPS_ACCOUNT_TO_ACCOUNT_PXPAY_CURRENCY,
+    'commerce_dps_account_to_account_cancel_return_url' => COMMERCE_DPS_ACCOUNT_TO_ACCOUNT_PXPAY_CANCEL_RETURN_URL,
+    'commerce_dps_account_to_account_refprefix' => COMMERCE_DPS_ACCOUNT_TO_ACCOUNT_PXPAY_REFPREFIX,
+    'commerce_dps_account_to_account_log_transactions' => 0,
+  );
+
+  $form['commerce_dps_account_to_account_userid'] = array(
+    '#type' => 'textfield',
+    '#title' => t('PxPay User Id'),
+    '#description' => t('PxPay User Id that was issued by Payment Express.'),
+    '#default_value' => $settings['commerce_dps_account_to_account_userid'],
+    '#required' => TRUE,
+  );
+
+  $form['commerce_dps_account_to_account_key'] = array(
+    '#type' => 'textfield',
+    '#title' => t('PxPay key'),
+    '#description' => t('PxPay Key that was issued by Payment Express.'),
+    '#default_value' => $settings['commerce_dps_account_to_account_key'],
+    '#required' => TRUE,
+  );
+
+  $form['commerce_dps_account_to_account_server'] = array(
+    '#type' => 'value',
+    '#title' => t('PxPay server'),
+    '#value' => $settings['commerce_dps_account_to_account_server'],
+  );
+
+  $form['commerce_dps_account_to_account_log_transactions'] = array(
+    '#type' => 'select',
+    '#title' => t('Record transaction information to Drupal logs.'),
+    '#description' => t('Record communication with DPS server to Drupal logs. For development only.'),
+    '#options' => array(
+      0 => ('Disabled (production)'),
+      1 => ('Enabled (development)'),
+    ),
+    '#default_value' => $settings['commerce_dps_account_to_account_log_transactions'],
+    '#required' => TRUE,
+  );
+
+  $form['commerce_dps_account_to_account_currency'] = array(
+    '#type' => 'select',
+    '#title' => t('Currency code'),
+    '#description' => t('Transactions can only be processed in one of the listed currencies.'),
+    '#options' => commerce_dps_account_to_account_currencies(),
+    '#default_value' => $settings['commerce_dps_account_to_account_currency'],
+  );
+
+  $form['commerce_dps_account_to_account_cancel_return_url'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Cancel return URL'),
+    '#description' => t('Specify the path customers who cancel their DPS Account 2 Account payment will be directed to when they return to your site.'),
+    '#default_value' => $settings['commerce_dps_account_to_account_cancel_return_url'],
+    '#size' => 32,
+    '#field_prefix' => url(NULL, array('absolute' => TRUE)) . (variable_get('clean_url', 0) ? '' : '?q='),
+  );
+
+  $form['commerce_dps_account_to_account_refprefix'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Merchant Reference Prefix'),
+    '#description' => t('Added before order number sent to DPS for example Website Order #1234'),
+    '#default_value' => $settings['commerce_dps_account_to_account_refprefix'],
+    '#required' => TRUE,
+  );
+
+  return $form;
+}
+
+/**
+ * Payment method callback: checkout form.
+ */
+function commerce_dps_account_to_account_submit_form($payment_method, $pane_values, $checkout_pane, $order) {
+  $form['commerce_dps_account_to_account_logo'] = array(
+    '#markup' => l(
+      theme('image', array(
+          'path' => drupal_get_path('module', 'commerce_dps_account_to_account') . '/images/account2accountgrey2.png',
+          'alt' => t('DPS - Payment Gateway by Payment Express.'),
+          'title' => t('DPS - Payment Gateway by Payment Express.'),
+          'attributes' => array('style' => 'float: left; margin: 1em 1em 1em 1.5em;'),
+        )),
+      'http://www.paymentexpress.com',
+      array('html' => TRUE, 'attributes' => array('target' => '_blank'))
+    ),
+  );
+
+  return $form;
+}
+
+/**
+ * Called from commerce_dps_account_to_account_redirect_form().
+ */
+function commerce_dps_account_to_account_order_form($form, &$form_state, $order, $settings) {
+  module_load_include('inc', 'commerce_dps_account_to_account', 'commerce_dps_account_to_account');
+
+  $wrapper = entity_metadata_wrapper('commerce_order', $order);
+  $currency_code = $wrapper->commerce_order_total->currency_code->value();
+  $amount = $wrapper->commerce_order_total->amount->value();
+  $amount = commerce_currency_amount_to_decimal($amount, $currency_code);
+
+  $transaction = array(
+    'PxPayUserId' => $settings['commerce_dps_account_to_account_userid'],
+    'server' => $settings['commerce_dps_account_to_account_server'],
+    'PxPayKey' => $settings['commerce_dps_account_to_account_key'],
+    'AmountInput' => $amount,
+    'TxnType' => 'Purchase',
+    'TxnId' => substr(uniqid($order->order_number . '-'), 0, 16),
+    'MerchantReference' => commerce_dps_account_to_account_merchant_reference($order, $settings),
+    'CurrencyInput' => $currency_code,
+    'UrlSuccess' => $settings['return'],
+    'UrlFail' => $settings['return'],
+    'EmailAddress' => $order->mail,
+    'log' => $settings['commerce_dps_account_to_account_log_transactions'],
+  );
+
+  if ($url = commerce_dps_account_to_account_generate_request($transaction)) {
+    drupal_goto($url);
+  }
+  else {
+    watchdog('commerce_dps_account_to_account', 'Unable to generate DPS request with settings: @settings', array('@settings' => print_r($settings, 1)), WATCHDOG_DEBUG);
+  }
+}
+
+/**
+ * Generates a DPS merchant reference.
+ *
+ * @param object $order
+ *   Commerce order.
+ * @param array $settings
+ *   commerce_dps configuration settings.
+ *
+ * @return string
+ *   Transaction data.
+ */
+function commerce_dps_account_to_account_merchant_reference($order, $settings) {
+  $reference = $settings['commerce_dps_account_to_account_refprefix'] . " #" . $order->order_number;
+  // Allow other modules to alter the transaction data before sending it to DPS.
+  drupal_alter('commerce_dps_account_to_account_merchant_reference', $reference, $order, $settings);
+
+  return $reference;
+}

@@ -1,1 +1,0 @@
-This module will add a new component to webform module that allows you to render multiple components inside a table element

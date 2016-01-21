@@ -1,0 +1,230 @@
+<?php
+
+/**
+ * Constants for the status of email system tickets 
+ */
+define('ABOUT_TICKET_ISSUED', 1);
+define('ABOUT_TICKET_TO_EXPIRE', 2);
+define('ABOUT_TICKET_EXPIRED', 3);
+define('ABOUT_TICKET_USED', 4);
+
+/**
+ * implementation of hook_init() 
+ */
+function about_tools_init() {
+  drupal_add_library('system', 'ui.dialog');
+  //drupal_add_js('jQuery(document).ready(function(){jQuery("#dialog").dialog({ modal: true });});', 'inline');
+}
+
+/**
+ * implementation of hook_menu()
+ */
+function about_tools_menu() {
+  $items['about_tools/mailman/new'] = array(
+    'title' => 'Mailman',
+    'page callback' => 'about_tools_mailman_new',
+    'access callback' => true,
+    'type' => MENU_CALLBACK,
+  );
+  $items['about_tools/mailman/send'] = array(
+    'title' => 'Mailman',
+    'page callback' => 'about_tools_mailman_send',
+    'access callback' => true,
+    'type' => MENU_CALLBACK,
+  );
+
+
+  return $items;
+}
+
+
+/**
+ * implementation of hook_about_links() 
+ */
+function about_tools_about_links() {
+  $about_tools_dir = drupal_get_path('module', 'about_tools');
+  $about_email = theme_get_setting('about_tools_email', 'about');
+  
+  $links['email'] = array(
+    'icon' => $about_email ? "$about_tools_dir/images/email_32.png" : null,
+    'path' => '#',
+    'js' => "$about_tools_dir/js/about_tools.js",
+    'js options' => array('type' => 'file', 'scope' => 'footer'),
+    'css' => "$about_tools_dir/css/jquery-ui.custom.css",
+    //'css options' => '',
+    'form elements' => array(
+      '#type' => 'textfield',
+      '#title' => t('Email address'),
+      '#description' => t('The email address to send messages to.  This will not be displayed to visitors, but used interally to send messages that are composed on screen.'),
+      '#default_value' => isset($about_email) ? $about_email : variable_get('site_mail', ''),
+    ),
+  );
+  
+  return $links;
+}
+
+
+/**
+ * ajax backend menu callback for sending mail
+ */
+function about_tools_mailman_new() {
+  $ticket = sha1(rand());
+  $mid = db_insert('about_tools_mail')
+    ->fields(array(
+      'ticket' => $ticket,
+      'status' => ABOUT_TICKET_ISSUED,
+      'message' => '', // no default
+      'req_ip' => $_SERVER['REMOTE_ADDR'],
+      'created' => time(),
+      'changed' => time(),
+    ))
+    ->execute();
+          
+  print json_encode(array(
+    'error' => $mid ? false : true,
+    'ticket' => $ticket,
+  ));
+  exit;
+}
+
+
+function about_tools_mailman_send($ticket) {
+  $to_email = theme_get_setting('about_tools_email', 'about');
+  if (empty($to_email)) {
+    _about_tools_json_error();
+  }
+  
+  $mid = 0; // impossible initial result
+    
+  // check the ticket value
+  $sql = "select mid 
+          from {about_tools_mail} 
+          where ticket = :ticket and status in (:status) and req_ip = :ip";
+  $result = db_query($sql, array(
+    ':ticket' => $ticket,
+    ':status' => array(ABOUT_TICKET_ISSUED, ABOUT_TICKET_TO_EXPIRE),
+    ':ip' => $_SERVER['REMOTE_ADDR'],
+  ));
+  if ($result) {
+    while ($row = $result->fetchAssoc()) {
+      $mid = $row['mid'];
+    }
+  }
+  else {
+    _about_tools_json_error();
+  }
+  
+  $name = check_plain($_POST['n']);
+  $email = check_plain($_POST['e']);
+  $subj = check_plain($_POST['s']);
+  $mssg = check_plain($_POST['m']);
+
+  if (about_tools_mail_send($to_email, $name, $email, $subj, $mssg)) {
+    // record it to the db
+    db_update('about_tools_mail')
+      ->fields(array(
+        'status' => ABOUT_TICKET_USED,
+        'from_email' => $email,
+        'from_name' => $name,
+        'subject' => $subj,
+        'message' => $mssg,
+        'changed' => time(),
+      ))
+      ->condition('mid', $mid, '=')
+      ->execute();
+      
+    print json_encode(array(
+     'error' => $mid ? false : true,
+     'ticket' => $ticket,
+   ));
+   exit;
+  }
+  else {
+    _about_tools_json_error();
+  }
+   
+  exit;
+}
+
+
+/**
+ * implementation of hook_mail()
+ */
+function about_tools_mail($key, &$message, $params) {
+  $options = array(
+    'langcode' => $message['language']->language,
+  );
+
+  switch ($key) {
+    // Send a simple message from the contact form.
+    case 'about_link_email':
+      $message['subject'] = t('[@site]: @subject', array(
+        '@site' => variable_get('site_name', 'Drupal'),
+        '@subject' => $params['subject'],
+       ), $options);
+      $message['body'][] = t('@name <@email> sent you the following message:', array(
+        '@name' => $params['from name'],
+        '@email' => $params['from email'],
+      ), $options);
+      $message['body'][] = check_plain($params['message']);
+      break;
+  }
+}
+
+
+/**
+ * sends an email.
+ */
+function about_tools_mail_send($to_email, $author_name, $author_email, $subject, $message) {
+  $module = 'about_tools';
+  $key = 'about_link_email';
+  $from = variable_get('site_mail', 'admin@example.com');
+  $language = language_default();
+  
+  $params = array(
+    'subject' => $subject,
+    'message' => $message,
+    'from name' => $author_name,
+    'from email' => $author_email,
+  );
+  
+  $result = drupal_mail($module, $key, $to_email, $language, $params, $from);
+  return $result['result'];
+}
+
+
+/**
+ * implemenation of hook_cron() 
+ * 
+ * Stage each issued and unused ticket to be expired on the subsequent cron run
+ * and expire the tickets that were staged during the previous cron run.
+ * 
+ * Tickets that have been used already will be unaffected.
+ */
+function about_tools_cron() {
+  // expire the staged ones
+  db_update('about_tools_mail')
+    ->fields(array(
+      'status' => ABOUT_TICKET_EXPIRED,
+      'changed' => time(),
+    ))
+    ->condition('status', ABOUT_TICKET_TO_EXPIRE, '=')
+    ->execute();
+  
+  // setup a new set of staged tickets for next time
+  db_update('about_tools_mail')
+    ->fields(array(
+      'status' => ABOUT_TICKET_TO_EXPIRE,
+      'changed' => time(),
+    ))
+    ->condition('status', ABOUT_TICKET_ISSUED, '=')
+    ->execute();
+}
+
+/**
+ * print a JSON error and exit. 
+ */
+function _about_tools_json_error() {
+  print json_encode(array('error' => true));
+  exit;
+}

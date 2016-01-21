@@ -1,0 +1,88 @@
+<?php
+
+/**
+ * @file
+ * This file contains the array of Domains listed in configuration page.
+ */
+
+/**
+ * This function builts domain array.
+ */
+function domain_finder_get_domains() {
+  return array(
+    'basic' => array(
+      'title' => t('Basic domains'),
+      'domains' => array(
+        'ae',
+        'aero',
+        'ag',
+        'asia',
+        'at',
+        'au',
+        'be',
+        'biz',
+        'br',
+        'ca',
+        'cat',
+        'ch',
+        'cl',
+        'cn',
+        'co',
+        'com',
+        'coop',
+        'cz',
+        'de',
+        'edu',
+        'es',
+        'eu',
+        'fi',
+        'fj',
+        'fm',
+        'fr',
+        'hu',
+        'ie',
+        'in',
+        'info',
+        'int',
+        'ip',
+        'ip',
+        'ir',
+        'is',
+        'it',
+        'jp',
+        'lt',
+        'lu',
+        'ly',
+        'me',
+        'mobi',
+        'museum',
+        'mx',
+        'name',
+        'net',
+        'nl',
+        'nu',
+        'nz',
+        'org',
+        'org',
+        'pl',
+        'pro',
+        'pt',
+        'ro',
+        'ru',
+        'sc',
+        'se',
+        'si',
+        'su',
+        'tel',
+        'travel',
+        'tv',
+        'uk',
+        'us',
+        've',
+        'ws',
+        'za',
+        'zanet',
+      ),
+    ),
+  );
+}

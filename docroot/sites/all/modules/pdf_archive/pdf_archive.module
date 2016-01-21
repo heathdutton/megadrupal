@@ -1,0 +1,253 @@
+<?php
+/**
+ * @file
+ * Contains core functions for the PDF Archive module.
+ */
+
+/**
+ * Include additional files.
+ */
+foreach (module_list() as $module) {
+  if (file_exists($file = dirname(__FILE__) . "/includes/{$module}.inc")) {
+    require_once $file;
+  }
+}
+
+/**
+ * Implements hook_theme().
+ */
+function pdf_archive_theme() {
+  $items = array();
+
+  $items['pdf_archive'] = array(
+    'template' => 'pdf_archive',
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_preprocess_html().
+ */
+function pdf_archive_preprocess_html(&$vars) {
+  if (isset($vars['pdf_archive']) && $vars['pdf_archive'] == TRUE) {
+    $vars['theme_hook_suggestions'][] = 'pdf_archive';
+  }
+}
+
+/**
+ * Create TCPDF object from provided entity.
+ */
+function pdf_archive_create($entity_type, $entities, $page_top, $page_bottom, $view_mode, $rid) {
+  $age = FIELD_LOAD_CURRENT;
+  $null = NULL;
+
+  // Prepare the entities.
+  // The following to functions have to be involked manually instead of using
+  // field_attach_load() as the Entity object being provided already has some
+  // un-prepared field information and field_attach_load() will append those
+  // same objects to the Entity resulting in duplicate fields.
+  _field_invoke_multiple('load', $entity_type, $entities, $age, $null, array());
+  module_invoke_all('field_attach_load', $entity_type, $entities, $age, array());
+  field_attach_prepare_view($entity_type, $entities, $view_mode);
+  entity_prepare_view($entity_type, $entities);
+
+  // Log temporary user in.
+  global $user;
+  $original_user = $user;
+  $new_user = drupal_anonymous_user();
+  if ($rid != DRUPAL_ANONYMOUS_RID) {
+    $new_user->roles = array();
+    if ($rid != DRUPAL_AUTHENTICATED_RID) {
+      $role = user_role_load(DRUPAL_AUTHENTICATED_RID);
+      $new_user->roles[DRUPAL_AUTHENTICATED_RID] = $role->name;
+    }
+    $role = user_role_load($rid);
+    $new_user->roles[$rid] = $role->name;
+  }
+  module_invoke_all('user_logout', $user);
+  drupal_session_regenerate();
+  $user = $new_user;
+
+  // Render HTML for TCPDF.
+  $page = entity_view($entity_type, $entities, $view_mode);
+  render($page);
+  $page['page_top'] = array('#markup' => $page_top);
+  $page['page_bottom'] = array('#markup' => $page_bottom);
+  $content = theme('html', array(
+    'page' => $page,
+    'pdf_archive' => TRUE,
+  ));
+
+  // Log original user back in.
+  drupal_session_regenerate();
+  $user = $original_user;
+  $edit = array();
+  user_module_invoke('login', $edit, $user);
+
+  // Build TCPDF object.
+  require_once(libraries_get_path('tcpdf') . '/tcpdf.php');
+  $pdf = new TCPDF();
+
+  // Remove default header/footer.
+  $pdf->setPrintHeader(FALSE);
+  $pdf->setPrintFooter(FALSE);
+
+  // Adjust HTML vertical spacing to cleanup excessive spacing on output.
+  // @TODO: Make this configurable?
+  $pdf->setHtmlVSpace(array(
+    'div' => array(
+      array('h' => 0, 'n' => 0), array('h' => 0, 'n' => 0)
+    ),
+    'p' => array(
+      array('h' => 0.1, 'n' => 1), array('h' => 0, 'n' => 0)
+    ),
+  ));
+
+  $pdf->AddPage();
+  $pdf->writeHTML($content);
+  $pdf->Close();
+
+  return $pdf;
+}
+
+/**
+ * Attach TCPDF output PDF to a File field.
+ */
+function pdf_archive_field_attach($entity_type, $entity, $pdf, $field_name, $filename) {
+  if (!isset($entity->{$field_name})) {
+    watchdog('pdf_archive', 'Field %field_name not present on destination entity.', array('%field_name' => $field_name), WATCHDOG_ERROR);
+    return FALSE;
+  }
+
+  global $user;
+
+  // Ensure a valid filepath.
+  pdf_achive_prepare_filename($filename);
+
+  // Save PDF to filesystem as a managed file.
+  $data = pdf_archive_output($pdf, 'S', $filename);
+  $file = file_save_data($data, $filename, FILE_EXISTS_REPLACE);
+  $file->display = TRUE;
+
+  // Attach PDF to entity.
+  $langcode = field_language($entity_type, $entity, $field_name);
+  $entity->{$field_name}[$langcode][0] = (array) $file;
+  field_attach_update($entity_type, $entity);
+}
+
+/**
+ * Output TCPDF object.
+ */
+function pdf_archive_output($pdf, $mode, $filename) {
+  // Ensure a valid filepath when saving to server filesystem.
+  if (strstr($mode, 'F')) {
+    pdf_achive_prepare_filename($filename);
+  }
+
+  $output = $pdf->Output($filename, $mode);
+
+  switch ($mode) {
+    case 'I':
+    case 'D':
+      drupal_exit();
+
+    case 'S':
+      return $output;
+  }
+}
+
+/**
+ * Prepare filename and ensure a valid filepath.
+ */
+function pdf_achive_prepare_filename(&$filename) {
+  if (!file_valid_uri($filename)) {
+    $filename = file_build_uri($filename);
+  }
+  $pathinfo = pathinfo($filename);
+  $directory = str_replace($pathinfo['basename'], '', $filename);
+  if (!file_prepare_directory($directory, FILE_CREATE_DIRECTORY)) {
+    watchdog('pdf_archive', 'Directory %directory could not be created.', array('%directory' => $directory), WATCHDOG_ERROR);
+  }
+}
+
+/**
+ * Entity view modes.
+ */
+function pdf_archive_view_modes($entity_type = NULL) {
+  $view_modes = array('full' => t('Default'));
+
+  // Get Entity Type from RulesAction object if set.
+  if (is_object($entity_type) && isset($entity_type->settings)) {
+    $entity_type = $entity_type->settings['entity_wrapper:select'];
+  }
+
+  // Get all available Entities information.
+  $entities = entity_get_info($entity_type);
+  if (!is_null($entity_type)) {
+    $entities = array($entity_type => $entities);
+  }
+
+  // Build array of View modes based on provided Entities.
+  foreach ($entities as $entity) {
+    if (!empty($entity['view modes'])) {
+      foreach (array_keys($entity['view modes']) as $view_mode) {
+        $view_modes[$entity['label']][$view_mode] = $entity['view modes'][$view_mode]['label'];
+      }
+    }
+  }
+
+  return !is_null($entity_type) ? $view_modes[$entities[$entity_type]['label']] : $view_modes;
+}
+
+/**
+ * User roles.
+ */
+function pdf_archive_user_roles() {
+  return user_roles();
+}
+
+/**
+ * File field field names.
+ */
+function pdf_archive_file_fields($entity_type = NULL) {
+  $file_fields = array();
+
+  // Get Entity Type from RulesAction object if set.
+  if (is_object($entity_type) && isset($entity_type->settings)) {
+    $entity_type = $entity_type->settings['entity_wrapper:select'];
+  }
+
+  $entities = field_info_instances($entity_type);
+  if (!is_null($entity_type)) {
+    $entities = array($entity_type => $entities);
+  }
+
+  foreach ($entities as $bundles) {
+    foreach ($bundles as $fields) {
+      foreach ($fields as $field) {
+        if ('file_generic' == $field['widget']['type']) {
+          $file_fields[$field['field_name']] = t('!label (!field_name)', array(
+            '!label' => $field['label'],
+            '!field_name' => $field['field_name'],
+          ));
+        }
+      }
+    }
+  }
+
+  return $file_fields;
+}
+
+/**
+ * TCPDF output modes.
+ */
+function pdf_archive_output_modes() {
+  return array(
+    'I' => t('Send inline to browser'),
+    'D' => t('Send to browser as file download'),
+    'F' => t('Save to server filesystem'),
+    'FI' => t('Save to server filesystem and then send inline to browser'),
+    'FD' => t('Save to server filesystem and then send to browser as file download'),
+  );
+}

@@ -1,0 +1,290 @@
+<?php
+/**
+ * @file
+ * Implements the Tripletex payment method for Ubercart
+ */
+
+// Options for when invoice or order should be sent.
+define('TRIPLETEX_UC_INVOICE', 0);
+define('TRIPLETEX_UC_INVOICE_ON_UPDATE', 1);
+define('TRIPLETEX_UC_ORDER', 2);
+define('TRIPLETEX_UC_PAID_INVOICE', 3);
+define('TRIPLETEX_UC_NO_INVOICE', 4);
+define('TRIPLETEX_DEFAULT_UC_ORDER_RANGE_START', 3000);
+
+/**
+ * Implements hook_payment_method().
+ */
+function tripletex_uc_payment_method() {
+  $methods = array();
+
+  $methods[] = array(
+    'id'       => 'tripletex',
+    'name'     => t('Invoice'),
+    'title'    => t('Invoice'),
+    'desc'     => t('Send invoice through Tripletex'),
+    'callback' => 'tripletex_uc_payment_method_backend',
+    'weight'   => 1,
+    'bank_transferout' => TRUE,
+    'no_gateway' => TRUE,
+    'checkout' => FALSE,
+  );
+
+  return $methods;
+}
+
+/**
+ * Implements hook_order().
+ */
+function tripletex_uc_order($op, $uc_order, $arg2) {
+  if ($op == 'update') {
+    if ($uc_order->payment_method != 'tripletex' && $arg2 == 'payment_received') {
+      // TODO: We need to map payment types to payment methods. Right now, we use
+      // default payment code for everything, which will mess up the accounting.
+      $payment_type = variable_get('tripletex_default_payment_code', TRIPLETEX_DEFAULT_PAYMENT_CODE);
+      $result = tripletex_uc_create_invoice($order, 'Paid invoice', $payment_type);
+    }
+    elseif ($uc_order->payment_method == 'tripletex') {
+      $order_type = variable_get('tripletex_uc_order_type', TRIPLETEX_UC_INVOICE);
+      $status_trigger = variable_get('tripletex_uc_order_status_trigger', 'invoice_sent');
+      if ($order_type == TRIPLETEX_UC_INVOICE_ON_UPDATE && $arg2 == $status_trigger) {
+        $result = tripletex_uc_create_invoice($uc_order, 'Invoice');
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function tripletex_uc_form_alter(&$form, $form_state, $form_id) {
+  if ($form_id == 'uc_cart_checkout_review_form' && ($order_id = intval($_SESSION['cart_order'])) > 0) {
+      $form['#submit'][] = 'tripletex_uc_process_order';
+  }
+}
+
+/**
+ * Backend for the Tripletex payment method.
+ */
+function tripletex_uc_payment_method_backend($op, &$order) {
+  switch ($op) {
+    case 'cart-details':
+      return '<strong>' . t('Receive invoice by email.') . '</strong>';
+      break;
+    case 'settings':
+      $form['tripletex_uc_order_type'] = array(
+        '#type'          => 'radios',
+        '#title'         => t('When should invoices be sent?'),
+        '#default_value' => variable_get('tripletex_uc_order_type', TRIPLETEX_UC_INVOICE),
+        '#options'       => array(
+          TRIPLETEX_UC_INVOICE => t('Send invoice at checkout'),
+          TRIPLETEX_UC_INVOICE_ON_UPDATE  => t('Send invoice when order status is updated.'),
+          TRIPLETEX_UC_ORDER  => t('Register order only. I will process orders manually in Tripletex'),
+        ),
+       );
+      // Make an array of all order statuses in the order state 'post_checkout'.
+      foreach (uc_order_status_list('post_checkout') as $status) {
+        $statuses[$status['id']] = $status['title'];
+      }
+      // Revove default status from array of order statuses.
+      $default_order_status = uc_order_state_default('post_checkout');
+      unset($statuses[$default_order_status]);
+      $form['tripletex_uc_order_status_trigger'] = array(
+        '#type'          => 'radios',
+        '#title'         => t('Order status which will trigger invoice'),
+        '#description'   => t('This only applies if you chose option 2 above.'),
+        '#default_value' => variable_get('tripletex_uc_order_status_trigger', 'invoice_sent'),
+        '#options'       => $statuses,
+      );
+      $form['tripletex_uc_other_methods'] = array(
+        '#type'          => 'radios',
+        '#title'         => t('Register paid invoices with Tripletex when paid by other payment method?'),
+        '#default_value' => variable_get('tripletex_uc_other_methods', TRIPLETEX_UC_NO_INVOICE),
+        '#options'       => array(
+          TRIPLETEX_UC_PAID_INVOICE => t('Yes, register paid invoice when payment is received.'),
+          TRIPLETEX_UC_NO_INVOICE  => t('No, don\'t register these invoices.'),
+        ),
+      );
+      return $form;
+  }
+}
+
+/**
+ * Process new Ubercart order
+ */
+function tripletex_uc_process_order($form, &$form_state) {
+  $order_id = intval($_SESSION['cart_order']);
+  $uc_order = uc_order_load($order_id);
+  if ($uc_order->payment_method == 'tripletex') {
+    $order_type = variable_get('tripletex_uc_order_type', TRIPLETEX_UC_INVOICE);
+    if ($order_type == TRIPLETEX_UC_INVOICE) {
+     $result = tripletex_uc_create_invoice($uc_order, 'Invoice');
+    }
+    elseif ($order_type == TRIPLETEX_UC_ORDER) {
+      $result = tripletex_uc_create_invoice($uc_order, 'Order');
+    }
+    else {
+      $result = FALSE;
+    }
+    if ($result) {
+      uc_order_update_status($order_id, 'invoice_sent');
+    }
+  }
+}
+
+/**
+ * Create a Tripletex invoice or order from an Ubercart order
+ *
+ * @param object $uc_order
+ *   The Ubercart order object.
+ * @param string $order_type
+ *   Order type can be Order, Invoice or Paid invoice. Defaults to Order.
+ * @param string $payment_type
+ *   If the order is a paid invoice, payment type is mandatory.
+ *
+ * @return bool
+ *   Returnes TRUE if the invoice or order is sent successfully, if not FALSE.
+ */
+function tripletex_uc_create_invoice($uc_order, $order_type = 'Order', $payment_type = '') {
+  $session = tripletex_login();
+  $invoice_params = array();
+  $order_lines = array();
+
+  // TODO: Only the fist order line needs all this information.
+  //$first_order_line = array_shift($uc_order->products);
+  foreach ($uc_order->products as $product) {
+    $params = array(
+      // TODO: Create our own order numbers and synchronize them with Ubercart.
+      // For now we'll use the invoice number as order number.
+      'Order-number' => _tripletex_get_invoice_num(),
+      'Customer-name' => $uc_order->billing_first_name . ' ' . $uc_order->billing_last_name,
+      'Customer-address1' => $uc_order->billing_street1,
+      'Customer-address2' => $uc_order->billing_street2,
+      'Customer-postal-number' => $uc_order->billing_postal_code,
+      'Customer-city' => $uc_order->billing_city,
+      'Customer-email' => $uc_order->primary_email,
+      'Unit-price' => $product->price,
+      'Order-line-description' => $product->title,
+      'Count' => $product->qty,
+      'Currency-code' => $uc_order->currency,  // Issue #1525520 by stenjo: Currency code is not handled when creating an invoice
+    );
+
+    if ($order_type == 'Paid invoice') {
+      $params['Paid-amount'] = $uc_order->order_total;
+      //If the order is a paid invoice, payment type is mandatory.
+      if ($payment_type == '') {
+        $payment_type = variable_get('tripletex_default_payment_code', TRIPLETEX_DEFAULT_PAYMENT_CODE);
+      }
+      $params['Payment-type'] = $payment_type;
+    }
+
+    if ($order_type == 'Order') {
+      $order_line = tripletex_create_order($params);
+    }
+    else {
+      $order_line = tripletex_create_invoice($params);
+    }
+
+    $order_lines[] = implode(';', $order_line) . ";\r\n";
+  }
+
+  $output = implode('', $order_lines);
+  if ($order_type == 'Order') {
+    $result = tripletex_api_request('Project.importOrdersTripletexCSV', $output, $session);
+    //  If no problems sending order, add to internal log and return TRUE.
+    // TODO: We need to track order numbers separately from invoice numbers. Aa a
+    // temporary work-around we'll register an empty invoice in the internal log.
+    if ($result === NULL) {
+    $order_line["Invoice-date"] = $order_line["Order-date"];
+    $order_line["Due-date"] = $order_line["Order-date"];
+    $order_line['Unit-price'] = 0;
+    _tripletex_add_invoice_log($order_line, 0, $uc_order->uid);
+      return TRUE;
+    }
+    else {
+      return FALSE;
+    }
+  }
+  else {
+    $result = tripletex_api_request('Invoice.importInvoicesTripletexCSV', $output, $session);
+    // If no problems sending invoice, add to internal log and return TRUE.
+    if ($result === NULL) {
+      _tripletex_add_invoice_log($order_line, 0, $uc_order->uid, $uc_order->order_total);
+      return TRUE;
+    }
+    else {
+      return FALSE;
+    }
+  }
+}
+
+
+/**
+ * Implements hook_tripletex_invoice_update()
+ * Called when an invoice is updated
+ *
+ * @param int $invoice_id
+ */
+function tripletex_uc_tripletex_invoice_update($invoice_id) {
+
+  $invoice = _tripletex_load_invoice($invoice_id);
+  $order_id = (int) _tripletex_uc_get_order_mapping($invoice_id);
+
+  if ($order_id && is_int($order_id)) {
+    // If there is an Ubercart order with this invoice
+    $uc_order = uc_order_load($order_id);
+    $method = array_shift(tripletex_uc_payment_method());
+
+    // Check if already paid if neccessary?
+    $balance = uc_payment_balance($uc_order);
+
+    if ($invoice->remaining_amount == 0) {
+      // If the order still has a balance - this is now settled
+      if ($balance > 0) {
+        uc_payment_enter($order_id, $method['id'], $balance, $uid = 0, $data = NULL, t('Invoice paid in full via bank.'));
+      }
+    }
+    else {  // Still remaining on this invoice. Check if balance is same
+      if ($invoice->remaining_amount < $balance) {
+        uc_payment_enter($order_id, $method['id'], $balance - $invoice->remaining_amount, $uid = 0, $data = NULL, t('Invoice paid in part via bank.'));
+      }
+    }
+  }
+}
+
+
+/*******************************************************************************************
+ * Helper functions
+*/
+
+
+function _tripletex_uc_get_invoice_mapping($order_id) {
+
+  $result = db_query("SELECT iid FROM {tripletex_uc_invoice} WHERE oid = '" . $order_id . "'");
+  if (!$result) return NULL;
+  return db_result($result);
+}
+
+function _tripletex_uc_get_order_mapping($invoice_id) {
+
+  $result = db_query("SELECT oid FROM {tripletex_uc_invoice} WHERE iid = '" . $invoice_id . "'");
+  if (!$result) return NULL;
+  return db_result($result);
+}
+
+/**
+ * Inserts a Ubercart order id to invoice mapping
+ *
+ * @param array $map
+ *   Set of order (key) to invoice (value) mappings
+ */
+function _tripletex_uc_map_order_invoice($map) {
+
+  $values = array();
+
+  foreach ($map as $key => $value) {
+    $values['oid'] = $key;
+    $values['iid'] = $value;
+    drupal_write_record('tripletex_uc_invoice', $values);
+  }
+}

@@ -1,0 +1,181 @@
+<?php
+/**
+ * @file
+ * Core module to add CPS support to taxonomy term entities.
+ */
+
+/**
+ * Implements hook_entity_info_alter().
+ */
+function cps_taxonomy_entity_info_alter(&$info) {
+  $info['taxonomy_term']['cps'] = TRUE;
+  $info['taxonomy_term']['entity keys']['status'] = 'cps_status';
+  $info['taxonomy_term']['entity status']['published'] = 1;
+  $info['taxonomy_term']['entity status']['unpublished'] = 0;
+
+  // Add the 'cps_status' column to the list of schema fields for the revision
+  // table. For entity types such as taxonomy terms where the revision table is
+  // added in hook_entity_info_alter() (in this case by the taxonomy_revision
+  // module) this must be done manually since entity_get_info() sets the
+  // automatic values before hook_entity_info_alter() is called.
+  $info['taxonomy_term']['schema_fields_sql']['revision table'][] = 'cps_status';
+
+  // Tell cps_field_sql_storage_field_storage_query() which database column is
+  // used to track taxonomy term bundles.
+  $info['taxonomy_term']['entity keys']['bundle_database_column'] = 'vid';
+
+  // Override the Entity API module's access callback for taxonomy terms to use
+  // a custom one that takes CPS into account.
+  $info['taxonomy_term']['access callback'] = 'cps_taxonomy_term_access_callback';
+}
+
+/**
+ * Entity API access callback function for taxonomy terms.
+ */
+function cps_taxonomy_term_access_callback($op, $entity = NULL, $account = NULL, $entity_type) {
+  if (!cps_can_edit_entities($op, 'taxonomy_term', $entity)) {
+    return FALSE;
+  }
+
+  // Use the default Entity API access callback if we aren't blocking access
+  // above.
+  return entity_metadata_taxonomy_access($op, $entity, $account, $entity_type);
+}
+
+/**
+ * Implements hook_menu_alter().
+ */
+function cps_taxonomy_menu_alter(&$items) {
+  $items['taxonomy/term/%taxonomy_term/revisions']['access callback'] = FALSE;
+
+  // The core Taxonomy module does not have a built-in entity access system, so
+  // modify the relevant menu access callbacks here to use the Entity API's
+  // access system. This way the CPS modifications to the entity access
+  // callback for taxonomy terms (see cps_taxonomy_term_access_callback()) take
+  // effect here also.
+  $entity_access_arguments_by_path = array(
+    'taxonomy/term/%taxonomy_term' => array('view', 'taxonomy_term', 2),
+    'taxonomy/term/%taxonomy_term/edit' => array('update', 'taxonomy_term', 2),
+    'admin/structure/taxonomy/%taxonomy_vocabulary_machine_name/add' => array('create', 'taxonomy_term'),
+  );
+  foreach ($entity_access_arguments_by_path as $path => $access_arguments) {
+    $items[$path]['access callback'] = 'entity_access';
+    $items[$path]['access arguments'] = $access_arguments;
+  }
+}
+
+/**
+ *  Implements hook_module_implements_alter().
+ */
+function cps_taxonomy_module_implements_alter(&$implementations, $hook) {
+  // Move several hook implementations last so they correctly override others:
+  // - This module's hook_entity_info_alter() implementation needs to run after
+  //   the Entity module's so it can set a custom entity access callback for
+  //   taxonomy terms.
+  // - This module's hook_field_attach_form() implementation needs to run after
+  //   the Taxonomy Revision module's so it can alter the fields that module
+  //   adds to the form.
+  if (isset($implementations['cps_taxonomy']) && (in_array($hook, array('entity_info_alter', 'field_attach_form')))) {
+    $group = $implementations['cps_taxonomy'];
+    unset($implementations['cps_taxonomy']);
+    $implementations['cps_taxonomy'] = $group;
+  }
+}
+
+/**
+ * Implements hook_field_attach_form().
+ */
+function cps_taxonomy_field_attach_form($entity_type, $entity, &$form, &$form_state, $langcode) {
+  if ($entity_type == 'taxonomy_term' && !empty($entity->tid)) {
+    $form['revision_information']['#access'] = FALSE;
+    if (empty($form_state['input'])) {
+      $warning = cps_changeset_edit_warning($entity_type, $entity);
+      if ($warning) {
+        drupal_set_message($warning, 'warning');
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function cps_taxonomy_form_taxonomy_form_term_alter(&$form, &$form_state) {
+  // Use the entity API access system to ensure that taxonomy terms cannot be
+  // deleted if disallowed by CPS. See cps_taxonomy_term_access_callback().
+  if ($form_state['term']->tid && !entity_access('delete', 'taxonomy_term', $form_state['term'])) {
+    $form['actions']['delete']['#access'] = FALSE;
+  }
+
+  // Deny access to the "Relations" fieldset, since the existence of the
+  // taxonomy overview form means that term parents and weights are not
+  // compatible with CPS; they should therefore not be edited in individual
+  // revisions but rather only be set sitewide on the overview form. See
+  // cps_taxonomy_form_taxonomy_overview_terms_alter().
+  $form['relations']['#access'] = FALSE;
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function cps_taxonomy_form_taxonomy_overview_terms_alter(&$form, &$form_state) {
+  $form['actions']['message'] = array(
+    '#prefix' => '<p><strong>',
+    '#suffix' => '</strong></p>',
+    '#markup' => t('Submitting this form will change the term ordering in <em>all</em> site versions, including on the live site.'),
+    '#weight' => -50,
+  );
+}
+
+/**
+ * Implements hook_views_api().
+ */
+function cps_taxonomy_views_api() {
+  return array(
+    'path' => drupal_get_path('module', 'cps_taxonomy') . '/plugins/views',
+    'api' => 3,
+  );
+}
+
+/**
+ * Implements hook_menu()
+ */
+function cps_taxonomy_menu() {
+  $items = array();
+
+  $items['taxonomy/term/%taxonomy_term/history'] = array(
+    'title' => 'History',
+    'page callback' => 'cps_revisions_page',
+    'page arguments' => array('taxonomy_term', 2),
+    'access callback' => '_taxonomy_revision_access',
+    'access arguments' => array(2, array('view taxonomy term revisions', 'view own taxonomy term revisions')),
+    'weight' => 12,
+    'file' => 'includes/admin.inc',
+    'file path' => drupal_get_path('module', 'cps'),
+    'type' => MENU_LOCAL_TASK,
+  );
+
+  $items['taxonomy/term/%taxonomy_term/history/%cps_changeset_optional/%cps_changeset_optional'] = array(
+    'title' => 'Compare revisions',
+    'page callback' => 'cps_diff_page',
+    'page arguments' => array('taxonomy_term', 2, 4, 5),
+    'access callback' => '_taxonomy_revision_access',
+    'access arguments' => array(2, array('view taxonomy term revisions', 'view own taxonomy term revisions')),
+    'file' => 'includes/admin.inc',
+    'file path' => drupal_get_path('module', 'cps'),
+    'type' => MENU_LOCAL_TASK,
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_admin_paths().
+ */
+function cps_taxonomy_admin_paths() {
+  $paths = array(
+    'taxonomy/term/*/history' => TRUE,
+    'taxonomy/term/*/history/*' => TRUE,
+  );
+  return $paths;
+}

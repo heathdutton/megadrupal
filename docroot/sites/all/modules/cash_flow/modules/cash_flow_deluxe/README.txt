@@ -1,0 +1,3 @@
+This will contain stuff that I use on my own implementations of Cash Flow. Initially, it contains a view called Tasks that shows all content tagged with finance log. I use this to keep track of tasks I have to do each time I update the finances (e.g. add new income, add new expenses) and notes about stuff I did (transferred too much to Savings). I usually just add articles and tag them finance log, but it will work with any content type.
+
+It also contains weekly, monthly, and yearly tags. If you already have these, you can install Term Merge (term_merge) to combine them. You should leave the ones you're already using as the main ones. It's a good idea to make a backup first.

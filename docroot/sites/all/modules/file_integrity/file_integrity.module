@@ -1,0 +1,632 @@
+<?php 
+/**
+ * @file
+ * Checks all files below site root (except uploaded files) for
+ * changes.
+ */
+
+
+/**
+ * Implements hook_help().
+ */
+function file_integrity_help($path, $arg) {
+  if ($path == 'admin/help#file_integrity') {
+    return '<p>' . t('This module monitors file integrity and sends email alerts when files or directories are modified.') . '</p>' .
+      '<p>' . advanced_help_hint_docs('file_integrity', NULL, TRUE) . '</p>';
+  }
+}
+
+/**
+ * Implements hook_cron().
+ */
+function file_integrity_cron() {
+  if (!variable_get('file_integrity_masterswitch', 0)) {
+    return;
+  }
+  if (!variable_get('file_integrity_last', 0)) {
+    return;
+  }
+  $srtban = variable_get('file_integrity_startban', -1);
+  if (-1 != $srtban) {
+    $endban = variable_get('file_integrity_endban', -1);
+    $now = REQUEST_TIME;
+    $startnow = strtotime("$srtban:00:00");
+    if ($srtban < $endban) {
+      $srtstamp = strtotime("$srtban:00:00");
+      $endstamp = strtotime("$endban:00:00");
+    }
+    elseif ($now < $startnow) {
+      $srtstamp = strtotime("$srtban:00:00") - 86400;
+      $endstamp = strtotime("$endban:00:00");
+    }
+    else {
+      $srtstamp = strtotime("$srtban:00:00");
+      $endstamp = strtotime("$endban:00:00") + 86400;
+    }
+    if (($now > $srtstamp) && ($now < $endstamp)) {
+      return;
+    }
+  }
+  $last_fid = variable_get('file_integrity_last_fid', 0);
+  if (0 == $last_fid) {
+    db_truncate('file_integrity_files')->execute();
+    //$files = _file_integrity_scandir(DRUPAL_ROOT . '/sites/all/modules/file_integrity');
+    $files = _file_integrity_scandir(DRUPAL_ROOT);
+    $count = count($files);
+    variable_set('file_integrity_emailsent', FALSE);
+    variable_set('file_integrity_filecount', $count);
+    $last_fid = 1;
+    foreach($files as $file) {
+      db_insert('file_integrity_files')
+      ->fields(array(
+        'path' => $file,
+      ))
+      ->execute();
+    } 
+    db_insert('file_integrity_log')
+    ->fields(array(
+      'msg' => t('Automatic scan started, !count files to check.', array('!count' => $count)),
+      'severity' =>  WATCHDOG_INFO,
+      'timestamp' => REQUEST_TIME,
+    ))
+    ->execute();
+  }
+  $batchsize = variable_get('file_integrity_batchsize', 1000);
+  $limit = $last_fid + $batchsize;
+  $count = variable_get('file_integrity_filecount', 0);
+
+  for ($ii = $last_fid; $ii < $limit; $ii++) {
+    $path = db_query("SELECT path FROM {file_integrity_files} WHERE fid = :fid LIMIT 1", array(':fid' => $ii))->fetchField();
+    list($tainted, $message) = _file_integrity_compare_md5($path, FALSE);
+    // Check $path.
+    if ($ii >= $count) {
+      // We need it to point to next;
+      $ii++;
+      variable_set('file_integrity_last_fid', 0);
+      $last_fid = variable_get('file_integrity_last_fid', 0);
+      break;
+    }
+  }
+  // Do no longer point to next.
+  $ii--;
+  $severity = WATCHDOG_INFO;
+  $checksum = 'Checksum';
+  $msg = t('Automatic check, so far checked !noof files.', array('!noof' => $ii));
+  $foo = variable_get('file_integrity_skipchecksum', FALSE);
+  if (!variable_get('file_integrity_skipchecksum', FALSE)) {
+    $storedcs = variable_get('file_integrity_checksum', 0);
+    $computedcs = _fileintegrity_compute_checksum();
+    $msg = t('Automatic check, so far checked !noof files. !checksum: !computedcs.', array('!noof' => $ii, '!checksum' => $checksum, '!computedcs' => $computedcs));
+    if ($storedcs != $computedcs) {
+      $results['error'][] = 'The file checksums do not match.';
+      $tainted = TRUE;
+      $severity = WATCHDOG_WARNING;
+      $checksum = 'Bad checksum';
+      _file_integrity_send();
+    }
+  }
+  if (($ii != $count) &&  (variable_get('file_integrity_verbose', FALSE) || $tainted)) { 
+    db_insert('file_integrity_log')
+      ->fields(array(
+        'msg' => $msg,
+        'severity' =>  $severity,
+        'timestamp' => REQUEST_TIME,
+      ))
+      ->execute();
+  }
+  variable_set('file_integrity_last_fid', $limit);
+  if ($limit >= $count) {
+    $result = db_query("SELECT path FROM {file_integrity_md5} WHERE cfound = 0");
+    foreach ($result as $record) {
+      $message = t('File: “@file” is missing.', array('@file' => $record->path));
+      $results['error'][] = $message;
+      $fid = db_insert('file_integrity_log')
+      ->fields(array(
+        'msg' => $message,
+        'severity' => WATCHDOG_WARNING,
+        'timestamp' => REQUEST_TIME,
+      ))
+      ->execute();
+      _file_integrity_send();
+    }
+
+    $msg = t('Automatic scan ended, checked !noof files.', array('!noof' => $ii));
+    variable_set('file_integrity_last_fid', 0);
+    if (!variable_get('file_integrity_skipchecksum', FALSE)) {
+      $storedcs = variable_get('file_integrity_checksum', 0);
+      $computedcs = _fileintegrity_compute_checksum();
+      $msg = t('Automatic scan ended, checked !noof files. !checksum: !computedcs.', array('!noof' => $ii, '!checksum' => $checksum, '!computedcs' => $computedcs));
+      if ($storedcs != $computedcs) {
+        $results['error'][] = 'The file checksums do not match.';
+        $tainted = TRUE;
+        $severity = WATCHDOG_WARNING;
+        $checksum = 'Bad checksum';
+        _file_integrity_send();
+      }
+    }
+    db_insert('file_integrity_log')
+    ->fields(array(
+      'msg' => $msg,
+      'severity' =>  $severity,
+      'timestamp' => REQUEST_TIME,
+    ))
+    ->execute();
+  }
+  else {
+     variable_set('file_integrity_last_fid', $limit);
+  }
+}
+
+/**
+ * Implements hook_mail().
+ */
+function file_integrity_mail($key, &$message, $params) {
+  $upl = user_preferred_language(1);
+  $sitename = variable_get('site_name', 'Drupal');
+  $url = url('admin/reports/file_integrity', array('absolute' => TRUE));
+
+  $message['headers']['MIME-Version'] = '1.0';
+  $message['headers']['Content-Type'] = 'text/plain;charset=utf-8';
+  $message['subject'] = t('[!sitename]: security warning', array(
+    '!sitename' => $sitename,
+  ), array('langcode' => $upl->language));
+  $message['body'][] = t('This is a warning about a potential file integrity problem at !sitename.', array(
+    '!sitename' => $sitename,
+  ), array('langcode' => $upl->language));
+  $message['body'][] = t('Please visit !url to inspect the report.', array(
+    '!url' => $url,
+  ), array('langcode' => $upl->language));
+  $message['body'][] = "-- \n" . t('This message is sent automatically by the **File integrity** module.', array(), array('langcode' => $upl->language));
+}
+
+
+/**
+ * Implements hook_menu().
+ */
+function file_integrity_menu() {
+
+  $items = array();
+
+  $items['admin/config/system/file_integrity'] = array(
+    'title' => 'File integrity',
+    'description' => "Create and compare site fingerprint.",
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('file_integrity_admin_settings'),
+    'access arguments' => array('administer site configuration'),
+    'type' => MENU_NORMAL_ITEM,
+  );
+
+  $items['admin/reports/file_integrity'] = array(
+    'title' => 'File integrity',
+    'description' => "Get a file integrity report about the site.",
+    'page callback' => 'file_integrity_overview',
+    'access arguments' => array('access site reports'),
+    //'file' => 'dblog.admin.inc',
+    'file' => 'file_integrity.admin.inc',
+    'type' => MENU_NORMAL_ITEM,
+  );
+
+  return $items;
+}
+
+/**
+ * Menu callback: Create and compare fingerprints.
+ *
+ * @return array
+ *   Form.
+ */
+function file_integrity_admin_settings() {
+  $batchsize = array(
+    0 => t('all'),
+    10 => 10,
+    100 => 100,
+    250 => 250,
+    500 => 500,
+    1000 => 1000,
+    2500 => 2500,
+    5000 => 5000,
+    10000 => 10000,
+  );
+
+  $hours = array(
+   -1 => t('always'),
+    0 => 0,
+    4 => 4,
+    8 => 8,
+    10 => 10,
+    12 => 12,
+    14 => 14,
+    16 => 16,
+    18 => 18,
+    22 => 22,
+  );
+
+  $form = array();
+  $form['fi_settings'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Settings for file integrity'),
+    '#collapsible' => TRUE,
+    '#collapsed' => TRUE,
+  );
+
+  $form['fi_settings']['file_integrity_masterswitch'] = array(
+    '#type' => 'radios',
+    '#title' => t('Check file integrity during cron runs:'),
+    '#default_value' => variable_get('file_integrity_masterswitch', 0), 
+    '#options' => array(t('Disabled'), t('Enabled')),
+    '#description' => t('This is the master switch for this function. If this is not Enabled, none of the settings below has any effect'),
+  );
+
+  $form['fi_settings']['file_integrity_batchsize'] = array(
+    '#type' => 'select',
+    '#title' => t('How many files to check per cron run?'),
+    '#default_value' => variable_get('file_integrity_batchsize', 1000),
+    '#options' => $batchsize,
+    '#description' => t('Throttle the file fingerprint check.  Checking requires some heavy pocessing.  Selecting “all” may make your site appear sluggish during cron runs.'),
+  );
+  $form['fi_settings']['file_integrity_startban'] = array(
+    '#type' => 'select',
+    '#title' => t('Do not check after this hour:'),
+    '#default_value' => variable_get('file_integrity_startban', array(-1)),
+    '#options' => $hours,
+    '#description' => t('You may suspend fingerprint check at a certain hour of the day (24 hour clock). You may want to do this during peak hours. Setting this to “always” will never suspend.'),
+  );
+  $form['fi_settings']['file_integrity_endban'] = array(
+    '#type' => 'select',
+    '#title' => t('Check again after this hour:'),
+    '#default_value' => variable_get('file_integrity_endban', array(-1)),
+    '#options' => $hours,
+    '#description' => t('Hour to end suspension.  If this is less than the the start hour, next day is assumed.'),
+  );
+  $form['fi_settings']['file_integrity_skipchecksum'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Skip checksum check at each cron run (will make cron run faster, but may delay detection)'),
+    '#return_value' => 1,
+    '#default_value' => variable_get('file_integrity_skipchecksum', FALSE),
+  );
+  $form['fi_settings']['file_integrity_verbose'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Log progress at the end of each cron run.'),
+    '#return_value' => 1,
+    '#default_value' => variable_get('file_integrity_verbose', FALSE),
+  );
+
+  $admin = user_load(1);
+  $form['fi_settings']['file_integrity_email'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Notifiy site administrator (!email) by email about potential problems.', array('!email' => $admin->mail)),
+    '#return_value' => 1,
+    '#default_value' => variable_get('file_integrity_email', 1),
+  );
+
+  $form['fi_settings']['createmd5_submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Save settings'),
+    '#submit' => array('file_integrity_settings_submit'),
+  );
+  $last = variable_get('file_integrity_last', 0);
+  $storedcs = variable_get('file_integrity_checksum', 0);
+  if ($last) {
+    $datetime = format_date($last, 'short');
+    $datestring = t('The “fingerprint” was generated !datetime.<br/>Stored checksum: !checksum.', array('!datetime' => $datetime, '!checksum' => $storedcs));
+  }
+  else {
+    $datestring = t('No valid “fingerprint” exists.');
+  }
+  $markup = '<p><strong>' . $datestring . '</strong></p>' .
+    '<p>' .
+    t('Press <em>Create and save site fingerprint</em> to create a MD5 “fingerprint” of the site for later comparison.');
+  if ($last) {
+    $markup .= '<br/>' .
+      t('Press <em>Compare current site with saved fingerprint</em> to compare the current site with the saved fingerprint.');
+  }
+  $markup .= '</p>';
+  $form['file_integrity_usersec'] = array(
+    '#markup' => $markup,
+  );
+
+  $form['createmd5_submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Create and save site fingerprint'),
+    '#submit' => array('file_integrity_createmd5_submit'),
+  );
+  $disabled = $last ? FALSE : TRUE;
+  $form['compare_submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Compare current site with saved fingerprint'),
+    '#submit' => array('file_integrity_compare_submit'),
+    '#disabled' => $disabled,
+  );
+  return $form;
+}
+
+
+/**
+ * Submit for module settings.
+ */
+function file_integrity_settings_submit($form, &$form_state) {
+  variable_set('file_integrity_masterswitch', $form_state['values']['file_integrity_masterswitch']);
+  variable_set('file_integrity_batchsize', $form_state['values']['file_integrity_batchsize']);
+  variable_set('file_integrity_skipchecksum', $form_state['values']['file_integrity_skipchecksum']);
+  variable_set('file_integrity_verbose', $form_state['values']['file_integrity_verbose']);
+  variable_set('file_integrity_email', $form_state['values']['file_integrity_email']);
+  $srt = $form_state['values']['file_integrity_startban'];
+  $end = $form_state['values']['file_integrity_endban'];
+  if ((-1 == $srt) || (-1 == $end)) {
+    $srt = $end = -1;
+  }
+  variable_set('file_integrity_startban', $srt);
+  variable_set('file_integrity_endban', $end);
+  drupal_set_message(t('File integrity settings saved.'));
+}
+
+/**
+ * Submit for create MD5 fingerprint.
+  $maxpath = ($len > $maxpath) ? $len : $maxpath;
+ */
+function file_integrity_createmd5_submit($form, &$form_state) {
+  $datetime = format_date(REQUEST_TIME, 'custom', 'H:i:s');
+  drupal_set_message(t('!datetime: Starting fingerprinting.', array('!datetime' => $datetime)), 'status');
+  variable_set('file_integrity_last', 0);
+  $query = db_truncate('file_integrity_md5')->execute();
+  //$files = _file_integrity_scandir(DRUPAL_ROOT . '/sites/all/modules/file_integrity');
+  $files = _file_integrity_scandir(DRUPAL_ROOT);
+
+  $maxpath = variable_get('file_integrity_maxpath', 255);
+  $maxlength = 0;
+  $tainted = FALSE;
+  foreach($files as $file) {
+    $len = strlen($file);
+    if ($len > $maxlength) {
+      $maxlength = $len;
+      $maxstring = $file;
+    }
+    if ($len > $maxpath) {
+      $tainted = TRUE;
+    }
+    else {
+    // $operations[] = array(<function name>, <array of arguments to pass to function>);
+      $operations[] = array('file_integrity_create_md5', array($file));
+    }
+  }
+  if ($tainted) {
+    drupal_set_message(t('Path exceeds maximum field size (!maxpath characters). Longest path was !maxlength characters (@maxstring). See README.md to learn how to increase this field length.',
+       array('!maxpath' => $maxpath, '!maxlength' => $maxlength, '@maxstring' => $maxstring)), 'error');
+  }
+  else {
+    // build the batch instructions
+    $batch = array(
+      'operations' => $operations,
+      'finished' => 'file_integrity_create_md5_finished',
+      'title' => t('Create MD5 fingerprints'),
+      'init_message' => t('Fingerprinting is starting...'),
+      'progress_message' => t('Processed @current out of @total files.'),
+      'error_message' => t('Fingerprinting has encountered an error.'),
+      'file' => drupal_get_path('module', 'file_integrity') . '/file_integrity.batch.inc',
+    );
+    batch_set($batch);
+    $checksum = _fileintegrity_compute_checksum();
+    variable_set('file_integrity_checksum', $checksum);
+    drupal_set_message(t('Longest path: !maxlength characters.', array('!maxlength' => $maxlength)));
+  }
+}
+
+/**
+ * Submit for compare MD5 fingerprint.
+ */
+function file_integrity_compare_submit($form, &$form_state) {
+  $datetime = format_date(REQUEST_TIME, 'custom', 'H:i:s');
+  drupal_set_message(t('!datetime: Starting comparing.', array('!datetime' => $datetime)), 'status');
+  variable_set('file_integrity_startedfp', REQUEST_TIME);
+  $startedfp = variable_get('file_integrity_startedfp', 0);
+  $num_updated = db_update('file_integrity_md5')
+    ->fields(array(
+      'bfound' => 0,
+    ))
+    ->execute();
+  //$files = _file_integrity_scandir(DRUPAL_ROOT . '/sites/all/modules/file_integrity');
+  $files = _file_integrity_scandir(DRUPAL_ROOT);
+  $count = count($files);
+  db_insert('file_integrity_log')
+  ->fields(array(
+    'msg' => t('Manual scan started, !count files to check.', array('!count' => $count)),
+    'severity' =>  WATCHDOG_INFO,
+    'timestamp' => REQUEST_TIME,
+  ))
+  ->execute();
+  foreach($files as $file) {
+    // $operations[] = array(<function name>, <array of arguments to pass to function>);
+    $operations[] = array('file_integrity_compare_md5', array($file));
+  }
+  // build the batch instructions
+  $batch = array(
+    'operations' => $operations,
+    'finished' => 'file_integrity_compare_md5_finished',
+    'title' => t('Compare MD5 fingerprints'),
+    'init_message' => t('Comparing fingerprints is starting...'),
+    'progress_message' => t('Processed @current out of @total files.'),
+    'error_message' => t('Fingerprint comparison has encountered an error.'),
+    'file' => drupal_get_path('module', 'file_integrity') . '/file_integrity.batch.inc',
+  );
+  batch_set($batch);
+}
+
+/**
+ * Helper function to compute checksum of all file content.
+ * May time out on a large site.
+ */
+function _fileintegrity_compute_checksum() {
+  $accnum = 1;
+  $modulo = PHP_INT_MAX >> 5;
+  //$files = _file_integrity_scandir(DRUPAL_ROOT . '/sites/all/modules');
+  $files = _file_integrity_scandir(DRUPAL_ROOT);
+  foreach($files as $file) {
+    $updated = filemtime($file);
+    if (is_readable ($file)) {
+      $crc32 = crc32(md5_file($file));
+      $accnum = ($accnum % $modulo) * 31 + $crc32;
+    }
+  }
+  return $accnum;
+}
+
+/**
+ * Helper function to compare MD5 fingerprint for a single file.
+ *
+ * @return array
+ *   An array with the boolean $tainted and the string $message.
+ */
+function _file_integrity_compare_md5($file, $batchp = FALSE) {
+  $tainted = FALSE;
+  $message = '';
+  
+  if (is_readable ($file)) {
+    $len = strlen($file);
+    if ($len <= 255) {
+      $updnow = filemtime($file);
+      $updated = db_query("SELECT updated FROM {file_integrity_md5} WHERE path = :path LIMIT 1", array(':path' => $file))->fetchField();
+      if ($updnow != $updated) {
+        $md5 = md5_file($file);
+        $md5hash = db_query("SELECT md5hash FROM {file_integrity_md5} WHERE path = :path LIMIT 1", array(':path' => $file))->fetchField();
+        if (FALSE === $md5hash) {
+          $message = t('File: “@file” may be a back-door.', array('@file' => $file));
+          $tainted = TRUE;
+        }
+        elseif (strcmp($md5hash, $md5)) {
+          $message = t('File: “@file” is modified.', array('@file' => $file));
+          $tainted = TRUE;
+        }
+      }
+    }
+    else {
+      $message = t('Unable to check file: “@file” (path !length characters ).', array('@file' => $file, '!length' => $len));
+      $tainted = TRUE;
+    }
+  }
+  else {
+    $message = t('File: “@file” is not readable by the web server.', array('@file' => $file));
+    $tainted = TRUE;
+  }
+  if (!$tainted && is_writable($file)) {
+    $message = t('File: “@file” is writeable by the web server.', array('@file' => $file));
+    $tainted = TRUE;
+  }
+  if ($batchp) {
+    $num_updated = db_update('file_integrity_md5')
+      ->fields(array(
+        'bfound' => 1,
+      ))
+      ->condition('path', $file)
+      ->execute();
+  }
+  else {
+    $num_updated = db_update('file_integrity_md5')
+      ->fields(array(
+        'cfound' => 1,
+      ))
+      ->condition('path', $file)
+      ->execute();
+  }
+  if ($tainted) {
+    $fid = db_insert('file_integrity_log')
+    ->fields(array(
+      'msg' => $message,
+      'severity' =>  WATCHDOG_WARNING,
+      'timestamp' => REQUEST_TIME,
+    ))
+    ->execute();
+    _file_integrity_send();
+  }
+  return array($tainted, $message);
+}
+
+/**
+ * Helper function to get path and length of public file directory.
+ *
+ * @return array
+ *   $publicpath, $publicpath_length);
+ */
+function _file_integrity_public () {
+  static $publicpath;
+  static $publicpath_length;
+  static $drupalroot_length;
+
+  if (!isset($publicpath)) {
+    if ($wrapper = file_stream_wrapper_get_instance_by_uri('public://')) {
+      $publicpath = $wrapper->realpath();
+      $publicpath_length = strlen($publicpath);
+      $drupalroot_length = strlen(DRUPAL_ROOT);
+    }
+    else {
+      drupal_set_message(t('Unable to determine real path to <code>public://</code>.'), 'error');
+      $publicpath = '';
+      // Setting it to 0 stops _file_integrity_scandir recursing.
+      // Set it to some large value to recurse into site.
+      $publicpath_length = 0;
+    }
+  }
+  return array($publicpath, $publicpath_length, $drupalroot_length);
+}
+
+/**
+ * Helper function to recursively scan directory below Drupal root.
+ */
+function _file_integrity_scandir($dir) {
+  list($publicpath, $publicpath_length, $drupalroot_length) = _file_integrity_public ();
+  //return;
+  $files = array();
+  // do not check symlinks
+  if (is_link($dir)) {
+    return $files;
+  }
+  // do not check uploaded files.
+  if (0 == strncmp($dir, $publicpath, $publicpath_length)) {
+    return $files;
+  }
+  $tail = substr($dir, $drupalroot_length);
+  $tokens = explode('/', $tail);
+  // do not recurse into multisite uploaded files
+  if (isset($tokens[3])) {
+    if (('sites' == $tokens[1]) && ('files' == $tokens[3])) {
+      return $files;
+    }
+  }
+  // Use 0 instead of SCANDIR_SORT_NONE to make it work for PHP prior to 5.4.0.
+  if (!is_readable($dir)) {
+    drupal_set_message(t('Directory/file: “@dir” is not readable by the web server.', array('@dir' => $dir)), 'warning');
+    return NULL;
+  }
+  $root = scandir($dir, 0);
+  foreach ($root as $entry) {
+    if($entry === '.' || $entry === '..') {
+      continue;
+    }
+    $path = $dir.'/'.$entry;
+    if (is_file($path))  {
+      $files[] = $path;
+      continue;
+    }
+
+    if ($scannedfiles =_file_integrity_scandir($path)) {
+      foreach ($scannedfiles as $entry) {
+        $files[] = $entry;
+      }
+    }
+  }
+  return $files;
+}
+
+/**
+ * Helper function to send the email to admin
+ */
+function _file_integrity_send() {
+  if ((variable_get('file_integrity_email', FALSE)) && (FALSE == variable_get('file_integrity_emailsent', FALSE))) {
+    $admin = user_load(1);
+    if (!drupal_mail('file_integrity', 'send', $admin->mail, user_preferred_language(1))) {
+      watchdog('file_integrity', 'Sending mail to site administrator (@mail) failed.', array('@mail' => $admin->mail), WATCHDOG_ERROR);
+    }
+    else {
+      variable_set('file_integrity_emailsent', TRUE);
+    }
+  }
+}

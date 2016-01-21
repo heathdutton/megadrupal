@@ -1,0 +1,1 @@
+Remove this folder when task https://www.drupal.org/node/2346073 is complete

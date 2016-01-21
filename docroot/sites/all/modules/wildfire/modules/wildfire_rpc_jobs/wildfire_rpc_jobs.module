@@ -1,0 +1,298 @@
+<?php
+/**
+ * @file
+ *  wildfire_rpc_jobs.module
+ *
+ * Manages Wildfire RPC Jobs
+ *
+ * @author Craig Jones <craig@tiger-fish.com>
+ */
+
+/**
+ * It's possible in the future that the client will ship separately to the
+ * server. If the server is upgraded to a point where it no longer supports
+ * old clients, it will return 'API version not supported' as an RPC error code.
+ * Therefore, all requests are versioned, so that any attempt for an old client
+ * to talk to a new server will be handled correctly.
+ */
+define('WILDFIRE_RPC_API_VERSION', 0x0001);
+
+/**
+ * Define the relevant error codes that the XML-RPC API may return
+ */
+define('WILDFIRE_RPC_ERROR_UNKNOWN', -1);
+define('WILDFIRE_RPC_ERROR_BAD_REQUEST', 100);
+define('WILDFIRE_RPC_ERROR_BAD_JOBS_LIST', 101);
+define('WILDFIRE_RPC_ERROR_UNKNOWN_METHOD', 102);
+define('WILDFIRE_RPC_ERROR_INSUFFICIENT_QUOTA', 200);
+define('WILDFIRE_RPC_ERROR_JOB_NOT_READY', 201);
+define('WILDFIRE_RPC_ERROR_JOB_UID_INVALID', 202);
+define('WILDFIRE_RPC_ERROR_JOB_STATUS_DISALLOWS_OPERATION', 203);
+
+/**
+ * Implements hook_permission().
+ */
+function wildfire_rpc_jobs_permission() {
+  return array(
+    'use wildfire rpc jobs status refresh' => array(
+      'title' => t('use wildfire rpc jobs status refresh'),
+      'description' => t('Allows a user to manually refresh a jobs status from the server'),
+    ),
+    'use wildfire rpc jobs retry' => array(
+      'title' => t('use wildfire rpc jobs retry'),
+      'description' => t('Allows a user to retry a job with the server'),
+    ),
+  );
+}
+
+/**
+ * Implements hook_cron().
+ */
+function wildfire_rpc_jobs_cron() {
+
+  /**
+   * Check on Job statuses
+   */
+  wildfire_rpc_jobs_cron_get_status();
+
+}
+
+/**
+ * Obtains the Jobs statuses from the remote server. Usually called during a
+ * Cron run.
+ */
+function wildfire_rpc_jobs_cron_get_status() {
+
+  /**
+   * On cron, check all of the currently pending and in progress jobs,
+   * and obtain their status from remote, updating the local copy to
+   * reflect the new status
+   *
+   * This is also one of the few place where handling the 'wildfire_jobs'
+   * table escapes the WildfireClientJobs class
+   */
+
+  // Define statuses for jobs that are in a running state, plus any paused jobs
+  // in case they are coming out of the paused state.
+  $running_statuses = array(
+    WILDFIRE_JOB_PENDING,
+    WILDFIRE_JOB_PREPARING,
+    WILDFIRE_JOB_PREPARED,
+    WILDFIRE_JOB_PROCESSING,
+    WILDFIRE_JOB_PAUSED,
+  );
+
+  // Initialize
+  $jids_to_check = array();
+
+  // Obtain a list of the jobs the server has for this system
+  $job = new WildfireClientJobRpc();
+  $server_jobs = $job->sendRequest(
+    'wildfire.jobs.list',
+    array(
+      'status' => $running_statuses,
+    )
+  );
+  unset($job);
+
+  if (!empty($server_jobs)) {
+    // Obtain a local job list based upon the jobs that the server returned
+    $query = db_select('wildfire_jobs', 'wj')
+      ->fields('wj');
+    $query->condition('juid', $server_jobs, 'IN');
+    $result = $query->execute();
+
+    // Add these jobs to the list of jobs to check
+    while ($row = $result->fetchAssoc()) {
+      $jids_to_check[] = $row['jid'];
+    }
+  }
+
+  // Obtain a local job list based upon running statuses
+  $query = db_select('wildfire_jobs', 'wj')
+    ->fields('wj');
+  $query->condition('status', $running_statuses, 'IN');
+  $result = $query->execute();
+
+  // Add these to the list of jobs to check
+  while ($row = $result->fetchAssoc()) {
+    $jids_to_check[] = $row['jid'];
+  }
+
+  // De-dupe the list
+  $jids_to_check = array_unique($jids_to_check);
+
+  /**
+   * Now that we have a list of all the jobs that either the server or client
+   * thinks are running, update them all accordingly.
+   */
+  foreach ($jids_to_check as $jid) {
+
+    $job = new WildfireClientJobRpc($jid);
+    if (!empty($job->juid)) {
+      $job->getStatus();
+    }
+    else {
+      // Job is is a running status without a JUID
+      // TODO: Do something with this state.
+    }
+
+  }
+
+}
+
+/**
+ * Implements hook_menu().
+ */
+function wildfire_rpc_jobs_menu() {
+  $items = array();
+
+  $items['admin/wildfire/jobs/%/status-refresh'] = array(
+    'title' => 'Refresh job status',
+    'description' => 'Manually refresh a jobs status from the server',
+    'access arguments' => array('use wildfire rpc jobs status refresh'),
+    'page callback' => 'wildfire_rpc_jobs_manual_refresh',
+    'page arguments' => array(3),
+    'type' => MENU_CALLBACK,
+  );
+  $items['admin/wildfire/jobs/%/retry'] = array(
+    'title' => 'Retry a job',
+    'description' => 'Manually retry a job at the server',
+    'access arguments' => array('use wildfire rpc jobs retry'),
+    'page callback' => 'wildfire_rpc_jobs_request_retry',
+    'page arguments' => array(3),
+    'type' => MENU_CALLBACK,
+  );
+
+  return $items;
+}
+
+/**
+ * Manually refresh the status of a job from the server
+ *
+ * The user must have the 'use wildfire jobs status refresh' permission to use
+ * this callback.
+ *
+ * @param int $jid
+ *  The job ID to refresh.
+ */
+function wildfire_rpc_jobs_manual_refresh($jid) {
+
+  $job = new WildfireClientJobRpc($jid);
+  if (($job->juid)) {
+
+    try {
+      $job->getStatus();
+
+      drupal_set_message(
+        t(
+          'Refreshed status for Job #!jid',
+          array(
+            '!jid' => $jid
+          )
+        ),
+        'status'
+      );
+    }
+    catch (Exception $e) {
+      /**
+       * Exception will already have been logged by whatever threw it, just
+       * tell the end user what went wrong
+       */
+      drupal_set_message(
+        t(
+          'Cannot obtain status for Job #!jid (!message)',
+          array(
+            '!jid' => $jid,
+            '!message' => $e->getMessage()
+          )
+        ),
+        'error'
+      );
+    }
+  }
+  else {
+    drupal_set_message(
+      t(
+        'Cannot obtain status for Job #!jid as it does not have a valid JUID',
+        array(
+          '!jid' => $jid
+        )
+      ),
+      'error'
+    );
+  }
+
+  // Redirect back to the job list page after refresh.
+  drupal_goto('admin/wildfire/jobs');
+
+}
+
+/**
+ * Manually retry a job at the server
+ *
+ * The user must have the 'use wildfire rpc jobs retry' permission to use
+ * this callback.
+ *
+ * @param int $jid
+ *  The job ID to refresh.
+ */
+function wildfire_rpc_jobs_request_retry($jid) {
+
+  $job = new WildfireClientJobRpc($jid);
+    if (($job->juid)) {
+
+      try {
+        $retried = $job->retryJob();
+
+        if ($retried) {
+
+          drupal_set_message(
+            t(
+              'Requested a retry for Job #!jid',
+              array(
+                '!jid' => $jid
+              )
+            ),
+            'status'
+          );
+
+        }
+
+      }
+      catch (Exception $e) {
+        /**
+         * Exception will already have been logged by whatever threw it, just
+         * tell the end user what went wrong
+         */
+        drupal_set_message(
+          t(
+            'Job #!jid could not be retried (!message). Please check that you have'
+            . ' sufficient send quota and try again.',
+            array(
+              '!jid' => $jid,
+              '!message' => $e->getMessage()
+            )
+          ),
+          'error'
+        );
+
+      }
+
+    }
+    else {
+      drupal_set_message(
+        t(
+          'Cannot request a retry for Job #!jid as it does not have a valid JUID',
+          array(
+            '!jid' => $jid
+          )
+        ),
+        'error'
+      );
+    }
+
+    // Redirect back to the job list page after refresh.
+    drupal_goto('admin/wildfire/jobs');
+
+}
