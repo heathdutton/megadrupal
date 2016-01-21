@@ -1,0 +1,140 @@
+<?php
+/**
+ * @file
+ * Gearman application framework integration module.
+ */
+
+/**
+ * Implements of hook_menu()
+ *
+ * Admin settings callbacks so that drupal can connect to the Gearmand server.
+ */
+function gearman_menu() {
+  $items = array();
+  $items['admin/config/system/gearman'] = array(
+    'title' => 'Gearman configuration',
+    'description' => 'Configure your drupal site to connect to a Gearman job queue.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('gearman_settings'),
+    'access arguments' => array('administer site configuration'),
+    'file' => 'gearman.admin.inc',
+  );
+  
+  return $items;
+}
+
+/**
+ * Implements hook_gearman_drush_function().
+ *
+ * This implementation has a general function for wrapping other drush commands,
+ * processing item in queue defined with hook_cron_queue_info and using our
+ * Gearman backend, and the classic "reverse text" example.
+ */
+function gearman_gearman_drush_function() {
+  $functions = array(
+    array(
+      'function_name' => 'reverse',
+      'function' => 'gearman_reverse_fn',
+    ),
+    array(
+      'function_name' => 'drush-invoke',
+      'function' => 'gearman_drush_fn',
+    ),
+  );
+  // Add functions for cron queue using our Gearman backend.
+  $queues = module_invoke_all('cron_queue_info');
+  drupal_alter('cron_queue_info', $queues);
+  $queue_default_class = variable_get('queue_default_class', 'SystemQueue');
+  foreach ($queues as $name => $queue_info) {
+    if (variable_get('queue_class_' . $name, $queue_default_class) == 'DrupalGearmanQueue') {
+      // The cron queue is a Gearman queue.
+      $functions[] = array(
+        'function_name' => $name,
+        'function' => 'gearman_cron_queue_fn',
+        'context' => $queue_info,
+        'timeout' => isset($queue_info['time']) ? $queue_info['time'] : 60,
+      );
+    }
+  };
+  return $functions;
+}
+
+/**
+ * Job callback for the "reverse" gearman command.
+ */
+function gearman_reverse_fn(GearmanJob $job) {
+  drush_print("Received job: " . $job->handle() . "\n");
+
+  $workload = $job->workload();
+  $workload_size = $job->workloadSize();
+
+  drush_print("Workload: $workload ($workload_size)\n");
+  
+  # This status loop is not needed, just showing how it works
+  for ($x= 0; $x < $workload_size; $x++)
+  {
+    drush_print("Sending status: " + $x + 1 . "/$workload_size complete\n");
+    $job->sendStatus($x+1, $workload_size);
+    $job->sendData(substr($workload, $x, 1));
+    sleep(1);
+  }
+
+  $result= strrev($workload);
+  drush_print("Result: $result\n");
+
+  # Return what we want to send back to the client.
+  return $result;
+}
+
+/**
+ * Job callback for the "drush" gearman command.
+ */
+function gearman_drush_fn(GearmanJob $job) {
+  $data = $job->workload();
+  drush_print("Running drush: $data");
+  $argv = explode(' ', $data);
+  $results = drush_invoke_process('@self', array_shift($argv), $argv);
+  foreach ($results['log'] as $log) {
+    drush_log($log['message'], $log['type'], $log['error']);
+  }
+  return $results['output'];
+}
+
+/**
+ * Job callback for Gearmanized cron queues.
+ */
+function gearman_cron_queue_fn(GearmanJob $job, $queue_info) {
+  // Error handling stuffs.
+  // FIXME: Move to an helper function (if not already available).
+  static $json_error = array();
+  if (empty($json_error)) {
+    $json_error += array(
+      JSON_ERROR_DEPTH =>	t('The maximum stack depth has been exceeded', array(), array('context' => 'json_error')),
+      JSON_ERROR_STATE_MISMATCH => t('Invalid or malformed JSON', array(), array('context' => 'json_error')),
+      JSON_ERROR_CTRL_CHAR => t('Control character error, possibly incorrectly encoded', array(), array('context' => 'json_error')),
+      JSON_ERROR_SYNTAX => t('Syntax error', array(), array('context' => 'json_error')),
+      JSON_ERROR_UTF8 => t('Malformed UTF-8 characters, possibly incorrectly encoded', array(), array('context' => 'json_error'))
+    );
+  }
+
+  // Decode item from Job's workload.
+  $item = json_decode($job->workload());
+  if ($item === NULL) {
+    watchdog('gearman_cron_queue', "JSON error while decoding workload: %error/n<pre>@workload</pre>", array(
+      '%error' => $json_error[json_last_error()],
+      '@workload' => $job->workload(),
+    ), WATCHDOG_ERROR);
+    return;
+  }
+  elseif (!is_object($item)) {
+    watchdog('gearman_cron_queue', "Workload is not an object:/n<pre>@workload</pre>", array(
+      '@workload' => $job->workload(),
+    ), WATCHDOG_ERROR);
+    return;
+  }
+  // Allow modules to alter the item to fix decoded data.
+  drupal_alter('gearman_cron_queue_item', $item, $queue_info);
+  // Process item's data using worker callback.
+  $function = $queue_info['worker callback'];
+  $function($item->data);
+}

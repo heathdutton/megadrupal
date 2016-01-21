@@ -1,4 +1,0 @@
-<?php
-
-?>
-Payment was successfull.

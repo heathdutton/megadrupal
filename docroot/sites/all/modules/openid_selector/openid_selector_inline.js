@@ -1,0 +1,24 @@
+(function ($) {
+openid.init__inline = openid.init;
+openid.init = function(input_id) {
+  $("li.openid-link, li.user-link").hide();
+  $(".form-item-name, .form-item-pass, .form-item-openid-identifier").css("display", "block");
+  this.init__inline(input_id);
+  $("#" + this.form_id).append('<br/><hr/>').append($(".form-item-openid-identifier"));
+}
+
+openid.useInputBox__inline = openid.useInputBox;
+openid.useInputBox = function(provider) {
+  this.useInputBox__inline(provider);
+  $('#openid_input_area').append('<input id="openid_submit" type="submit" value="'+this.signin_text+'"/>');
+}
+
+openid.final_submit__inline = openid.final_submit;
+openid.final_submit = function(inner_form) {
+  if (inner_form) {
+	  this.final_submit__inline(inner_form);
+  } else {
+	  // no action
+  }
+}
+})(jQuery);

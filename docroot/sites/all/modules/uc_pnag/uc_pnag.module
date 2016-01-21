@@ -1,0 +1,252 @@
+<?php
+
+/**
+ * @file
+ * The main file for the uc_pnag module.
+ */
+
+// Import some more module files and the library from SOFORT AG.
+include_once 'ressources/strings.inc';
+include_once 'uc_pnag.inc';
+include_once 'uc_pnag.pages.inc';
+include_once 'library/sofortLib.php';
+
+/**
+ * Version string of this module which help SOFORT to analyze server requests.
+ */
+define('UC_PNAG_VERSION', 'drupal7_uc3_pnag_3');
+
+/**
+ * ID of this payment method used to identify payment transactions in the database.
+ */
+define('UC_PNAG_PAYMENT_METHOD_ID', 'SOFORTBanking');
+
+/**
+ * URL of the SOFORT API.
+ */
+define('UC_PNAG_API_URL', 'https://api.sofort.com/api/xml');
+
+/**
+ * Implements hook_help().
+ */
+function uc_pnag_help($path, $arg) {
+  switch ($path) {
+    case 'admin/help#uc_pnag':
+      return '<pre>' . file_get_contents(dirname(__FILE__) . '/README.txt') . '</pre>';
+  }
+}
+
+/**
+ * Implements hook_menu().
+ */
+function uc_pnag_menu() {
+  $items = array();
+
+  $items['uc_pnag/payment/%'] = array(
+    'page callback' => 'uc_pnag_callback',
+    'page arguments' => array(2),
+    'access arguments' => array('access content'),
+    'type' => MENU_CALLBACK,
+    'file' => 'uc_pnag.callbacks.inc',
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_uc_payment_method().
+ */
+function uc_pnag_uc_payment_method() {
+  $methods[] = array(
+    'id' => UC_PNAG_PAYMENT_METHOD_ID,
+    'name' => uc_pnag_name(),
+    'title' => uc_pnag_checkout_display(),
+    'review' => uc_pnag_name(),
+    'desc' => uc_pnag_description(),
+    'callback' => 'uc_pnag_setting',
+    //'redirect' => 'uc_paypal_wps_form',//TODO: This is new in PayPal, let's see if we need this
+    'checkout' => TRUE,
+    'no_gateway' => TRUE,
+    'weight' => variable_get('uc_pnag_recommended', TRUE) ? -9999 : 0,
+  );
+  return $methods;
+}
+
+/**
+ * Implements hook_uc_payment_method_alter().
+ */
+function uc_pnag_uc_payment_method_alter(&$methods) {
+  if (variable_get('uc_pnag_recommended', TRUE)) {
+    variable_set('uc_payment_method_' . UC_PNAG_PAYMENT_METHOD_ID . '_weight', -9999);
+  }
+}
+
+/**
+ * Add SOFORT Banking to the payment method settings form.
+ *
+ * @param string $op
+ *   Only the operation "settings" is supported by this function and will return
+ *   the settings form for uc_pnag back to uc_payment
+ * @param string $arg1
+ *   Not required in this context.
+ * @return array
+ *   An array for the form API which contains all required fields and current
+ *   values for uc_pnag.
+ */
+function uc_pnag_setting($op, &$arg1) {
+  switch ($op) {
+    case 'settings':
+      return uc_pnag_project_form();
+  }
+}
+
+/**
+ * Implements hook_uc_order().
+ */
+function uc_pnag_uc_order($op, &$order) {
+  if ($order->payment_method == UC_PNAG_PAYMENT_METHOD_ID) {
+    switch ($op) {
+      case 'submit':
+        _uc_pnag_start_payment($order);
+        break;
+
+    }
+  }
+}
+
+/**
+ * Callback to determine the proper subject line of a transaction which replaces
+ * the tokens from the SOFORT API by the relevant values.
+ *
+ * @param integer $id
+ *   This value can either be "1" or "2" to identify which of the two
+ *   subject lines should be determined.
+ * @param object $order
+ *   The current order objects from uc_order which contains all details
+ *   about the order.
+ * @return string
+ *   Proper string for the given subject line with all tokens being replaced.
+ */
+function _uc_pnag_order_subject($id, $order) {
+  $subject = ($id == 1) ? variable_get('uc_pnag_order_subject_1', 'Order {{order_id}}') : variable_get('uc_pnag_order_subject_2', '');
+  $subject = str_replace('{{transaction_id}}', '-TRANSACTION-', $subject);
+  $subject = str_replace('{{order_id}}', $order->order_id, $subject);
+  $subject = str_replace('{{order_date}}', format_date($order->modified, 'short'), $subject);
+  $subject = str_replace('{{customer_id}}', $order->uid, $subject);
+  $subject = str_replace('{{customer_name}}', $order->billing_first_name . ' ' . $order->billing_last_name, $subject);
+  $subject = str_replace('{{customer_email}}', $order->primary_email, $subject);
+  return $subject;
+}
+
+/**
+ * Callback to start the actual transaction.
+ *
+ * This function determines all required parameters, initializes a transaction
+ * with SOFORT Banking and redirects the customer to the given URL on the payment
+ * platform.
+ *
+ * If anything goes wrong, this method redirects the customer to the cart
+ * review page again and logs the error details in watchdog.
+ *
+ * @param object $order
+ *   The current order from uc_order which contains all details about the
+ *   order that should be paid.
+ */
+function _uc_pnag_start_payment($order) {
+  $amount = uc_currency_format($order->order_total, FALSE, FALSE, '.');
+  $currency = $order->currency;
+  $subject1 = _uc_pnag_order_subject(1, $order);
+  $subject2 = _uc_pnag_order_subject(2, $order);
+  $url_success = uc_pnag_callback_url('success');
+  $url_cancel = uc_pnag_callback_url('cancel');
+  $url_timeout = uc_pnag_callback_url('timeout');
+  $url_notify = uc_pnag_callback_url('notify');
+
+  // The following line replaces localhost in the notify_url because the API
+  // would reject the request otherwise. This has no effect on production
+  // platforms that have no "localhost" string in their URL.
+  $url_notify = str_replace('localhost', 'paragon-es.de', $url_notify);
+
+  $sofort = new SofortLib_Multipay(variable_get('uc_pnag_config_key', ''));
+  uc_pnag_setup_logger($sofort);
+  $sofort->setVersion(UC_PNAG_VERSION);
+  $sofort->setAmount($amount, $currency);
+  $sofort->setReason($subject1, $subject2);
+  $sofort->setSuccessUrl($url_success);
+  $sofort->setAbortUrl($url_cancel);
+  $sofort->setTimeoutUrl($url_timeout);
+  $sofort->setNotificationUrl($url_notify);
+  $sofort->setSofortueberweisung($amount);
+  if (variable_get('uc_pnag_customer_protection', FALSE)) {
+    $sofort->setSofortueberweisungCustomerprotection();
+  }
+
+  $sofort->sendRequest();
+
+  if ($sofort->isError()) {
+    watchdog('SOFORT', '!error', array('!error' => $sofort->getError()), WATCHDOG_CRITICAL);
+    drupal_set_message(sofortbanking_strings(9001), 'error');
+    drupal_goto('cart/checkout/review');
+  }
+
+  $id = $sofort->getTransactionId();
+  $order->data['uc_pnag_transaction_id'] = $id;
+  uc_order_save($order);
+  $values = array(
+    'order_id' => $order->order_id,
+    'transaction_id' => $id,
+    'token' => drupal_get_token(),
+  );
+  db_delete('uc_pnag_orders')
+    ->condition('order_id', $order->order_id)
+    ->condition('token', drupal_get_token())
+    ->execute();
+  drupal_write_record('uc_pnag_orders', $values);
+  drupal_goto($sofort->getPaymentUrl());
+}
+
+/**
+ * Helper function to setup the logging context for the SofortLib.
+ *
+ * @param SofortLib $sofort
+ */
+function uc_pnag_setup_logger($sofort) {
+  if (!variable_get('uc_pnag_logging', FALSE)) {
+    return;
+  }
+  $logger = new UC_PNAG_Logger();
+  $sofort->setLogEnabled();
+  $sofort->setLogger($logger);
+}
+
+/**
+ * Class UC_PNAG_Logger
+ */
+class UC_PNAG_Logger extends SofortLibLogger {
+
+  /**
+   * Function begin called of the SofortLib has something to log.
+   *
+   * @param string $message
+   *   A string containing the log message.
+   * @param string $uri
+   *   A string containing the URI where to write the log message to. This is
+   *   not used by this module because it utilizes the watchdog framework from
+   *   Drupal.
+   */
+  function log($message, $uri) {
+    watchdog('SOFORT', '!message', array('!message' => $message));
+  }
+
+  /**
+   * Function which would normally be called by SofortLib to rotate log files.
+   * This is not required for this module because it utilizes Drupal's
+   * watchdog framework.
+   *
+   * @param string $uri
+   */
+  function logRotate($uri) {
+    // Nothing to do.
+  }
+
+}
