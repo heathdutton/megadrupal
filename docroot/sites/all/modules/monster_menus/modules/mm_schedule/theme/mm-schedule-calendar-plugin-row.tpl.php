@@ -1,1 +1,0 @@
-<?php /* This is a dummy file, to prevent PHP warnings */ ?>
