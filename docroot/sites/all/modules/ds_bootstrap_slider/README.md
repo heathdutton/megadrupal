@@ -1,1 +1,0 @@
-# DS Bootstrap Slider

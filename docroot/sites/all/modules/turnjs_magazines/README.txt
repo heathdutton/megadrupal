@@ -1,1 +1,0 @@
-See https://www.drupal.org/project/turnjs_magazines for all information abozt the module and how to install it.

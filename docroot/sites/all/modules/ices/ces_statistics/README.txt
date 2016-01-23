@@ -1,4 +1,0 @@
-Statistics
-==========
-
-Statistics for integralces
