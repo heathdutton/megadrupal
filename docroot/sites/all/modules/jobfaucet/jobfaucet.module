@@ -1,0 +1,490 @@
+<?php
+
+/**
+ * @file
+ * Module file for JobFaucet module.
+ */
+
+define('JOBFAUCET_SYNDICATION_OFF', 0);
+define('JOBFAUCET_SYNDICATION_ON', 1);
+define('JOBFAUCET_TEST_MODE', 2);
+
+/**
+ * Implements hook_help().
+ */
+function jobfaucet_help($path, $arg) {
+  switch ($path) {
+    case 'admin/structure/types/manage/%/jobfaucet-mapping':
+      $output = '<p>' . t('Map fields from the @content_type content type to the appropriate field on external job boards.',
+        array('@content_type' => node_type_get_name($arg[4]))) . '</p>';
+      return $output;
+
+    case 'admin/config/services/jobfaucet':
+      $output = t('Getting started with the JobFaucet module is a three step process:') . '<br/>';
+      $output .= '1. ' . t('Create a JobFaucet account on JobFaucet.com and enter the provided API keys.') . '<br/>';
+      $output .= '2. ' . t("Select the content types you wish to use for jobs.  Unless you already have a job
+        content type, you should use the provided JobFaucet Job content type.  If you select
+        an exisiting content type, you'll need to configure the mapping.") . '<br/>';
+      $output .= '3. ' . t("When you're ready to publish your jobs, turn syndication on.");
+      $output = '<p>' . $output . '</p>';
+      return $output;
+  }
+}
+
+/**
+ * Implements hook_menu().
+ */
+function jobfaucet_menu() {
+
+  $items['admin/config/services/jobfaucet'] = array(
+    'access callback' => 'user_access',
+    'access arguments' => array('administer site configuration'),
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('jobfaucet_admin_settings_form'),
+    'title' => 'JobFaucet',
+    'description' => 'Configure JobFaucet Promote settings.',
+    'file' => 'jobfaucet.admin.inc',
+  );
+
+  $items['admin/structure/types/manage/%jobfaucet_content_type/jobfaucet-mapping'] = array(
+    'access callback' => 'user_access',
+    'access arguments' => array('administer site configuration'),
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('jobfaucet_mapping_form', 4),
+    'title' => 'Jobfaucet Mapping',
+    'description' => 'Configure JobFaucet mapping.',
+    'file' => 'jobfaucet.admin.inc',
+    'weight' => 3,
+    'type' => MENU_LOCAL_TASK,
+  );
+
+  return $items;
+}
+
+/**
+ * Menu loader callback. Only show the tab on job content types.
+ */
+function jobfaucet_content_type_load($content_type) {
+  $job_content_types = variable_get('jobfaucet_content_type', array('jobfaucet_job'));
+
+  if (!isset($content_type) || !in_array($content_type, $job_content_types)) {
+    return FALSE;
+  }
+  return $content_type;
+}
+
+/**
+ * Implements hook_form_BASE_FORM_ID_alter().
+ *
+ * Adds a tab to job node forms.
+ */
+function jobfaucet_form_node_form_alter(&$form, &$form_state, $form_id) {
+  $job_content_types = variable_get('jobfaucet_content_type', array('jobfaucet_job'));
+
+  if (in_array($form['#node']->type, $job_content_types)) {
+    $form['jobfaucet'] = array(
+      '#title' => t('Jobfaucet'),
+      '#type' => 'fieldset',
+      '#group' => 'additional_settings',
+    );
+
+    $remote_id = isset($form['#node']->nid) ? jobfaucet_get_remote_job_id($form['#node']->nid) : FALSE;
+    $status = ($remote_id) ? t('Syndicated to Jobfaucet.') : t('Not yet syndicated.');
+
+    $form['jobfaucet']['syndicated'] = array(
+      '#title' => t('Syndication Status'),
+      '#type' => 'item',
+      '#markup' => $status,
+    );
+
+    $form['jobfaucet']['feeds_selected'] = array(
+      '#title' => t('Syndicate this job to the following services'),
+      '#description' => t('Per-job selection of services is not yet supported.  However, you can change this setting
+        site-wide on the JobFaucet settings page.'),
+      '#type' => 'checkboxes',
+      '#options' => jobfaucet_get_services(),
+      '#default_value' => variable_get('jobfaucet_feeds_selected', array_keys(jobfaucet_get_services())),
+      '#disabled' => TRUE,
+    );
+  }
+}
+
+/**
+ * Implements hook_node_update().
+ *
+ * Contacts the jobfaucet server on node update.
+ */
+function jobfaucet_node_update($node) {
+  if (variable_get('jobfaucet_syndication_status') != JOBFAUCET_SYNDICATION_OFF) {
+    $job_content_types = variable_get('jobfaucet_content_type', array('jobfaucet_job'));
+    if (in_array($node->type, $job_content_types)) {
+      jobfaucet_send_job($node, 'update');
+    }
+  }
+}
+
+/**
+ * Implements hook_node_insert().
+ *
+ * Contacts the jobfaucet server on node insert.
+ */
+function jobfaucet_node_insert($node) {
+  if (variable_get('jobfaucet_syndication_status') != JOBFAUCET_SYNDICATION_OFF) {
+    $job_content_types = variable_get('jobfaucet_content_type', array('jobfaucet_job'));
+    if (in_array($node->type, $job_content_types)) {
+      jobfaucet_send_job($node, 'insert');
+    }
+  }
+}
+
+/**
+ * Implements hook_node_update().
+ *
+ * Contacts the jobfaucet server on node delete.
+ */
+function jobfaucet_node_delete($node) {
+  if (variable_get('jobfaucet_syndication_status') == JOBFAUCET_SYNDICATION_ON) {
+    $job_content_types = variable_get('jobfaucet_content_type', array('jobfaucet_job'));
+    if (in_array($node->type, $job_content_types)) {
+      jobfaucet_delete_job($node->nid);
+    }
+  }
+}
+
+/**
+ * Formats and sends jobs to JobFaucet.com.
+ *
+ * @param object $node
+ *   The job node object.
+ *
+ * @return void
+ *   Displays a message based on the server response.
+ */
+function jobfaucet_send_job($node) {
+  $mapping = jobfaucet_get_mapping($node->type);
+
+  if (jobfaucet_validate_field_content($node, $mapping) == TRUE) {
+    foreach ($mapping as $target => $source) {
+      $source_value = token_replace($source, array('node' => $node), array('clear' => TRUE));
+      $node_data[$target] = $source_value;
+    }
+
+    $node_data['jobfaucet_job_url'] = url('node/' . $node->nid, array('absolute' => TRUE));
+    $node_data['jobfaucet_reference_number'] = $node->nid;
+    $node_data['active'] = $node->status;
+    $node_data['jobfaucet_job_boards'] = variable_get('jobfaucet_feeds_selected', array_keys(jobfaucet_get_services()));
+
+    // Allow other modules to alter job data before sending.
+    // A clone of the $node object is used since it will be passed by reference
+    // but shouldn't be altered.
+    $context = array('node' => clone $node);
+    drupal_alter('jobfaucet_job_data', $node_data, $context);
+
+    $connection = jobfaucet_client();
+
+    if (variable_get('jobfaucet_syndication_status') == JOBFAUCET_TEST_MODE) {
+      $node_data['jobfaucet_test'] = TRUE;
+      $response = $connection->createJob($node_data);
+    }
+    elseif ($remote_id = jobfaucet_get_remote_job_id($node->nid)) {
+      $response = $connection->updateJob($node_data, $remote_id);
+    }
+    else {
+      $response = $connection->createJob($node_data);
+      if ($response->succeeded == TRUE && isset($response->data['job_id'])) {
+        jobfaucet_save_remote_job_id($node->nid, $response->data['job_id']);
+      }
+    }
+
+    if (isset($response->jf_message)) {
+      $type = $response->succeeded ? 'status' : 'warning';
+      drupal_set_message($response->jf_message, $type);
+    }
+  }
+}
+
+
+/**
+ * Job delete callback.
+ *
+ * @param string $nid
+ *   The nid of the node to delete
+ */
+function jobfaucet_delete_job($nid) {
+  if ($remote_id = jobfaucet_get_remote_job_id($nid)) {
+
+    // Delete job remotely.
+    $connection = jobfaucet_client();
+    $response = $connection->deleteJob($remote_id);
+
+    // Local cleanup.  If we didn't get a successful response, leave this intact
+    // so we can try again during cleanup.
+    if ($response->succeeded == TRUE) {
+      db_delete('jobfaucet_jobs')
+        ->condition('nid', $nid)
+        ->execute();
+    }
+
+    if (isset($response->jf_message)) {
+      $type = $response->succeeded ? 'status' : 'warning';
+      drupal_set_message($response->jf_message, $type);
+    }
+  }
+}
+
+/**
+ * Creates a new JobFaucet client.
+ */
+function jobfaucet_client() {
+  $instance = &drupal_static(__FUNCTION__);
+
+  // If there is no instance yet, create a new one.
+  if (!isset($instance)) {
+    $instance = new JobFaucetRemote();
+  }
+  return $instance;
+}
+
+/**
+ * Gets the remote id of a job that has already been sent to JobFaucet.
+ *
+ * @param string $nid
+ *   The nid of the job node.
+ *
+ * @return mixed
+ *   An integer representing the remote job id of the job if it exists,
+ *   otherwise FALSE.
+ */
+function jobfaucet_get_remote_job_id($nid) {
+  $remote_id = db_query("SELECT remote_id FROM {jobfaucet_jobs} WHERE nid = :nid", array(':nid' => $nid))
+    ->fetchField();
+
+  return $remote_id;
+}
+
+/**
+ * Saves the remote id of a job to the database.
+ *
+ * @param string $nid
+ *   The nid of the job node.
+ * @param string $remote_id
+ *   The job id of the node on jobfaucet.com.
+ */
+function jobfaucet_save_remote_job_id($nid, $remote_id) {
+  db_merge('jobfaucet_jobs')
+    ->key(array('nid' => $nid))
+    ->fields(array(
+      'nid' => $nid,
+      'remote_id' => $remote_id,
+    ))
+    ->execute();
+}
+
+/**
+ * Implements hook_node_prepare().
+ *
+ * Set validation messages on node edit page.
+ */
+function jobfaucet_node_prepare($node) {
+  // Don't validate if it's a new node.
+  if (isset($node->nid)) {
+    if (variable_get('jobfaucet_syndication_status') != JOBFAUCET_SYNDICATION_OFF) {
+      $job_content_types = variable_get('jobfaucet_content_type', array('jobfaucet_job'));
+      if (in_array($node->type, $job_content_types)) {
+        $mapping = jobfaucet_get_mapping($node->type);
+        jobfaucet_validate_field_content($node, $mapping, TRUE);
+        _jobfaucet_test_mode_message();
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_node_view().
+ *
+ * Set validation messages on full node page for users with edit permissions.
+ */
+function jobfaucet_node_view($node, $view_mode, $langcode) {
+  if ($view_mode == 'full' && node_access('update', $node)) {
+    if (variable_get('jobfaucet_syndication_status') != JOBFAUCET_SYNDICATION_OFF) {
+      $job_content_types = variable_get('jobfaucet_content_type', array('jobfaucet_job'));
+      if (in_array($node->type, $job_content_types)) {
+        $mapping = jobfaucet_get_mapping($node->type);
+        jobfaucet_validate_field_content($node, $mapping, TRUE);
+        _jobfaucet_test_mode_message();
+      }
+    }
+  }
+}
+
+/**
+ * Checks that required fields are present for a given node.
+ *
+ * @param object $node
+ *   The node object to validate mapping for.
+ *
+ * @return bool
+ *   Returns TRUE if all required fields have content.
+ */
+function jobfaucet_validate_field_content($node, $mapping, $display_message = FALSE) {
+  module_load_include('inc', 'jobfaucet', 'jobfaucet.targets');
+  $targets = jobfaucet_get_target_fields();
+
+  // Fields that don't have configured mapping should still be
+  // validated (e.g. in case they're required).
+  foreach ($targets as $field_name => $field) {
+    if (!isset($mapping[$field_name])) {
+      $mapping[$field_name] = '';
+    }
+  }
+
+  foreach ($mapping as $target => $source) {
+    $source_value = token_replace($source, array('node' => $node), array('clear' => TRUE));
+    if ($targets[$target]['required']) {
+      if (empty($source_value)) {
+        $empty_fields[] = $targets[$target]['label'];
+      }
+    }
+  }
+
+  if (isset($empty_fields)) {
+    if ($display_message) {
+      $empty_fields = implode(', ', $empty_fields);
+      $mapping_page = url('admin/structure/types/manage/' . $node->type . '/jobfaucet-mapping');
+
+      drupal_set_message(t("This job won't be sent to JobFaucet because the following required values are empty: @empty_fields.
+        You may need to update the job or check your <a href='@mapping_page'>content type mapping</a>.",
+        array('@empty_fields' => $empty_fields, '@mapping_page' => $mapping_page)), 'warning');
+    }
+    return FALSE;
+  }
+  else {
+    return TRUE;
+  }
+}
+
+/**
+ * Set the default mapping for a content type.
+ *
+ * @param string $content_type
+ *   The machine name of the the content type.
+ */
+function jobfaucet_set_default_mapping($content_type) {
+  module_load_include('inc', 'jobfaucet', 'jobfaucet.targets');
+
+  $targets = jobfaucet_get_target_fields();
+  foreach ($targets as $key => $target) {
+    $mapping[$key] = $target['default_mapping'];
+  }
+  jobfaucet_set_mapping($content_type, $mapping);
+}
+
+/**
+ * Get the current mapping for a given content type.
+ *
+ * @param string $content_type
+ *   The machine name of the the content type.
+ *
+ * @return array
+ *   A keyed array of the mapping settings where the key is the target and
+ *   the value is the source.
+ */
+function jobfaucet_get_mapping($content_type) {
+  $config = db_select('jobfaucet_mapping', 'j')
+    ->fields('j', array('target', 'source'))
+    ->condition('type', $content_type)
+    ->execute()
+    ->fetchAllKeyed();
+
+  return $config;
+}
+
+/**
+ * Save mapping values to the database.
+ *
+ * @param string $content_type
+ *   The machine name of the the content type.
+ * @param array $mapping
+ *   An array containing mapping settings where the key is the target and the
+ *   value is the source.
+ */
+function jobfaucet_set_mapping($content_type, $mapping) {
+  foreach ($mapping as $key => $field) {
+    db_merge('jobfaucet_mapping')
+      ->key(array(
+      'type' => $content_type,
+      'target' => $key,
+    ))
+      ->fields(array(
+      'type' => $content_type,
+      'target' => $key,
+      'source' => $field,
+    ))
+      ->execute();
+  }
+}
+
+/**
+ * Implements hook_theme().
+ */
+function jobfaucet_theme($existing) {
+  return array(
+    'jobfaucet_mapping_form' => array(
+      'render element' => 'form',
+      'file' => 'jobfaucet.admin.inc',
+    ),
+  );
+}
+
+/**
+ * Checks account authentication.
+ *
+ * @todo remove this function and move any remaining functionality into the
+ *   jobfaucetRemote class.
+ */
+function jobfaucet_auth_status() {
+  $connection = jobfaucet_client();
+  $response = $connection->verifyAccount();
+
+  // Unlike with syndication status which is all dealt with locally, we get
+  // authentication errors from the server (except in a few special cases
+  // below).
+  $status['message'] = $response->jf_message;
+  $status['authenticated'] = $response->succeeded;
+
+  if (!$response->succeeded) {
+    // If there was a network error, we're not going to get an error message
+    // back so it needs to get set here.
+    if ($response->code == HTTP_REQUEST_TIMEOUT || $response->code >= 500) {
+      $status['message'] = t('Unable to contact JobFaucet server to verify account.');
+    }
+  }
+
+  return $status;
+}
+
+/**
+ * Set a warning message that test mode is enabled.
+ */
+function _jobfaucet_test_mode_message() {
+  if (user_access('administer site configuration')) {
+    if (variable_get('jobfaucet_syndication_status') == JOBFAUCET_TEST_MODE) {
+      $settings_url = url('admin/config/services/jobfaucet');
+      drupal_set_message(t('JobFaucet is in test mode.  If you are ready to syndicate your jobs, go to the
+      <a href="@settings">settings</a> page to turn syndication on.', array('@settings' => $settings_url)), 'warning');
+    }
+  }
+}
+
+/**
+ * Get a list of available job boards.
+ *
+ * @return array
+ *   An associative array of supported job syndication websites.
+ */
+function jobfaucet_get_services() {
+  return array(
+    'indeed' => t('Indeed'),
+    'simply_hired' => t('Simply Hired'),
+  );
+}

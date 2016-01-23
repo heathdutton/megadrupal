@@ -1,0 +1,327 @@
+<?php
+
+/**
+ * @file
+ * The Zendesk module helps you to interact with zendesk using Drupal.
+ *
+ * authors:
+ * Tom Deryckere (Tom.Deryckere@gmail.com)
+ * Mark Koester (https://github.com/markwk/zendesk)
+ */
+
+/**
+ * Implements hook_permission().
+ */
+function zendesk_permission() {
+  return array(
+    'configure zendesk' => array(
+      'title' => t('Configure Zendesk'),
+      'description' => t('Configure Drupal settings to communicate with Zendesk.'),
+    ),
+  );
+}
+
+/**
+ * Implements hook_menu().
+ */
+function zendesk_menu() {
+  // Callback use by zendesk for remote authentication.
+  $items['services/zendesk'] = array(
+    'title' => 'Zendesk remote authentication',
+    'page callback' => 'zendesk_remote_authentication',
+    'access callback' => TRUE,
+    'type' => MENU_CALLBACK,
+  );
+
+  $items['admin/config/people/zendesk'] = array(
+    'title' => 'Zendesk settings',
+    'access arguments' => array('configure zendesk'),
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('zendesk_configuration_form'),
+    'type' => MENU_NORMAL_ITEM,
+    'description' => 'Configure Drupal settings to communicate with Zendesk',
+    'file' => 'zendesk.admin.inc',
+  );
+  return $items;
+}
+
+/**
+ * Initialization of the zendesk library.
+ */
+function zendesk_initialize_library() {
+  $api_key    = variable_get('zendesk_api_token', '');
+  $user       = variable_get('zendesk_api_mail', '');
+  $subdomain  = variable_get('zendesk_api_group', '');
+  $zd         = new zendesk($api_key, $user, $subdomain);
+  return $zd;
+}
+
+/**
+ * Helper function to retrieve zendesk id of the user.
+ */
+function _zendesk_get_user($uid) {
+  $query = db_select('zendesk_users', 'zu')
+      ->fields('zu', array('uid', 'zid'))->condition('zu.uid', $uid, '=');
+  $result = $query->execute();
+  if ($result->rowCount() <> 0) {
+    foreach ($result as $user) {
+      return $user->zid;
+    }
+  }
+  else {
+    return FALSE;
+  }
+}
+
+/**
+ * Implements hook_user_insert().
+ */
+function zendesk_user_insert(&$edit, $account, $category) {
+  if (variable_get('zendesk_api_sync_users', 0)) {
+    zendesk_create_user($account);
+  }
+}
+
+/**
+ * Implements hook_user_update().
+ */
+function zendesk_user_update(&$edit, $account, $category) {
+  if (variable_get('zendesk_api_sync_users', 0)) {
+    if ($user_id = _zendesk_get_user($account->uid)) {
+      $zd = zendesk_initialize_library();
+      $data = array(
+        'user' => array(
+          'id' => $user_id,
+          'name' => format_username($account),
+          'email' => $account->mail,
+          'role' => 'end-user',
+        ),
+      );
+
+      // Invoke a alter call to allow other modules to pass data to ZenDesk.
+      drupal_alter(array('zendesk_user', 'zendesk_user_update'), $data, $account);
+
+      $data = drupal_json_encode($data);
+
+
+      $result = $zd->call('/users/' . $user_id, $data, 'PUT');
+    }
+  }
+}
+
+/**
+ * Implements hook_user_delete().
+ */
+function zendesk_user_delete($account) {
+  if (variable_get('zendesk_api_sync_users', 0)) {
+    if ($user_id = _zendesk_get_user($account->uid)) {
+      $zd = zendesk_initialize_library();
+      $data = drupal_json_encode(array(
+        'user' => array(
+          'id' => $user_id,
+          'name' => format_username($account),
+          'email' => $account->mail,
+          'suspended' => TRUE,
+        ),
+      ));
+
+      // Alter call to omitted since we are destroying the User object.
+      $result = $zd->call('/users/' . $user_id, $data, 'PUT');
+    }
+  }
+}
+
+/**
+ * Create a user on Zendesk's side.
+ *
+ * @param object $account
+ *   The Drupal user object that we want to create on zendesk.
+ *
+ * @return mixed
+ *   The zendesk's user id if succeeded, FALSE otherwise.
+ */
+function zendesk_create_user($account) {
+  $zd = zendesk_initialize_library();
+  $data = array(
+    'user' => array(
+      'name' => format_username($account),
+      'email' => $account->mail,
+      'role' => 'end-user',
+    ),
+  );
+  if (variable_get('zendesk_authed_user', FALSE)) {
+    $data['user'] += array('verified' => TRUE);
+  }
+
+  // Invoke a alter call to allow other modules to pass data to ZenDesk.
+  drupal_alter(array('zendesk_user', 'zendesk_user_create'), $data, $account);
+  
+  $data = drupal_json_encode($data);
+
+  $result = $zd->call("/users", $data, 'POST');
+
+  if (!empty($result->error)) {
+    // Try to handle special case where a user can be on zendesk's side, but
+    // not recorded on our table.
+    if ($result->error == 'RecordInvalid' && $result->details->email[0]->description == 'Email: ' . $account->mail . ' is already being used by another user') {
+      return zendesk_sync_user_back($account);
+    }
+    watchdog('zendesk', '%description: %error', array(
+      '%description' => $result->description,
+      '%error' => print_r($result->details, 1),
+    ), WATCHDOG_ERROR);
+    return FALSE;
+  }
+  else {
+    db_insert('zendesk_users')
+      ->fields(array(
+        'uid' => $account->uid,
+        'zid' => $result->user->id,
+      ))
+      ->execute();
+    return $result->user->id;
+  }
+}
+
+/**
+ * Try to sync user from zendesk on drupal side.
+ *
+ * If a user already exist on zendesk's side but not our the drupal side, add
+ * it in our database.
+ *
+ * @param object $account
+ *   An object containing the user account.
+ *
+ * @return mixed
+ *   Zendesk's user ID if succeeded, FALSE otherwise.
+ */
+function zendesk_sync_user_back($account) {
+  // Look for the user.
+  $zd = zendesk_initialize_library();
+  $result = $zd->call('/users/search.json?query=' . $account->mail, '', 'GET');
+  if (isset($result->users[0]->id)) {
+    db_insert('zendesk_users')
+       ->fields(array(
+         'uid' => $account->uid,
+         'zid' => $result->users[0]->id,
+       ))
+       ->execute();
+    return $result->users[0]->id;
+  }
+  else {
+    return FALSE;
+  }
+}
+
+/**
+ * Remote authentication script.
+ *
+ * @see http://developer.zendesk.com/documentation/sso
+ * @see https://support.zendesk.com/entries/23675367
+ */
+function zendesk_remote_authentication() {
+  global $user;
+  // Check if anonymous, if so redirect to login with destination the path where
+  // he comes from.
+  if ($user->uid) {
+    // Check if user role is allowed to be authenticated.
+    if (zendesk_user_has_access($user)) {
+      zendesk_authenticate_user();
+    }
+    else {
+      drupal_goto(variable_get('zendesk_no_permission_page', ''));
+    }
+  }
+  else {
+    drupal_goto('user', array('query' => array('destination' => 'services/zendesk')));
+  }
+}
+
+/**
+ * Check if the user may be be authenticated or synced with zendesk.
+ */
+function zendesk_user_has_access($user) {
+  $zendesk_roles = variable_get('zendesk_roles', array());
+  if (!array_sum($zendesk_roles)) {
+    // No roles are set, give access.
+    return TRUE;
+  }
+  else {
+    $keys = array_keys($user->roles);
+    foreach ($keys as $key) {
+      if ($zendesk_roles[$key] > 0) {
+        return TRUE;
+      }
+    }
+  }
+  return FALSE;
+}
+
+/**
+ * Authentication of the user after the user is logged in.
+ */
+function zendesk_authenticate_user() {
+  global $user;
+
+  $token = array(
+    'jti'   => sha1($user->uid . REQUEST_TIME . rand()),
+    'iat'   => REQUEST_TIME,
+    'name'  => format_username($user),
+    'email' => $user->mail,
+    'external_id' => $user->uid,
+  );
+  $key = variable_get('zendesk_secret_key', '');
+  $jwt = zendesk_jwt_encode($token, $key);
+
+  // Redirect
+  $url = variable_get('zendesk_url', '') . '/access/jwt';
+  drupal_goto($url, array('query' => array('jwt' => $jwt)));
+}
+
+/**
+ * Converts and signs a PHP object or array into a JWT string.
+ *
+ * Taken from PEAR::JWT.
+ *
+ * @param $payload
+ *   PHP object or array.
+ * @param $key
+ *   The secret key.
+ *
+ * @return
+ *   A signed JWT.
+ */
+function zendesk_jwt_encode($payload, $key) {
+  $header = array(
+    'typ' => 'JWT',
+    'alg' => 'HS256'
+  );
+  $segments = array();
+  $segments[] = zendesk_urlsafeb64_encode(json_encode($header));
+  $segments[] = zendesk_urlsafeb64_encode(json_encode($payload));
+  $signing_input = implode('.', $segments);
+
+  $signature = hash_hmac('sha256', $signing_input, $key, true);
+  $segments[] = zendesk_urlsafeb64_encode($signature);
+
+  return implode('.', $segments);
+}
+
+/**
+ * Encodes the given data with urlsafe base64.
+ *
+ * A base64 encoded string is made urlsafe by replacing '+' with '-',
+ * '/' with '_', and removing '='.
+ *
+ * Taken from PEAR::JWT.
+ *
+ * @param $data
+ *   The data to encode.
+ *
+ * @return
+ *   The encoded string.
+ */
+function zendesk_urlsafeb64_encode($data) {
+  $b64 = base64_encode($data);
+  return str_replace(array('+', '/', '\r', '\n', '='), array('-', '_'), $b64);
+}

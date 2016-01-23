@@ -1,0 +1,283 @@
+<?php
+
+/**
+ * @file
+ * Drupal hooks and functions for the acb module.
+ */
+
+/**
+ * Implements hook_modules_enabled().
+ */
+function acb_modules_enabled($modules) {
+  // Check if newly enabled modules are access control modules.
+  $new = count(array_intersect(acb_get_modules(TRUE), $modules));
+  if ($new) {
+    // Ask for rebuilding node permissions.
+    node_access_needs_rebuild(TRUE);
+  }
+}
+
+/**
+ * Returns a list of all active access control modules.
+ *
+ * @param bool $self
+ *  Boolean indicating if acb itself should be included in the list.
+ *
+ * @return array
+ *  An array containing all active access controlling modules.
+ */
+function acb_get_modules($self = FALSE) {
+  $modules = array_unique(
+    array_merge(
+      module_implements('node_grants'),
+      module_implements('node_access_records')
+    )
+  );
+  // Exclude ACL as it doesn't control anything on its own.
+  $exclude = array('acl');
+  if ($self) $exclude[] = 'acb';
+
+  // Sort the list so the modules are always returned in the same order.
+  sort($modules);
+  return array_diff($modules, $exclude);
+}
+
+/**
+ * Implements hook_node_access_records_alter().
+ *
+ * Creates and inserts our cascaded access records for nodes.
+ */
+function acb_node_access_records_alter(&$grants, $node) {
+  // Split all grants into their respective controlling modules.
+  $split_grants = array();
+  foreach (acb_get_modules() as $module) {
+    $split_grants[$module] = array_filter($grants, function ($grant) use ($module) {
+      switch ($grant['realm']) {
+        // 'all' and ACL require special care.
+        case 'acl':
+        case 'all':
+          // Check 'module' or '#module' key. If not present, then assume it to be Content Access.
+          if (isset($grant['module'])) {
+            $realm = $grant['module'];
+          }
+          elseif (isset($grant['#module'])) {
+            $realm = $grant['#module'];
+          }
+          else {
+            $realm = 'content_access';
+          }
+          break;
+
+        default:
+          $realm = $grant['realm'];
+          break;
+      }
+
+      return (acb_is_module_realm($realm, $module) === TRUE);
+    });
+  }
+
+  // Filter out any modules that didn't set access records.
+  $split_grants = array_filter($split_grants);
+
+  // Only proceed and alter the grants if multiple modules control this node.
+  // If this is not the case, the legacy user grants will control the node as usual.
+  if (count($split_grants) <= 1) {
+    return;
+  }
+
+  // Convert 'all' realm grants to anonymous and authenticated role grants.
+  $roles = array(DRUPAL_ANONYMOUS_RID, DRUPAL_AUTHENTICATED_RID);
+  foreach ($split_grants as $module => $split_grant_module) {
+    foreach ($split_grant_module as $key => $split_grant) {
+      if ($split_grant['realm'] == 'all') {
+        foreach ($roles as $rid) {
+          $split_grants[$module][$rid] = $split_grant;
+          $split_grants[$module][$rid]['realm'] = $module . '_rid';
+          $split_grants[$module][$rid]['gid'] = $rid;
+        }
+        unset($split_grants[$module][$key]);
+      }
+    }
+  }
+
+  // We keep the existing grants and merge ours because we overrule them
+  // by setting a high priority on our own grants in _acb_cascade_grants().
+  $grants = array_merge($grants, _acb_cascade_grants($split_grants, TRUE));
+}
+
+/**
+ * Implements hook_node_grants_alter().
+ *
+ * Let Drupal know of the current user's grants.
+ * We're using the _alter function because we need existing grants to calculate ours.
+ */
+function acb_node_grants_alter(&$grants, $account, $op) {
+  // Split all grants into their respective controlling modules and prepare the array for the recursive cascader.
+  $split_grants = array();
+
+  // ACL requires special care. The responsible module can only be determined by using the database.
+  if (module_exists('acl')) {
+    $acl = db_select('acl')
+      ->fields('acl', array('acl_id','module'))
+      ->execute()
+      ->fetchAllAssoc('acl_id');
+  }
+
+  // For our ACB grants, we need the 'Edit any domain content' and 'Delete any domain content' permissions to be enabled to
+  // enable other modules to control it effectively (due to the AND-logic we're implementing).
+  // Add them to the user grants if not already present if Domain Access is active.
+  // Additionally, fork $grants so we don't add them permanently to the referenced grants array.
+  $acb_grants = $grants;
+  if (module_exists('domain') && ($op == 'update' || $op == 'delete')) {
+    $domains = $account->domain_user;
+    if (!empty($domains)) {
+      foreach ($domains as $id) {
+        if (abs($id) > 0) {
+          $value = ($id > 0) ? $id : 0;
+          if (!isset($acb_grants['domain_id']) || !in_array($value, $acb_grants['domain_id'])) {
+            $acb_grants['domain_id'][] = $value;
+          }
+        }
+      }
+    }
+  }
+
+  foreach (acb_get_modules() as $module) {
+    // ACL requires special care. Extract the ACL ids for the current module.
+    if (module_exists('acl')) {
+      $acl_current = array_keys(
+        array_filter($acl, function ($entry) use ($module) {
+          return ((acb_is_module_realm($entry->module, $module) === TRUE));
+        })
+      );
+    }
+
+    foreach ($acb_grants as $realm => $gids) {
+      // ACL requires special care. Filter out any ACL entries that were not set by the current module.
+      if ($realm == 'acl') {
+        $gids = array_intersect($gids, $acl_current);
+      }
+
+      // If this realm is originating from the current module (or if ACL has entries), then add the gids.
+      if ((acb_is_module_realm($realm, $module) === TRUE) || ($realm == 'acl' && !empty($gids))) {
+        // Eventually prepare the module's subarray for pushing.
+        if (empty($split_grants[$module])) $split_grants[$module] = array();
+        foreach ($gids as $gid) {
+          array_push($split_grants[$module], array('realm' => $realm, 'gid' => $gid));
+        }
+      }
+    }
+  }
+
+  // We keep the existing grants and merge ACB's to support the case where only one module controls the node.
+  // Filter out any modules that didn't set grants.
+  $grants = array_merge($grants, _acb_cascade_grants(array_filter($split_grants)));
+}
+
+/**
+ * Checks if a realm is originating from a specified module.
+ *
+ * @param string $realm
+ *   A string containing a realm machine_name
+ * @param string $module
+ *   A module's machine name
+ *
+ * @return bool
+ *  TRUE if the specified realm originates from the given module,
+ *  FALSE otherwise.
+ */
+function acb_is_module_realm($realm, $module) {
+  // Just in case, ensure consistency.
+  if ($module == 'domain_access') {
+    $module = 'domain';
+  }
+
+  switch ($realm) {
+    case 'term_access':
+      return $module == 'taxonomy_access';
+      break;
+    default:
+      return strpos($realm, $module) === 0;
+      break;
+  }
+}
+
+/**
+ * The beating heart of this module. Receives split-sorted grants
+ * and converts it into cascaded grants to be used by this module.
+ * Workhorse for both hook_node_grants_alter() and hook_node_access_records_alter().
+ *
+ * @param array $grants
+ *  The recursive grants array.
+ * @param bool $access_records
+ *  (optional) Boolean indicating if we should cascade access records (TRUE) or not user grants (FALSE)
+ * @param array $output
+ *  (optional) The final output array used for recursing.
+ * @param array $realm
+ *  (optional) The realm storage array used for recursing.
+ * @param bool $view
+ *  (optional) The grant_view value used for recursing.
+ * @param bool $update
+ *  (optional) The grant_update value used for recursing.
+ * @param bool $delete
+ *  (optional) The grant_delete value used for recursing.
+ *
+ * @return array
+ *  The output grants array.
+ */
+function _acb_cascade_grants($grants, $access_records = FALSE, &$output = array(), $realm = array(), $view = 1, $update = 1, $delete = 1) {
+  // Let's make any possible cross-combination respecting the given element order of $grants.
+  if(count($grants)) {
+    // This nesting level has available combinations left.
+    foreach(reset($grants) as $grant) {
+      // Assemble new pieces for the realm.
+      $realm_storage = $realm;
+      $realm_storage[] = $grant['realm'] . '+' . $grant['gid'];
+      // Try to go one level deeper.
+      $grants_storage = array_slice($grants, 1);
+
+      // The recursive function is called differently for node access records and user grants.
+      if ($access_records) {
+        // We can use simple math to cascade each node access record grant value:
+        // multiplication ensures that zeros (deny) are retained throughout cascading
+        // while a one (allow) is only possible if all cascaded grants allow access.
+        _acb_cascade_grants($grants_storage, $access_records, $output, $realm_storage, $view * $grant['grant_view'], $update * $grant['grant_update'], $delete * $grant['grant_delete']);
+      }
+      else {
+        // For the user grants we call the recursive function twice: once using the updated realm and once pretending the realm wouldn't exist.
+        _acb_cascade_grants($grants_storage, $access_records, $output, $realm);
+        _acb_cascade_grants($grants_storage, $access_records, $output, $realm_storage);
+      }
+    }
+  }
+
+  // Create a record for this combination if:
+  //  - in case of access records: there are no remaining nesting levels
+  //  - in case of user grants: always!
+  if(!count($grants) || !$access_records) {
+    // Prepend 'acb' to comply to best practice of prefixing realms with the name of their responsible module.
+    $final_realm = 'acb&' . implode('&', $realm);
+    // Finished combination; save it.
+    // Exclude empty access record grants as they are useless and only take up memory.
+    if ($access_records && ($view || $update || $delete)) {
+      // Node access record.
+      $output[$final_realm] = array(
+        'realm' => $final_realm,
+        'gid' => 0,
+        'grant_view' => (int) $view,
+        'grant_update' => (int) $update,
+        'grant_delete' => (int) $delete,
+        'priority' => 100
+      );
+    }
+    elseif (!$access_records) {
+      // User grant.
+      if (!empty($realm)) {
+        $output[$final_realm] = array(0);
+      }
+    }
+  }
+
+  return $output;
+}

@@ -1,0 +1,192 @@
+<?php
+/**
+ * @file commerce_vat_included.module
+ * Makes coffee and provides exact vat-included prices.
+ */
+
+/**
+ * Helper for alter hooks in submodules. We use the fact that tax and vat api are nearly identical.
+ *
+ * @param array $tax_rates
+ *   Tax rates from commerce_tax OR commerce_vat module.
+ * @param bool $is_vat
+ *   True if we are called from commerce_vat module.
+ * @param bool $create
+ *   True if we are supposed to create additional rates instead of altering the existing ones.
+ */
+function commerce_vat_included_alter_rates(array &$tax_rates, $is_vat, $create) {
+  foreach ($tax_rates as $tax_name => $tax_rate) {
+    if ($is_vat or ($tax_rate['type'] == 'vat')) {
+      $tax_rate_vat_included = $tax_rate;
+      // Title.
+      $tax_rate_vat_included['title'] .= t(' (from VAT included price)');
+      // Rules component.
+      if ($create and isset($tax_rate_vat_included['rules_component'])) {
+        $tax_rate_vat_included['rules_component'] .= '_inc';
+      }
+      // Calculation callback.
+      $tax_rate_vat_included['calculation_callback'] = $is_vat? 'commerce_vat_included_vat_rate_calculate' : 'commerce_vat_included_tax_rate_calculate';
+      // Maybe change name.
+      if ($create) {
+        $tax_name .= '_inc';
+      }
+      // Finally check name and rules component. We yell long items to watchdog whether we caused them or not.
+      if ((strlen($tax_name) > 42) and !isset($tax_rate['rules_component'])) {
+        watchdog('Commerce VAT included',
+          'A tax name > 42 chars must declare rules_component explicitly so it won\'t exceed 64 chars. Omitting tax  %tax.',
+          array('%tax' => $tax_name), WATCHDOG_ERROR);
+        continue;
+      }
+      if (isset($tax_rate_vat_included['rules_component']) and strlen($tax_rate_vat_included['rules_component']) > 64) {
+        watchdog('Commerce VAT included',
+          'Rules component %component exceeds 64 chars. Omitting tax %tax.',
+          array('%component' => $tax_rate_vat_included['rules_component'], '%tax' => $tax_name), WATCHDOG_ERROR);
+        continue;
+      }
+      // Add or change tax rate.
+      $tax_rates[$tax_name] = $tax_rate_vat_included;
+    }
+  }
+}
+
+/**
+ * TAX callback: Wraps tax callback for the commerce_tax module.
+ *
+ * @param array $tax_rate
+ * @param EntityDrupalWrapper $line_item_wrapper
+ * @return array|bool
+ */
+function commerce_vat_included_tax_rate_calculate(array $tax_rate, EntityDrupalWrapper $line_item_wrapper) {
+  $price_component = $tax_rate['price_component'];
+  $calculate_amount_excluding_vat = function(&$amount, $vat_is_included) use($tax_rate) {
+    if ($vat_is_included) {
+      $original_amount = $amount;
+      // We change sign here because the rounding mode is configered for tax, but we calculate amount excluding tax here.
+      $amount = -commerce_tax_rate_round_amount($tax_rate, -$amount / (1 + $tax_rate['rate']));
+      return $original_amount - $amount;
+    }
+    else {
+      return commerce_tax_rate_round_amount($tax_rate, $amount * $tax_rate['rate']);
+    }
+  };
+  $return = commerce_vat_included_rate_calculate($line_item_wrapper, $price_component, $calculate_amount_excluding_vat);
+  if (is_array($return)) {
+    $return['data'] = array(
+      'tax_rate' => $tax_rate,
+    );
+  }
+  return $return;
+}
+
+/**
+ * VAT callback: Wraps tax callback for the commerce_vat module.
+ *
+ * @param $vat_rate
+ * @param $rate_info
+ * @param EntityDrupalWrapper $line_item_wrapper
+ * @return array|bool
+ */
+function commerce_vat_included_vat_rate_calculate($vat_rate, $rate_info, EntityDrupalWrapper $line_item_wrapper) {
+  $price_component = $vat_rate['price_component'];
+  $calculate_amount_excluding_vat = function(&$amount, $vat_is_included) use($rate_info) {
+    if ($vat_is_included) {
+      $original_amount = $amount;
+      // We change sign here because the rounding mode is configered for tax, but we calculate amount excluding tax here.
+      // We do this although VAT module has no configurable rounding yet. See https://drupal.org/node/2125611
+      $amount = -commerce_vat_rate_round_amount(-$amount / (1 + $rate_info['rate']));
+      return $original_amount - $amount;
+    }
+    else {
+      return commerce_vat_rate_round_amount($amount * $rate_info['rate']);
+    }
+  };
+  $return = commerce_vat_included_rate_calculate($line_item_wrapper, $price_component, $calculate_amount_excluding_vat);
+  if (is_array($return)) {
+    $return['data'] = array(
+      'vat_rate' => $vat_rate,
+      'vat_rate_info' => $rate_info,
+    );
+  }
+  return $return;
+}
+
+/**
+ * Tax callback: Calculates a price array for the tax on the unit price of a line item.
+ *
+ * Like @see commerce_tax_rate_calculate() and @see commerce_vat_rate_calculate(), but changes the net price.
+ * Called from @see commerce_tax_rate_apply().
+ * Or @see commerce_vat_rate_apply().
+ *
+ * @param \EntityDrupalWrapper $line_item_wrapper
+ *   An entity_metadata_wrapper() for the line item the unit price of which should be
+ *     used in the tax calculation.
+ *
+ * @param string $price_component
+ * @param callback $calculate_amount
+ * @return array|bool
+ *   The tax price array or FALSE if the tax is already applied.
+ */
+function commerce_vat_included_rate_calculate(EntityDrupalWrapper $line_item_wrapper, $price_component, $calculate_amount) {
+  // By default, do not duplicate a tax that's already on the line item.
+  if (!is_null($line_item_wrapper->commerce_unit_price->value()) &&
+    !commerce_price_component_load($line_item_wrapper->commerce_unit_price->value(), $price_component)) {
+
+    // Get values.
+    // We use get('data') here to calm our IDE.
+    /** @var EntityDrupalWrapper $price_wrapper */
+    $price_wrapper = $line_item_wrapper->commerce_unit_price;
+    $price_data = $price_wrapper->get('data')->value();
+    $components = &$price_data['components'];
+
+    $total_amount_given = $price_wrapper->amount->value();
+
+    // Enumerate components and sum up price components including and excluding vat.
+    $summed_tax_amount = $summed_original_amount = $summed_altered_amount = 0;
+    foreach($components as &$component) {
+      $component_name = $component['name'];
+      $component_amount = &$component['price']['amount'];
+
+      // Sum up before change
+      $summed_original_amount += $component_amount;
+
+      $vat_is_included = commerce_vat_included_is_applicable_price_component($component_name);
+      // Calculate tax and maybe alter $component_amount.
+      $component_tax_amount = $calculate_amount($component_amount, $vat_is_included);
+
+      // Sum up after change.
+      $summed_altered_amount += $component_amount;
+      $summed_tax_amount += $component_tax_amount;
+    }
+    // Check if someone gave us inconsistent price data.
+    if ((int)$summed_original_amount !== (int)$total_amount_given) {
+      watchdog('Commerce VAT included',
+        'Don\'t blame me for this inconsistent price: Amount is %amount but components only %components.',
+        array('%amount' => $total_amount_given, '%components' => $summed_original_amount), WATCHDOG_ERROR);
+    }
+
+    $price_wrapper->get('data')->set($price_data);
+
+    // Adjust amount: commerce_tax_rate_apply() will add the tax amount we return, so set value without tax.
+    $price_wrapper->amount->set($summed_altered_amount);
+
+    return array(
+      'amount' => $summed_tax_amount,
+      'currency_code' => $price_wrapper->currency_code->value(),
+    );
+  }
+  return FALSE;
+}
+
+/**
+ * @param string $component_name
+ * @return bool;
+ */
+function commerce_vat_included_is_applicable_price_component($component_name) {
+  $applicable_price_components = &drupal_static('commerce_vat_included_price_components');
+  if (!isset($applicable_price_components)) {
+    // Use array keys for faster search.
+    $applicable_price_components = array_fill_keys(variable_get_value('commerce_vat_included_price_components'), TRUE);
+  }
+  $applicable = !empty($applicable_price_components[$component_name]);
+  return $applicable;
+}

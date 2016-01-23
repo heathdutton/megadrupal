@@ -1,0 +1,247 @@
+<?php
+/**
+ * @file
+ * Janrain Widgets submodule file.
+ */
+
+/**
+ * Implements hook_init().
+ */
+function janrain_widgets_init() {
+  module_load_include('php', 'janrain_widgets', 'janrain_widgets_form');
+
+  $sdk = JanrainSdk::instance();
+  $config = $sdk->getConfig();
+
+  $xdcomm_path = $GLOBALS['base_url'] . '/janrain/xdcomm.html';
+  $logout_uri = $GLOBALS['base_url'] . '/user/logout';
+  $config->setItem('sso.xdr', $xdcomm_path);
+  $config->setItem('sso.logoutUri', $logout_uri);
+
+  if (_janrain_is_login_only()) {
+    $sdk->addFeatureByName('EngageWidget');
+    module_load_include('php', 'janrain_widgets', 'login');
+    if ($sdk->BackplaneWidget) {
+      foreach ($sdk->BackplaneWidget->getHeadJsSrcs() as $js) {
+        drupal_add_js($js, 'external');
+      }
+    }
+  }
+  else {
+    $sdk->addFeatureByName('CaptureWidget');
+    module_load_include('php', 'janrain_widgets', 'registration');
+  }
+
+  if ($sdk->FederateWidget && user_is_logged_in()) {
+    // Federate in play, make sure SSO logout works.
+    foreach ($sdk->FederateWidget->getHeadJsSrcs() as $src) {
+      drupal_add_js($src, 'external');
+    }
+    $sso_script = $sdk->FederateWidget->getStartHeadJs()
+      . $sdk->FederateWidget->getSettingsHeadJs()
+      . $sdk->FederateWidget->getEndHeadJs();
+    drupal_add_js($sso_script, 'inline');
+  }
+}
+
+/**
+ * Implements hook_menu().
+ */
+function janrain_widgets_menu() {
+  $menu = array();
+  if (module_exists('janrain_admin_ui')) {
+    $menu["admin/config/people/janrain/widgets"] = array(
+      'type' => MENU_LOCAL_TASK,
+      'title' => 'SSO / Backplane',
+      'access arguments' => array('administer site configuration'),
+      'page callback' => 'drupal_get_form',
+      'page arguments' => array('janrain_widgets_settings_form'),
+      'weight' => 20,
+    );
+  }
+  $menu['janrain/xdcomm.html'] = array(
+    'type' => MENU_CALLBACK,
+    'access callback' => TRUE,
+    'page callback' => '_janrain_widgets_xdcomm',
+  );
+  return $menu;
+}
+
+/**
+ * Menu callback to do nothing but render the xdcomm page.
+ */
+function _janrain_widgets_xdcomm() {
+  \janrain\platform\features\FederateWidget::renderXdcomm();
+  drupal_exit();
+}
+
+/**
+ * Implements hook_cron().
+ *
+ * Makes sure the widget packages are properly synchronized with the state of
+ * the disk.
+ */
+function janrain_widgets_cron() {
+  _janrain_widgets_discover_pkgs();
+}
+
+/**
+ * Helper to remove package assets by managed file id.
+ *
+ * Accepts managed file id. Does a sanity check. Purges the unzipped folder then
+ * deletes the managed file.
+ */
+function _janrain_widgets_remove_pkg($fid) {
+  $file = file_load($fid);
+
+  // Sanity check that you're only trying to remove files from janrain_widgets.
+  if (0 !== strpos($file->uri, 'public://janrain_widgets/')) {
+    watchdog('janrain_widgets', 'Invalid remove location for {{pkg}}!', array('{{pkg}}' => $file->filename), WATCHDOG_ERROR);
+    return FALSE;
+  }
+
+  // Remove.
+  $folder = sprintf('public://janrain_widgets/%s', basename($file->filename, '.zip'));
+  if (file_unmanaged_delete_recursive($folder)) {
+    watchdog('janrain_widgets', 'Removed package {{file}}', array('{{file}}' => $file->filename), WATCHDOG_NOTICE);
+  }
+  $success = file_delete($file, TRUE);
+  if ($success) {
+    watchdog('janrain_widgets', 'Removed file {{uri}}', array('{{uri}}' => $file->uri), WATCHDOG_NOTICE);
+  }
+  return $success;
+}
+
+/**
+ * Helper to install static assets from managed upload.
+ *
+ * Does a quick sanity check, then purges existing installation and "unzips"
+ * the package into it's own folder. Note: using phar because ZipArchive is not
+ * always present.
+ */
+function _janrain_widgets_install_pkg($file) {
+  // Sanity check that file is a file and is a widget package.
+  if (0 !== strpos($file->uri, 'public://janrain_widgets/')) {
+    watchdog('janrain_widgets', 'Invalid install location for {{pkg}}!', array('{{pkg}}' => $file->filename), WATCHDOG_ERROR);
+    return FALSE;
+  }
+
+  // Prepare install folder.
+  $install_path = sprintf('public://janrain_widgets/%s', basename($file->uri, '.zip'));
+  file_unmanaged_delete_recursive($install_path);
+  file_prepare_directory($install_path, FILE_CREATE_DIRECTORY);
+  // Extract package.
+  $phar = new \PharData(drupal_realpath($file->uri), FilesystemIterator::KEY_AS_FILENAME);
+  foreach ($phar as $name => $info) {
+    $fp = fopen($info, 'r');
+    $success = file_unmanaged_save_data($fp, "{$install_path}/{$name}", FILE_EXISTS_REPLACE);
+    fclose($fp);
+    if (!$success) {
+      watchdog('janrain_widgets', 'Package install failed!', NULL, WATCHDOG_ERROR);
+      return FALSE;
+    }
+  }
+  watchdog('janrain_widgets', 'Installed {{pkg}} successfully!', array('{{pkg}}' => $file->filename), WATCHDOG_NOTICE);
+  return TRUE;
+}
+
+/**
+ * Helper to actually save a managed file upload.
+ *
+ * Basically working around invisble managed file versioning and "default-temp"
+ * assumptions. Note: we add a file_usage as a requirement of managed files. We
+ * always force delete which removes the usage.
+ */
+function _janrain_widgets_save_pkg($fid) {
+  // Get file.
+  $file = file_load($fid);
+
+  // File exists, is zip, and lives where it should. Proceed.
+  // Deal with managed file quirks.
+  $file->status = FILE_STATUS_PERMANENT;
+  $file->filename = basename($file->uri);
+  file_usage_add($file, 'janrain_widgets', 'package', $file->fid);
+  return file_save($file);
+}
+
+/**
+ * Helper to manage cached list of available widget packages.
+ *
+ * Returns array[package_uri] => file_id. Caches results so cache clearing is
+ * necessary to update widgets list.
+ */
+function _janrain_widgets_list_pkgs() {
+  // Shortcut return cache.
+  $pkgs = cache_get('janrain_widgets:packages');
+  if ($pkgs) {
+    return $pkgs->data;
+  }
+
+  // Cache empty fill cache.
+  $out = array();
+  $result = db_select('file_managed', 'fm')
+    ->fields('fm', array('fid', 'uri'))
+    ->condition('uri', 'public://janrain_widgets/%', 'LIKE')
+    ->condition('status', '1')
+    ->execute();
+  while ($file = $result->fetchObject()) {
+    $out[$file->uri] = (int) $file->fid;
+  }
+  cache_set('janrain_widgets:packages', $out);
+  return $out;
+}
+
+/**
+ * Helper to synchronize upload folder to managed files.
+ *
+ * There may be a situation during upgrades and or uninstall/reinstall cycles
+ * where drupal forgets about come packages. This function helps ensure packages
+ * wont be lost, however, if they become unbound from their managed file entry
+ * they'll be assigned a new managed file (new blocks). Likewise, managed files
+ * that point to nothing are purged. This clears the list cache.
+ */
+function _janrain_widgets_discover_pkgs() {
+  // Track success of all ops.
+  $success = TRUE;
+  // Purge temporary uploads.
+  $temp_managed_files = db_select('file_managed', 'fm')
+    ->fields('fm')
+    ->condition('uri', 'public://janrain_widgets/%', 'LIKE')
+    ->condition('status', '0')
+    ->execute();
+  foreach ($temp_managed_files as $f) {
+    $success = _janrain_widgets_remove_pkg($f->fid) && $success;
+  }
+
+  // Lookup pkgs in folder.
+  $pkgs = file_scan_directory('public://janrain_widgets', '/.*\.zip$/');
+  $pkg_uris = array_keys($pkgs);
+
+  // Find managed file ids.
+  $manageds = db_select('file_managed', 'fm')
+    ->fields('fm')
+    ->condition('uri', 'public://janrain_widgets/%', 'LIKE')
+    ->condition('status', '1')
+    ->execute()->fetchAllAssoc('uri');
+  $managed_uris = array_keys($manageds);
+
+  // First add packages Drupal doesn't know about.
+  foreach (array_diff($pkg_uris, $managed_uris) as $new_pkg) {
+    $file = file_save_data(file_get_contents($new_pkg), $new_pkg, FILE_EXISTS_REPLACE);
+    if ($file && file_usage_add($file, 'janrain_widgets', 'package', $file->fid)) {
+      $success = _janrain_widgets_install_pkg($new_file) && $success;
+    }
+  }
+
+  // Next remove packages Drupal is incorrectly pointing to.
+  foreach (array_diff($managed_uris, $pkg_uris) as $missing_pkg) {
+    $file = file_load($manageds[$missing_pkg]->fid);
+    if ($file) {
+      $success = _janrain_widgets_remove_pkg($file->fid) && $success;
+    }
+  }
+
+  // Flush package cache.
+  cache_clear_all('janrain_widgets:packages', 'cache');
+  return $success;
+}

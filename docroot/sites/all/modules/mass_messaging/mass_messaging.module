@@ -1,0 +1,451 @@
+<?php
+
+/**
+ * @file
+ * This module allows the mass sending of messages over different channels (e-mail, SMS and so on)
+ * by using Rules. The module provides an action which sends the messages. The selection
+ * of the recipient is done with Views. The subject, the body and some other aspects of the
+ * message can be generated also by Views.
+ *
+ */
+
+
+/**
+ * Implementation of hook_views_api().
+ */
+function mass_messaging_views_api() {
+  return array(
+    'api' => '3.0-alpha1',
+  );
+}
+
+
+/**
+ * Provides a list of views with a mass messaging display inside.
+ * This function is used to provide the list for the rules
+ * argument selection.
+ */
+function mass_messaging_view_list() {
+  $views = views_get_all_views();
+
+  $list = array();
+
+  foreach($views as $view => $view_object) {
+    foreach($view_object->display as $display => $display_object) {
+      if ($display_object->display_plugin == 'message') {
+        $list[$view . ':' . $display] = $view_object->human_name . ': ' . $display_object->display_title;
+      }
+    }
+  }
+
+  return $list;
+}
+
+/**
+ * Implementation of hook_theme()
+ */
+function mass_messaging_theme() {
+  return array(
+    'mass_messaging_view_preview' => array(
+      'variables' => array('view' => NULL, 'sets' => array()),
+  ),
+    'mass_messaging_debug_format_message' => array(
+      'variables' => array('message' => NULL),
+  ),
+  );
+}
+
+/**
+ * Implementation of hook_menu()
+ */
+function mass_messaging_menu() {
+
+  // Administration pages.
+  $items['admin/config/mass_messaging'] = array(
+    'title' => 'Mass messaging',
+    'description' => 'Administer Mass messaging.',
+    'position' => 'left',
+    'weight' => -10,
+    'page callback' => 'system_admin_menu_block_page',
+    'access arguments' => array('access administration pages'),
+    'file' => 'system.admin.inc',
+    'file path' => drupal_get_path('module', 'system'),
+  );
+
+  $items['admin/config/mass_messaging/configuration'] = array(
+    'title' => 'Configure',
+    'description' => 'Configure Mass messaging module.',
+    'page callback' => 'drupal_get_form',
+    'access arguments' => array('administer mass messaging'),
+    'page arguments' => array('mass_messaging_settings_form'),
+    'file' => 'mass_messaging.admin.inc',
+    'weight' => 10,
+  );
+
+  $items['admin/config/mass_messaging/queue'] = array(
+    'title' => 'Queue',
+    'description' => 'View the Mass messaging queue.',
+    'page callback' => 'drupal_get_form',
+    'access arguments' => array('view mass messaging queue'),
+    'page arguments' => array('mass_messaging_queue_form'),
+    'file' => 'mass_messaging.admin.inc',
+    'weight' => 10,
+  );
+
+  return $items;
+}
+
+
+function mass_messaging_permission() {
+  return array(
+    'administer mass messaging' => array(
+      'title' => t('administer mass messaging'),
+      'description' => t('Administer mass messaging'),
+  ),
+    'view mass messaging queue' => array(
+      'title' => t('view mass messaging queue'),
+      'description' => t('View the mass messaging queue.'),
+  ),
+  );
+}
+
+
+
+/**
+ * This function sends messages to the recipients. It messages are only
+ * queued. The real sending is done later by the cron.
+ *
+ * @param string $view_id
+ * @param string $display_id
+ * @param array $arguments
+ */
+function mass_messaging_send_messages($view_id, $display_id, $arguments = array()) {
+  db_insert('mass_messaging_queue')
+  ->fields(array(
+    'view_id' => $view_id,
+    'display_id' => $display_id,
+    'arguments' => serialize($arguments),
+  ))
+  ->execute();
+}
+
+/**
+ * Implementation of hook_cron()
+ *
+ * This method is used to process the messages in the queue.
+ */
+function mass_messaging_cron() {
+
+  // The cron percentage defines how long, of the available time the
+  // cron can take for the processing of the mails in the queue. Default
+  // 80, so other application get also a chance to process anything.
+  $cron_percentage = variable_get('mass_messaging_cron_percentage', '80');
+
+  // This timeout indicates how long a queue cannot show any
+  // activity until it is seen as a broken. After each
+  // batch the queue is updated.
+  $timeout = variable_get('mass_messaging_queue_timeout', '180');
+
+  // The batch size determine how many messages are processed
+  // with in a iteration.
+  $batch_size = variable_get('mass_messaging_batch_size', '100');
+
+  // If we are on the debug mode, we log some information.
+  $debug = variable_get('mass_messaging_debug', FALSE);
+
+  $total_seconds = ini_get('max_execution_time');
+  if (empty($total_seconds)) {
+    // If we can't get any max execution time, then we set it to 30 seconds.
+    // because this is the default max execution time.
+    $total_seconds = 30;
+  }
+
+  $lost_seconds = timer_read('page')/1000;
+  $available_seconds = $total_seconds - $lost_seconds;
+
+  // Get the real usable time for processing. We give other application at least 5 seconds
+  // to process anything. This ensures that any user input wont hurt the application.
+  $usable_seconds = min(array($available_seconds - 5, $total_seconds*$cron_percentage/100));
+
+  // Process as long as we have enough time.
+  while (timer_read('page')/1000 < $lost_seconds + $usable_seconds) {
+
+    $transaction = db_transaction();
+    try {
+
+      $result = db_query("SELECT
+        queue_item_id, 
+        view_id, 
+        display_id, 
+        arguments 
+      FROM 
+        {mass_messaging_queue} 
+      WHERE 
+        (is_processing = 0 OR last_process_activity + :timeout < NOW())
+      ORDER BY last_process_activity ASC
+      LIMIT 0,1", array(':timeout' => $timeout));
+
+      $queue_item = $result->fetchObject();
+
+      if (!empty($queue_item)) {
+        db_update('mass_messaging_queue')
+        ->fields(array(
+            'is_processing' => 1,
+            'last_process_activity' => time(),
+        ))
+        ->condition('queue_item_id', $queue_item->queue_item_id, '=')
+        ->execute();
+        
+        // Force the commit
+        unset($transaction);
+      }
+     
+
+    } catch (Exception $e) {
+      
+      watchdog('mass_messaging', $e->getMessage(), array(), WATCHDOG_ERROR);
+      $transaction->rollback();
+      unset($transaction);
+      // We are in a error state, so stop and try to take another queue item.
+      break;
+    }
+
+    // If no queue item is set, then the queue seems to be empty. So nothing
+    // to process.
+    if (empty($queue_item)) {
+      return;
+    }
+
+    // Start processing the queue item
+    // Processing steps:
+    // 1. Load queue item view with display & arguments (Left outer join is in the display plugin).
+    // 2. Iterates over the message in the view
+    // 3. Start Transaction
+    // 4. Insert message to the messages_sent table
+    // 5. Send the message
+    // 6. Commit
+    // 7. take next message until there is no message in the view.
+
+    $view = views_get_view($queue_item->view_id);
+
+    // Make sure the query is not cached
+    $view->is_cacheable = FALSE;
+
+    // Try to load the display
+    if (!$view->set_display($queue_item->display_id)) {
+      watchdog('mass_messaging', "Can't load display '" . $queue_item->display_id . "'.");
+      return;
+    }
+
+    $view->display_handler->set_option('mass_messaging_queue_item_id', $queue_item->queue_item_id);
+
+    $no_messages_left_in_view = FALSE;
+      
+    // Limit result set size by the batch_size
+    $view->display_handler->set_option('pager', array('type' => 'some', 'options' => array('items_per_page' => $batch_size)));
+
+    // Make sure the query is not cached
+    $view->is_cacheable = FALSE;
+
+    // Get the messages
+    $messages = $view->execute_display($queue_item->display_id, unserialize($queue_item->arguments));
+	
+    if (empty($messages)) {
+    	$number_of_messages = 0;
+    }
+    else {
+    	$number_of_messages = count($messages);
+    }
+    
+
+    if ($debug) {
+      // puts the query into the watchdog.
+      //watchdog('mass_messaging', (string)$view->query->query());
+      watchdog('mass_messaging', t('Number of Messages to process: %number', array('%number' => $number_of_messages)));
+    }
+
+    // Check if there is time left for processing. This is required, because
+    // complex queries can lead to long loading times. Especially when the batch
+    // size is too big.
+    if (!(timer_read('page')/1000 < $lost_seconds + $usable_seconds)) {
+        
+    }
+    elseif (empty($messages) || $number_of_messages <= 0) {
+      $no_messages_left_in_view = true;
+    }
+    else {
+
+
+      $i = 0;
+      while($number_of_messages > $i && (timer_read('page')/1000 < $lost_seconds + $usable_seconds)) {
+        $message = $messages[$i];
+          
+        $transaction = db_transaction();
+        try {
+            
+          db_insert('mass_messaging_sent_messages')
+          ->fields(array(
+            'queue_item_id' => $queue_item->queue_item_id,
+            'message_id' => $message->message_id,
+            'message_sent_on' => time(),
+          ))
+          ->execute();
+            
+            
+            
+          if ($debug == TRUE) {
+            watchdog('mass_messaging', theme('mass_messaging_debug_format_message', array('message' => $message, 'queue_item' => $queue_item)), array(), WATCHDOG_DEBUG);
+          }
+          else {
+            $callback = $message->send_method['callback'];
+            $callback($message);
+          }
+          
+          // Force Commit
+          unset($transaction);
+            
+        } catch (Exception $e) {
+          $transaction->rollback();
+          watchdog('mass_messaging', $e->getMessage(), array(), WATCHDOG_ERROR);
+          unset($transaction);
+        }
+
+        $i++;
+      }
+    }
+
+    // Since we have processed all message in this view
+    // we can remove the item from the view
+    if ($no_messages_left_in_view || $number_of_messages <= $i) {
+      db_delete('mass_messaging_queue')
+      ->condition('queue_item_id', $queue_item->queue_item_id, '=')
+      ->execute();
+      db_delete('mass_messaging_sent_messages')
+      ->condition('queue_item_id', $queue_item->queue_item_id, '=')
+      ->execute();
+    }
+    else {
+      // Update the queue activity
+      db_update('mass_messaging_queue')
+      ->fields(array(
+          'is_processing' => '0',
+          'last_process_activity' => time(),
+      ))
+      ->condition('queue_item_id', $queue_item->queue_item_id, '=')
+      ->execute();
+    }
+  }
+
+
+}
+
+/**
+ * Generates the list of send methods available.
+ *
+ * @param string $method Identifier of the method
+ * @param booelan $reset Resets the cache
+ * @return array list of available methods
+ */
+function mass_messaging_send_methods($method = NULL, $reset = FALSE) {
+  static $methods;
+
+  if (count($methods) == 0 || $reset) {
+    $methods = module_invoke_all('mass_messaging_send_method_info');
+  }
+
+  if ($method != NULL) {
+    if (isset($methods[$method])) {
+      return $methods[$method];
+    }
+    else {
+      return NULL;
+    }
+  }
+
+  return $methods;
+}
+
+
+
+
+function theme_mass_messaging_view_preview($vars) {
+  $view = $vars['view'];
+  $results = $vars['results'];
+
+  $header = array(
+    'message_id' => t('Message Id'),
+    'subject' => t('Subject'),
+    'recipients' => t('Recipients'),
+    'carbon_copy' => t('Carbon Copy (CC)'),
+    'blind_carbon_copy' => t('Blind Carbon Copy (BCC)'),
+    'from' => t('From'),
+    'html_body' => t('HTML Body'),
+    'text_body' => t('Text Body'),
+    'attachments' => t('Attachments'),
+    'send_method' => t('Send Method'),
+  );
+
+  $rows = array();
+
+  foreach ($results as $record) {
+    $cells = array();
+    foreach ($record as $key => $value) {
+      if ($key == 'send_method') {
+        $cells[$key] = (is_array($value) && isset($value['name'])) ? $value['name'] : t('no send method defined');
+      }
+      elseif($key == 'attachments') {
+        $cell_content = '';
+        
+        foreach($value as $attachment) {
+          if (isset($attachment['filepath'])) {
+            $cell_content .= '<strong>' . t('File Path') . ':</strong> ' . $attachment['filepath'] . '<br />';
+          }
+          if (isset($attachment['filemime'])) {
+            $cell_content .= '<strong>' . t('File Mime') . ':</strong> ' . $attachment['filemime'] . '<br />';
+          }
+          
+          
+          $cell_content .= '<br />';
+        }
+        $cells[$key] = $cell_content;
+        
+      }
+      else {
+        $cells[$key] = is_array($value) ? implode(',', $value) : $value;
+      }
+        
+    }
+    $rows[] = $cells;
+
+  }
+
+  return theme_table(array(
+    'rows' => $rows, 
+    'header' => $header, 
+    'attributes' => array(), 
+    'caption' => '', 
+    'colgroups' => array(), 
+    'sticky' => false, 
+    'empty' => t('No matching entry found.'),
+  ));
+}
+
+function theme_mass_messaging_debug_format_message($vars) {
+  $message = $vars['message'];
+  $output = '';
+  $queue_item = $vars['queue_item'];
+  
+  $output .= '<strong>Message ID:</strong> ' . $message->message_id . '<br /> ';
+  $output .= '<strong>Queue Item ID:</strong> ' . $queue_item->queue_item_id . '<br /> ';
+  $output .= '<strong>View:</strong> ' . $queue_item->view_id . '<br /> ';
+  $output .= '<strong>Display:</strong> ' . $queue_item->display_id . '<br /> <br />';
+  
+  $output .= '<strong>Subject:</strong> ' . htmlentities($message->subject) . '<br />';
+  $output .= '<strong>Recipients:</strong> ' . htmlentities(implode(', ', $message->recipients)) . '<br />';
+  $output .= '<strong>Carbon Copy (CC):</strong> ' . htmlentities(implode(', ', $message->carbon_copy)) . '<br />';
+  $output .= '<strong>Blind Carbon Copy (BCC):</strong> ' . htmlentities(implode(', ', $message->blind_carbon_copy)) . '<br />';
+  $output .= '<strong>Body (Text):</strong><br />' . strip_tags($message->text_body) . '<br /><br />';
+  $output .= '<strong>Body (HTML):</strong><br />' . htmlentities($message->html_body) . '<br /><br />';
+  
+  return $output;
+}

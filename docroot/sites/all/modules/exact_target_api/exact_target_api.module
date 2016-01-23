@@ -1,0 +1,732 @@
+<?php
+/**
+ * @file
+ * Main module for the ExactTarget API.  This file implements the public and
+ * internal "private" functions used to wrap the ExactTarget XML API.
+ */
+
+// Constants for use throughout module
+
+define('ET_MSG_MODULE', 'exact_target_api');
+define('ET_XML_ENDPOINT_NORMAL', 'https://api.dc1.exacttarget.com/integrate.aspx');
+define('ET_XML_ENDPOINT_S4', 'https://api.s4.exacttarget.com/integrate.aspx');
+define('ET_XML_ENDPOINT_S6', 'https://api.s6.exacttarget.com/integrate.aspx');
+
+define('ET_CFG_VAR', 'exact_target_api_cfg');
+define('ET_CFG_ENDPOINT', 'et_cfg_endpoint');
+define('ET_CFG_API_USER', 'et_api_user');
+define('ET_CFG_API_PASS', 'et_api_pass');
+define('ET_CFG_CHANNEL_MEMBER_ID', 'et_channel_member_id');
+
+// Schema table and column names:
+
+define('ET_TABLE_LIST_CACHE', 'et_list_cache');
+define('ET_COL_LISTID', 'listid');
+define('ET_COL_LIST_NAME', 'list_name');
+define('ET_COL_LIST_TYPE', 'list_type');
+
+// Convenience constants to help with ET
+
+define('ET_TRUE', 'True');
+define('ET_FALSE', 'False');
+
+define('ET_LIST_PUBLIC', 'Public');
+define('ET_LIST_PRIVATE', 'Private');
+define('ET_LIST_SALESFORCE', 'Salesforce');
+define('ET_LIST_MASTER', 'Master');
+define('ET_LIST_VIRTUAL', 'Virtual');
+
+define('ET_SUBSCRIBER_ACTIVE', 'Active');
+define('ET_SUBSCRIBER_UNSUBSCRIBED', 'Unsubscribed');
+define('ET_SUBSCRIBER_RETURNED', 'Returned');
+define('ET_SUBSCRIBER_UNDELIVERABLE', 'Undeliverable');
+define('ET_SUBSCRIBER_DELETED', 'Deleted');
+
+/*
+ * Start of Drupal hook implementations
+ */
+
+/**
+ * Implements hook_menu().
+ */
+function exact_target_api_menu() {
+  $items = array();
+
+  $items['admin/config/system/exact-target-api'] = array(
+    'title' => 'ExactTarget API',
+    'description' => 'Configure integration with Exact Target API',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('exact_target_api_configure_form'),
+    'access callback' => 'user_access',
+    'access arguments' => array('administer site configuration'),
+    'file' => 'exact_target_api.admin.inc',
+    'type' => MENU_NORMAL_ITEM,
+  );
+
+  return $items;
+}
+
+/**
+ * Start of "private" utility functions for this module
+ */
+
+/**
+ * Helper function to retrieve config info
+ */
+function _exact_target_api_get_config() {
+  return variable_get(ET_CFG_VAR);
+}
+
+/**
+ * Helper function to store config info
+ */
+function _exact_target_api_set_config($cfg) {
+  if (is_array($cfg)) {
+    variable_set(ET_CFG_VAR, $cfg);
+  }
+}
+
+/**
+ * Constructs and makes a call to ExactTarget API server
+ */
+function _exact_target_api_call($system_name, $action, $params = array()) {
+  $cfg = _exact_target_api_get_config();
+  $return = NULL;
+  $def_params = array(
+    'search_type' => '',
+    'search_value' => '',
+  );
+  $params = array_merge($def_params, $params);
+
+  // Check to make sure we have credentials:
+  if (!isset($cfg[ET_CFG_API_USER]) || !isset($cfg[ET_CFG_API_PASS])) {
+    $msg = t('ExactTarget API credentials need to be set (user and password).  !click_here to set them.',  
+        array('!click_here' => l(t('Click here'), 'admin/config/system/exact-target-api')));
+    watchdog(ET_MSG_MODULE, $msg);
+    if (user_access('administer site configuration')) {
+      drupal_set_message($msg, 'error', FALSE);
+    }
+    return $return;
+  }
+
+  // Formats XML elements
+  $xml_arr = array(
+    'exacttarget' => array(
+      'authorization' => array(
+        'username' => $cfg[ET_CFG_API_USER],
+        'password' => $cfg[ET_CFG_API_PASS],
+      ),
+      'system' => array(
+        'system_name' => $system_name,
+        'action' => $action,
+      ),
+    ),
+  );
+  $xml_arr['exacttarget']['system'] = array_merge($xml_arr['exacttarget']['system'], $params);
+  $xml = '<?xml version="1.0"?>' . format_xml_elements($xml_arr);
+
+  watchdog(ET_MSG_MODULE, htmlspecialchars($xml));
+
+  // Create cURL instance and execute the request:
+  $ch = curl_init($cfg[ET_CFG_ENDPOINT]);
+  if ($ch) {
+    curl_setopt($ch, CURLOPT_POST, TRUE);
+    curl_setopt($ch, CURLOPT_HEADER, FALSE);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, TRUE);
+    curl_setopt($ch, CURLOPT_POSTFIELDS, 'qf=xml&xml=' . rawurlencode($xml));
+
+    // Allow other modules to make changes. module_invoke_all() throws
+    // notices in PHP5.3 since it cannot pass by reference
+    foreach (module_implements('exact_target_api_curl_alter') as $module) {
+      $function = $module . '_exact_target_api_curl_alter';
+      $function($ch);
+    }
+
+    $return_xml = curl_exec($ch);
+
+    // See if we received a valid return value
+    if ($return_xml) {
+      $return = new SimpleXMLElement($return_xml);
+
+      // Check XML response for error codes.  Since the error condition can be 
+      // reported under who-knows-how-many levels of XML tags, and ET doesn't 
+      // document their error responses worth a damn, we use an XPath query to 
+      // find any occurence of the "error" tag
+      $errors = $return->xpath('//error');
+      if (!empty($errors)) {
+        // Report error returned by ET:
+        $code = $errors[0];
+        $descrs = $return->xpath('//error_description[1]');
+        $descr = (!empty($descrs)) ? $descrs[0] : '[No error text given]';
+        watchdog(
+          ET_MSG_MODULE,  
+          t('Call to ExactTarget returned error code @code<br />@descr<br />@xml', array('@code' => (string) $code, '@descr' => (string) $descr, '@xml' => htmlspecialchars($xml)))
+        );
+
+        $return = NULL;
+      }
+    }
+    else {
+      // No valid return received
+      watchdog(ET_MSG_MODULE, 'Call to ExactTarget server returned no valid response - dump from curl:<br /><pre>@dump</pre>', array('@dump' => print_r(curl_getinfo($ch), TRUE)), WATCHDOG_ERROR);
+    }
+    // Record any cURL errors.
+    if ($error = curl_error($ch)) {
+      watchdog(ET_MSG_MODULE, 'Call to ExactTarget server failed with the following error message: @message', array('@message' => $error), WATCHDOG_ERROR);
+    }   
+    
+    // Explicitly shut down connection to free resources
+    curl_close($ch);
+    unset($ch);
+  }
+
+  return $return;
+}
+
+/**
+ * Start of public API methods
+ */
+
+/**
+ * Retrieves profile andpreference attributes defined in the ET account
+ *
+ * The Attributes (Account Info) Retrieve call retrieves the profile and
+ * preference attributes defined in your account. The call requires no
+ * additional input, and it returns the details of your attribute
+ * definitions.
+ * @see http://wiki.memberlandingpages.com/030_Developer_Documentation/040_XML_API/XML_API_Calls_and_Sample_Code/List_Management/Attributes_%28Account_Info%29_Retrieve
+ */
+function exact_target_api_get_attributes() {
+  $attrs = array();
+
+  $data = _exact_target_api_call('accountinfo', 'retrieve_attrbs');
+  if ($data) {
+    // Make sure we have attributes 
+    if (!empty($data->system->profile->attribute)) {
+      foreach ($data->system->profile->attribute as $attr) {
+        // Extract the options before we flatten the object
+        $attr_values = array();
+        if (!empty($attr->values->value)) {
+          foreach ($attr->values->value as $value) {
+            $attr_values[] = (string) $value;
+          }
+        }
+        // Flatten object to array, scrub data a bit before storing off
+        $new_attr = get_object_vars($attr);
+        if (!empty($attr_values)) {
+          $new_attr['values'] = $attr_values;
+        }
+        $new_attr['hidden'] = (is_object($new_attr['display'])) ? TRUE : FALSE;
+        $new_attr['min_size'] = (int) $new_attr['min_size'];
+        $new_attr['max_size'] = (int) $new_attr['max_size'];
+
+        // Anything else left as an object can be wiped out:
+        foreach ($new_attr as $key => $val) {
+          if (is_object($val)) {
+            $new_attr[$key] = '';
+          }
+        }
+        if ('Email Type' != $new_attr['name']) {
+          $new_attr['fieldid'] = str_replace(' ', '__', $new_attr['name']);
+        }
+        else {
+          $new_attr['fieldid'] = str_replace(' ', '', $new_attr['name']);
+        }
+        $attrs[$new_attr['fieldid']] = $new_attr;
+      }
+    }
+  }
+
+  return $attrs;
+}
+
+/**
+ * Retrieves all groups in the ET account
+ *
+ * The List Retrieve Groups (All Groups) retrieves all groups in your
+ * account. No additional input is required, and the call returns the ID,
+ * name, description, and parent list ID of all groups in your account.
+ * @see http://wiki.memberlandingpages.com/030_Developer_Documentation/040_XML_API/XML_API_Calls_and_Sample_Code/List_Management/List_Retrieve_Groups_%28All_Groups%29
+ */
+function exact_target_api_get_groups() {
+  $groups = array();
+  $params = array(
+    'search_type' => 'groups',
+  );
+
+  $data = _exact_target_api_call('list', 'retrievegroups', $params);
+  if ($data) {
+    if (!empty($data->system->list->groups->group)) {
+      foreach ($data->system->list->groups->group as $group) {
+        $new_group = get_object_vars($group);
+        $groups[$new_group['groupID']] = $new_group;
+      }
+    }
+  }
+  return $groups;
+}
+
+/**
+ * Retrieves list of all ID's for this account
+ * @see http://wiki.memberlandingpages.com/030_Developer_Documentation/040_XML_API/XML_API_Calls_and_Sample_Code/List_Management/List_Retrieve
+ */
+function exact_target_api_get_lists() {
+  $lists = array();
+  $params = array(
+    'search_type' => 'listname',
+  );
+
+  $data = _exact_target_api_call('list', 'retrieve', $params);
+  if ($data) {
+    if (!empty($data->system->list->listid)) {
+      foreach ($data->system->list->listid as $listid) {
+        $lists[] = (string) $listid;
+      }
+    }
+  }
+
+  return $lists;
+}
+
+/**
+ * Retrieves list information for a given ID
+ * @see http://wiki.memberlandingpages.com/030_Developer_Documentation/040_XML_API/XML_API_Calls_and_Sample_Code/List_Management/List_Retrieve
+ */
+function exact_target_api_get_list_info($listid) {
+  static $cache = array();
+  $listinfo = array();
+
+  // Pre-pop our lookup cache for this page load from the DB
+  if (empty($cache)) {
+    $result = db_select(ET_TABLE_LIST_CACHE, 'et')
+    ->fields('et')
+    ->execute()
+    ->fetchAssoc();
+    
+    if ($result) {
+      foreach ($result as $record) {
+        $cache[$record[ET_COL_LISTID]] = $record;
+      }
+    }
+  }
+
+  // Now, let's see if we have a cached copy of the list info:
+  if (!empty($cache[$listid])) {
+    $listinfo = $cache[$listid];
+  }
+
+  // If not, retrieve the info and cache it in the DB
+  else {
+    $params = array(
+      'search_type' => 'listid',
+      'search_value' => $listid,
+    );
+
+    $data = _exact_target_api_call('list', 'retrieve', $params);
+    if ($data) {
+      if (!empty($data->system->list)) {
+        $listinfo = get_object_vars($data->system->list);
+        watchdog('exact_target_api', 'Fetched' . $data->system->list);
+        $listinfo[ET_COL_LISTID] = $listid;
+
+        // Store in DB:
+        drupal_write_record(ET_TABLE_LIST_CACHE, $listinfo, ET_COL_LISTID);
+
+        // Store in static cache
+        $cache[$listid] = $listinfo;
+      }
+    }
+  }
+
+  return $listinfo;
+}
+
+/**
+ * Creates a new subscriber list
+ *
+ * The List Add call creates a new subscriber list. The call requires the
+ * list name and type as input, and you receive the listID of the new list
+ * as a result of the call. Once the list has been created, you can add
+ * subscribers.
+ * @see http://wiki.memberlandingpages.com/030_Developer_Documentation/040_XML_API/XML_API_Calls_and_Sample_Code/List_Management/List_Add
+ */
+function exact_target_api_add_list($name, $type = ET_LIST_PUBLIC) {
+  $result = array();
+  $params = array(
+    'list_type' => $type,
+    'list_name' => $name,
+  );
+
+  $data = _exact_target_api_call('list', 'add', $params);
+  if ($data) {
+    // TODO - This either succeeds or fails - not sure if there is anything we should do with the response.
+
+  }
+
+  return $result;
+}
+
+/**
+ * Deletes a list and all subscribers who belong to that list
+ *
+ * The List Delete call deletes a list and all subscribers who belong to
+ * that list. The call requires a listID as input and returns a confirmation
+ * message.
+ * @see http://wiki.memberlandingpages.com/030_Developer_Documentation/040_XML_API/XML_API_Calls_and_Sample_Code/List_Management/List_Delete
+ */
+function exact_target_api_delete_list($listid) {
+  $result = array();
+  $params = array(
+    'search_type' => 'listid',
+    'search_value' => $listid,
+  );
+
+  $data = _exact_target_api_call('list', 'delete', $params);
+  if ($data) {
+    // TODO - This either succeeds or fails - not sure if there is anything we should do with the response.
+
+  }
+
+  return $result;
+}
+
+/**
+ * Renames a subscriber list
+ *
+ * The List Edit (Rename) call renames a subscriber list. The call requires a
+ * listID as input and returns a confirmation message.
+ * @see http://wiki.memberlandingpages.com/030_Developer_Documentation/040_XML_API/XML_API_Calls_and_Sample_Code/List_Management/List_Edit_%28Rename%29
+ */
+function exact_target_api_rename_list($listid, $name) {
+  $result = array();
+  $params = array(
+    'search_type' => 'listid',
+    'search_value' => $listid,
+    'list_name' => $name,
+  );
+
+  $data = _exact_target_api_call('list', 'edit', $params);
+  if ($data) {
+    // TODO - This either succeeds or fails - not sure if there is anything we should do with the response.
+
+  }
+
+  return $result;
+}
+
+/**
+ * Retrieves the profile and preference attributes for all subscribers on a 
+ * specified list
+ *
+ * The List Retrieve Subscribers call retrieves the profile and preference
+ * attributes for all subscribers on a specified list. You can filter these
+ * results by including subscriber status in the call. You provide a listID
+ * as input, and the call returns the values of all profile and preference
+ * attributes of the subscribers on your list.
+ * @see http://wiki.memberlandingpages.com/030_Developer_Documentation/040_XML_API/XML_API_Calls_and_Sample_Code/List_Management/List_Retrieve_Subscribers
+ */
+function exact_target_api_get_list_subscribers($listid, $status = '') {
+  $listsubs = array();
+  $params = array(
+    'search_type' => 'listid',
+    'search_value' => $listid,
+    'search_status' => $status,
+  );
+
+  $data = _exact_target_api_call('list', 'retrieve_sub', $params);
+  if ($data) {
+    // Make sure we have attributes 
+
+    if (!empty($data->system->list->subscribers->subscriber)) {
+      foreach ($data->system->list->subscribers->subscriber as $sub) {
+        // Flatten object to array, scrub data a bit before storing off
+
+        $new_sub = get_object_vars($sub);
+        foreach ($new_sub as $key => $val) {
+          if (is_object($val)) {
+            $new_sub[$key] = '';
+          }
+        }
+
+        $listsubs[$new_sub['id']] = $new_sub;
+      }
+    }
+  }
+
+  return $listsubs;
+}
+
+/**
+ * Returns information about subscribers currently on the Master Unsubscribe list
+ *
+ * The Master Unsub Retrieve call returns information about subscribers
+ * currently on the Master Unsubscribe list. You can specify a date range of
+ * when the unsubscribe action took place as input or retrieve all
+ * subscribers on the list. The call returns subscribers' names, email
+ * addresses, and unsubscribe information.
+ *
+ * NOTE - date ranges are not implemented at this time
+ * @see http://wiki.memberlandingpages.com/030_Developer_Documentation/040_XML_API/XML_API_Calls_and_Sample_Code/Subscriber_Management/Master_Unsub_Retrieve
+ */
+function exact_target_api_get_master_unsubscribe_list() {
+  $listsubs = array();
+  $params = array(
+    'sub_action' => 'masterunsub',
+  );
+
+  $data = _exact_target_api_call('tracking', 'retrieve', $params);
+  if ($data) {
+    // Make sure we have attributes 
+    if (!empty($data->system->tracking->masterunsub->subscriber)) {
+      foreach ($data->system->tracking->masterunsub->subscriber as $sub) {
+        // Flatten object to array, scrub data a bit before storing off
+        $new_sub = get_object_vars($sub);
+        foreach ($new_sub as $key => $val) {
+          if (is_object($val)) {
+            $new_sub[$key] = '';
+          }
+        }
+
+        $listsubs[$new_sub['subid']] = $new_sub;
+      }
+    }
+  }
+
+  return $listsubs;
+}
+
+/**
+ * Adds a subscriber to a subscriber list
+ *
+ * The Subscriber Add call adds a subscriber to a subscriber list. The call
+ * requires a listID and all applicable subscriber data, and you receive a
+ * subscriberID for each subscriber successfully added to a list.
+ * @see http://wiki.memberlandingpages.com/030_Developer_Documentation/040_XML_API/XML_API_Calls_and_Sample_Code/Subscriber_Management/Subscriber_Add
+ */
+function exact_target_api_add_subscriber($listid, $fields = array(), $channel_member_id = '') {
+  // If no channel ID given, check config to make sure it wasn't accidentally omitted:
+  $cfg = _exact_target_api_get_config();
+  if (!empty($cfg[ET_CFG_CHANNEL_MEMBER_ID])) {
+    $channel_member_id = $cfg[ET_CFG_CHANNEL_MEMBER_ID];
+  }
+
+  $listsubs = array();
+  $def_values = array(
+    'status' => 'active',
+    'ChannelMemberID' => $channel_member_id,
+  );
+  // Merge fields into default values and generate XML
+
+  $arr_values = array_merge($def_values, $fields);
+
+  $params = array(
+    'search_type' => 'listid',
+    'search_value' => $listid,
+    'search_value2' => '',
+    'values' => $arr_values,
+  );
+
+  $data = _exact_target_api_call('subscriber', 'add', $params);
+  if ($data) {
+    // TODO - This either succeeds or fails - not sure if there is anything we should do with the response.
+
+  }
+
+  return $data;
+}
+
+/**
+ * Removes a subscriber from a single list
+ *
+ * To remove a subscriber from a single list, use the following syntax. The
+ * subscriber will be removed from the specified list but will not be deleted
+ * from other lists to which the subscriber may belong (unless the list ID
+ * you use is that of the All Subscribers list, in which case the subscriber
+ * will be deleted entirely).
+ * @see http://wiki.memberlandingpages.com/030_Developer_Documentation/040_XML_API/XML_API_Calls_and_Sample_Code/Subscriber_Management/Subscriber_Delete
+ */
+function exact_target_api_remove_subscriber($listid, $email) {
+  $result = array();
+  $params = array(
+    'search_type' => 'listid',
+    'search_value' => $listid,
+    'search_value2' => $email,
+  );
+
+  $data = _exact_target_api_call('subscriber', 'delete', $params);
+  if ($data) {
+    // TODO - This either succeeds or fails - not sure if there is anything we should do with the response.
+
+  }
+
+  return $result;
+}
+
+/**
+ * Deletes a subscriber entirely from your account.
+ * @see http://wiki.memberlandingpages.com/030_Developer_Documentation/040_XML_API/XML_API_Calls_and_Sample_Code/Subscriber_Management/Subscriber_Delete
+ */
+
+function exact_target_api_delete_subscriber($subscriber_id) {
+  $result = array();
+  $params = array(
+    'search_type' => 'subid',
+    'search_value' => $subscriber_id,
+  );
+
+  $data = _exact_target_api_call('subscriber', 'delete', $params);
+  if ($data) {
+    // TODO - This either succeeds or fails - not sure if there is anything we should do with the response.
+
+  }
+
+  return $result;
+}
+
+/**
+ * Updates attribute values and the status of an existing subscriber
+ *
+ * The Subscriber Edit (Update) call updates attribute values and the status
+ * of an existing subscriber. This call can also be used to reactivate a
+ * subscriber on the Master Unsubscribe list. You must provide the email
+ * address and the listID or subscriberID if you are reactivating a
+ * subscriber. The call returns a subscriberID for each subscriber successfully
+ * updated.
+ * @see http://wiki.memberlandingpages.com/030_Developer_Documentation/040_XML_API/XML_API_Calls_and_Sample_Code/Subscriber_Management/Subscriber_Edit_%28Update%29
+ */
+function exact_target_api_update_subscriber($listid, $email, $fields = array()) {
+  $listsubs = array();
+  $def_values = array(
+    'status' => 'active', 'ChannelMemberID',
+  );
+  // Merge fields into default values and generate XML
+
+  $arr_values = array_merge($def_values, $fields);
+
+  $params = array(
+    'search_type' => 'listid',
+    'search_value' => $listid,
+    'search_value2' => $email,
+    'values' => $arr_values,
+  );
+
+  $data = _exact_target_api_call('subscriber', 'edit', $params);
+  if ($data) {
+    // TODO - This either succeeds or fails - not sure if there is anything we should do with the response.
+
+  }
+
+  return $listsubs;
+}
+
+/**
+ * Places one or more email addresses on your Master Unsubscribe list
+ *
+ * The Subscriber Master Unsub (Master Unsubscribe List) call places one or
+ * more email addresses on your Master Unsubscribe list so that the email
+ * address is never added to any of your subscribe lists. The call requires
+ * one or more email addresses as input, and it returns a confirmation message
+ * for each successful addition. This call cannot be used in Enterprise
+ * accounts; you must use the Subscriber Add call with a status of unsub.
+ * 
+ * @see http://wiki.memberlandingpages.com/030_Developer_Documentation/040_XML_API/XML_API_Calls_and_Sample_Code/Subscriber_Management/Subscriber_Master_Unsub_%28Master_Unsubscribe_List%29
+ */
+function exact_target_api_unsubscribe_master($email) {
+  $result = array();
+  $params = array(
+    'search_type' => 'emailaddress',
+    'search_value' => '<emailaddress>' . $email . '</emailaddress>',
+  );
+
+  $data = _exact_target_api_call('subscriber', 'masterunsub', $params);
+  if ($data) {
+    // TODO - This either succeeds or fails - not sure if there is anything we should do with the response.
+
+  }
+
+  return $result;
+}
+
+/**
+ * Retrieves all profile and preference attribute values for a subscriber on a 
+ * specific list by ID
+ *
+ * The Subscriber Retrieve call retrieves all profile and preference attribute
+ * values for a subscriber on a specific list. You can also use the call to
+ * retrieve all attribute values for a subscriber and all lists to which the
+ * subscriber belongs.
+ *
+ * The call requires an email address or subscriberID. You can also pass in a
+ * listID to retrieve information from a specific list. The call returns all
+ * attribute values (including subscriberID) for a subscriber, as well as all
+ * applicable lists if specified.
+ *
+ * @see http://wiki.memberlandingpages.com/030_Developer_Documentation/040_XML_API/ExactTarget_XML_API_Technical_Reference/Subscriber_Management/Subscriber_Retrieve
+ */
+function exact_target_api_get_subscriber_by_id($subid) {
+  $subscriber_lists = array();
+  $params = array(
+    'search_type' => 'subid',
+    'search_value' => $subid,
+  );
+
+  $data = _exact_target_api_call('subscriber', 'retrieve', $params);
+  if ($data) {
+    // Make sure we have attributes 
+
+    if (!empty($data->system->subscriber)) {
+      foreach ($data->system->subscriber as $sub) {
+        // Flatten object to array, scrub data a bit before storing off
+
+        $new_sub = get_object_vars($sub);
+        foreach ($new_sub as $key => $val) {
+          if (is_object($val)) {
+            $new_sub[$key] = '';
+          }
+        }
+
+        $subscriber_lists[$new_sub['listid']] = $new_sub;
+      }
+    }
+  }
+
+  return $subscriber_lists;
+}
+
+/** 
+ * Retrieves all profile and preference attribute values for a subscriber on a 
+ * specific list by ID and email address.
+ * 
+ * @see exact_target_api_get_subscriber_by_id().
+ */
+function exact_target_api_get_subscriber_by_email($email, $listid = '') {
+  $subscriber_lists = array();
+  $params = array(
+    'search_type' => 'listid',
+    'search_value' => $listid,
+    'search_value2' => $email,
+  );
+
+  $data = _exact_target_api_call('subscriber', 'retrieve', $params);
+  if ($data) {
+    // Make sure we have attributes 
+
+    if (!empty($data->system->subscriber)) {
+      foreach ($data->system->subscriber as $sub) {
+        // Flatten object to array, scrub data a bit before storing off
+
+        $new_sub = get_object_vars($sub);
+        foreach ($new_sub as $key => $val) {
+          if (is_object($val)) {
+            $new_sub[$key] = '';
+          }
+        }
+
+        $subscriber_lists[$new_sub['listid']] = $new_sub;
+      }
+    }
+  }
+
+  return $subscriber_lists;
+}
+

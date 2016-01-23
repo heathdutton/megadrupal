@@ -1,0 +1,536 @@
+<?php
+
+/**
+ * @file
+ * Tests suite for the mapping process.
+ */
+
+use Drupal\maps_import\Mapping\Mapper\Object as ObjectMapper;
+use Drupal\maps_import\Converter\ConverterInterface;
+use Drupal\maps_import\Profile\Profile;
+use Drupal\maps_import\Mapping\Source\MapsSystem\PropertyWrapper;
+use Drupal\maps_import\Cache\Object\Profile as CacheProfile;
+
+/**
+ * Performs functional tests on MaPS Import / Mapping opearation.
+ *
+ * @see DrupalWebTestCase
+ */
+class MapsImportMapperWebTestCase extends MapsImportWebTestCase {
+
+  /**
+   * The expected counts for mapping tables.
+   * @var array
+   */
+  protected $count = array(
+    'node' => 14,
+    'term' => 20,
+    'file' => 14,
+  );
+
+  /**
+   * SimpleTest getInfo.
+   * @inheritdoc
+   */
+  public static function getInfo() {
+    return array(
+      'name' => 'MaPS Import Mapper',
+      'description' => 'Tests the mapping operation.',
+      'group' => MapsSuiteTestInterface::TEST_GROUP,
+    );
+  }
+
+  /**
+   * SimpleTest setUp.
+   * @inheritdoc
+   */
+  public function setUp(array $modules = array(), array $permissions = array()) {
+    // Put the site in maintenance mode.
+    variable_set('maintenance_mode', 1);
+
+    $permissions[] = 'access site in maintenance mode';
+    parent::setUp($modules, $permissions);
+  }
+
+  /**
+   * Test manual import differential form.
+   * 
+   * Test if the manual import form correctly displays the
+   * differential checkbox.
+   */
+  public function testManualImportDifferentialForm() {
+    $profile = $this->createProfile();
+
+    $this->drupalGet("admin/maps-suite/profiles/{$profile->getName()}/import");
+    $this->assertNoRaw(t('Use differential import.'), t('User can not select the differential import'));
+
+    // Set the profile to differential.
+    $profile->addOption('differential', 1);
+    $record = $profile->toArray();
+    drupal_write_record('maps_import_profile', $record, 'pid');
+
+    CacheProfile::getInstance()->clearBinCache();
+
+    // We have to process a complete import before using the differential import
+    // functionnality.
+    variable_set('maps_import:configuration_full:' . $profile->getPid(), time());
+    variable_set('maps_import:objects_full:' . $profile->getPid(), time());
+
+    $this->drupalGet("admin/maps-suite/profiles/{$profile->getName()}/import");
+    $this->assertRaw(t('Use differential import.'), t('User can select the differential import'));
+  }
+
+  /**
+   * Test manual import configuration form.
+   * 
+   * Tests if the configuration import operation is available
+   * on the manual import form.
+   */
+  public function testManualImportConfigurationForm() {
+    $profile = $this->createProfile();
+
+    $this->drupalGet("admin/maps-suite/profiles/{$profile->getName()}/import");
+    $this->assertResponse(200, t('User can access the manual operations form.'));
+
+    // Check that we can only process the configuration import.
+    $this->assertFieldById('edit-update-config', t('Update the configuration'), t('User can process the configuration import'));
+    $this->assertNoFieldById('edit-update', t('Update'), t('User cannot process the other operations'));
+  }
+
+  /**
+   * Test manual import global form.
+   * 
+   * Tests if the configuration import and the global mapping operations are
+   * available on the manual import form.
+   */
+  public function testManualImportGlobalForm() {
+    extract($this->initMapping(FALSE));
+
+    $this->drupalGet("admin/maps-suite/profiles/{$profile->getName()}/import");
+    $this->assertResponse(200, t('User can access the manual operations form.'));
+
+    // Check that we can process both the configuration import
+    // and the global mapping.
+    $this->assertFieldById('edit-update-config', t('Update the configuration'), t('User can process the configuration import'));
+    $this->assertFieldById('edit-update', t('Update'), t('User can process the other operations'));
+
+    // Assert that we can ignore some operations.
+    $this->assertRaw(t('Library mapping'), t('User can ignore the library mapping operation.'));
+    $this->assertRaw(t('Objects mapping'), t('User can ignore the objects mapping operation.'));
+  }
+
+  /**
+   * Test the mapping process.
+   */
+  public function testCountObject() {
+    extract($this->initMapping());
+
+    // Firstly assert that the entities has been created.
+    $entities = db_select('maps_import_entities', 'mie')
+      ->fields('mie')
+      ->execute();
+
+    foreach ($entities as $i => $record) {
+      $entity = entity_load($record->entity_type, array($record->entity_id));
+
+      $this->assertTrue(!empty($entity), t('Entity %id of type %type (%bundle) successfully created (Uid: %uid)', array(
+        '%id' => $record->entity_id,
+        '%type' => $record->entity_type,
+        '%bundle' => $record->bundle,
+        '%uid' => $record->uid,
+      )));
+    }
+
+    // Then, assert that the right count of entities has been created.
+    $this->checkCount();
+
+    // We process the mapping a second time.
+    $objects_fetcher->process();
+    $mapper->process();
+
+    // Assert that there is the same count of entities.
+    $this->checkCount();
+  }
+
+  /**
+   * Test publication state.
+   * 
+   * Test the publication state of Drupal entities when changing the
+   * status of MaPS System objects.
+   */
+  public function testPublicationState() {
+    extract($this->initMapping());
+
+    // Check the published state.
+    // We will unpublish some objects.
+    $publication_converters = array(
+      $category_converter,
+      $flat_product_converter,
+      $marketing_product_converter,
+      $product_converter,
+    );
+
+    $publication_entities = array();
+    foreach ($publication_converters as $publication_converter) {
+      $publication_entities[] = array(
+        'entity_id' => $this->unpublishRandomObject($publication_converter),
+        'entity_type' => $publication_converter->getEntityType(),
+      );
+    }
+
+    // Re-process the mapping.
+    $mapper->process();
+
+    foreach ($publication_entities as $publication_entity) {
+      $this->assertPublicationState($publication_entity['entity_id'], $publication_entity['entity_type']);
+    }
+  }
+
+  /**
+   * Test the Drupal entities label values.
+   */
+  public function testLabelValues() {
+    extract($this->initMapping());
+
+    $converters = array(
+      $category_converter,
+      $flat_product_converter,
+      $marketing_product_converter,
+      $product_converter,
+    );
+
+    foreach ($converters as $converter) {
+      $field_name = $converter->getEntityType() == 'taxonomy_term' ? 'name' : 'title';
+
+      $this->assertFieldValue($converter, $maps_import_objects, $field_name, 'attribute:1');
+    }
+  }
+
+  /**
+   * Test editing the label of Drupal entities.
+   */
+  public function testEditLabel() {
+    extract($this->initMapping());
+
+    $objects_fetcher->process();
+
+    // Set the new label.
+    $objects = array();
+    foreach ($maps_import_objects as $key => $object) {
+      if (empty($objects[$object['code']])) {
+        $attributes = unserialize($object['attributes']);
+
+        $new_label = $this->randomName(8);
+
+        $attributes[1][$profile->getDefaultLanguage()] = array();
+        $attributes[1][$profile->getDefaultLanguage()][] = $new_label;
+
+        $objects[$object['code']] = serialize($attributes);
+      }
+
+      db_update('maps_import_objects')
+        ->fields(array(
+          'attributes' => $objects[$object['code']],
+        ))
+        ->condition('id', $object['id'], '=')
+        ->execute();
+
+      $maps_import_objects[$key]['attributes'] = $objects[$object['code']];
+    }
+
+    // Launch the mapping.
+    $mapper->process();
+
+    // Now assert that the new field has been set.
+    $converters = array(
+      $category_converter,
+      $flat_product_converter,
+      $marketing_product_converter,
+      $product_converter,
+    );
+
+    foreach ($converters as $converter) {
+      $field_name = $converter->getEntityType() == 'taxonomy_term' ? 'name' : 'title';
+
+      $this->assertFieldValue($converter, $maps_import_objects, $field_name, 'attribute:1');
+    }
+  }
+
+  /**
+   * Test the Drupal entities fields values.
+   */
+  public function testFields() {
+    extract($this->initMapping(FALSE));
+
+    // Store a mapping between attribute types and field_types.
+    $types = array(
+      'float' => 'number_float',
+      'int' => 'number_integer',
+      'string' => 'text',
+      'html' => 'text_long',
+    );
+
+    $attributes = array();
+
+    foreach ($types as $attribute_type => $field_type) {
+      // Get the attribute.
+      $attribute_ids = $this->getAttributeIdsFromType($profile, $attribute_type);
+
+      foreach ($attribute_ids as $attribute_id) {
+        // Generate a field name.
+        $field_name = $field_type . '_' . str_replace('attribute:', '', $attribute_id);
+
+        // Create a new field.
+        $field = array(
+          'field_name' => $field_name,
+          'type' => $field_type,
+        );
+        field_create_field($field);
+
+        // Create a new field instance.
+        $instance = array(
+          'field_name' => $field_name,
+          'entity_type' => 'node',
+          'bundle' => 'flat_product',
+        );
+        field_create_instance($instance);
+
+        // Add the mapping item.
+        $this->createMappingItem($flat_product_converter, array(
+          'property' => $attribute_id,
+          'field' => $field_name,
+        ));
+        $attributes[$field_name] = $attribute_id;
+      }
+    }
+
+    $mapper = new ObjectMapper($profile);
+    $mapper->process();
+
+    foreach ($attributes as $field_name => $attribute_id) {
+      $this->assertFieldValue($flat_product_converter, $maps_import_objects, $field_name, $attribute_id);
+    }
+  }
+
+  /**
+   * Check count.
+   * 
+   * Assert that the right count of entities
+   * has been created, and return the count
+   * of related tables.
+   *
+   * @return array
+   *   An array containing the count of
+   *   row found for each related table.
+   */
+  protected function checkCount() {
+    $count['node'] = $this->getCount('node');
+    $count['term'] = $this->getCount('taxonomy_term_data');
+    $count['file'] = $this->getCount('file_managed');
+
+    foreach ($count as $type => $result) {
+      $this->assertEqual($result, $this->count[$type], t('Right count for @type : @count / @count2', array(
+        '@type' => $type,
+        '@count' => $result,
+        '@count2' => $this->count[$type],
+      )));
+    }
+
+    return $count;
+  }
+
+  /**
+   * Assert the publication state of a given entity.
+   *
+   * @param int $entity_id
+   *   The id of the entity to test.
+   * @param string $entity_type
+   *   The type of the entity.
+   * @param bool $state
+   *   The expected state.
+   */
+  protected function assertPublicationState($entity_id, $entity_type, $state = 0) {
+    $entity = entity_load($entity_type, array($entity_id), array(), TRUE);
+    if (is_array($entity)) {
+      $entity = reset($entity);
+    }
+
+    switch ($entity_type) {
+      case 'taxonomy_term':
+        $this->assertFalse((int) ((bool) $entity), t('Taxonomy term %id has been deleted', array('%id' => $entity_id)));
+        break;
+
+      default:
+        $this->assertTrue($entity->status == $state, t('%entity_type %id has been unpublished', array('%entity_type' => $entity_type, '%id' => $entity_id)));
+        break;
+    }
+  }
+
+  /**
+   * Assert Field value.
+   * 
+   * Assert that the given field has the correct values for all entities
+   * generated by the given converter.
+   *
+   * @param ConverterInterface $converter
+   *   The related converter.
+   * @param array $maps_import_objects
+   *   The array of MaPS System objects.
+   * @param string $field_name
+   *   The field name.
+   * @param string $attribute
+   *   The attribute id.
+   * @param bool $assert
+   *   The expected result of the assertion.
+   * @param bool $check_markup
+   *   The filter format to apply to the object values.
+   */
+  protected function assertFieldValue(ConverterInterface $converter, $maps_import_objects, $field_name, $attribute, $assert = TRUE, $check_markup = FALSE) {
+    // Reindex the objects array so that it is indexed by the MaPS id.
+    $objects_array = array();
+    foreach ($maps_import_objects as $object) {
+      $objects_array[$object['id']][] = $object;
+    }
+
+    $query = db_select('maps_import_entities', 'e');
+    $query->join('maps_import_object_ids', 'i', 'i.correspondence_id = e.id');
+    $query
+      ->fields('e')
+      ->fields('i')
+      ->condition('e.cid', $converter->getCid(), '=');
+    $entities = $query->execute();
+
+    foreach ($entities as $i => $record) {
+      $entity = entity_load($record->entity_type, array($record->entity_id));
+      if (empty($entity)) {
+        continue;
+      }
+
+      $wrapper = entity_metadata_wrapper($record->entity_type, reset($entity));
+
+      $value = $wrapper->{$field_name}->value();
+
+      $exploded_attribute = explode(':', $attribute);
+
+      $property_wrapper = PropertyWrapper::load($converter, $attribute);
+      if ($exploded_attribute[0] == 'attribute') {
+        // Compare with the attribute value.
+        $objects = $objects_array[$record->maps_id];
+
+        foreach ($objects as $object) {
+          $attributes = unserialize($object['attributes']);
+
+          if (empty($attributes[$exploded_attribute[1]])) {
+            continue;
+          }
+
+          $attribute_values_language = $attributes[$exploded_attribute[1]];
+
+          $id_language = $property_wrapper->isTranslatable() ? $converter->getProfile()->getDefaultLanguage() : 0;
+
+          // Value for default language.
+          if (empty($attribute_values_language[$id_language])) {
+            continue;
+          }
+
+          $attribute_values = $attribute_values_language[$id_language];
+
+          $attribute_value = reset($attribute_values);
+          $attribute_value = $attribute_value;
+
+          if ($check_markup) {
+            $value = $value['value'];
+            $attribute_value = check_markup($attribute_value, $check_markup);
+          }
+
+          $this->assertTrue(($attribute_value == $value) == $assert, t('%object_id: Field %field correctly set (%value / %attribute_value)', array(
+            '%field' => $field_name,
+            '%value' => $value,
+            '%attribute_value' => $attribute_value,
+            '%object_id' => $record->maps_id,
+          )));
+        }
+      }
+    }
+
+  }
+
+  /**
+   * Unpublish a random element in the objects table.
+   *
+   * @param ConverterInterface $converter
+   *   The related converter.
+   * 
+   * @return array
+   *   The Drupal entity id of the unpublished element.
+   */
+  protected function unpublishRandomObject(ConverterInterface $converter) {
+    $object = $this->getRandomObject($converter);
+
+    // We have to set status one to all objects from this uid.
+    db_update('maps_import_objects')
+      ->fields(array(
+        'status' => 1,
+        'inserted' => 1,
+      ))
+      ->condition('code', $object['code'], '=')
+      ->condition('pid', $converter->getProfile()->getPid(), '=')
+      ->execute();
+
+    return $object['entity_id'];
+  }
+
+  /**
+   * Return a succesfully mapped MaPS System object for the given converter.
+   *
+   * @param ConverterInterface $converter
+   *   The related converter.
+   *
+   * @return array
+   *   The MaPS System object.
+   */
+  protected function getRandomObject(ConverterInterface $converter) {
+    $query = db_select('maps_import_objects', 'o');
+    $query->join('maps_import_object_ids', 'i', 'i.maps_id = o.id');
+    $query->join('maps_import_entities', 'e', 'e.id = i.correspondence_id');
+    $query
+      ->fields('o')
+      ->fields('e', array('entity_id'))
+      ->condition('e.cid', $converter->getCid(), '=')
+      ->condition('o.status', 8, '=');
+
+    $result = $query->execute()->fetchAllAssoc('id', \PDO::FETCH_ASSOC);
+
+    if (!$result) {
+      return FALSE;
+    }
+
+    return $result[array_rand($result)];
+  }
+
+  /**
+   * Get a MaPS System attribute id from an attribute type.
+   *
+   * @param Profile $profile
+   *   The related profile.
+   * @param string $type
+   *   The type of the attribute.
+   *
+   * @return string
+   *   The attribute id.
+   */
+  protected function getAttributeIdsFromType(Profile $profile, $type, $translatable = FALSE, $multiple = FALSE) {
+    $attributes = $profile->getConfigurationTypes('attribute', $profile->getDefaultLanguage());
+
+    $attribute_ids = array();
+    foreach ($attributes as $attribute) {
+      $data = unserialize($attribute['data']);
+      if ($data['attribute_type_code'] == $type) {
+        $attribute_ids[] = 'attribute:' . $attribute['id'];
+      }
+    }
+
+    return $attribute_ids;
+  }
+
+}

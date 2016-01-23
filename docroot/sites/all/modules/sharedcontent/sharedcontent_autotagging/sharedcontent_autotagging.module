@@ -1,0 +1,489 @@
+<?php
+
+/**
+ * @file
+ * Hooks and callback functions for the Shared Content auto tagging module.
+ *
+ * Useful links:
+ *  - To learn more about YQL check out: http://developer.yahoo.com/yql/
+ *  - To learn more about contentanalysis.analyze check out: http://developer.yahoo.com/search/content/V2/contentAnalysis.html
+ *  - Also try out the YQL Console: http://developer.yahoo.com/yql/console/
+ *
+ * @todo also show a duplicate tag example
+ * @todo Clean up the code related to non OAuth requests.
+ * Indexing
+ * A sharedcontent server adds regular index records to the system. That's when autotagging comes into play.
+ *
+ * Indexing Shadow records
+ * This leads to one limitation: shadow records are being created on a client and lack capability of autotagging.
+ */
+/**
+ * Yahoo Query Language API OAuth url.
+ */
+define('SHAREDCONTENT_AUTOTAGGING_YQL_OAUTH_URL', 'http://query.yahooapis.com/v1/yql');
+/**
+ * Yahoo Query Language API OAuth url.
+ */
+define('SHAREDCONTENT_AUTOTAGGING_YQL_PUBLIC_URL', 'http://query.yahooapis.com/v1/public/yql');
+
+/**
+ * Implements hook_libraries_info().
+ *
+ */
+function sharedcontent_autotagging_libraries_info() {
+  // Yahoo! Social SDK - PHP
+  $libraries['yos-social-php'] = array(
+    'name' => 'Yahoo! Social SDK',
+    'vendor url' => 'http://yahoo.com',
+    'download url' => 'https://github.com/yahoo/yos-social-php',
+    'path' => 'lib',
+    'version arguments' => array(
+      'file' => 'CHANGELOG',
+      'pattern' => '/v([\d\.]+)/',
+      'lines' => 4,
+    ),
+    'files' => array(
+      'php' => array(
+        'Yahoo.inc',
+        'OAuth.inc',
+      ),
+    ),
+  );
+  return $libraries;
+}
+
+/**
+ * Implements hook_requirements().
+ */
+function sharedcontent_autotagging_requirements($phase) {
+  $requirements = array();
+  if ($phase == 'runtime' && sharedcontent_autotagging_use_oauth()) {
+    $requirements['yos_social_php'] = array(
+      'title' => t('Yahoo! Social SDK'),
+      'severity' => REQUIREMENT_OK,
+    );
+    $yos_social_php = libraries_detect('yos-social-php');
+    if (isset($yos_social_php['error'])) {
+      $requirements['yos_social_php']['severity'] = REQUIREMENT_ERROR;
+      $requirements['yos_social_php']['value'] = t('!error Download it from !url and place it inside of the libraries folder.', array(
+        '!error' => $yos_social_php['error message'],
+        '!url' => l(t('GitHub'), $yos_social_php['download url']),
+      ));
+    }
+    else {
+      $requirements['yos_social_php']['value'] = $yos_social_php['version'];
+    }
+  }
+  return $requirements;
+}
+
+function sharedcontent_autotagging_use_oauth() {
+  $consumer_key = variable_get('sharedcontent_autotagging_oauth_key');
+  $consumer_secret = variable_get('sharedcontent_autotagging_oauth_secret');
+  return !empty($consumer_key) && !empty($consumer_secret);
+}
+
+/**
+ * Build a query parameter string according to OAuth Spec.
+ * @param array $params an array of query parameters
+ * @return string all the query parameters properly sorted and encoded
+ * according to the OAuth spec, or an empty string if params is empty.
+ * @link http://oauth.net/core/1.0/#rfc.section.9.1.1
+ *
+ * Copied from https://github.com/joechung/oauth_yahoo/blob/master/oauth_helper.php
+ */
+function sharedcontent_autotagging_oauth_http_build_query($params, $exclude_oauth_params = FALSE) {
+  $query_string = '';
+  if (!empty($params)) {
+
+    // rfc3986 encode both keys and values
+    $keys = sharedcontent_autotagging_rfc3986_encode(array_keys($params));
+    $values = sharedcontent_autotagging_rfc3986_encode(array_values($params));
+    $params = array_combine($keys, $values);
+
+    // Parameters are sorted by name, using lexicographical byte value ordering.
+    // http://oauth.net/core/1.0/#rfc.section.9.1.1
+    uksort($params, 'strcmp');
+
+    // Turn params array into an array of "key=value" strings
+    $kvpairs = array();
+    foreach ($params as $k => $v) {
+      if ($exclude_oauth_params && substr($k, 0, 5) == 'oauth') {
+        continue;
+      }
+      if (is_array($v)) {
+        // If two or more parameters share the same name,
+        // they are sorted by their value. OAuth Spec: 9.1.1 (1)
+        natsort($v);
+        foreach ($v as $value_for_same_key) {
+          array_push($kvpairs, ($k . '=' . $value_for_same_key));
+        }
+      }
+      else {
+        // For each parameter, the name is separated from the corresponding
+        // value by an '=' character (ASCII code 61). OAuth Spec: 9.1.1 (2)
+        array_push($kvpairs, ($k . '=' . $v));
+      }
+    }
+
+    // Each name-value pair is separated by an '&' character, ASCII code 38.
+    // OAuth Spec: 9.1.1 (2)
+    $query_string = implode('&', $kvpairs);
+  }
+
+  return $query_string;
+}
+
+/**
+ * Encode input per RFC 3986
+ * @param string|array $raw_input
+ * @return string|array properly rfc3986 encoded raw_input
+ * If an array is passed in, rfc3896 encode all elements of the array.
+ * @link http://oauth.net/core/1.0/#encoding_parameters
+ */
+function sharedcontent_autotagging_rfc3986_encode($raw_input) {
+  if (is_array($raw_input)) {
+    return array_map('sharedcontent_autotagging_rfc3986_encode', $raw_input);
+  }
+  else {
+    if (is_scalar($raw_input)) {
+      return str_replace('%7E', '~', rawurlencode($raw_input));
+    }
+    else {
+      return '';
+    }
+  }
+}
+
+/**
+ * Extract a bunch of tags for a given local content.
+ *
+ * @param $entity
+ *   The entity object of the local content
+ * @param $entity_type
+ *    The entity type of the local content as string.
+ * @return
+ *   Array of tags.
+ */
+function sharedcontent_autotagging_get_tags($entity, $entity_type) {
+  $tags = array();
+
+  // Render content.
+  $view_mode = variable_get('sharedcontent_autotagging_extraction_view_mode', 'sharedcontent_autotagging');
+  $entity_view = entity_view($entity_type, array($entity), $view_mode);
+  $text = strip_tags(drupal_render($entity_view));
+
+  if (sharedcontent_autotagging_use_oauth()) {
+    $result = sharedcontent_autotagging_oauth_query($text);
+  }
+  else {
+    $result = sharedcontent_autotagging_public_query($text);
+  }
+
+  if (!empty($result)) {
+    // Create XML object
+    $xml = new SimpleXMLElement($result);
+    // Define default namespace in order to make xpath work.
+    // @see http://www.php.net/manual/en/simplexml.examples-basic.php#102599
+    $xml->registerXPathNamespace("def", "urn:yahoo:cap");
+    foreach ($xml->xpath('//def:yctCategories/def:yctCategory') as $category) {
+      $tags[] = "$category";
+    }
+    foreach ($xml->xpath('//def:entities/def:entity/def:text') as $text) {
+      $tags[] = "$text";
+    }
+
+    // Tags can contain duplicates.
+    $tags = array_unique($tags);
+    sharedcontent_event_save('sharedcontent_autotagging', __FUNCTION__, 'YQL parsing successful', array(
+      'text' => $text,
+      'response' => $result,
+      'tags' => $tags
+    ), array('severity' => WATCHDOG_DEBUG));
+  }
+  else {
+    sharedcontent_event_save('sharedcontent_autotagging', __FUNCTION__, 'YQL returned an error', array(
+      'text' => $text,
+      'response' => $result
+    ), array('severity' => WATCHDOG_ERROR));
+  }
+
+  return $tags;
+}
+
+/**
+ * Query OAuth API.
+ *
+ * Call to YQL service using the OAuth API.
+ *
+ * @param $text
+ *   The text the tags should be extracted from.
+ * @param $consumer_key
+ *    The OAuth consumer key.
+ * @param $consumer_secret
+ *    The OAuth consumer secret.
+ * @return
+ *  Array on success according to the response, null otherwise.
+ *
+ * @see http://developer.yahoo.com/search/content/V2/contentAnalysis.html
+ * @see https://github.com/yahoo/yos-social-php
+ */
+function sharedcontent_autotagging_oauth_query($text) {
+  if (!($library = libraries_load('yos-social-php')) || empty($library['loaded'])) {
+    sharedcontent_event_save('sharedcontent_autotagging', __FUNCTION__, 'Could not load library yos-social-php.', array('severity' => WATCHDOG_ERROR));
+    return NULL;
+  }
+
+  // define the base URL to the YQL web-service
+  $base_url = variable_get('sharedcontent_autotagging_yql_oauth_url', SHAREDCONTENT_AUTOTAGGING_YQL_OAUTH_URL);
+
+  $signature = new OAuthSignatureMethod_HMAC_SHA1();
+
+  $consumer_key = variable_get('sharedcontent_autotagging_oauth_key');
+  $consumer_secret = variable_get('sharedcontent_autotagging_oauth_secret');
+  $consumer = new OAuthConsumer($consumer_key, $consumer_secret);
+
+  $client = new OAuthClient($consumer);
+
+  $params = _sharedcontent_autotagging_query_build_query_parameters($text);
+  $response = $client->post($base_url, "application/x-www-form-urlencoded", $params, 30);
+  $success = ($response && $response["code"] == 200);
+
+  if ($success) {
+    return $response["responseBody"];
+  }
+  sharedcontent_event_save('sharedcontent_autotagging', __FUNCTION__, 'YQL request error', array(
+    'response' => $response,
+  ), array('severity' => WATCHDOG_ERROR));
+  return NULL;
+}
+
+/**
+ * Query public API.
+ *
+ * Call to YQL service using the public API.
+ *
+ * @param $text
+ *   The text the tags should be extracted from.
+ * @return
+ *  Array on success according to the response, null otherwise.
+ *
+ * @see http://developer.yahoo.com/search/content/V2/contentAnalysis.html
+ */
+function sharedcontent_autotagging_public_query($text) {
+
+  // define the base URL to the YQL web-service
+  $base_url = variable_get('sharedcontent_autotagging_yql_public_url', SHAREDCONTENT_AUTOTAGGING_YQL_PUBLIC_URL);
+
+  $params = _sharedcontent_autotagging_query_build_query_parameters($text);
+
+  $response = drupal_http_request($base_url, array(
+    'headers' => array(
+      'Content-Type' => 'application/x-www-form-urlencoded',
+    ),
+    'data' => sharedcontent_autotagging_oauth_http_build_query($params),
+    'method' => 'POST',
+  ));
+  if ($response->code == 200) {
+    return $response->data;
+  }
+  sharedcontent_event_save('sharedcontent_autotagging', __FUNCTION__, 'YQL parsing successful', array(
+    'response' => $response,
+  ), array('severity' => WATCHDOG_ERROR));
+  return NULL;
+}
+
+/**
+ * Build query parameters
+ *
+ * Defines the query parameters and concatenates them to a valid YQL
+ * query.
+ * @param $text
+ *   The text the tags should be extracted.
+ * @return
+ *   Array with the request parameters.
+ */
+function _sharedcontent_autotagging_query_build_query_parameters($text) {
+  // Escapement characters taken from
+  // http://developer.yahoo.com/boss/search/boss_api_guide/reserve_chars_esc_val.html
+  // excluded %20 for this will get double encoded and will brake the
+  // request.
+  $replacements = array(
+    '/' => '%2F',
+    '?' => '%3F',
+    '&' => '%26',
+    ';' => '%3B',
+    ':' => '%3A',
+    '@' => '%40',
+    ',' => '%2C',
+    '$' => '%24',
+    '=' => '%3D',
+//    ' ' => '%20',
+    '%' => '%25',
+    '"' => '%22',
+    '+' => '%2B',
+    '#' => '%23',
+    '*' => '%2A',
+    '<' => '%3C',
+    '>' => '%3E',
+    '{' => '%7B',
+    '}' => '%7D',
+    '|' => '%7C',
+    '[' => '%5B',
+    ']' => '%5D',
+    '^' => '%5E',
+    '\\' => '%5C',
+    '`' => '%60',
+    '(' => '%28',
+    ')' => '%29',
+  );
+
+  // Define query params.
+  $params = array(
+    'show_metadata' => FALSE,
+    'related_entities' => FALSE,
+    'max' => 50,
+    'unique' => TRUE,
+    'enable_categorizer' => variable_get('sharedcontent_autotagging_enable_categorizer', TRUE),
+    // Escape quotes to avoid syntax errors.
+    'text' => str_replace(array_keys($replacements), array_values($replacements), $text),
+  );
+
+  // Define converter callback.
+  $callback = function ($key, $value) {
+    // Convert boolean to textual representation.
+    if (is_bool($value)) {
+      $value = $value ? 'true' : 'false';
+    }
+    // Wrap non numeric values in ".
+    $value = is_numeric($value) ? $value : '"' . $value . '"';
+    // Concatenate as key=value.
+    return $key . '=' . $value;
+  };
+
+  // Format the parameters to the need of the query.
+  $params = array_map($callback, array_keys($params), $params);
+
+  return array(
+    // The YQL query
+    'q' => 'SELECT * FROM contentanalysis.analyze WHERE ' . implode(' AND ', $params),
+    // Nice and easy to parse
+    'format' => 'xml',
+    // Taken from the example
+    // @see https://github.com/yahoo/yos-social-php/blob/master/lib/Yahoo.inc#L789
+    'env' => 'http://datatables.org/alltables.env'
+  );
+}
+
+/**
+ * Implements hook_entity_info_alter().
+ */
+function sharedcontent_autotagging_entity_info_alter(&$entity_info) {
+  $entity_info['node']['view modes']['sharedcontent_autotagging'] = array(
+    'label' => t('Shared Content autotagging'),
+    'custom settings' => TRUE,
+  );
+}
+
+/**
+ * Implements hook_node_view().
+ */
+function sharedcontent_autotagging_node_view($node, $view_mode, $langcode) {
+  if ($view_mode == 'sharedcontent_autotagging') {
+    $node->content['#theme'] = 'sharedcontent_autotagging';
+  }
+}
+
+/**
+ * Implements hook_theme().
+ */
+function sharedcontent_autotagging_theme() {
+  return array(
+    'sharedcontent_autotagging' => array(
+      'render element' => 'node',
+    ),
+  );
+}
+
+/**
+ * Shared Content Autotagging theme function.
+ */
+function theme_sharedcontent_autotagging(&$variables) {
+  $node = $variables['node']['#node'];
+
+  $output = check_plain($node->title) . "\n\n";
+  if ($body = field_get_items('node', $node, 'body')) {
+    $output .= drupal_render(field_view_value('node', $node, 'body', $body[0]));
+  }
+
+  return $output;
+}
+
+/**
+ * Implements hook_menu().
+ */
+function sharedcontent_autotagging_menu() {
+  $items = array();
+
+  $items['admin/config/services/sharedcontent/autotagging'] = array(
+    'title' => 'Shared Content Autotagging',
+    'description' => 'Configure various autotagging settings.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('sharedcontent_autotagging_settings'),
+    'access arguments' => array('administer sharedcontent'),
+  );
+
+  return $items;
+}
+
+/**
+ * Returns a form with various autotagging settings.
+ */
+function sharedcontent_autotagging_settings($form, &$form_state) {
+  // Get node view modes.
+  $view_modes = array();
+  $entity_info = entity_get_info('node');
+  foreach ($entity_info['view modes'] as $key => $value) {
+    $view_modes[$key] = $value['label'];
+  }
+
+  $form['sharedcontent_autotagging_extraction_view_mode'] = array(
+    '#type' => 'select',
+    '#title' => t('Autotagging view mode'),
+    '#default_value' => variable_get('sharedcontent_autotagging_extraction_view_mode', 'sharedcontent_autotagging'),
+    '#options' => $view_modes,
+  );
+
+  $form['sharedcontent_autotagging_oauth'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('OAuth settings'),
+    '#collapsible' => FALSE,
+    '#collapsed' => FALSE,
+    '#description' => <<<EOF
+<p>This module uses the Yahoo Query Lanugage API to extract keywords from a
+text. Autotagging works without configuration but then has a limit of
+2000 requests per hour and ip. This limit can be raised to 20'000
+requests per hour and ip by using OAuth. See
+<a href="http://developer.yahoo.com/yql/guide/usage_info_limits.html">
+Usage Information and Limits</a></p>
+<p>In order to use OAuth
+<a href="https://developer.apps.yahoo.com/dashboard/createKey.html">
+get yourself an API Key</a> and fill in the key and secret below.</p>
+<p>If the following fields are left blank, the public API will be used.</p>
+EOF
+  );
+
+  $form['sharedcontent_autotagging_oauth']['sharedcontent_autotagging_oauth_key'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Consumer Key'),
+    '#default_value' => variable_get('sharedcontent_autotagging_oauth_key'),
+  );
+
+  $form['sharedcontent_autotagging_oauth']['sharedcontent_autotagging_oauth_secret'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Consumer Secret'),
+    '#default_value' => variable_get('sharedcontent_autotagging_oauth_secret'),
+  );
+
+  return system_settings_form($form);
+}

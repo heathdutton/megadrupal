@@ -1,0 +1,850 @@
+<?php
+
+/**
+ * @file
+ * maestro.admin.inc
+ */
+
+include_once './' . drupal_get_path('module', 'maestro') . '/maestro_interface.class.php';
+include_once './' . drupal_get_path('module', 'maestro') . '/maestro_task_interface.class.php';
+
+function maestro_admin($tid = 0, $operation = '', $var = 0) {
+  $maestro_path = drupal_get_path('module', 'maestro');
+  drupal_add_css($maestro_path . '/css/maestro.css');
+  drupal_add_js($maestro_path . '/js/maestro_structure_admin.js');
+  return theme('maestro_workflow_list', array('tid' => $tid, 'operation' => $operation , 'edit_var' => $var));
+}
+
+//called from the hooks_menu
+function maestro_edit_workflow($tid = '') {
+  if ($tid === '') drupal_goto('admin/structure/maestro');
+  $maestro_path = drupal_get_path('module', 'maestro');
+  drupal_add_css($maestro_path . '/css/maestro.css');
+  drupal_add_js($maestro_path . '/js/wz_jsgraphics.js');
+  drupal_add_js($maestro_path . '/js/admin_template_editor.js');
+  drupal_add_js($maestro_path . '/js/jquery.contextmenu.js');
+  drupal_add_js($maestro_path . '/js/jquery.simplemodal.min.js');
+  $mi = new MaestroInterface($tid);
+  return $mi->displayPage();
+}
+
+function maestro_handle_editor_ajax_request($task_type, $template_data_id, $template_id, $op, $security_token) {
+  if (class_exists($task_type)) {
+    $ti = new $task_type($template_data_id, $template_id);
+  }
+  else {
+    $ti = new MaestroTaskInterfaceUnknown($template_data_id, $template_id);
+  }
+  $ti->setSecurityToken($security_token);
+  drupal_json_output($ti->$op());
+  exit();
+}
+
+
+function maestro_handle_structure_ajax_request() {
+  global $base_url;
+  if (!user_access('maestro admin')) return FALSE;
+  $op = @check_plain($_POST['op']);
+  $cntr = @check_plain($_POST['cntr']);
+  $id = @check_plain($_POST['id']);
+  $token = @check_plain($_POST['token']);
+
+  // Check the token right here before OP-ing
+  if(!drupal_valid_token($token,'maestro_admin')) {
+    $arr = array('data' => t('Illegal action'), 'status' => 0);
+    drupal_json_output($arr);
+    exit(0);
+  }
+
+  switch ($op) {
+    case 'openimport':
+      //the fact that they made it in here means that we're OK as far as security is concerned.
+      //we have to check to see if the config parameter is set to even show this option.
+      $status = 0;
+      if (variable_get('maestro_enable_import_window', 0) == 1) {
+        $status = 1;
+      }
+      $arr=array('status' => $status);
+      drupal_json_output($arr);
+      exit(0);
+      break;
+
+    case 'doimport':
+      $status = 0;
+      if (variable_get('maestro_enable_import_window', 0) == 1) {
+        $templatecode=($_POST['templatecode']);
+        //Lets see if someone has tried to do something "evil".
+        if (strpos(strtolower($templatecode), 'delete') !== FALSE ||
+        strpos(strtolower($templatecode), 'drop') !== FALSE ||
+        strpos(strtolower($templatecode), 'truncate') !== FALSE ) {
+          $status = -1;
+        }
+        else {
+          try {
+            $ret=eval($templatecode);
+            $status = 1;
+          }
+          catch (Exception $ex) {
+            $status = 0;
+          }
+        }
+
+      }
+      $data = theme('maestro_workflow_list', array('tid' => 0, 'operation' => '' , 'edit_var' => 0));
+      $arr = array('data' => $data, 'status' => $status);
+      drupal_json_output($arr);
+      break;
+
+    case 'savetemplate':
+      $name = check_plain($_POST['templateName']);
+      $app_group = intval(check_plain($_POST['appGroup']));
+
+      $update = db_update('maestro_template')
+      ->fields(array( 'template_name' => $name,
+                      'app_group' => $app_group
+      ))
+      ->condition('id', $id)
+      ->execute();
+      $status = 0;
+      if ($update >= 0) {
+        $status = 1;
+      }
+      $arr=array('id' => $id, 'cntr' => $cntr, 'status' => $status);
+      drupal_json_output($arr);
+      break;
+
+    case 'createvariable':
+      $name = check_plain($_POST['newVariableName']);
+      $value = check_plain($_POST['newVariableValue']);
+      $rec_id = maestro_createTemplateVariable($id, $name, $value);
+      $status = 0;
+      if ($rec_id > 0) {
+        $status = 1;
+      }
+      $data = theme('maestro_workflow_edit_template_variables',  array('tid' => $id ));
+
+      $arr = array('status' => $status, 'data' => $data, 'cntr' => $id );
+      drupal_json_output($arr);
+      break;
+
+    case 'updatevariable':
+      $name = check_plain($_POST['name']);
+      $value = check_plain($_POST['val']);
+      $update = db_update('maestro_template_variables')
+      ->fields(array( 'variable_name' => $name,
+                      'variable_value' => $value
+      ))
+      ->condition('id', $id)
+      ->execute();
+
+      $query = db_select('maestro_template_variables', 'a');
+      $query->fields('a', array('template_id'));
+      $query->condition('a.id', $id, '=');
+      $res=current($query->execute()->fetchAll());
+
+      $status = 0;
+      if ($update >= 0) {
+        $status = 1;
+      }
+      $data = theme('maestro_workflow_edit_template_variables',  array('tid' => $res->template_id ));
+      $arr = array('status' => $status, 'data' => $data, 'var_id' => $id);
+      drupal_json_output($arr);
+      break;
+
+    case 'deletevariable':
+      $tid = check_plain($_POST['tid']);
+      $ret = maestro_deleteTemplateVariable($id);
+      $data = theme('maestro_workflow_edit_template_variables',  array('tid' => $tid ));
+      $status = 0;
+      if ($ret) {
+        $status = 1;
+      }
+      $arr = array('status' => $status, 'data' => $data, 'cntr' => $tid);
+      drupal_json_output($arr);
+      break;
+
+    case 'editvariable':
+      $tid = check_plain($_POST['tid']);
+      $data = theme('maestro_workflow_edit_template_variables',  array('tid' => $tid, 'edit_var' => $id));
+      $arr = array('status' => "1", 'data' => $data, 'cntr' => $tid);
+      drupal_json_output($arr);
+      break;
+
+    case 'showvariables':
+      $data = theme('maestro_workflow_edit_template_variables',  array('tid' => $id ));
+      $arr = array('status' => "1", 'data' => $data, 'cntr' => $id);
+      drupal_json_output($arr);
+      break;
+
+    case 'createtemplate':
+      $name = check_plain($_POST['name']);
+      $rec_id = maestro_createNewTemplate($name);
+      $status = 0;
+      if ($rec_id > 0) {
+        $status = 1;
+      }
+      $data = theme('maestro_workflow_list', array('tid' => 0, 'operation' => '' , 'edit_var' => 0));
+
+      $arr = array('status' => $status, 'data' => $data);
+      drupal_json_output($arr);
+      break;
+
+    case 'createappgroup':
+      $name = check_plain($_POST['name']);
+      if ($name != '')  $rec_id = maestro_createAppGroup($name);
+      $status = 0;
+      if ($rec_id > 0) {
+        $status = 1;
+      }
+      $arr=array('status' => $status, 'data' => '');
+      drupal_json_output($arr);
+      break;
+
+    case 'deleteappgroup':
+      maestro_deleteAppGroup($id);
+      $data=maestro_createAppGroupDropDown('deleteAppGroup');
+      $arr=array('status' => "1", 'data' => $data);
+      drupal_json_output($arr);
+      break;
+
+    case 'refreshappgroup':
+      $which = check_plain($_POST['which']);
+      $data=maestro_createAppGroupDropDown($which);
+      $arr = array('status' => "1", 'data' => $data);
+      drupal_json_output($arr);
+      break;
+
+    case 'deletetemplate':
+      $res = db_query("SELECT id FROM {maestro_template_data} WHERE template_id = :tid", array('tid' => $id));
+      foreach ($res as $rec) {
+        $query = db_delete('maestro_template_assignment');
+        $query->condition('template_data_id', $rec->id, '=');
+        $query->execute();
+
+        $query = db_delete('maestro_template_notification');
+        $query->condition('template_data_id', $rec->id, '=');
+        $query->execute();
+
+        $query = db_delete('maestro_template_data_next_step');
+        $query->condition('template_data_from', $rec->id, '=');
+        $query->execute();
+
+        $query = db_delete('maestro_template_data');
+        $query->condition('id', $rec->id, '=');
+        $query->execute();
+      }
+
+      $query = db_delete('maestro_template_variables');
+      $query->condition('template_id', $id, '=');
+      $query->execute();
+
+      $query = db_delete('maestro_template');
+      $query->condition('id', $id, '=');
+      $query->execute();
+
+      $data = theme('maestro_workflow_list', array('tid' => 0, 'operation' => '' , 'edit_var' => 0));
+      $arr = array('status' => "1", 'data' => $data);
+      drupal_json_output($arr);
+      break;
+
+    case 'copytemplate':
+      $query = db_select('maestro_template', 'a');
+      $query->fields('a', array('template_name', 'app_group', 'canvas_height'));
+      $query->condition('a.id', $id, '=');
+      $name=current($query->execute()->fetchAll());
+      $record = new stdClass();
+      $record ->template_name = $name->template_name . " - COPY";
+      $record ->app_group = $name->app_group;
+      $record ->canvas_height = $name->canvas_height;
+      drupal_write_record('maestro_template', $record);
+      $new_tid = $record->id;
+
+      $variable_xref_array = Array();
+      $variable_xref_array[0] = 0;
+      $res=db_query("SELECT * FROM {maestro_template_variables} WHERE template_id = :tid", array('tid' => $id));
+      foreach ($res as $rec) {
+        $newrecord = new stdClass();
+        $newrecord->template_id = $new_tid;
+        $newrecord->variable_name = $rec->variable_name;
+        $newrecord->variable_value = $rec->variable_value;
+        drupal_write_record('maestro_template_variables', $newrecord);
+        $variable_xref_array[$rec->id] = $newrecord->id;
+      }
+
+      $task_data_array=array();
+      $res = db_query("SELECT * FROM {maestro_template_data} WHERE template_id = :tid", array('tid' => $id));
+      foreach ($res as $rec) {
+        $newrecord = new stdClass();
+        $newrecord->template_id = $new_tid;
+        $newrecord->task_class_name = $rec->task_class_name;
+        $newrecord->is_interactive = $rec->is_interactive;
+
+        //we need to transform this data here to use the new variables etc etc if required.
+        $task_type = substr($rec->task_class_name, 15);
+        $task_class = 'MaestroTaskInterface' . $task_type;
+        $ti = new $task_class(0, 0);
+        $fixed_data = $ti->modulateExportTaskData($rec->task_data, $variable_xref_array);
+        $rec->task_data = $fixed_data;
+        $newrecord->task_data = $rec->task_data;
+
+        $newrecord->handler = $rec->handler;
+        $newrecord->first_task = $rec->first_task;
+        $newrecord->taskname = $rec->taskname;
+        $newrecord->assigned_by_variable = $rec->assigned_by_variable;
+        $newrecord->argument_variable = $rec->argument_variable;
+        $newrecord->if_argument_process = $rec->if_argument_process;
+        $newrecord->operator = $rec->operator;
+        $newrecord->if_value = $rec->if_value;
+        $newrecord->regenerate = $rec->regenerate;
+        $newrecord->regen_all_live_tasks = $rec->regen_all_live_tasks;
+        $newrecord->is_dynamic_form = $rec->is_dynamic_form;
+        $newrecord->dynamic_form_variable_id = $rec->dynamic_form_variable_id;
+        $newrecord->is_dynamic_taskname = $rec->is_dynamic_taskname;
+        $newrecord->dynamic_taskname_variable_id = $rec->dynamic_taskname_variable_id;
+        $newrecord->function = $rec->function;
+        $newrecord->form_id = $rec->form_id;
+        $newrecord->field_id = $rec->field_id;
+        $newrecord->var_value = $rec->var_value;
+        $newrecord->inc_value = $rec->inc_value;
+        $newrecord->var_to_set = $rec->var_to_set;
+        $newrecord->optional_parm = $rec->optional_parm;
+        $newrecord->reminder_interval = $rec->reminder_interval;
+        $newrecord->reminder_interval_variable = $rec->reminder_interval_variable;
+        $newrecord->subsequent_reminder_interval = $rec->subsequent_reminder_interval;
+        $newrecord->last_updated = $rec->last_updated;
+        $newrecord->pre_notify_subject = $rec->pre_notify_subject;
+        $newrecord->post_notify_subject = $rec->post_notify_subject;
+        $newrecord->reminder_subject = $rec->reminder_subject;
+        $newrecord->pre_notify_message = $rec->pre_notify_message;
+        $newrecord->post_notify_message = $rec->post_notify_message;
+        $newrecord->reminder_message = $rec->reminder_message;
+        $newrecord->num_reminders = $rec->num_reminders;
+        $newrecord->escalate_variable_id = $rec->escalate_variable_id;
+        $newrecord->offset_left = $rec->offset_left;
+        $newrecord->offset_top = $rec->offset_top;
+        $newrecord->surpress_first_notification = $rec->surpress_first_notification;
+        drupal_write_record('maestro_template_data', $newrecord);
+        $task_data_array[$rec->id]= $newrecord->id;
+      }
+
+      //at this point, we have a list that points the old ID record to the new one.
+      //now for each template data next step, we determine which record to go to/from
+      $res = db_query("SELECT * FROM {maestro_template_data} WHERE template_id = :tid", array('tid' => $id));
+      foreach ($res as $rec) {
+        $nextstepres = db_query("SELECT * FROM {maestro_template_data_next_step} WHERE template_data_from = :id", array('id' => $rec->id));
+        foreach ($nextstepres as $nextstep) {
+          $sql  = "INSERT INTO {maestro_template_data_next_step} (template_data_from, template_data_to, template_data_to_false) ";
+          $sql .= "VALUES (:a1, :b1, :c1)";
+          db_query($sql, array('a1' => $task_data_array[$nextstep->template_data_from], 'b1' => $task_data_array[$nextstep->template_data_to], 'c1' => $task_data_array[$nextstep->template_data_to_false]));
+        }
+
+        $assignmentres = db_query("SELECT * FROM {maestro_template_assignment} WHERE template_data_id = :id", array('id' => $rec->id));
+        foreach ($assignmentres as $ares) {
+          $assign_by = $ares->assign_by;
+          $modulated_id = intval($ares->assign_id);
+          switch ($ares->assign_type) {
+            case MaestroAssignmentTypes::USER:
+              if ($assign_by == MaestroAssignmentBy::VARIABLE) {
+                $modulated_id = $variable_xref_array[$ares->assign_id];
+              }
+              break;
+
+            case MaestroAssignmentTypes::GROUP:
+              //@TODO:  implement this when we implement OG suppport
+              break;
+
+            case MaestroAssignmentTypes::ROLE:
+              //@TODO:  implement this when we implement Role suppport
+              break;
+          }
+
+          $sql  = "INSERT INTO {maestro_template_assignment} (template_data_id, assign_type, assign_by, assign_id) ";
+          $sql .= "VALUES (:a1, :b1, :c1, :d1)";
+          db_query($sql, array( 'a1' => $task_data_array[$ares->template_data_id],
+                                'b1' => $ares->assign_type,
+                                'c1' => $ares->assign_by,
+                                'd1' => $modulated_id
+          ));
+        }
+
+      }
+      $data = theme('maestro_workflow_list', array('tid' => 0, 'operation' => '' , 'edit_var' => 0));
+      $arr = array('status' => "1", 'data' => $data);
+      drupal_json_output($arr);
+      break;
+
+  }
+}
+
+function maestro_configure() {
+  return drupal_get_form('maestro_admin_form');
+}
+
+function maestro_admin_form() {
+
+  $form['maestro_batch_script_location'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Maestro batch script physical file location'),
+    '#default_value' => variable_get('maestro_batch_script_location', drupal_get_path('module', 'maestro') . "/batch/"),
+    '#size' => 100,
+    '#description' => t('This is the physical directory where the batch scripts are stored.
+          It is highly recommended that batch scripts be placed in a directory outside of web root.'),
+    '#required' => TRUE,
+  );
+  $form['maestro_run_orchestrator_in_task_console'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Run the Orchestrator when the Task Console Renders'),
+    '#default_value' => variable_get('maestro_run_orchestrator_in_task_console', 0),
+    '#description' => t('Enabling this option will run the Orchestrator each time you visit or refresh the Task Console page.'),
+    '#required' => FALSE,
+  );
+  $form['maestro_orchestrator_lock_delay'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Orchestrator lock release timeout'),
+    '#default_value' => variable_get('maestro_orchestrator_lock_delay', 512.0),
+    '#description' => t('Orchestrator can\'t be executed in parallel, Maestro uses a lock when executing it. However if the execution fails, the lock remains there. This value allows you to specify when maestro should consider the lock invalid. Usually the maximum sane value is the Maximum execution time of PHP configuration.'),
+    '#required' => FALSE,
+  );
+  $form['maestro_enable_import_window'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Enable the import window in the Template Editor.'),
+    '#default_value' => variable_get('maestro_enable_import_window', 0),
+    '#description' => t('Enabling this option will turn on the Import Window in the template editor.  It is NOT recommended to have this on in production environments.'),
+    '#required' => FALSE,
+  );
+
+  $form['maestro_enable_notifications'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Enable Maestro Notifications.'),
+    '#default_value' => variable_get('maestro_enable_notifications', 1),
+    '#description' => t('Checking this option will turn on the Maestro Notifications mechanism.'),
+    '#required' => FALSE,
+  );
+  $form['maestro_debug_mode_enabled'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Enable Maestro Debug Mode.'),
+    '#default_value' => variable_get('maestro_debug_mode_enabled', FALSE),
+    '#description' => t('Checking this option will turn on additional Watchdog logging.'),
+  );
+  $form['maestro_orchestrator_token'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Orchestrator token used for the orchestrator URL'),
+    '#default_value' => variable_get('maestro_orchestrator_token', ''),
+    '#description' => t('Supply a token for the orchestrator URL to use.  If this is blank, then no token is used.  If set, the URL to run the orchestrator is http://www.example.com/maestro/orchestrator/token'),
+    '#required' => FALSE,
+  );
+  include_once('maestro_notification.class.php');
+  $observers = array();
+  $observers[0] = t("No Notifier");
+  foreach (module_implements('maestro_notification_observer') as $module) {
+    $function = $module . '_maestro_notification_observer';
+    if ($declared_observer = $function()) {
+      foreach ($declared_observer as $observer) {
+        $obj = new $observer();
+        $observers[$observer] = $obj->displayName;
+      }
+    }
+  }
+
+  if (variable_get('maestro_enabled_notifiers') == NULL || (is_array(variable_get('maestro_enabled_notifiers')) && count(variable_get('maestro_enabled_notifiers')) == 0 )  ) {
+    //this means that all of them should be selected by default
+    $x = array();
+    foreach ($observers as $key => $val) {
+      if ($key != '0') {
+        $x[$key] = $key;
+      }
+    }
+
+    variable_set('maestro_enabled_notifiers', $x);
+  }
+
+
+  $form['maestro_enabled_notifiers'] = array(
+    '#type' => 'select',
+    '#title' => t('Select Which Notifiers to Enable'),
+    '#default_value' => variable_get('maestro_enabled_notifiers', NULL),
+    '#options' =>  $observers,
+    '#description' => t('The notifiers highlighted will be used to send Maestro notifications.'),
+    '#rows'        => 10,
+    '#multiple'    => TRUE,
+  );
+
+  $form['notifications'] = array(
+  '#type' => 'vertical_tabs',
+  );
+
+  $form['assignment_notifications'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Task Assignment Notifcation settings'),
+    '#collapsible' => TRUE,
+    '#collapsed' => FALSE,
+    '#group' => 'notifications'
+    );
+
+    $form['assignment_notifications']['maestro_assignment_subject'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Assignment Notification Default Subject'),
+    '#default_value' => variable_get('maestro_assignment_subject'),
+    '#required' => FALSE,
+    );
+
+    $form['assignment_notifications']['maestro_assignment_message'] = array(
+    '#type' => 'textarea',
+    '#title' => t('Assignment Notification Default Message'),
+    '#default_value' => variable_get('maestro_assignment_message'),
+    '#description' => t('Valid tokens: [workflow_name], [task_name], [task_owner], [task_console_url]'),
+    '#required' => FALSE,
+    );
+
+    $form['commpletion_notifications'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Task Completion Notifcation settings'),
+    '#collapsible' => TRUE,
+    '#collapsed' => FALSE,
+    '#group' => 'notifications'
+    );
+
+    $form['commpletion_notifications']['maestro_completion_subject'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Completion Notification Default Subject'),
+    '#default_value' => variable_get('maestro_completion_subject'),
+    '#required' => FALSE,
+    );
+
+    $form['commpletion_notifications']['maestro_completion_message'] = array(
+    '#type' => 'textarea',
+    '#title' => t('Completion Notification Default Message'),
+    '#default_value' => variable_get('maestro_completion_message'),
+    '#description' => t('Valid tokens: [workflow_name], [task_name], [task_owner], [task_console_url]'),
+    '#required' => FALSE,
+    );
+
+    $form['reminder_notifications'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Task Reminder Notifcation settings'),
+    '#collapsible' => TRUE,
+    '#collapsed' => FALSE,
+    '#group' => 'notifications'
+    );
+
+    $form['reminder_notifications']['maestro_reminder_subject'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Reminder Notification Default Subject'),
+    '#default_value' => variable_get('maestro_reminder_subject'),
+    '#required' => FALSE,
+    );
+
+    $form['reminder_notifications']['maestro_reminder_message'] = array(
+    '#type' => 'textarea',
+    '#title' => t('Reminder Notification Default Message'),
+    '#default_value' => variable_get('maestro_reminder_message'),
+    '#description' => t('Valid tokens: [workflow_name], [task_name], [task_owner], [task_console_url]'),
+    '#required' => FALSE,
+    );
+
+    $form['escalation_notifications'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Task Escalation Notification settings'),
+    '#collapsible' => TRUE,
+    '#collapsed' => FALSE,
+    '#group' => 'notifications'
+    );
+
+    $form['escalation_notifications']['maestro_escalation_subject'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Escalation Notification Default Subject'),
+    '#default_value' => variable_get('maestro_escalation_subject'),
+    '#required' => FALSE,
+    );
+
+    $form['escalation_notifications']['maestro_escalation_message'] = array(
+    '#type' => 'textarea',
+    '#title' => t('Escalation Notification Default Message'),
+    '#default_value' => variable_get('maestro_escalation_message'),
+    '#description' => t('Valid tokens: [workflow_name], [task_name], [task_owner], [task_console_url]'),
+    '#required' => FALSE,
+    );
+
+    return system_settings_form($form);
+}
+
+
+function maestro_edit_properties($tid, $var=0) {
+  //$tid is the edited template
+  return maestro_admin($tid, 'edit', $var);
+}
+
+/*
+ * The following functions are here in support of the Maestro Structure page functionality.
+ * These functions need to exist in order to run unit tests against their functionality.
+ */
+
+function maestro_createNewTemplate($name, $skip_task_creation = FALSE, $skip_variable_creation = FALSE, $canvas_height=500) {
+  if (!user_access('maestro admin')) return FALSE;
+  if (trim($name) != '') {
+    $record = new stdClass();
+    $record->template_name = $name;
+    $record->canvas_height = $canvas_height;
+    drupal_write_record('maestro_template', $record);
+    $new_template_rec_id = $record->id;
+    if (!$skip_task_creation) {
+      $task = new MaestroTaskInterfaceStart(0, $new_template_rec_id);
+      $task->setSecurityToken(drupal_get_token('maestro_admin'));
+      $task->create();
+      $task = new MaestroTaskInterfaceEnd(0, $new_template_rec_id);
+      $task->setSecurityToken(drupal_get_token('maestro_admin'));
+      $task->create();
+    }
+    if (!$skip_variable_creation) {
+      maestro_createTemplateVariable($new_template_rec_id, 'initiator', '');
+    }
+    return $new_template_rec_id;
+  }
+  else {
+    return FALSE;
+  }
+}
+
+function maestro_createTemplateVariable($tid, $name, $value) {
+  if (!user_access('maestro admin')) return FALSE;
+  $record = new stdClass();
+  $record ->variable_name = $name;
+  $record ->variable_value = $value;
+  $record ->template_id = $tid;
+  drupal_write_record('maestro_template_variables', $record);
+  return $record->id;
+}
+
+function maestro_deleteTemplateVariable($id) {
+  if (!user_access('maestro admin')) return FALSE;
+  $query = db_select('maestro_template_variables', 'a');
+  $query->fields('a', array('variable_name'));
+  $query->condition('a.id', $id, '=');
+  $name=current($query->execute()->fetchAll());
+  if ($name->variable_name != 'initiator') {
+    $query = db_delete('maestro_template_variables');
+    $query->condition('id', $id, '=');
+    $query->execute();
+    return TRUE;
+  }
+  else {
+    return FALSE;
+  }
+
+}
+
+function maestro_createAppGroup($name) {
+  if (!user_access('maestro admin')) return FALSE;
+  $record = new stdClass();
+  $record ->app_group = $name;
+  drupal_write_record('maestro_app_groups', $record);
+  return $record->id;
+}
+
+function maestro_deleteAppGroup($id) {
+  if (!user_access('maestro admin')) return FALSE;
+  $query = db_delete('maestro_app_groups');
+  $query->condition('id', $id, '=');
+  $query->execute();
+}
+
+function maestro_joinAppGroup($template_id, $appgroup_id) {
+  if (!user_access('maestro admin')) return FALSE;
+  $update = db_update('maestro_template')
+  ->fields(array( 'app_group' => $appgroup_id
+  ))
+  ->condition('id', $template_id)
+  ->execute();
+}
+
+function maestro_export($id) {
+  $output_php = "";
+  $id = intval($id);
+  if ($id > 0) {
+    //first step -- fetch the name of the original template
+    $output_php .= '$_POST[\'offset_top\'] = 0;' . "\n";
+    $output_php .= '$_POST[\'offset_left\'] = 0;' . "\n";
+    $output_php .= '$variable_xref_array = Array();' . "\n";
+    $output_php .= '$variable_xref_array[0] = 0;' . "\n";
+    $output_php .= '$task_xref_array = Array();' . "\n";
+    $output_php .= '$task_xref_array[0] = 0;' . "\n";
+    $query = db_select('maestro_template', 'a');
+    $query->fields('a', array('template_name', 'canvas_height'));
+    $query->condition('a.id', $id, '=');
+    $name=current($query->execute()->fetchAll());
+    $original_template_name = str_replace('"', '\"', $name->template_name);
+    $canvas_height = $name->canvas_height;
+    $output_php .= '$templateID = maestro_createNewTemplate("IMPORT - ' . $original_template_name . '", TRUE, TRUE, ' . $canvas_height . ');' . "\n"; //create new template
+    //lets get all of the template variables:
+    $template_variables_record_set=db_query("SELECT * FROM {maestro_template_variables} WHERE template_id = :tid", array('tid' => $id));
+    $initiator_variable_id=0;
+    foreach ($template_variables_record_set as $rec) {
+      $var_name = str_replace('"', '\"', $rec->variable_name);
+      $var_value = str_replace('"', '\"', $rec->variable_value);
+      if ($rec->variable_name == 'initiator') {
+        $initiator_variable_id = $rec->id;
+      }
+      $output_php .= '$variable_xref_array[' . $rec->id . '] = maestro_createTemplateVariable($templateID, "' . $var_name . '", "' . $var_value . '");' . "\n";
+    }
+    //lets get all of the template_data entries
+    $template_data_record_set=db_query("SELECT * FROM {maestro_template_data} WHERE template_id = :tid", array('tid' => $id));
+    foreach ($template_data_record_set as $rec) {
+      $task_type = substr($rec->task_class_name, 15);
+      $task_class = 'MaestroTaskInterface' . $task_type;
+      $output_php .= '$ti = new ' . $task_class . '(0, $templateID);' . "\n";
+      $output_php .= '$ti->setSecurityToken(drupal_get_token("maestro_admin"));' . "\n";
+      $output_php .= '$ti->create();' . "\n";
+      $output_php .= '$task_xref_array[' . $rec->id . '] = $ti->get_task_id();' . "\n";
+      $output_php .= '$res = db_select(\'maestro_template_data\', \'a\');' . "\n";
+      $output_php .= '$res->fields(\'a\', array(\'id\', \'task_data\'));' . "\n";
+      $output_php .= '$res->condition(\'a.id\', $ti->get_task_id(), \'=\');' . "\n";
+      $output_php .= '$rec = current($res->execute()->fetchAll());' . "\n";
+      foreach ($rec as $key => $data) {
+        if ($key != 'id' && $key != 'task_class_name' && $key != 'template_id') {
+          if ($key == 'task_data') {
+            $output_php .= '$fixed_data = $ti->modulateExportTaskData(\'' . str_replace("'", "\'", $data) . '\', $variable_xref_array);' . "\n";
+            $output_php .= '$rec->task_data = $fixed_data;' . "\n";
+          }
+          elseif (is_numeric($data)) {
+            $output_php .= '$rec->' . $key . ' = ' . $data . ';' . "\n";
+          }
+          else {
+            $output_php .= '$rec->' . $key . ' = \'' . $data . '\';' . "\n";
+          }
+        }
+      }
+      $output_php .= 'drupal_write_record(\'maestro_template_data\', $rec, array(\'id\'));' . "\n";
+    }
+    //we now have to create the next step and assignmnents
+    $template_data_record_set=db_query("SELECT * FROM {maestro_template_data} WHERE template_id = :tid", array('tid' => $id));
+    foreach ($template_data_record_set as $rec) {
+      $nextstepres = db_query("SELECT * FROM {maestro_template_data_next_step} WHERE template_data_from = :id", array('id' => $rec->id));
+      foreach ($nextstepres as $nextstep) {
+        $output_php .= '$sql  = "INSERT INTO {maestro_template_data_next_step} (template_data_from, template_data_to, template_data_to_false) VALUES (:a1, :b1, :c1)";' . "\n";
+        $output_php .= 'db_query($sql, array(\'a1\' => $task_xref_array[' .
+          intval($nextstep->template_data_from) . '], \'b1\' => $task_xref_array[' .
+          intval($nextstep->template_data_to) . '], \'c1\' => $task_xref_array[' .
+          intval($nextstep->template_data_to_false) . ']));' . "\n";
+      }
+      $assignmentres = db_query("SELECT * FROM {maestro_template_assignment} WHERE template_data_id = :id", array('id' => $rec->id));
+      foreach ($assignmentres as $ares) {
+        $output_php .= '$query = db_select(\'maestro_template_data\', \'a\');' . "\n";
+        $output_php .= '$query->fields(\'a\',array(\'task_class_name\'));' . "\n";
+        $output_php .= '$query->condition(\'a.id\',$task_xref_array[' . $ares->template_data_id . '],\'=\');' . "\n";
+        $output_php .= '$name=current($query->execute()->fetchAll());' . "\n";
+        $output_php .= '$task_type = substr($name->task_class_name, 15);' . "\n";
+        $output_php .= '$task_class = \'MaestroTaskInterface\' . $task_type;' . "\n";
+        $output_php .= '$ti = new $task_class(0,0);' . "\n";
+
+        //we'll just make an initial assumption that the assign_by is by variable
+        //we overwrite this in the switch if it is actually by a fixed value
+        $assign_by = $ares->assign_by;
+        $assign_type = $ares->assign_type;
+        $output_php .= '$assign_by = ' . $assign_by . ";\n";
+        $output_php .= '$assign_type = ' . $assign_type . ";\n";
+
+        $modulated_string = '$modulated_id = $variable_xref_array[' . intval($ares->assign_id) . '];' . "\n";
+        switch ($ares->assign_type) {
+          case MaestroAssignmentTypes::USER:
+            if ($assign_by == MaestroAssignmentBy::FIXED) {
+              $temp_user_info = user_load($ares->assign_id);
+              $modulated_string = '$modulated_id = $ti->modulateExportUser("' . $temp_user_info->name . '");' . "\n";
+            }
+            break;
+
+          case MaestroAssignmentTypes::GROUP:
+            if ($assign_by == MaestroAssignmentBy::FIXED) {
+              if (module_exists('og')) {
+                $og_values = MaestroOgCommon::getOgTableValues();
+                $query = db_select($og_values['table'], 'a');
+                $query->addField('a', $og_values['title_column'], 'label');
+                $query->condition('a.' . $og_values['gid_column'], intval($ares->assign_id), '=');
+                $group = $query->execute()->fetchField();
+                $modulated_string  = '$modulated_id = $ti->modulateExportOG("' . $group . '");' . "\n";
+                $modulated_string .= 'if ($modulated_id == FALSE) {' . "\n";
+                $modulated_string .= '  $assign_by = ' . MaestroAssignmentBy::VARIABLE . ";\n";
+                $modulated_string .= '  $assign_type = ' . MaestroAssignmentTypes::USER . ";\n";
+                $modulated_string .= '  $modulated_id = ' . $initiator_variable_id . ';' . "\n";
+                $modulated_string .= "}\n";
+              }
+              else { //we are going to simply set this to the initiator variable
+                  //This would be an odd situation here, but this is the EXPORT noticing that og isnt installed but yet the
+                  //template they are exporting is trying to export an OG reference.  IMPOSSIBLE!  But yet, because OG could conceivably
+                  //be disabled/uninstalled by accident, exports of a template shouldn't suffer.
+                watchdog('maestro import', 'You do not have OG installed.  Task assignment changed to assigned by INITIATOR variable.');
+                $modulated_string  = '$assign_by = ' . MaestroAssignmentBy::VARIABLE . ";\n";
+                $modulated_string .= '$assign_type = ' . MaestroAssignmentTypes::USER . ";\n";
+                $modulated_string .= '$modulated_id = ' . $initiator_variable_id . ';' . "\n";
+              }
+            }
+            break;
+
+          case MaestroAssignmentTypes::ROLE:
+            if ($assign_by == MaestroAssignmentBy::FIXED) {
+              $query = db_select('role', 'a');
+              $query->addField('a', 'name');
+              $query->condition('a.rid', intval($ares->assign_id), '=');
+              $role = $query->execute()->fetchField();
+              $modulated_string = '$modulated_id = $ti->modulateExportRole("' . $role . '");' . "\n";
+            }
+            break;
+        }
+
+        $output_php .= $modulated_string;
+
+        $output_php .= '$sql  = "INSERT INTO {maestro_template_assignment} (template_data_id, assign_type, assign_by, assign_id) VALUES (:a1, :b1, :c1, :d1)";' . "\n";
+        $output_php .= 'db_query($sql, array( \'a1\' => $task_xref_array[' . $ares->template_data_id . '],';
+        $output_php .= '\'b1\' => $assign_type,';
+        $output_php .= '\'c1\' => $assign_by,';
+        $output_php .= '\'d1\' => $modulated_id,';
+        $output_php .= '));' . "\n";
+
+      }
+
+      //notifications
+      $notifications = db_query("SELECT * FROM {maestro_template_notification} WHERE template_data_id = :id", array('id' => $rec->id));
+      foreach ($notifications as $ares) {
+
+        $assign_by = $ares->notify_by;
+        $assign_type = $ares->notify_type;
+        $output_php .= '$assign_by = ' . $assign_by . ";\n";
+        $output_php .= '$assign_type = ' . $assign_type . ";\n";
+
+        $modulated_string = '$modulated_id = $variable_xref_array[' . intval($ares->notify_id) . '];' . "\n";
+        switch($ares->notify_type) {
+          case MaestroAssignmentTypes::USER:  //user
+            if ($ares->notify_by == MaestroAssignmentBy::FIXED) {
+              $temp_user_info = user_load($ares->notify_id);
+              $modulated_string = '$modulated_id = $ti->modulateExportUser("' . $temp_user_info->name . '");' . "\n";
+            }
+            break;
+
+          case MaestroAssignmentTypes::ROLE:  //role
+            if ($ares->notify_by == MaestroAssignmentBy::FIXED) {
+              $query = db_select('role', 'a');
+              $query->addField('a', 'name');
+              $query->condition('a.rid', intval($ares->notify_id), '=');
+              $role = $query->execute()->fetchField();
+              $modulated_string = '$modulated_id = $ti->modulateExportRole("' . $role . '");' . "\n";
+            }
+            break;
+
+        }
+        $output_php .= $modulated_string;
+        $output_php .= '$sql  = "INSERT INTO {maestro_template_notification} (template_data_id, notify_type, notify_by, notify_when, notify_id) VALUES (:a1, :b1, :c1, :d1, :e1)";' . "\n";
+        $output_php .= 'db_query($sql, array( \'a1\' => $task_xref_array[' . $ares->template_data_id . '],';
+        $output_php .= '\'b1\' => ' . $ares->notify_type . ',';
+        $output_php .= '\'c1\' => ' . $ares->notify_by . ',';
+        $output_php .= '\'d1\' => ' . $ares->notify_when . ',';
+        $output_php .= '\'e1\' => $modulated_id,';
+        $output_php .= '));' . "\n";
+      }
+    }
+  }
+  return $output_php;
+}
+
+function maestro_export_template($tid, $var=0) {
+  $content = maestro_export($tid);
+  return maestro_admin($tid, 'export_template', $var);
+}

@@ -1,0 +1,945 @@
+<?php
+
+/**
+ * @file
+ * MoneySuite CCBill Gateway
+ *
+ * Original author: Leighton Whiting - Released under GENERAL PUBLIC LICENSE
+ * Current maintenance by multiple MoneySuite users.
+ * Re: new initiative: https://www.drupal.org/node/2315653 
+ */
+
+/**
+ * Implements hook_cron().
+ */
+function ms_ccbill_cron() {
+  // Use the Data Link to check for cancelled or failed payments, and also to log payments
+  if ($username = variable_get('ms_ccbill_datalink_username', '')) {
+    $perform_update = FALSE;
+    // Only run cron once per day.
+    $last_run_day = variable_get('ms_ccbill_datalink_cron_last_day', 0);
+    $current_day = date('z');
+    if ($last_run_day != $current_day) {
+      $perform_update = TRUE;
+    }
+
+    // Run the cron job once per day, but only after 6 AM.
+    // By running the cron job, we make sure to capture all CCBill expirations from
+    // the previous day, at least in the US.
+    if ($perform_update && date('G') > 6) {
+      // Calculate the timestamp of yesterday:
+      $timestamp = REQUEST_TIME - 86400;
+      $year = date('Y', $timestamp);
+      $month = date('m', $timestamp);
+      $day = date('d', $timestamp);
+      $yesterday_start = (string) $year . $month . $day . '000000';
+      $yesterday_end = (string) $year . $month . $day . '235959';
+
+      // Connect to CCBill and remove all expired Supporters.
+      if (ms_ccbill_datalink_update($yesterday_start, $yesterday_end)) {
+        // @todo Do this every hour instead.
+        // Update the day variable.
+        variable_set('ms_ccbill_datalink_cron_last_day', date('z'));
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_help().
+ */
+function ms_ccbill_help($path, $arg) {
+  $output = '';
+  switch ($path) {
+    case "admin/moneysuite/gateways/ms_ccbill":
+    case "admin/help#ms_ccbill":
+      $output = '<p>' .  t("CCBill payment gateway module which allows you to process
+      payments for MS Core modules. You will need to have an account with CCBill
+      and enter the account information in the settings page for this module.") . '</p>';
+      break;
+  }
+  return $output;
+}
+
+/**
+ * Access test to see if the user can modify an order
+ */
+function ms_ccbill_modify_test($oid, $id) {
+  global $user;
+  $order = ms_core_order_load($oid);
+  if ($order->uid == $user->uid) {
+    return TRUE;
+  }
+  return FALSE;
+}
+
+/**
+ * Access callback to see if the user can cancel their order
+ */
+function ms_ccbill_cancel_test($oid) {
+  global $user;
+  $order = ms_core_order_load($oid);
+  if ($user->uid == $order->uid OR user_access('administer moneysuite orders')) {
+    return TRUE;
+  }
+  return FALSE;
+}
+
+/**
+ * Implements hook_menu().
+ */
+function ms_ccbill_menu() {
+  $items = array();
+  $items['ms/checkout/ccbill'] = array(
+    'title' => 'Checkout',
+    'page callback' => 'ms_ccbill_checkout_page',
+    'access callback' => 'ms_core_view_page_access_test',
+    'type' => MENU_VISIBLE_IN_BREADCRUMB,
+  );
+  $items['ms_ccbill/success'] = array(
+    'page callback' => 'ms_ccbill_success_callback_page',
+    'access callback' => 'ms_core_view_page_access_test',
+    'type' => MENU_CALLBACK,
+  );
+  $items['ms_ccbill/failure'] = array(
+    'page callback' => 'ms_ccbill_failure_callback_page',
+    'access callback' => 'ms_core_view_page_access_test',
+    'type' => MENU_CALLBACK,
+  );
+  $items['ms_ccbill/approved/%'] = array(
+    'title' => 'Payment Approved',
+    'page callback' => 'ms_ccbill_approved_page',
+    'page arguments' => array(2),
+    'access callback' => 'ms_core_view_page_access_test',
+    'type' => MENU_CALLBACK,
+  );
+  $items['ms_ccbill/denied/%'] = array(
+    'title' => 'Payment Denied',
+    'page callback' => 'ms_ccbill_denied_page',
+    'page arguments' => array(2),
+    'access callback' => 'ms_core_view_page_access_test',
+    'type' => MENU_CALLBACK,
+  );
+  $items['ms_ccbill/modify/%/%'] = array(
+    'title' => 'Modify Payments',
+    'page callback' => 'ms_ccbill_modify_page',
+    'page arguments' => array(2, 3),
+    'access callback' => 'ms_ccbill_modify_test',
+    'access arguments' => array(2, 3),
+    'type' => MENU_VISIBLE_IN_BREADCRUMB,
+  );
+  $items['ms_ccbill/cancel/%'] = array(
+    'title' => 'Cancel Payments',
+    'page callback' => 'ms_ccbill_cancel_page',
+    'page arguments' => array(2),
+    'access callback' => 'ms_ccbill_cancel_test',
+    'access arguments' => array(2),
+    'type' => MENU_VISIBLE_IN_BREADCRUMB,
+  );
+  $items['ms_ccbill/check_order_status/%'] = array(
+    'page callback' => 'ms_ccbill_order_ajax_page',
+    'page arguments' => array(2),
+    'access callback' => 'ms_core_view_page_access_test',
+    'type' => MENU_CALLBACK,
+  );
+
+  return $items;
+}
+
+
+/**
+ * Admin Settings Form
+ */
+function ms_ccbill_admin() {
+  $form['main'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Main Settings'),
+    '#collapsible' => FALSE,
+    '#collapsed' => FALSE,
+  );
+  $form['main']['ms_ccbill_client_acc_num'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Client Account Number'),
+    '#size' => 32,
+    '#maxlength' => 64,
+    '#default_value' => variable_get('ms_ccbill_client_acc_num', ''),
+    '#description' => t("Enter the Client Account Number."),
+    '#required' => TRUE,
+    '#ms_override' => TRUE,
+  );
+  $form['main']['ms_ccbill_client_sub_acc'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Client Sub-Account Number'),
+    '#size' => 32,
+    '#maxlength' => 64,
+    '#default_value' => variable_get('ms_ccbill_client_sub_acc', ''),
+    '#description' => t("Enter the Client Sub-Account Number."),
+    '#required' => TRUE,
+    '#ms_override' => TRUE,
+  );
+  $form['main']['ms_ccbill_form_name'] = array(
+    '#type' => 'textfield',
+    '#title' => t('CCBill Form Name'),
+    '#size' => 32,
+    '#maxlength' => 64,
+    '#default_value' => variable_get('ms_ccbill_form_name', ''),
+    '#description' => t("Enter the name of the CCBill form that will be used for payments.
+      Note that this form must have Dynamic Pricing enabled."),
+    '#required' => TRUE,
+    '#ms_override' => TRUE,
+  );
+  $form['main']['ms_ccbill_md5_salt'] = array(
+    '#type' => 'textfield',
+    '#title' => t('MD5 Salt'),
+    '#size' => 32,
+    '#maxlength' => 255,
+    '#default_value' => variable_get('ms_ccbill_md5_salt', ''),
+    '#description' => t("Enter the MD5 Salt used to generate the MD5 Hash Code to
+      verify the payments. You will need to contact CCBill Support to have
+      them generate an MD5 Salt for you."),
+    '#required' => TRUE,
+    '#ms_override' => TRUE,
+  );
+
+  // -----------------------------
+  // Datalink Settings
+  // -----------------------------
+  $form['datalink'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Data Link Settings'),
+    '#collapsible' => FALSE,
+    '#collapsed' => FALSE,
+    '#description' => t("You will need to create a Data Link user and enter the
+      information for it here so that users can cancel their recurring payments,
+      among other things."),
+  );
+  $form['datalink']['ms_ccbill_datalink_username'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Data Link Username'),
+    '#default_value' => variable_get('ms_ccbill_datalink_username', ''),
+    '#ms_override' => TRUE,
+  );
+  $form['datalink']['ms_ccbill_datalink_password'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Data Link Password'),
+    '#default_value' => variable_get('ms_ccbill_datalink_password', ''),
+    '#ms_override' => TRUE,
+  );
+  $form['datalink']['ms_ccbill_datalink_ip'] = array(
+    '#type' => 'item',
+    '#title' => t('IP Address'),
+    '#markup' => t("Use the %ip IP Address when setting up the Data Link user.",
+      array('%ip' => $_SERVER['SERVER_ADDR'])),
+  );
+
+  // -----------------------------
+  // Redirection Fieldset
+  // -----------------------------
+  $form['redirection'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Redirection URLs'),
+    '#collapsible' => FALSE,
+    '#collapsed' => FALSE,
+    '#description' => t("Copy and paste these URLs into your CCBill settings pages
+      for the Approval and Denial URLs. This is in the Sub-Account Basic settings page."),
+  );
+  $form['redirection']['ms_ccbill_approval_page'] = array(
+    '#type' => 'item',
+    '#title' => t('Payment Approved URL'),
+    '#markup' => url('ms_ccbill/approved', array('absolute' => TRUE)) . '/%%ms_unique_key%%',
+  );
+  $form['redirection']['ms_ccbill_denial_page'] = array(
+    '#type' => 'item',
+    '#title' => t('Payment Denied URL'),
+    '#markup' => url('ms_ccbill/denied', array('absolute' => TRUE)) . '/%%ms_unique_key%%',
+  );
+
+  // -----------------------------
+  // Background Post Fieldset
+  // -----------------------------
+  $form['background'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Background Post URLs'),
+    '#collapsible' => FALSE,
+    '#collapsed' => FALSE,
+    '#description' => t("Copy and paste these URLs into your CCBill settings pages
+      for the Approval and Denial Post URLs. This is in the Sub-Account
+      Advanced settings page."),
+  );
+  $form['background']['ms_ccbill_success_page'] = array(
+    '#type' => 'item',
+    '#title' => t('Payment Approved URL'),
+    '#markup' => url('ms_ccbill/success', array('absolute' => TRUE)),
+  );
+  $form['background']['ms_ccbill_failure_page'] = array(
+    '#type' => 'item',
+    '#title' => t('Payment Denied URL'),
+    '#markup' => url('ms_ccbill/failure', array('absolute' => TRUE)),
+  );
+
+  // -----------------------------
+  // Notes Fieldset
+  // -----------------------------
+  $form['notes'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Extra Notes'),
+    '#collapsible' => FALSE,
+    '#collapsed' => FALSE,
+  );
+  $form['notes']['ms_ccbill_free_trials'] = array(
+    '#type' => 'item',
+    '#title' => t('Free Trials'),
+    '#markup' => t("To use free trials, you will need to have CCBill turn on that
+      feature for your account."),
+  );
+  $form['notes']['ms_ccbill_trial_period'] = array(
+    '#type' => 'item',
+    '#title' => t('Minimum Period'),
+    '#markup' => t("The Minumum Period for recurring payments must be at least 30
+      days. And Trial Periods must be at least 2 days. You can request that this
+      be lowered and CCBill may do it for you."),
+  );
+  $form['notes']['ms_ccbill_lowest_price'] = array(
+    '#type' => 'item',
+    '#title' => t('Test Mode'),
+    '#markup' => t("You can't charge less than 2.95."),
+  );
+  $form['notes']['ms_ccbill_modification'] = array(
+    '#type' => 'item',
+    '#title' => t('Subscription Modifications'),
+    '#markup' => t("Subscription Modifications are not supported by CCBill. Users
+      won't be able to upgrade/downgrade their subscriptions. They will instead
+      need to cancel any recurring payments and then sign up again using a different
+      plan."),
+  );
+  $form['notes']['ms_ccbill_test_mode'] = array(
+    '#type' => 'item',
+    '#title' => t('Test Mode'),
+    '#markup' => t("To test your form, you will need to set up a test user in your
+      CCBill admin area. You can ask CCBill to send you the card numbers that you
+      can use for testing. If you use the card number that is for testing along
+      with the email address of the testing user you created, then the transaction
+      will be seen as a test transaction."),
+  );
+  $form['notes']['ms_ccbill_datalink_cancel'] = array(
+    '#type' => 'item',
+    '#title' => t('Data Link Cancellations'),
+    '#markup' => t("If you want to detect cancellations, you will need to have CCBill enable
+      the 'CANCELLATION' Data Link Transaction Type for your account. Otherwise,
+      cancellations aren't detected until the EXPIRE notice is received."),
+  );
+  $form['notes']['ms_ccbill_datalink_fields'] = array(
+    '#type' => 'item',
+    '#title' => t('Data Link Fields'),
+    '#markup' => t("Because Data Link only supports CSV and not XML, if you change the order of
+      the fields that are returned by Data Link, or change which fields are returned,
+      it will confuse the system. Keep all of the Data Link fields settings in your
+      CCBill account set to the default."),
+  );
+
+  return $form;
+}
+
+/**
+ * Get the Cancellation URL for a recurring order
+ */
+function ms_ccbill_get_cancel_url($order) {
+  return 'ms_ccbill/cancel/' . $order->oid;
+}
+
+/**
+ * Initiate a cancellation
+ */
+function ms_ccbill_cancel_page($oid) {
+  return drupal_get_form('ms_ccbill_cancel_confirm', $oid);
+}
+
+/**
+ * Initiate a cancellation
+ */
+function ms_ccbill_cancel_confirm($form, &$form_state, $oid) {
+  $order = ms_core_order_load($oid);
+  $form['#ms_core_oid'] = $order->oid;
+  return confirm_form($form, t('Are you sure you want to cancel your order?'), '', t('This action cannot be undone.'), t('Confirm'));
+}
+
+/**
+ * Submit handler to cancel an order
+ */
+function ms_ccbill_cancel_confirm_submit($form, &$form_state) {
+  $order = ms_core_order_load($form['#ms_core_oid']);
+
+  // Load the subscription id for the order
+  $subscription_id = ms_core_get_order_rec_id($order->oid);
+
+  $data = array(
+    'clientSubacc' => '',
+    'usingSubacc' => ms_core_variable_get('ms_ccbill_client_sub_acc', '', $order),
+    'subscriptionId' => $subscription_id,
+    'username' => ms_core_variable_get('ms_ccbill_datalink_username', '', $order),
+    'password' => ms_core_variable_get('ms_ccbill_datalink_password', '', $order),
+    'action' => 'cancelSubscription',
+    'clientAccnum' => ms_core_variable_get('ms_ccbill_client_acc_num', '', $order),
+  );
+
+  $result = drupal_http_request('https://datalink.ccbill.com/utils/subscriptionManagement.cgi',
+    array('data' => $data));
+
+  if ($result->data == 1) {
+    // Success
+    // Enter the rec_cancel payment
+    $payment = ms_core_new_payment($order->oid, 'ms_ccbill', 'rec_cancel');
+
+    // Generate a Unique Transaction ID
+    $payment->transaction = drupal_get_token(serialize($order));
+    $payment->currency = $order->currency;
+    $payment->recurring_id = $subscription_id;
+
+    ms_core_enter_payment($payment);
+  }
+  else {
+    // Error
+    drupal_set_message(t("The order could not be canceled. The error has been logged."));
+    // Log the error and order info
+    ms_core_log_error('ms_ccbill', "The order could not be canceled. Order: !order",
+      array('!order' => ms_core_print_r($order)));
+  }
+}
+
+/**
+ * Implements hook_ms_core_payment_gateway().
+ */
+function ms_ccbill_ms_core_payment_gateway() {
+  $gateway['ms_ccbill'] = array(
+    'name' => 'CCBill',
+    'display_name' => t('Credit Card'),
+    'description' => t('Pay by Credit Card'),
+    'cards' => array('visa', 'mc', 'discover', 'amex'),
+    'module' => 'ms_ccbill',
+    'checkout_path' => 'ms/checkout/ccbill',
+    'settings' => ms_ccbill_admin(),
+    'cancel_url' => variable_get('ms_ccbill_datalink_username', '') ? 'ms_ccbill_get_cancel_url' : '',
+  );
+  return $gateway;
+}
+
+// ======================================
+// Pages and Functions:
+// ======================================
+
+/**
+ * Displays the Checkout Page
+ */
+function ms_ccbill_checkout_page() {
+  // Stop the caching
+  $GLOBALS['conf']['cache'] = FALSE;
+
+  // Load the order
+  if (!$order = ms_core_load_session_order()) {
+    // Error
+    return t('There was an error with the checkout');
+  }
+
+  // Set the order status
+  ms_core_set_order_status($order, 'pending');
+
+  // Jump to CCBill
+  ms_ccbill_jump($order);
+}
+
+/**
+ * Builds the form for the jump page
+ */
+function ms_ccbill_jump($order) {
+  $url = 'https://bill.ccbill.com/jpost/signup.cgi';
+  $salt = ms_core_variable_get('ms_ccbill_md5_salt', '', $order);
+
+  $form = array();
+  $data = array();
+
+  $form['#action'] = $url;
+  $form['#id'] = 'ccbill-jump';
+
+  // Add the variables
+  $data['clientAccnum'] = ms_core_variable_get('ms_ccbill_client_acc_num', '', $order);
+  $data['clientSubacc'] = ms_core_variable_get('ms_ccbill_client_sub_acc', '', $order);
+  $data['formName'] = ms_core_variable_get('ms_ccbill_form_name', '', $order);
+  $data['currencyCode'] = ms_ccbill_get_currency_code($order->currency);
+  $data['ms_unique_key'] = $order->unique_key;
+
+  switch ($order->order_type) {
+    case 'recurring':
+      $data['formRecurringPrice'] = $order->recurring_schedule['main_amount'];
+      $data['formRecurringPeriod'] = ms_ccbill_get_period($order->recurring_schedule['main_length'], $order->recurring_schedule['main_unit']);
+      $data['formRebills'] = ($order->recurring_schedule['total_occurrences'] > 0) ? $order->recurring_schedule['total_occurrences'] : 99;
+      $data['formPrice'] = $data['formRecurringPrice'];
+      $data['formPeriod'] = $data['formRecurringPeriod'];
+
+      // Add Trial Period Settings if applicable
+      if ($order->recurring_schedule['has_trial']) {
+        $data['formPrice'] = $order->recurring_schedule['trial_amount'];
+        $data['formPeriod'] = ms_ccbill_get_period($order->recurring_schedule['trial_length'], $order->recurring_schedule['trial_unit']);
+      }
+
+      $data['formDigest'] = md5($data['formPrice'] . $data['formPeriod'] . $data['formRecurringPrice']
+        . $data['formRecurringPeriod'] . $data['formRebills'] . $data['currencyCode'] . $salt);
+      break;
+
+    case 'cart':
+      $data['formPrice'] = $order->amount;
+      $data['formPeriod'] = 2;
+
+      $data['formDigest'] = md5($data['formPrice'] . $data['formPeriod'] . $data['currencyCode'] . $salt);
+      break;
+  }
+
+  drupal_goto($url, array('query' => $data, 'external' => TRUE));
+}
+
+/**
+ * Callback page for denied payments.
+ *
+ * Verifies the MD5 Hash and then logs the denial
+ */
+function ms_ccbill_failure_callback_page() {
+  $post = $_POST;
+  $salt = variable_get('ms_ccbill_md5_salt', '');
+  // First verify the hash
+  if (isset($post['responseDigest']) AND isset($post['denialId']) AND md5($post['denialId'] . 0 . $salt) == $post['responseDigest']) {
+    // Verified
+    $unique_key = $post['ms_unique_key'];
+
+    // Attempt to load the order
+    if (!$order = ms_core_order_load_unique($unique_key)) {
+      // Should never get this far
+      ms_core_log_error('ms_ccbill', 'The order was unable to be loaded from the unique key: !key',
+        array('!key' => $unique_key));
+
+      return t("There was an error processing the payment. This error has been logged. Please contact the admin for more help.");
+    }
+
+    // Log the denial in the order history
+    ms_core_add_history_item($order, 0, t('Payment was denied. Reason: @reason', array('@reason' => $post['reasonForDecline'])), TRUE);
+
+    ms_core_log_error('ms_ccbill', 'A payment was denied. Vars: !vars',
+      array('!vars' => ms_core_print_r($post)));
+
+    return 1;
+  }
+  else {
+    // Invalid hash, show error
+    ms_core_log_error('ms_ccbill', 'The responseDigest was not valid. Vars: !vars',
+      array('!vars' => ms_core_print_r($post)));
+    return 0;
+  }
+}
+
+/**
+ * Callback page for successful payments.
+ *
+ * Verifies the MD5 Hash and then inserts the payment
+ */
+function ms_ccbill_success_callback_page() {
+  $post = $_POST;
+  $salt = variable_get('ms_ccbill_md5_salt', '');
+  // First verify the hash
+  if (isset($post['responseDigest']) AND isset($post['subscription_id']) AND md5($post['subscription_id'] . 1 . $salt) == $post['responseDigest']) {
+    // Attempt to load the order
+    if (!$order = ms_core_order_load_unique($post['ms_unique_key'])) {
+      // Should never get this far
+      ms_core_log_error('ms_ccbill', 'The order was unable to be loaded from the unique key: !key',
+        array('!key' => $post['ms_unique_key']));
+      return 0;
+    }
+
+    $amount = isset($post['accountingAmount']) ? $post['accountingAmount'] : isset($post['initialPrice']) ? $post['initialPrice'] : 0;
+    // Check that the currency and amount match the order.
+    if (!ms_core_valid_payment($order, 'cart', $amount)) {
+      drupal_set_message(t('There was an error with the payment. Please contact the site administrator.'), 'error');
+      ms_core_log_error('ms_ccbill', 'Possible spoofing attempt. Price mismatch. Ignoring IPN. Order: !order IPN: !ipn',
+        array('!order' => ms_core_print_r($order), '!ipn' => ms_core_print_r($post)));
+      return 0;
+    }
+
+    // Process the payment
+    ms_ccbill_process_payment($post, $order);
+    return 1;
+  }
+  else {
+    // Invalid hash, show error
+    ms_core_log_error('ms_ccbill', 'The responseDigest was not valid. Vars: !vars',
+      array('!vars' => ms_core_print_r($post)));
+    return 0;
+  }
+}
+
+/**
+ * Shows an error message informing the user the payment was denied
+ */
+function ms_ccbill_denied_page() {
+  drupal_set_message(t("The payment was denied. Message: @message",
+    array('@message' => isset($post['reasonForDecline']) ? $post['reasonForDecline'] : t('N/A'))));
+  drupal_goto('');
+}
+
+/**
+ * Loads the order and redirects to the thankyou page
+ */
+function ms_ccbill_approved_page($unique_key) {
+  if ($order = ms_core_order_load_unique($unique_key)) {
+    $thank_you_page = url('ms/thankyou');
+    $check_url = url('ms_ccbill/check_order_status/' . $unique_key, array('absolute' => TRUE));
+
+    // JS
+    $js = "
+    jQuery(function($) {
+     jQuery('.ms_ccbill_landing_click_here').hide();
+     check_order_status();
+    });
+
+    function check_order_status() {
+      jQuery.getJSON('$check_url', {txn_id : '$unique_key'}, parse_info);
+    }
+
+    function parse_info(data) {
+      switch (data.result) {
+        case 'success':
+          window.location.replace('$thank_you_page');
+          break;
+        case 'error':
+          alert(data.error);
+          break;
+        case 'failure':
+          setTimeout(check_order_status, 5000);
+          break;
+        default:
+          setTimeout(check_order_status, 5000);
+          break;
+      }
+    }
+    ";
+    drupal_add_js($js, 'inline');
+
+    // Show a loading page while we wait for the IPN from PayPal
+    $output = '';
+    $ajax_img = base_path() . drupal_get_path('module', 'ms_core') . '/images/ajax-bar-loader.gif';
+    $output .= "<div style='text-align:center;width:100%;'>"
+     . t('Your order is being processed. Please allow up to 2 minutes for this process to complete.')
+     . "</div>";
+    $output .= "<div style='text-align:center;width:100%;'>"
+     . t('Thank you for your patience.')
+     . "</div>";
+
+    $output .= "<div class='ajax_loader' style='margin: 15px 0 0;clear:both;width:100%;text-align:center;'><img src='$ajax_img' alt='Loading' /></div>";
+    $output .= "<div class='ms_ccbill_landing_click_here'>"
+      . t('If you have waited for over one minute, please !click.',
+         array('!click' => l(t('click here'), 'ms/thankyou')))
+      . "</div>";
+
+    return $output;
+  }
+  else {
+    // Should never get this far
+    ms_core_log_error('ms_ccbill', 'The order was unable to be loaded from the unique key: !key',
+      array('!key' => $unique_key));
+    return t("There was an error processing the payment. This error has been logged.");
+  }
+}
+
+/**
+ * Checks if an order post has been received yet.
+ *
+ * @param $unique_key
+ *   The unique key associated with the order.
+ *
+ * @return void
+ *   Returns a json encoded string.
+ */
+function ms_ccbill_order_ajax_page($unique_key) {
+  // Stop the caching
+  $GLOBALS['conf']['cache'] = FALSE;
+
+  $data = array();
+  if (!$order = ms_core_order_load_unique($unique_key)) {
+    // Should never get this far
+    ms_core_log_error('ms_ccbill', 'The order was unable to be loaded from the unique key: !key',
+      array('!key' => $unique_key));
+    $data['result'] = 'error';
+    $data['error'] = t("There was an error loading the order. Please contact a site administrator.");
+  }
+  else {
+    // Check if the payment has been recorded yet
+    if ($order->uid) {
+      // The order has a user id and is ready to go
+      $data['result'] = 'success';
+      $data['status'] = 'Unable to determine status';
+    }
+    else {
+      $data['result'] = 'failure';
+    }
+  }
+  print drupal_json_encode($data);
+}
+
+/**
+ * Process the payment by adding a Payment record to an Order
+ */
+function ms_ccbill_process_payment($post, $order) {
+  // Create the payment object
+  $payment = ms_core_new_payment($order->oid, 'ms_ccbill', 'cart');
+
+  $payment->transaction = ms_core_generate_transaction_id();
+  $payment->amount = isset($post['accountingAmount']) ? $post['accountingAmount'] : isset($post['initialPrice']) ? $post['initialPrice'] : 0;
+
+  $payment->currency = $order->currency;
+  $payment->recurring_id = (isset($post['subscription_id'])) ? $post['subscription_id'] : '';
+  $payment->data = $post;
+
+  // Update the address
+  $payment->billing_address = array(
+    'street' => isset($post['address1']) ? $post['address1'] : '',
+    'city' => isset($post['city']) ? $post['city'] : '',
+    'state' => isset($post['state']) ? $post['state'] : '',
+    'zip' => isset($post['zipcode']) ? $post['zipcode'] : '',
+    'country' => isset($post['country']) ? $post['country'] : '',
+    'phone' => isset($post['phone_number']) ? $post['phone_number'] : '',
+  );
+  // Update the contact details
+  $payment->first_name = $post['customer_fname'];
+  $payment->last_name = $post['customer_lname'];
+
+  switch ($order->order_type) {
+    case 'recurring':
+      $payment->type = 'rec_signup';
+      ms_core_enter_payment($payment);
+
+      ms_core_add_history_item($order, 0, t('Payment of @amount submitted through CCBill.',
+        array('@amount' => ms_core_format_money($payment->amount, $payment->currency))));
+      break;
+
+    case 'cart':
+      ms_core_add_history_item($order, 0, t('Payment of @amount submitted through CCBill.',
+        array('@amount' => ms_core_format_money($payment->amount, $payment->currency))));
+
+      // Add the Payment to the Order
+      ms_core_enter_payment($payment);
+      break;
+  }
+}
+
+/**
+ * Returns the 3 digit currency code
+ */
+function ms_ccbill_get_currency_code($currency) {
+  switch ($currency) {
+    case 'USD':
+      return 840;
+    case 'EUR':
+      return 978;
+    case 'AUD':
+      return 036;
+    case 'CAD':
+      return 124;
+    case 'GBP':
+      return 826;
+    case 'JPY':
+      return 392;
+    default:
+      ms_core_log_error('ms_ccbill', 'Unsupported currency used.');
+      return $currency;
+  }
+}
+
+/**
+ * Calculates the period in days based on length and unit
+ */
+function ms_ccbill_get_period($length, $unit) {
+  switch ($unit) {
+    case 'D':
+      return $length;
+    case 'M':
+      return $length * 30;
+    case 'S':
+    case 'W':
+      return $length * 7;
+    case 'Y':
+      return $length * 365;
+    default:
+      return 0;
+  }
+}
+
+/**
+ * Implements CCBill Datalink System.
+ *
+ * @param int $start
+ *   The start time of expirations (from yesterday) that should be checked.
+ *
+ * @param int $end
+ *   The end time of expirations (from yesterday) that should be checked.
+ *
+ * @return bool
+ *   TRUE if it succeeded, FALSE otherwise.
+ *
+ */
+function ms_ccbill_datalink_update($start, $end) {
+  // Process all of the REBILLs
+  if ($transactions = ms_ccbill_datalink_request($start, $end, array('CANCELLATION', 'REBILL', 'CHARGEBACK', 'REFUND', 'EXPIRE'))) {
+    foreach ($transactions as $transaction) {
+      switch ($transaction['type']) {
+        case 'REBILL':
+          // First we need to load the order for this transaction
+          if ($order = ms_core_order_load_by_rec_id($transaction['subscr_id'])) {
+            // Then we need to log the payment
+            $payment = ms_core_new_payment($order->oid, 'ms_ccbill', 'rec_payment', $transaction['amount'], $order->currency);
+            $payment->transaction = $transaction['txn_id'];
+            $payment->recurring_id = $transaction['subscr_id'];
+            $payment->data = $transaction;
+            ms_core_enter_payment($payment);
+          }
+          else {
+            ms_core_log_error('ms_ccbill', 'Unable to load order for data link REBILL. Details: !details',
+              array('!details' => ms_core_print_r($transaction)));
+          }
+          break;
+
+        case 'CHARGEBACK':
+          // First we need to load the order for this transaction
+          if ($order = ms_core_order_load_by_rec_id($transaction['subscr_id'])) {
+            ms_core_add_history_item($order, 0, t('Chargeback logged. Marking Order as EOT.'));
+            // Then we need to log the expiration
+            $payment = ms_core_new_payment($order->oid, 'ms_ccbill', 'rec_eot', -$transaction['amount'], $order->currency);
+            $payment->transaction = ms_core_generate_transaction_id(10);
+            $payment->recurring_id = $transaction['subscr_id'];
+            $payment->data = $transaction;
+            ms_core_enter_payment($payment);
+          }
+          else {
+            ms_core_log_error('ms_ccbill', 'Unable to load order for data link CHARGEBACK. Details: !details',
+              array('!details' => ms_core_print_r($transaction)));
+          }
+          break;
+
+        case 'REFUND':
+          // First we need to load the order for this transaction
+          if ($order = ms_core_order_load_by_rec_id($transaction['subscr_id'])) {
+            // Then we need to log the expiration
+            $payment = ms_core_new_payment($order->oid, 'ms_ccbill', 'refund', -$transaction['amount'], $order->currency);
+            $payment->transaction = ms_core_generate_transaction_id(10);
+            $payment->recurring_id = $transaction['subscr_id'];
+            $payment->data = $transaction;
+            ms_core_enter_payment($payment);
+          }
+          else {
+            ms_core_log_error('ms_ccbill', 'Unable to load order for data link REFUND. Details: !details',
+              array('!details' => ms_core_print_r($transaction)));
+          }
+          break;
+
+        case 'EXPIRE':
+          // First we need to load the order for this transaction
+          if ($order = ms_core_order_load_by_rec_id($transaction['subscr_id'])) {
+            // Then we need to log the expiration
+            $payment = ms_core_new_payment($order->oid, 'ms_ccbill', 'rec_eot', 0, $order->currency);
+            $payment->transaction = ms_core_generate_transaction_id(10);
+            $payment->recurring_id = $transaction['subscr_id'];
+            $payment->data = $transaction;
+            ms_core_enter_payment($payment);
+          }
+          else {
+            ms_core_log_error('ms_ccbill', 'Unable to load order for data link EXPIRE. Details: !details',
+              array('!details' => ms_core_print_r($transaction)));
+          }
+          break;
+
+        case 'CANCELLATION':
+          // First we need to load the order for this transaction
+          if ($order = ms_core_order_load_by_rec_id($transaction['subscr_id'])) {
+            // Then we need to log the expiration
+            $payment = ms_core_new_payment($order->oid, 'ms_ccbill', 'rec_cancel', $transaction['amount'], $order->currency);
+            $payment->transaction = ms_core_generate_transaction_id(10);
+            $payment->recurring_id = $transaction['subscr_id'];
+            $payment->data = $transaction;
+            ms_core_enter_payment($payment);
+          }
+          else {
+            ms_core_log_error('ms_ccbill', 'Unable to load order for data link CANCELLATION. Details: !details',
+              array('!details' => ms_core_print_r($transaction)));
+          }
+          break;
+      }
+    }
+  }
+  else {
+    return FALSE;
+  }
+
+  return TRUE;
+}
+
+/**
+ * Maps the values of the Data Link results to meaningful keys
+ */
+function ms_ccbill_map_values($raw) {
+  $map = array(
+    'REBILL' => array('type', 'clientAccnum', 'clientSubacc', 'txn_id', 'date', 'subscr_id', 'amount'),
+    'CHARGEBACK' => array('type', 'clientAccnum', 'clientSubacc', 'subscr_id', 'date', 'amount'),
+    'REFUND' => array('type', 'clientAccnum', 'clientSubacc', 'subscr_id', 'date', 'amount'),
+    'EXPIRE' => array('type', 'clientAccnum', 'clientSubacc', 'subscr_id', 'expired_date', 'canceled_date', 'batched'),
+    'CANCELLATION' => array('type', 'clientAccnum', 'clientSubacc', 'subscr_id', 'expired_date', 'canceled_date', 'batched'),
+  );
+
+  $transactions = array();
+  foreach ($raw as $row) {
+    if (isset($map[$row[0]])) {
+      $transactions[] = array_combine($map[$row[0]], $row);
+    }
+    else {
+      $transactions[] = $row;
+    }
+  }
+
+  return $transactions;
+}
+
+/**
+ * Fetch transactions from CCBill
+ */
+function ms_ccbill_datalink_request($start, $end, $types) {
+  $options = array(
+    'startTime' => $start,
+    'endTime' => $end,
+    'transactionTypes' => implode(',', $types),
+    'clientAccnum' => variable_get('ms_ccbill_client_acc_num', ''),
+    'clientSubacc' => variable_get('ms_ccbill_client_sub_acc', ''),
+    'username' => variable_get('ms_ccbill_datalink_username', ''),
+    'password' => variable_get('ms_ccbill_datalink_password', ''),
+  );
+  $data_link_options = array(
+    'external' => TRUE,
+    'query' => $options,
+  );
+
+  // Compose the Data Link Source URL
+  $data_link_url = url('https://datalink.ccbill.com/data/main.cgi', $data_link_options);
+  $response = file_get_contents($data_link_url);
+  if (stristr($response, 'error')) {
+    ms_core_log_error('ms_ccbill', "Data Link Error: @message",
+      array('@message' => $response));
+    return FALSE;
+  }
+
+  // Remove quotation marks
+  $response = trim(str_replace('"', '', $response));
+
+  // Process results into an array.
+  $response_lines = explode("\n", $response);
+  $response_array = array();
+  foreach ($response_lines as $line) {
+    if (trim($line)) {
+      $response_array[] = explode(',', trim($line));
+    }
+  }
+
+  return ms_ccbill_map_values($response_array);
+}

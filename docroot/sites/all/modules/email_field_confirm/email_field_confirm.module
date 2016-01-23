@@ -1,0 +1,1422 @@
+<?php
+
+/**
+ * @file
+ * Email Field Confirm module file
+ */
+
+define("EMAIL_FIELD_CONFIRM_EXPIRATION", 86400); // 24 HRS
+
+define("EMAIL_FIELD_CONFIRM_AWAITING_CONFIRMATION", 0);
+define("EMAIL_FIELD_CONFIRM_CONFIRMED", 1);
+define("EMAIL_FIELD_CONFIRM_CONFIRMED_BYPASS", 2);
+define("EMAIL_FIELD_CONFIRM_CONFIRMED_ADMIN", 3);
+
+/**
+ * Implements hook_help().
+ *
+ * @todo Create the help text.
+ */
+function email_field_confirm_help($path, $arg) {
+  switch ($path) {
+    case 'admin/modules#description':
+      $output = '';
+      return $output;
+    case 'admin/help#email_field_confirm':
+      $output = '';
+      return $output;
+  }
+}
+
+/**
+ * Implements hook_permission().
+ */
+function email_field_confirm_permission() {
+  return array(
+    'bypass email field confirmation' => array(
+      'title' => t('Bypass email field confirmation'),
+      'description' => t('Email fields that require email confirmation will automatically be confirmed and not generate an email with confirmation link.'),
+    ),
+    'view any pending email field addresses' => array(
+      'title' => t('View ANY pending email field addresses'),
+      'description' => t('View the pending (and confirmed) email addresses when viewing an add/edit form containing an email field.'),
+    ),
+    'edit any pending email field addresses' => array(
+      'title' => t('Edit ANY pending email field addresses'),
+      'description' => t('Can edit an email address value that is in a pending confirmation state. Note: Any user that may confirm the email address may automatically edit it.'),
+    ),
+    'resend any pending email field addresses' => array(
+      'title' => t('Resend ANY pending confirmation email'),
+      'description' => t('Generate an email with confirmation link to the user that is responsible for confirming. Note: any user that is responsible for confirming an email address may generate another confirmation email.'),
+    ),
+    'confirm any pending email field addresses' => array(
+      'title' => t('Confirm ANY pending confirmation email'),
+      'restrict access' => TRUE,
+      'description' => t('Manually confirm a pending email address without being the user responsible for confirming.'),
+    ),
+  );
+}
+
+/**
+ * Implements hook_menu().
+ */
+function email_field_confirm_menu() {
+  $items = array();
+
+  // Configuration admin page
+  $items['admin/config/people/email_field_confirm'] = array(
+    'title' => 'Email field change confirmaiton settings',
+    'description' => t('Configure the confirmation emails generated when an email field has been changed.'),
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('email_field_confirm_admin_settings'),
+    'access callback' => 'user_access',
+    'access arguments' => array('administer site configuration'),
+    'file' => 'email_field_confirm.admin.inc',
+    'type' => MENU_NORMAL_ITEM,
+  );
+  // Verify link callback
+  $items['email-field-confirm'] = array(
+    'title' => 'Verify / Change Email Address',
+    'page callback' => 'email_field_confirm_confirm_email',
+    'access callback' => 'user_is_logged_in',
+    'type' => MENU_CALLBACK,
+  );
+  // Resend
+  $items['email-field-resend'] = array(
+    'page callback' => 'email_field_confirm_resend',
+    'access callback' => 'email_field_confirm_resend_access',
+    'access arguments' => array(3),
+    'type' => MENU_CALLBACK,
+  );
+  // Manual Confirm
+  $items['email-field-manual-confirm'] = array(
+    'page callback' => 'email_field_confirm_manual_confirm',
+    'access arguments' => array('confirm any pending email field addresses'),
+    'type' => MENU_CALLBACK,
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_hook_info().
+ */
+function email_field_confirm_hook_info() {
+  $hooks['email_field_confirm_emails_confirmed'] = array(
+    'group' => 'email_field_confirm',
+  );
+  $hooks['email_field_confirm_delete_expired'] = array(
+    'group' => 'email_field_confirm',
+  );
+  $hooks['form_field_ui_field_edit_form_alter'] = array(
+    'group' => 'field_ui',
+  );
+  return $hooks;
+}
+
+/**
+ * Implements hook_entity_update().
+ *
+ * Evaluate the change in email addresses. Email addresses that are removed from
+ * a field will be cleared and no longer can be confirmed. New email addresses
+ * in a field that have not already been confirmed will have a confirmation
+ * email built/sent.
+ */
+function email_field_confirm_entity_update($entity, $type) {
+  // Get a list of all email fields on this entity.
+  list($entity_id, $entity_vid, $bundle) = entity_extract_ids($type, $entity);
+  $bundle = !empty($bundle) ? $bundle : $type;
+  $field_filter = array(
+    'entity_type' => $type,
+    'bundle' => $bundle,
+    'type' => 'email',
+  );
+  $email_fields = field_read_fields($field_filter);
+
+  // If we don't have an instances then there is nothing to do.
+  if (empty($email_fields)) {
+    return;
+  }
+
+  // For each email field on the entity that requires confirmation we need to
+  // perform several actions.
+  // - Remove any pending emails that have been removed from the field.
+  // - Add any new emails that have not already been confirmed to the the
+  //   pending list.
+  $email_fields = array_keys($email_fields);
+
+  foreach ($email_fields as $field_name) {
+    $instance = field_info_instance($type, $field_name, $bundle);
+
+    list($emails_new, $emails_removed, $emails_unchanged) = email_field_confirm_changed_emails($entity, $type, $field_name);
+
+    // Make sure we have email_field_confirm settings.
+    $efc_settings = email_field_confirm_efc_settings($instance);
+    if (empty($efc_settings)) {
+      continue;
+    }
+
+    // If field configured to retain the original value until a new email is
+    // confirmed, then reset the value back to the original. Multi-value fields
+    // should always save the new value (handled in settings).  If an entity is
+    // new and the field is required then we must save the new value as well.
+    if (!empty($emails_new) && !$efc_settings['save_value'] && (!$entity->is_new || !$instance['required'])) {
+      // If the email has already been confirmed then let it ride.
+      $account = email_field_confirm_get_confirming_account($efc_settings, $entity, $type);
+
+      // Get a list of already confirmed emails. Since we do not have to confirm
+      // these again, we can allow those values to be saved with the entity.
+      $email = $entity->{$field_name}[LANGUAGE_NONE][0]['email'];
+      $params = array(
+        'email' => $email,
+        'uid' => $account->uid,
+      );
+      $emails_confirmed = email_field_confirm_read_confirmed_emails($params);
+
+      // If the email has not been confirmed then check for an original email
+      // value or set to blank (if field not required).
+      if (empty($emails_confirmed[$email])) {
+        $original_email = '';
+        if (!empty($entity->original)) {
+          $original_email_items = field_get_items($type, $entity->original, $field_name);
+          $original_email = $original_email_items[0]['email'];
+        }
+        // Since we have already saved the entity, we'll simply update the field
+        // attached to that entity.
+        $entity->{$field_name}[LANGUAGE_NONE][0]['email'] = $original_email;
+        field_attach_update($type, $entity);
+      }
+    }
+
+    // We need to cleanup any pending emails for this field that have been
+    // removed. There is no reason to try and confirm them anymore.
+    email_field_confirm_delete_pending_by_field_emails($type, $entity_id, $field_name, $emails_removed);
+
+    // If we're saving the original email address for single-value fields then
+    // make sure to clean any pending before saving new records. This is to
+    // avoid having multiple pending emails for the same single-value field.
+    if (email_field_confirm_single_value_field($field_name) && $efc_settings['save_value'] && !empty($emails_new)) {
+      $params = array(
+        'field_name' => $field_name,
+      );
+      email_field_confirm_delete_pending_by_entity($entity_id, $type, $params);
+    }
+
+    // Add new emails to the pending status.
+    email_field_confirm_create_new_pending_emails($entity, $type, $field_name, $emails_new);
+  }
+}
+
+/**
+ * Implements hook_entity_insert().
+ */
+function email_field_confirm_entity_insert($entity, $type) {
+  email_field_confirm_entity_update($entity, $type);
+}
+
+/**
+ * Implements hook_entity_delete().
+ */
+function email_field_confirm_entity_delete($entity, $type) {
+  // Remove any pending emails for this entity.
+  list($entity_id, $entity_vid, $bundle) = entity_extract_ids($type, $entity);
+  email_field_confirm_delete_pending_by_entity($entity_id, $type);
+}
+
+/**
+ * Implements hook_field_widget_form_alter().
+ *
+ * When displaying the add/edit form for an email field we want to try and
+ * display the status of the pending email along with resend/confirm action
+ * links.
+ *
+ * @todo add static caching for multi-value fields.
+ */
+function email_field_confirm_field_widget_form_alter(&$element, &$form_state, $context) {
+  // We only care about the 'email' field type so exit if that's not the case.
+  if ($context['field']['type'] != 'email') {
+    return;
+  }
+  // If we're on the field_ui_field_edit_form then return;
+  if ($form_state['build_info']['form_id'] == 'field_ui_field_edit_form') {
+    return;
+  }
+
+  list($entity_id, $entity_vid, $bundle) = entity_extract_ids($element['#entity_type'], $element['#entity']);
+
+  // We won't have anything to show for a new entity.
+  if (empty($entity_id)) {
+    return;
+  }
+
+  // If we don't have any email_field_confirm settings or if the confirm flag is
+  // not enabled then return.
+  $efc_settings = email_field_confirm_efc_settings($context['instance']);
+  if (empty($efc_settings) || empty($efc_settings['confirm'])) {
+    return;
+  }
+
+  // Grab the email address currently saved on the entity so we can look the
+  // status up.
+  $email_values = field_get_items($element['#entity_type'], $element['#entity'], $element['#field_name']);
+  $emails = array();
+  if (!empty($email_values)) {
+    foreach ($email_values as $delta => $value) {
+      if (!empty($value['email'])) {
+        $emails[] = $value['email'];
+      }
+    }
+  }
+
+  // We want to get the status of all email values on this entity. This includes
+  // directly searching by entity_type/entity_id and searching by email /
+  // email_original values. So first get a list of all emails from this entity.
+  $entity_emails = db_select('email_field_confirm', 'efc')
+    ->fields('efc')
+    ->condition('entity_type', $element['#entity_type'])
+    ->condition('entity_id', $entity_id);
+  $entity_emails_results = $entity_emails->execute();
+  $efc_data_array = $entity_emails_results->fetchAllAssoc('email');
+
+  // Get a list of remaining emails to lookup and merge them with the previous
+  // results.
+  $emails_to_find = array_diff($emails, array_keys($efc_data_array));
+  if (!empty($emails_to_find)) {
+    $entity_emails = db_select('email_field_confirm', 'efc')
+      ->fields('efc')
+      ->condition(
+          db_or()
+            ->condition('email', $emails_to_find)
+            ->condition('email_original', $emails_to_find)
+        );
+    $entity_emails_to_find_results = $entity_emails->execute();
+    $entity_emails_to_find_array = $entity_emails_to_find_results->fetchAllAssoc('email');
+
+    $efc_data_array = !empty($entity_emails_to_find_array) ? array_merge($efc_data_array, $entity_emails_to_find_array) : $efc_data_array;
+  }
+
+  // Build an array keyed off of the email/email_original fields based on the
+  // status. We do this loop so we can also index the email_original values.
+  // @todo should this foreach be broken into help function?
+  $emails_status = array();
+  foreach ($efc_data_array as $efc_data) {
+    $efc_data->confirming_user = email_field_confirm_is_confirming_user($efc_data, $efc_settings, $element['#entity']);
+
+    // We always want to be able to check the status of the email that has been
+    // or is pending confirmation.
+    $emails_status[$efc_data->email] = $efc_data;
+
+    // If the status is pending then we also need to be able to lookup the email
+    // based on the 'email_original' column in case we're dealing with a field
+    // that doesn't retain the new email until it is confirmed.
+    if ($efc_data->status == EMAIL_FIELD_CONFIRM_AWAITING_CONFIRMATION && !empty($efc_data->email_original)) {
+      $emails_status[$efc_data->email_original] = $efc_data;
+    }
+
+    // If we're saving the original value that means we're dealing with a single
+    // value field. Add to the emails_status array the settings by field name
+    // since we don't care about the email value and the field may be empty with
+    // a pending email.
+    if (email_field_confirm_single_value_field($efc_data->field_name) && $efc_data->field_name == $element['#field_name']) {
+      $emails_status[$efc_data->field_name] = $efc_data;
+    }
+  }
+
+  // Get the efc_data for this particular field / delta so we can render the
+  // status / action links.
+  $efc_data = array();
+  if (!empty($emails_status)) {
+    // If we have an email value for a particular delta then set the index to
+    // the email address.
+    if (!empty($context['items'][$context['delta']]) && !empty($context['items'][$context['delta']]['email'])) {
+      $index = $context['items'][$context['delta']]['email'];
+    }
+    // When dealing with single-value fields where we can save the original email
+    // address then we can directly access that pending status.
+    elseif (email_field_confirm_single_value_field($element['#field_name'])) {
+      $index = $element['#field_name'];
+    }
+
+    if (!empty($index) && !empty($emails_status[$index])) {
+      $efc_data = $emails_status[$index];
+    }
+  }
+
+  // Provide any confirmation messages and disable the field based on user
+  // permissions.
+  if (!empty($efc_data)) {
+    // Add the delta to the efc_data so the messaging function can set the
+    // proper selector for any ajax functionality.
+    $efc_data->delta = $context['delta'];
+    $selector = "efc_{$element['#field_name']}__{$context['delta']}";
+    $element['email_field_confirm'] = email_field_confirm_field_status_form($efc_data, $context['delta'], $element['#entity']);
+
+    // Disable the field if the user does not have permission to edit a pending
+    // email address.
+    if ($efc_data->status == EMAIL_FIELD_CONFIRM_AWAITING_CONFIRMATION && !user_access('edit any pending email field addresses') && !$efc_data->confirming_user) {
+      $element['email']['#disabled'] = TRUE;
+    }
+  }
+}
+
+/**
+ * Return form api elements to insert into the widget form.  This function will
+ * display the pending status, resend and confirm action links.
+ *
+ * @param  object $efc_data
+ *   An object of email_field_confirm status information
+ * @param  int    $delta
+ *   The field delta for the value of the email address we're evaluating.
+ * @param  object $entity
+ *   (optional) The entity that contains the email field. If value not provided
+ *   the entity will be loaded based on the $efc_data.
+ *
+ * @return array
+ *   Form API elements to display on the email field widget form.
+ */
+function email_field_confirm_field_status_form($efc_data, $delta, $entity = NULL) {
+  global $user;
+
+  $can_view_message = FALSE;
+  // Check permissions before rendering message.  If the user cannot view the
+  // pending email address status then they won't be able to see the resend link
+  // either.
+  if (user_access('view any pending email field addresses') || $efc_data->confirming_user || (!empty($entity) && $user->uid == $entity->uid)) {
+    $can_view_message = TRUE;
+  }
+  if (!$can_view_message) {
+    return;
+  }
+
+  // Build the status string that will be displayed.
+  if ($efc_data->status == EMAIL_FIELD_CONFIRM_AWAITING_CONFIRMATION) {
+    $status = 'Pending';
+
+    // Expired emails should be cleaned up, however provide the expired message
+    // in case the entity is being edited before the clean-up task has run.
+    if ($efc_data->expiration <= REQUEST_TIME) {
+      $status = 'Expired.';
+    }
+  }
+  elseif ($efc_data->status == EMAIL_FIELD_CONFIRM_CONFIRMED) {
+    $status = 'Confirmed';
+  }
+  elseif ($efc_data->status == EMAIL_FIELD_CONFIRM_CONFIRMED_BYPASS) {
+    $status = 'Confirmed (bypass)';
+  }
+  elseif ($efc_data->status == EMAIL_FIELD_CONFIRM_CONFIRMED_ADMIN) {
+    $status = 'Confirmed (admin)';
+  }
+  else {
+    $status = 'Unknown';
+    // @todo add watchdog
+  }
+
+  // An email address that was previously confirmed on this field could be
+  // removed from the entity.  To avoid showing a confirmed message without
+  // having a field value, we make that check here.
+  if ($efc_data->status > EMAIL_FIELD_CONFIRM_AWAITING_CONFIRMATION && !empty($entity) && email_field_confirm_single_value_field($efc_data->field_name)) {
+    $field_items = field_get_items($efc_data->entity_type, $entity, $efc_data->field_name);
+
+    if (empty($field_items)) {
+      return;
+    }
+  }
+
+  // Get the instance settings to determine if we are saving the new email value
+  // with the entity or retaining the original. If retaining the original then
+  // we add the new email address to the status.
+  $instance = field_info_instance($efc_data->entity_type, $efc_data->field_name, $efc_data->bundle);
+  $efc_settings = email_field_confirm_efc_settings($instance);
+  $status_email = (!empty($efc_settings) && !$efc_settings['save_value'] && $efc_data->status == EMAIL_FIELD_CONFIRM_AWAITING_CONFIRMATION) ? "{$efc_data->email} " : '';
+  $status_class = 'efc-status-' . preg_replace('@[^a-z0-9-]+@', '-', strtolower($status));
+  $selector = "efc_{$efc_data->field_name}__{$delta}";
+
+  $form = array(
+    '#type' => 'container',
+    '#id' => $selector,
+    '#weight' => 50,
+    'efc_status' => array(
+      '#markup' => "<span class='{$status_class}'>{$status_email}{$status}</span>",
+    ),
+  );
+
+  // Resend link
+  if (email_field_confirm_resend_access($efc_data->uid) && $efc_data->status == EMAIL_FIELD_CONFIRM_AWAITING_CONFIRMATION) {
+    $form['efc_resend'] = array(
+      '#type' => 'link',
+      '#title' => t('Resend'),
+      '#prefix' => ' / <span class="efc-status-resend">',
+      '#suffix' => '</span>',
+      '#attributes' => array('class' => array('efc-action-resend')),
+      '#href' => 'email-field-resend/nojs/' . $efc_data->email . '/' . $efc_data->uid . '/' . $efc_data->field_name . '/' . $efc_data->delta,
+      '#ajax' => array(
+        'wrapper' => "efc_{$efc_data->field_name}__{$delta}__resend",
+      ),
+    );
+  }
+
+  // Manual confirm link
+  if (user_access('confirm any pending email field addresses') && $efc_data->status == EMAIL_FIELD_CONFIRM_AWAITING_CONFIRMATION) {
+    $link_options = array(
+      '#attributes' => array(
+        'class' => array('efc-action-confirm'),
+      ),
+      'query' => drupal_get_destination(),
+    );
+    $confirm_link = l(t('Confirm'), 'email-field-manual-confirm/' . $efc_data->email . '/' . $efc_data->uid, $link_options);
+    $form['efc_confirm'] = array(
+      '#markup' => ' / <span class="efc-status-confirm">' . $confirm_link . '</span>',
+    );
+  }
+
+  // Manual confirm button (testing)
+  // @todo figure out if we can make a form button update just the field with
+  // ajax instead of relying on the menu callback / page refresh.
+  // if (user_access('confirm any pending email field addresses') && $efc_data->status == EMAIL_FIELD_CONFIRM_AWAITING_CONFIRMATION) {
+  //   $form['efc_confirm_button'] = array(
+  //     '#type' => 'button',
+  //     '#value' => t('Confirm'),
+  //     '#prefix' => ' / <span class="efc-status-confirm-button">',
+  //     '#suffix' => '</span>',
+  //     '#name' => "efc_{$efc_data->field_name}__{$efc_data->delta}__confirm_button",
+  //     '#ajax' => array(
+  //       'callback' => 'email_field_confirm_manual_confirm_button',
+  //       'wrapper' => 'edit-' . str_replace('_', '-', $efc_data->field_name),
+  //     ),
+  //     '#entity' => $entity,
+  //     '#efc_data' => $efc_data,
+  //   );
+  // }
+
+  return $form;
+}
+
+/**
+ * Menu callback: Confirm a particular email address based on the hash.
+ *
+ * A user receives a confirmation link via email. Clicking on that link
+ * initiates this callback. The user must be authenticated to confirm an email
+ * address.
+ *
+ * The email address pending status is looked up based on the email address and
+ * acting user uid.  If the email is still pending (not confirmed or expired)
+ * then we check the hash (email + confirming user password + private key) to
+ * confirm. If that passes then a call is made to update the pending record and
+ * entity field value (if necessary).
+ *
+ * @param  string $email
+ *   The email address to confirm.
+ * @param  string $hash
+ *   The hash generated based on the user responsible for confirming the email
+ *   address, the email address, and the drupal private key.
+ *
+ * @todo make sure that an anonymous user can click the confirmation link and be
+ *   directed to login instead of just being denied access.
+ */
+function email_field_confirm_confirm_email($email = NULL, $hash = NULL) {
+  global $user;
+
+  // Check if all the required parameters are present.
+  if (!isset($email) || !isset($hash)) {
+    drupal_access_denied();
+    return;
+  }
+
+  // Get the status of the email this user is responsible for confirming.
+  $params = array(
+    'email' => $email,
+    'uid' => $user->uid,
+  );
+  $results = email_field_confirm_read($params);
+  $efc_data_array = $results->fetchAllAssoc('email');
+
+  // No emails to confirm.
+  // We don't get into tracking all of the reasons (expired, confirmed, wrong
+  // user, etc.) that the pending email may not be found.
+  if (empty($efc_data_array)) {
+    $message = t('You have attempted to use a one-time e-mail confirmation link that has either been used, expired, or otherwise no longer exists.');
+    watchdog('email_field_confirm', 'Unable to locate pending email (%email) for user !uid.', array('%email' => $email, '!uid' => $user->uid));
+    $goto = '';
+  }
+  else {
+    // Make sure we have the acting user password to verify the hash.
+    if (empty($user->pass)) {
+      $user = user_load($user->uid);
+    }
+
+    // We could potentially have the same email awaiting confirmation multiple
+    // times on different entities/fields. So loop through the results to see if
+    // any can still be confirmed. We may have a mixed of expired and pending.
+    foreach ($efc_data_array as $email => $efc_data) {
+      // Grab the entity so we can redirect the user to that entity to view or
+      // make updates.
+      $entities = entity_load($efc_data->entity_type, array($efc_data->entity_id));
+      $entity = $entities[$efc_data->entity_id];
+      $entity_uri = entity_uri($efc_data->entity_type, $entity);
+      $entity_uri['options']['absolute'] = TRUE;
+      $entity_url = url($entity_uri['path'], $entity_uri['options']);
+
+      // t() replacement arguments / options.
+      $args = array(
+        '%email' => $email,
+        '!uid' => $user->uid,
+      );
+      $options = array(
+        'language' => user_preferred_language($user),
+      );
+
+      // Already confirmed.
+      if ($efc_data->status > EMAIL_FIELD_CONFIRM_AWAITING_CONFIRMATION) {
+        $message = t('This email address %email has already been confirmed.', $args, $options);
+        $goto = $entity_url;
+        break;
+      }
+      // Expired.
+      elseif ($efc_data->expiration <= REQUEST_TIME) {
+        $message = t('You have attempted to use a one-time e-mail confirmation link that has expired.');
+        watchdog('email_field_confirm', 'Expired email confirmation attempted for email (%email) / user !uid.', $args);
+        $goto = $entity_url;
+      }
+      // Check the hash for confirmation.
+      else {
+        // Failed hash.
+        if ($hash != email_field_confirm_email_rehash($user->pass, $email)) {
+          $message = t('There was a problem confirming the email address %email.', $args, $options);
+          watchdog('email_field_confirm', 'Failed email confirmation attempt for email (%email) / user !uid.', $args);
+          $goto = $entity_url;
+        }
+        // Confirmed!!
+        else {
+          $message = t('The email address %email has been confirmed!', $args, $options);
+          $goto = $entity_url;
+          email_field_confirm_update_confirmed_emails(array($email), $user->uid);
+          break;
+        }
+      }
+    }
+  }
+  drupal_set_message($message);
+  drupal_goto($goto);
+}
+
+/**
+ * Updates the status of pending emails to one of the confirmed statuses.
+ *
+ * @param  array  $emails
+ *   An array of emails that have been confirmed.
+ * @param  int    $uid
+ *   The uid of the user that is responsible for confirming.
+ * @param  int    $confirmed_by_uid
+ *   (optional) The uid of the confirming user. Typically only used when a user
+ *   has bypass confirmation permissions and is not the user responsible.
+ * @param  int    $status
+ *   (optional) The confirm status
+ *   - (default) EMAIL_FIELD_CONFIRM_CONFIRMED
+ *   - EMAIL_FIELD_CONFIRM_CONFIRMED_BYPASS
+ *   - EMAIL_FIELD_CONFIRM_CONFIRMED_ADMIN
+ *
+ * @see email_field_confirm_email_field_confirm_emails_confirmed()
+ */
+function email_field_confirm_update_confirmed_emails($emails, $uid, $confirmed_by_uid = NULL, $status = EMAIL_FIELD_CONFIRM_CONFIRMED) {
+  global $user;
+  $confirmed_by_uid = !empty($confirmed_by_uid) ? $confirmed_by_uid : $user->uid;
+
+  $query = db_update('email_field_confirm')
+    ->fields(array(
+      'status' => $status,
+      'updated' => REQUEST_TIME,
+      'confirmed_by_uid' => $confirmed_by_uid,
+    ))
+    ->condition('email', $emails)
+    ->condition('uid', $uid)
+    ->condition('status', EMAIL_FIELD_CONFIRM_AWAITING_CONFIRMATION)
+    ->execute();
+
+  watchdog('email_field_confirm', 'User !uid confirmed emails %emails.', array('%emails' => implode(', ', $emails), '!uid' => $user->uid));
+
+  // Allow other modules / rules to respond to an email being confirmed.
+  module_invoke_all('email_field_confirm_emails_confirmed', $emails, $uid, $confirmed_by_uid, $status);
+  if (module_exists('rules')) {
+    $account = user_load($confirmed_by_uid);
+    rules_invoke_event('email_field_confirm_emails_confirmation', $emails, $user, $account, $status);
+  }
+}
+
+/**
+ * Menu Callback: Resend the confirmation email.
+ *
+ * On the field add/edit for a user with the proper permission may request to
+ * have the confirmation email resent. This callback looks up the pending record
+ * based on the email, uid (who should confirm), and the field_name. The records
+ * are filtered based on pending status that have not expired.
+ *
+ * The field $delta is also passed to allow for the ajax function to respond and
+ * make messaging changes.
+ *
+ * @param  string $type
+ *   ajax/nojs -- determins if this ajax / javascript is enabled.
+ * @param  string $email
+ *   The email address to lookup
+ * @param  int    $uid
+ *   The uid of the user responsible for confirming the email. Used to lookup
+ *   the pending status record.
+ * @param  string $field_name
+ *   The name of the field used to lookup and also used by the ajax response.
+ * @param  int    $delta
+ *   The field value delta used by ajax to make a messaging update.
+ *
+ * @return string
+ *   Short status result of the lookup / resend action.
+ */
+function email_field_confirm_resend($type = 'ajax', $email, $uid, $field_name, $delta) {
+  // Lookup the pending email address for the user responsible for confirming.
+  $query = db_select('email_field_confirm', 'efc')
+    ->fields('efc')
+    ->condition('email', $email)
+    ->condition('uid', $uid)
+    ->condition('field_name', $field_name)
+    ->condition('expiration', REQUEST_TIME, '>')
+    ->condition('status', EMAIL_FIELD_CONFIRM_AWAITING_CONFIRMATION);
+  $results = $query->execute();
+  $efc_data_array = $results->fetchAllAssoc('email');
+
+  // Unable to locate the email address for this user.
+  if (empty($efc_data_array)) {
+    $message = t('Error');
+    drupal_set_message(t('Unable to resend the confirmation message. Please contact your site administrators.'), 'error');
+    $watchdog_data = array(
+      'email' => $email,
+      'uid' => $uid,
+      'field_name' => $field_name,
+      'delta' => $delta,
+    );
+    watchdog('email_field_confirm', 'Unable to resend email confirmation.<br/>' . print_r($watchdog_data, TRUE), array(), WATCHDOG_WARNING);
+  }
+  else {
+    // We only need to generate a confirmation email once even if we have
+    // multiple records returned for the email/uid combination.
+    $efc_data = reset($efc_data_array);
+    email_field_confirm_build_email(array($efc_data), TRUE);
+    $message = t('Sent!');
+    drupal_set_message(t('The confirmation message has been sent to %email', array('%email' => $email)));
+  }
+
+  // We get the ajax magic
+  if ($type == 'ajax') {
+    // Make sure we don't set any messages with an ajax response so get them.
+    drupal_get_messages();
+    // Build selectors used for the ajax response.
+    $selector = "efc_{$field_name}__{$delta}";
+    $selector_resend = "#{$selector} .efc-action-resend";
+    // The response is a static message instead of a link.
+    $message = "<span class='efc-action-resend'>" . $message . '</span>';
+    $commands = array();
+    $commands[] = ajax_command_replace($selector_resend, $message);
+    $output = array('#type' => 'ajax', '#commands' => $commands);
+    ajax_deliver($output);
+  }
+  // No ajax love so load get the entity uri and goto it.
+  else {
+    // Grab the entity so we can redirect the user to that entity to view or
+    // make updates.
+    $entities = entity_load($efc_data->entity_type, array($efc_data->entity_id));
+    $entity = $entities[$efc_data->entity_id];
+    $entity_uri = entity_uri($efc_data->entity_type, $entity);
+    $entity_uri['options']['absolute'] = TRUE;
+    $entity_url = url($entity_uri['path'], $entity_uri['options']);
+    drupal_goto($entity_url);
+  }
+}
+
+/**
+ * Access Callback: Does the user have resent permissions.
+ *
+ * If the acting user is also responsible for confirmation then they have resend
+ * permissions, otherwise the acting user needs the specific resend permission.
+ *
+ * @param  int    $uid
+ *   The uid of the user responsible for confirmation.
+ *
+ * @return boolean
+ *   TRUE / FALSE -- whether the acting user can resend.
+ */
+function email_field_confirm_resend_access($uid) {
+  global $user;
+  return (($user->uid == $uid) || user_access('resend any pending email field addresses'));
+}
+
+/**
+ * Menu Callback: Manually confirm a pending email.
+ *
+ * A user with the manual confirm permission has the ability to confirm any
+ * email regardless of who was the responsible user. A destination parameter
+ * is expected to redirect the user back.
+ *
+ * @param  string $email
+ *   The email address that will be confirmed.
+ * @param  int    $uid
+ *   The user originally responsible for confirming the email address. We only
+ *   confirm the email address for this user.
+ */
+function email_field_confirm_manual_confirm($email, $uid) {
+  global $user;
+  email_field_confirm_update_confirmed_emails(array($email), $uid, $user->uid, EMAIL_FIELD_CONFIRM_CONFIRMED_ADMIN);
+  drupal_set_message(t('The email address %email has been confirmed.', array('%email' => $email)));
+  drupal_goto();
+}
+
+/**
+ * Create new pending email records.
+ *
+ * Called when an entity is created / updated, this function acts on the list of
+ * new emails by creating the email_field_confirm records. This function then
+ * makes a call to build / send the confirmation email.
+ *
+ * @param  object $entity
+ *   The entity object that contains the email field with new email addresses.
+ * @param  string $entity_type
+ *   The entity type used to get the bundle.
+ * @param  string $field_name
+ *   The name of the email field, in case there are multiple email fields on the
+ *   endity.
+ * @param  array  $emails_new
+ *   An array of new emails for the given entity/field_name.
+ */
+function email_field_confirm_create_new_pending_emails($entity, $entity_type, $field_name, $emails_new) {
+  global $user;
+
+  // There may be cases where there are no new emails so return.
+  if (empty($emails_new)) {
+    return;
+  }
+
+  // Get all of the instance settings.
+  list($entity_id, $entity_vid, $bundle) = entity_extract_ids($entity_type, $entity);
+  $instance = field_info_instance($entity_type, $field_name, $bundle);
+
+  $efc_settings = email_field_confirm_efc_settings($instance);
+  if (empty($efc_settings)) {
+    return;
+  }
+
+  // Make sure we have the right account uid before filtering out already
+  // confirmed email addresses. We do this so that a user cannot attempt to
+  // add an email address already confirmed by another user to bypass
+  // confirmation.
+  $account = email_field_confirm_get_confirming_account($efc_settings, $entity, $entity_type);
+
+  // Get a list of already confirmed emails so we don't generate a new
+  // confirmation.
+  $params = array(
+    'email' => $emails_new,
+    'uid' => $account->uid,
+  );
+  $emails_new_confirmed = email_field_confirm_read_confirmed_emails($params);
+  $emails_new = array_diff_key($emails_new, $emails_new_confirmed);
+
+  // All new emails have already been confirmed.
+  if (empty($emails_new)) {
+    return;
+  }
+
+  // For multi-value email fields it can be difficult to accurately determine
+  // what the email_original value was. This is due to values being added,
+  // removed, and reordered. The original entity only maintains the delta and it
+  // will recalculate those.
+  $email_original = '';
+  if (!$entity->is_new && !empty($entity->original) && email_field_confirm_single_value_field($field_name)) {
+    $field_items = field_get_items($entity_type, $entity->original, $field_name);
+    $email_original = $field_items[0]['email'];
+  }
+
+  // We build an array that mimics reading the email_field_confirm table keyed
+  // by the email address so that we can kick that off to the function to
+  // actually generate the email notifications.
+  foreach ($emails_new as $email) {
+    // @todo do we care about or can we do anything with the 'delta'?
+    $emails_to_confirm[$email] = array(
+      'email' => $email,
+      'email_original' => $email_original,
+      'entity_type' => $entity_type,
+      'bundle' => $bundle,
+      'entity_id' => empty($entity_id) ? 0 : $entity_id,  // for new entities
+      'revision_id' => empty($entity_vid) ? 0 : $entity_vid,
+      'field_name' => $field_name,
+      'uid' => $account->uid,
+      'created' => REQUEST_TIME,
+      'updated' => REQUEST_TIME,
+      'expiration' => REQUEST_TIME + EMAIL_FIELD_CONFIRM_EXPIRATION,
+      'status' => EMAIL_FIELD_CONFIRM_AWAITING_CONFIRMATION,
+    );
+
+    // We also need this in an array of objects to hand off to build the email.
+    $efc_data = new stdClass();
+    foreach ($emails_to_confirm[$email] as $key => $value) {
+      $efc_data->$key = $value;
+    }
+    $efc_data_array[$email] = $efc_data;
+
+    // Insert the new record
+    $query = db_insert('email_field_confirm')
+      ->fields($emails_to_confirm[$email])
+      ->execute();
+  }
+
+  // If the user responsible for confirming the email has bypass permissions
+  // then automatically confirm the emails with the bypass permission and avoid
+  // generating the emails. We also check to make sure the responsible account
+  // is the acting user to avoid a situation where the acting user is adding
+  // emails to a field where the entity owner (account) has the bypass
+  // permission.
+  if (user_access('bypass email field confirmation', $account) && $account->uid == $user->uid) {
+    $emails = array_keys($emails_to_confirm);
+    email_field_confirm_update_confirmed_emails($emails, $account->uid, $account->uid, EMAIL_FIELD_CONFIRM_CONFIRMED_BYPASS);
+  }
+  // Otherwise build the new emails
+  else {
+    email_field_confirm_build_email($efc_data_array);
+    drupal_set_message(t('Confirmation emails have been sent to the new email addresses. You must follow the link provided in that email within 24 hours in order to confirm the change.'));
+    // Perform any messaging / logging.
+    if (!empty($emails_new)) {
+      $message = t('!count pending emails created. (%emails)', array('!count' => count($emails_new), '%emails' => implode(', ', $emails_new)));
+      if (user_access('view any pending email field addresses')) {
+        drupal_set_message($message);
+      }
+      watchdog('email_field_confirm', $message);
+    }
+  }
+}
+
+/**
+ * Get the account object for the user that is responsible for confirming an
+ * email address.
+ *
+ * @param  array  $efc_settings
+ *   The email field instance settings.
+ * @param  object $entity
+ *   The entity object that contains the email field.
+ * @param  string $entity_type
+ *   The type of entity that has been passed.
+ *
+ * @return object
+ *   The user account responsible for confirming an email address.
+ */
+function email_field_confirm_get_confirming_account($efc_settings, $entity, $entity_type) {
+  global $user;
+
+  // If the acting user is responsible for confirming the email address or if
+  // the acting user is also the entity owner then use the user object.
+  if ($efc_settings['confirming_user'] == 'acting_user' || $user->uid == $entity->uid) {
+    $account = $user;
+  }
+  // If the entity on-hand is also the user entity we want to load, just return
+  // the current entity.
+  elseif ($entity_type == 'user') {
+    $account = $entity;
+  }
+  // The entity owner is responsible for confirming and the acting user is not
+  // the entity owner.
+  else {
+    $accounts = entity_load('user', array($entity->uid));
+    $account = $accounts[$entity->uid];
+  }
+
+  return $account;
+}
+
+/**
+ * Builds and sends the confirming / notification emails.
+ *
+ * @param  array  $efc_data_array
+ *   An array of the email_field_confirm data when pulled from the database.
+ * @param  boolean $disable_notify_original
+ *   (optional) override the field settings to disable generating the
+ *   notification email to the original email address. Typically used when
+ *   resending a confirmation email. (default: FALSE)
+ */
+function email_field_confirm_build_email($efc_data_array, $disable_notify_original = FALSE) {
+  global $user;
+
+  // SMTP module support.
+  if (module_exists('smtp') && variable_get('smtp_from', '') != '') {
+    $default_from = $smtp_from;
+  }
+  else {
+    $default_from = variable_get('site_mail', ini_get('sendmail_from'));
+  }
+
+  foreach ($efc_data_array as $efc_data) {
+    $instance = field_info_instance($efc_data->entity_type, $efc_data->field_name, $efc_data->bundle);
+
+    $efc_settings = email_field_confirm_efc_settings($instance);
+    if (empty($efc_settings)) {
+      continue;
+    }
+
+    // We need the user object to get the password so if the acting user
+    // is not the data/account user then load up the data/account user.
+    $account = ($user->uid == $efc_data->uid) ? $user : user_load($efc_data->uid);
+
+    $params = array();
+    $params['account'] = $account;
+    $params['context']['url'] = email_field_confirm_email_url($efc_data->email, $account);
+
+    $from = $default_from;
+
+    // Generate the confirmation email.
+    if ($message['result'] = drupal_mail('email_field_confirm', 'confirm_email', $efc_data->email, user_preferred_language($account), $params, $from)) {
+      $email_confirmations[$efc_data->email] = $efc_data;
+
+      // Notify original email address.
+      // We don't know what user account is responsible for the original email
+      // address so we use the site default language.
+      if (!$disable_notify_original && $efc_settings['notify_original'] && !empty($efc_data->email_original)) {
+        drupal_mail('email_field_confirm', 'original_email_notify', $efc_data->email_original, language_default(), $params, $from);
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_mail().
+ */
+function email_field_confirm_mail($key, &$message, $params) {
+  $language = $message['language'];
+  $context = $params['context'];
+  $account = $params['account'];
+
+  $email_field_confirm = new stdClass();
+  $email_field_confirm->url = $context['url'];
+
+  $variables = array(
+    'email_field_confirm' => $email_field_confirm,
+    'user' => $account,
+  );
+
+  $message['subject'] = email_field_confirm_mail_text($key . '_subject', $language, $variables);
+  $message['body'][] = email_field_confirm_mail_text($key . '_body', $language, $variables);
+}
+
+/**
+ * Provides the mail string for a particular variable. Offers up default values
+ * if not overridden in the admin settings and performs token replacement.
+ *
+ * @param  string   $key
+ *   The $key as used by drupal_mail.
+ * @param  array    $language
+ *   Provides specific language configuration.
+ * @param  array   $variables
+ *   Any additional variables used to generate the mail string.
+ * @param  boolean $replace
+ *   Option to perform token replacement.
+ *
+ * @return string
+ *   The string to use in the mail (e.g. subject, body, etc.)
+ */
+function email_field_confirm_mail_text($key, $language = NULL, $variables = array(), $replace = TRUE) {
+  $langcode = isset($language) ? $language->language : NULL;
+
+  if (module_exists('i18n_variable') && $langcode) {
+    $admin_setting = i18n_variable_get('email_field_confirm_'. $key, $langcode);
+  }
+  else {
+    $admin_setting = variable_get('email_field_confirm_' . $key, FALSE);
+  }
+
+  if ($admin_setting) {
+    // An admin setting overrides the default string.
+    $text = $admin_setting;
+  }
+  else {
+    switch ($key) {
+
+      // Confirmation email subject
+      case 'confirm_email_subject':
+        $text = t('Email address confirmation for [site:name]', array(), array('langcode' => $langcode));
+        break;
+
+      // Confirmation email body
+      case 'confirm_email_body':
+        $text = t('A new (or changed) email address has been made at [site:name] that requires confirmation.
+
+You need to verify the email address by clicking the link below or by copying and pasting it in your browser:
+
+[email_field_confirm:email_url]
+
+This is a one-time URL - in can be used only once. It expires after 24 hours.', array(), array('langcode' => $langcode));
+        break;
+
+      // Original email notification subject
+      case 'original_email_notify_subject':
+        $text = t('Email address changed for [site:name]', array(), array('langcode' => $langcode));
+        break;
+
+      // Original email notification body
+      case 'original_email_notify_body':
+        $text = t('A request to change this email address has been made at [site:name].
+
+An email address change confirmation has been sent to the new email address that requires confirmation within 24 hrs.
+
+If this change has been made in error, please contact the site administrators at [site:name].', array(), array('langcode' => $langcode));
+        break;
+    }
+  }
+
+  if ($replace) {
+    // We do not sanitize the token replacement, since the output of this
+    // replacement is intended for an e-mail message, not a web browser.
+    return token_replace($text, $variables, array('language' => $language, 'callback' => 'email_field_confirm_mail_tokens', 'sanitize' => FALSE));
+  }
+
+  return $text;
+}
+
+/**
+ * Provides specific tokens for use in confirmation/notification emails.
+ *
+ * @param  array  $replacements
+ *   The tokens to be replaced.
+ * @param  array  $data
+ *   The values to replace the tokens.
+ * @param  array  $options
+ *   An array of options for token replacements.
+ */
+function email_field_confirm_mail_tokens(&$replacements, $data, $options) {
+  // Add any core mail tokens
+  user_mail_tokens($replacements, $data, $options);
+
+  if (isset($data['email_field_confirm'])) {
+    $replacements['[email_field_confirm:email_url]'] = $data['email_field_confirm']->url;
+  }
+}
+
+/**
+ * Generates the confirmation url based on the email address and the user uid
+ * responsible for confirming the email address.
+ *
+ * @param  string $email
+ *   The email used to generate the hash.
+ * @param  object $account
+ *   Provides the account/user that is responsible for confirming the email
+ *   address. The acting (global $user) is used if this value is not provided.
+ *
+ * @return string
+ *   The url for confirming the email address.
+ */
+function email_field_confirm_email_url($email, $account = NULL) {
+  global $user;
+
+  $account = empty($account) ? $user : $account;
+
+  $pass = $account->pass;
+  $hash = email_field_confirm_email_rehash($pass, $email);
+
+  return url('email-field-confirm/' . $email . '/' . $hash, array('absolute' => TRUE));
+}
+
+/**
+ * Generates the hash based on an account password, the email address to confirm
+ * and the drupal private key.
+ *
+ * @param  string $pass
+ *   The account/user password.
+ * @param  string $email
+ *   The email address that is being confirmed.
+ *
+ * @return string
+ *   The md5 hash.
+ */
+function email_field_confirm_email_rehash($pass, $email) {
+  return md5($pass . $email . drupal_get_private_key());
+}
+
+/**
+ * Get a list of confirmed emails and their associated email_field_confirm data.
+ *
+ * @param  array  $params
+ *   (optional) An array of conditions for query for.
+ *
+ * @return array
+ *   An array of email_confirm_data with the email address as the key.
+ */
+function email_field_confirm_read_confirmed_emails($params = array()) {
+  // Begin building the query to pull email field confirm data.
+  $query = db_select('email_field_confirm', 'efc')
+    ->fields('efc')
+    ->condition('status', EMAIL_FIELD_CONFIRM_AWAITING_CONFIRMATION, '>');
+
+  foreach ($params as $key => $value) {
+    $query->condition($key, $value);
+  }
+
+  $results = $query->execute();
+  $results = $results->fetchAllAssoc('email');
+
+  return $results;
+}
+
+/**
+ * READ the email field confirm data.
+ *
+ * @param  array  $params
+ *   (optional) An array of key/value pairs to filter the result set.
+ *
+ * @return array
+ *   The results of the query->execute. This allows the calling function to
+ *   manipulate as sees fit.
+ */
+function email_field_confirm_read($params = array()) {
+  // Begin building the query to pull email field confirm data.
+  $query = db_select('email_field_confirm', 'efc')
+    ->fields('efc');
+  // Add in any conditional parameters.
+  foreach ($params as $key => $value) {
+    $query->condition($key, $value);
+  }
+  $results = $query->execute();
+
+  return $results;
+}
+
+/**
+ * Deletes the pending email addresses for a particular entity.
+ *
+ * @param  int    $entity_id
+ *   The id of the entity to delete pending emails for.
+ * @param  string $entity_type
+ *   The entity type for the $entity_id.
+ * @param  array  $params
+ *   (Optional) additional conditions to filter on.
+ */
+function email_field_confirm_delete_pending_by_entity($entity_id, $entity_type, $params = array()) {
+  // Build the conditions to determine which records should be deleted.
+  $deleted = db_delete('email_field_confirm')
+    ->condition('entity_id', $entity_id)
+    ->condition('entity_type', $entity_type)
+    ->condition('status', EMAIL_FIELD_CONFIRM_AWAITING_CONFIRMATION);
+
+  // Add any additional conditions provided in the function parameters.
+  foreach ($params as $key => $value) {
+    $deleted->condition($key, $value);
+  }
+
+  $deleted_count = $deleted->execute();
+
+  // Perform any messaging / logging.
+  if ($deleted_count) {
+    $message = t('!count pending emails removed for entity !entity_id', array('!count' => $deleted_count, '!entity_id' => $entity_id));
+    if (user_access('view any pending email field addresses')) {
+      drupal_set_message($message);
+    }
+    watchdog('email_field_confirm', $message);
+  }
+}
+
+/**
+ * Remove / delete any pending records for a particular field and set of email
+ * addresses.
+ *
+ * @param  string $entity_type
+ *   The entity_type containing the field/emails to be removed.
+ * @param  int    $entity_id
+ *   The entity ID that contains the field/emails to be removed.
+ * @param  string $field_name
+ *   The name of the field that contains the emails to be deleted. This is to
+ *   allow for entities that contain multiple email fields.
+ * @param  array  $emails
+ *   An array of email addresses that should be removed.
+ */
+function email_field_confirm_delete_pending_by_field_emails($entity_type, $entity_id, $field_name, $emails) {
+  // We could get an empty array for $emails so check for that and return if it
+  // is empty.
+  if (empty($emails)) {
+    return;
+  }
+
+  // Build the conditions to determine which records should be deleted.
+  $deleted = db_delete('email_field_confirm')
+    ->condition('entity_type', $entity_type)
+    ->condition('entity_id', $entity_id)
+    ->condition('field_name', $field_name)
+    ->condition('email', $emails)
+    ->condition('status', EMAIL_FIELD_CONFIRM_AWAITING_CONFIRMATION);
+  $deleted_count = $deleted->execute();
+
+  // Perform any messaging / logging.
+  if ($deleted_count) {
+    $message = t('!count pending emails removed.', array('!count' => $deleted_count));
+    if (user_access('view any pending email field addresses')) {
+      drupal_set_message($message);
+    }
+    watchdog('email_field_confirm', $message);
+  }
+}
+
+/**
+ * Deletes any pending expired email addresses.
+ *
+ * Prior to deleting we want to load the expired records first for processing.
+ * Some fields may need to revert back to the original email.
+ */
+function email_field_confirm_delete_expired() {
+  $to_be_deleted = db_select('email_field_confirm', 'efc')
+    ->fields('efc')
+    ->condition('expiration', REQUEST_TIME, '<=')
+    ->condition('status', EMAIL_FIELD_CONFIRM_AWAITING_CONFIRMATION)
+    ->execute();
+  $efc_data_array = $to_be_deleted->fetchAllAssoc('email');
+
+  $deleted = db_delete('email_field_confirm')
+    ->condition('expiration', REQUEST_TIME, '<=')
+    ->condition('status', EMAIL_FIELD_CONFIRM_AWAITING_CONFIRMATION);
+  $deleted_count = $deleted->execute();
+
+  // Perform any messaging / logging.
+  if ($deleted_count) {
+    module_invoke_all('email_field_confirm_delete_expired', $efc_data_array);
+    // @todo add rules event hook but not sure what variables would be useful yet.
+
+    $message = t('!count expired emails removed.', array('!count' => $deleted_count));
+    if (user_access('view any pending email field addresses')) {
+      drupal_set_message($message);
+    }
+    watchdog('email_field_confirm', $message);
+  }
+}
+
+/**
+ * Implements hook_cron().
+ */
+function email_field_confirm_cron() {
+  email_field_confirm_delete_expired();
+}
+
+/**
+ * Compares the original email addresses to the new email addresses and returns
+ * an array of email addresses with the type of change (e.g. new or removed).
+ *
+ * @param  object $entity
+ *   The entity containing the email fields to compare.
+ * @param  string $entity_type
+ *   The type of entity passed as $entity.
+ * @param  string $field_name
+ *   The name of the field to compare.
+ *
+ * @return
+ *   @todo
+ *
+ */
+function email_field_confirm_changed_emails($entity, $entity_type, $field_name) {
+  // Grab the emails on the entity and the original emails, if any on the
+  // original entity.  If the entity is_new then there are no original emails to
+  // deal with.
+  $email_items = field_get_items($entity_type, $entity, $field_name);
+  $original_email_items = $entity->is_new ? array() : field_get_items($entity_type, $entity->original, $field_name);
+
+  // Convert the email items in an array that is easier to work with for
+  // comparing and to return.
+  $original_emails = array();
+  if (!empty($original_email_items)) {
+    foreach ($original_email_items as $email_item) {
+      $original_emails[$email_item['email']] = $email_item['email'];
+    }
+  }
+  $emails = array();
+  if (!empty($email_items)) {
+    foreach ($email_items as $email_item) {
+      $emails[$email_item['email']] = $email_item['email'];
+    }
+  }
+
+  $emails_new = array_diff($emails, $original_emails);
+  $emails_removed = array_diff($original_emails, $emails);
+  $emails_unchanged = array_intersect($emails, $original_emails);
+
+  return array($emails_new, $emails_removed, $emails_unchanged);
+}
+
+/**
+ * Determine whether a particular account is able to confirm a pending email.
+ *
+ * @param  object $efc_data
+ *   An object of email_field_confirm status information
+ * @param  array  $efc_settings
+ *   An array of email_field_confirm instance settings.
+ * @param  object $entity
+ *   (optional) The entity that contains the email field. If value not provided
+ *   the entity will be loaded based on the $efc_data.
+ * @param  object $account
+ *   (optional) The user account to check if they are able to confirm a
+ *   a particular email address for a field.
+ *
+ * @return boolean
+ *   true/false
+ */
+function email_field_confirm_is_confirming_user($efc_data, $efc_settings, $entity = NULL, $account = NULL) {
+  global $user;
+
+  // Make sure we have an account to check against.
+  if (empty($account)) {
+    $account = $user;
+  }
+
+  // User that provided the email address.
+  if ($efc_settings['confirming_user'] == 'acting_user' && $account->uid == $efc_data->uid) {
+    return TRUE;
+  }
+  // Entity owner/author
+  elseif ($efc_settings['confirming_user'] == 'entity_owner') {
+    // Make sure we have an entity to work with.
+    if (empty($entity)) {
+      $entities = entity_load($efc_data->entity_type, array($efc_data->entity_id));
+      $entity = $entities[$efc_data->entity_id];
+    }
+    // Now check if viewing user is entity owner/author.
+    if ($account->uid == $entity->uid) {
+      return TRUE;
+    }
+  }
+
+  return FALSE;
+}
+
+/**
+ * Helper function to determine if a field only allows for single values.
+ *
+ * @param  string $field_name
+ *   The field name to lookup.
+ *
+ * @return boolean
+ *   TRUE/FALSE if the field is a single-value field.
+ */
+function email_field_confirm_single_value_field($field_name) {
+  $field_info = field_info_field($field_name);
+  return $field_info['cardinality'] == '1';
+}
+
+/**
+ * Helper function to return the email_field_confirm settings from an instances.
+ *
+ * @param  array $instance
+ *   Instance settings as returned by field_info_instance.
+ *
+ * @return array/boolean
+ *   The email_field_confirm settings array.
+ *   FALSE if not found.
+ */
+function email_field_confirm_efc_settings($instance) {
+  return (!empty($instance) && !empty($instance['settings']) && !empty($instance['settings']['email_field_confirm'])) ? $instance['settings']['email_field_confirm'] : FALSE;
+}
+
+// function email_field_confirm_manual_confirm_button($form, &$form_state) {
+//   global $user;
+
+//   $entity = $form_state['triggering_element']['#entity'];
+//   $efc_data = $form_state['triggering_element']['#efc_data'];
+// $form[$efc_data->field_name][LANGUAGE_NONE][$efc_data->delta]['email']['#value'] = 'testing';
+//   // email_field_confirm_update_confirmed_emails(array($efc_data->email), $efc_data->uid, $user->uid, EMAIL_FIELD_CONFIRM_CONFIRMED_ADMIN);
+
+//   return $form[$efc_data->field_name];
+//   return '<pre>' . print_r($form[$efc_data->field_name][LANGUAGE_NONE][$efc_data->delta], TRUE) . '</pre>';
+// }

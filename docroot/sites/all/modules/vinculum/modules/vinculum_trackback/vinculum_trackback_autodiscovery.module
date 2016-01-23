@@ -1,0 +1,314 @@
+<?php
+/**
+ * @file
+ * Provide auto-discovery for the Trackback protocol.
+ */
+
+/**
+ * Implements hook_vinculum_handler().
+ */
+function vinculum_trackback_autodiscovery_vinculum_handler() {
+  return array(
+    'protocol' => t('Trackback auto-discovery'),
+  );
+}
+
+
+/**
+ * Implements hook_vinculum_send().
+ *
+ * Attempt to send a trackback to an external site.
+ */
+function vinculum_trackback_autodiscovery_vinculum_send($target, $source, $node) {
+  // Use auto-discovery to check that the external URL supports trackback.
+  if ($trackback_endpoint_url = vinculum_trackback_autodiscovery_autodetect_trackback_support($target)) {
+    $params = array(
+      'url' => url("node/{$node->nid}", array('absolute' => TRUE)), 
+      'title' => $node->title,
+      // @TODO: extract an excerpt.
+      // 'excerpt' => 
+    );
+
+    // Allow other modules to change the data sent to the remote site, via
+    // hook_trackback_send_params_alter().
+    drupal_alter('trackback_send_params', $params);
+
+    // Attempt to send the trackback.
+    $result = vinculum_trackback_send_trackback($trackback_endpoint_url, $params);
+
+    return $result;
+  }
+}
+
+/**
+ * Test whether a URL has support for trackbacks.
+ *
+ * @param String $url
+ *  URL of the remote page.
+ *
+ * @return String|FALSE|NULL
+ * String: The endpoint URL for registering trackbacks.
+ * FALSE: The URL was successfully reached, and trackbacks are not suppported.
+ * NULL: The URL could not be successfully requested.
+ */
+function vinculum_trackback_autodiscovery_autodetect_trackback_support($url) {
+  // Efficiency-check: check the mime-type for potential Trackback support
+  // before using a full GET request.
+  if (!($result = vinculum_trackback_autodiscovery_autodetect_trackback_support_efficiency_check_passes($url))) {
+    return $result;
+  }
+
+
+  // Auto-discovery steps.
+  // From http://www.sixapart.com/pronet/docs/trackback_spec#Auto-Discovery_of_TrackBack_Ping_URLs:
+  //
+  // Given a URL my_url, clients should follow these steps:
+  //   1. Send an HTTP GET request to retrieve the contents of the page at my_url.
+  //   2. Scan the page contents for embedded RDF. Pages can contain multiple instances of embedded RDF--clients should pick the block whose dc:identifier matches my_url.
+  //   3. Extract the trackback:ping value from the block of RDF. This is the TrackBack Ping URL.
+
+  // Request the third-party URL.
+  $options = array(
+    'headers' => array(
+      'User-Agent' => VINCULUM_TRACKBACK_UA,
+    ),
+  );
+  $result = drupal_http_request($url, $options);
+
+  // If the request failed, abort early.
+  if (isset($result->error) || $result->code != 200 || empty($result->data)) {
+    watchdog('Trackback', 'Trackback auto-discovery not attempted: an error occurred when making a GET request for %url.', array('%url' => $url), WATCHDOG_DEBUG);
+    return NULL;
+  }
+
+  // Test for Trackback endpoint RDF metadata within the page.
+  $endpoints = _vinculum_trackback_autodiscovery_extract_endpoint_from_html($result->data);
+
+  // Pages might list multiple endpoints: use the endpoint whose identifier
+  // matches the URL provided.
+  if (is_null($endpoints)) {
+    watchdog('Trackback', 'Trackback auto-discovery not checked on %url - the html cannot be parsed.', array('%url' => $url), WATCHDOG_DEBUG);
+    return FALSE;
+  }
+  elseif (!isset($endpoints[$url])) {
+    watchdog('Trackback', 'Trackback auto-discovery is not supported on %url.', array('%url' => $url), WATCHDOG_DEBUG);
+    return FALSE;
+  }
+  else {
+    watchdog('Trackback', 'Trackback auto-discovery is supported on %url, with the Trackback endpoint %endpoint.', array('%url' => $url, '%endpoint' => $endpoints[$url]), WATCHDOG_DEBUG);
+    return $endpoints[$url];
+  }
+}
+
+/**
+ * Efficiency check.
+ */
+function vinculum_trackback_autodiscovery_autodetect_trackback_support_efficiency_check_passes($url) {
+  // Efficient-mode (the default) uses a HTTP HEAD request to check whether the
+  // content *might* support the Trackback protocol, by checking the mime-type.
+  // Images/media are frequently linked by nodes, but these URLs would not
+  // support Trackback.
+
+  // This check can be bypassed by setting the variable
+  // 'vinculum_trackback_autodiscovery_inefficient_mode' to TRUE.
+  // This is "inefficient-mode".
+  $skip_test = variable_get('vinculum_trackback_autodiscovery_inefficient_mode', FALSE);
+  if ($skip_test) {
+    return TRUE;
+  }
+
+  // Efficient-mode is active here.  Attempt to check the URL efficiently.
+  $discoverable = _vinculum_trackback_autodiscovery_check_url_provides_parsable_content($url);
+
+  // Possible return values from the helper:
+  // - TRUE:  the content *might* support Trackbacks.
+  // - FALSE: the content is unlikely to support Trackbacks.
+  // - NULL:  the remote site did not provide a valid response to a HTTP HEAD request.
+  if (is_null($discoverable)) {
+    watchdog('Trackback', 'Trackback auto-discovery not attempted: an error occurred when making a HEAD request for %url.', array('%url' => $url), WATCHDOG_DEBUG);
+  }
+  else {
+    watchdog('Trackback', 'Trackback auto-discovery not attempted: %url does not appear to be a web page.', array('%url' => $url), WATCHDOG_DEBUG);
+  }
+  return $discoverable;
+}
+
+
+/**
+ * Check whether a URL has the potential for trackback auto-discovery.
+ *
+ * Since autodetection might encounter a link to a media file, we first want to
+ * make a simple 'HEAD' HTTP request instead of an actual GET.  This results in
+ * having to make an extra drupal_http_request() later for an actual GET, but
+ * it is worth it considering the strong likelihood that auto-detection may
+ * encounter a URL that links to a media file.
+ *
+ * @param String $url
+ *   The URL to test.
+ *
+ * @return Boolean|NULL
+ * - TRUE if the URL was reached and might support Trackback auto-discovery.
+ * - FALSE if the URL was reached and is unlikely to support Trackback auto-
+ *   discovery.
+ * - NULL if the URL could not be reached (for example, due to a 404 error).
+ */
+function _vinculum_trackback_autodiscovery_check_url_provides_parsable_content($url) {
+  $options = array(
+    'method' => 'HEAD',
+    'headers' => array(
+      'User-Agent' => VINCULUM_TRACKBACK_UA,
+    ),
+  );
+  $result = drupal_http_request($url, $options);
+  if (isset($result->error) || $result->code != 200) {
+    return NULL;
+  }
+
+  $mime_type = (isset($result->headers['content-type'])) ? $result->headers['content-type'] : NULL;
+  $is_valid = substr_count($mime_type, 'text/html')
+           || substr_count($mime_type, 'application/xhtml+xml')
+           || substr_count($mime_type, 'application/xml')
+           || substr_count($mime_type, 'text/xml');
+
+  return $is_valid;
+}
+
+
+/**
+ * Extract the Trackback endpoints from a section of text (such as the contents
+ * of a web page).
+ *
+ * @param String $html
+ *   The HTML to search
+ *
+ * @return Array|NULL
+ *   Array of discovered trackback endpoints (where the key is the entity's
+ *   identifier - i.e. the remote page's URL - and the value is the endpoint).
+ *   If no Trackback endpoints are discovered, an empty array will be returned.
+ *   If the html cannot be parsed, NULL is returned.
+ */
+function _vinculum_trackback_autodiscovery_extract_endpoint_from_html($html) {
+  $matches = array();
+
+  // Sample RDF:
+  // <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+  //          xmlns:dc="http://purl.org/dc/elements/1.1/"
+  //          xmlns:trackback="http://madskills.com/public/xml/rss/module/trackback/">
+  //    <rdf:Description
+  //      rdf:about="http://www.foo.com/archive.html#foo"
+  //      dc:identifier="http://www.foo.com/archive.html#foo"
+  //      dc:title="Foo Bar"
+  //      trackback:ping="http://www.foo.com/tb.cgi/5" />
+  //  </rdf:RDF>
+
+  // We need to match: RDF/Description[@ping and @identifier]
+
+  // If RDF tags are wrapped in comment tags, remove the comment tags so the
+  // RDF tags can be parsed by SimpleXML
+  $html = trim(_vinculum_trackback_autodiscovery_strip_comment_tags($html));
+
+  $result = @simplexml_load_string($html) or
+  $result = @simplexml_load_string(_vinculum_trackback_autodiscovery_cleanup_html($html));
+  if ($result === FALSE) {
+    // If the html can't be loaded by simplexml, abort.
+    return NULL;
+  }
+
+  // Discover three unused namespace prefixes, to avoid namespace prefix
+  // collision.
+  // (There's an issue in Simplexml which prevents namespace-prefixed access
+  // to nodes which redefine a pre-existing namespace prefix to a new
+  // namespace - the node can be accessed by the correct namespace with a non-
+  // conflicting prefix, but cannot be accessed through registering the pre-
+  // existing namespace prefix to the correct namespace. WTF is an appropriate
+  // response to this explanation!)
+  list($p1, $p2, $p3) = _vinculum_trackback_autodiscovery_generate_unique_prefixes($result->getNamespaces(TRUE));
+
+  $result->registerXPathNamespace($p1, 'http://www.w3.org/1999/02/22-rdf-syntax-ns#');
+  $result->registerXPathNamespace($p2, 'http://purl.org/dc/elements/1.1/');
+  $result->registerXPathNamespace($p3, 'http://madskills.com/public/xml/rss/module/trackback/');
+
+  if ($rdf_tags = $result->xpath("//{$p1}:RDF/{$p1}:Description[@{$p2}:identifier and @{$p3}:ping]")) {
+    foreach($rdf_tags as $element) {
+      $identifier = (string) $element->attributes('http://purl.org/dc/elements/1.1/')->identifier;
+      $ping       = (string) $element->attributes('http://madskills.com/public/xml/rss/module/trackback/')->ping;
+      $matches[$identifier] = $ping;
+    }
+  }
+
+  return $matches;
+}
+
+/**
+ * Attempt to clean HTML to allow SimpleXML to load the HTML.
+ */
+function _vinculum_trackback_autodiscovery_cleanup_html($html) {
+  // Strip everything except the RDF tags.
+  $pattern = '#<rdf:RDF (?:.*?)</rdf:RDF>#ms';
+  if (preg_match($pattern, $html, $matches)) {
+    $res = "<?xml version='1.0'?>";
+    $res .= implode("\n", $matches);
+    return $res;
+  }
+
+  // Final attempt: Run it through the filter HTML corrector
+  // (filter_htmlcorrector).
+  return trim(_filter_htmlcorrector($html));
+}
+
+/**
+ * Where RDF tags are wrapped by comment tags, remove the comment tags.
+ */
+function _vinculum_trackback_autodiscovery_strip_comment_tags($html) {
+  // If RDF tags are found within a comment section, strip out the comment tags
+  // so the RDF can be parsed via SimpleXml.
+
+  // Simply run every comment tag through a helper function.
+  // The /m modifier indicates multi-line matching, and /s allows the dot [.]
+  //   character to include \n (the new-line character).
+  // The ? character (in .*?) indicated non-greedy matching.
+  $html = preg_replace_callback('/<!--(.*?)-->/ms', "_vinculum_trackback_autodiscovery_strip_comment_tags_helper", $html);
+  return $html;
+}
+
+/**
+ * Helper function to check for RDF tags within a HTML comment, and strip the
+ * comment tag if they're present.  Used with preg_replace_callback().
+ */
+function _vinculum_trackback_autodiscovery_strip_comment_tags_helper($matches) {
+  $comment_text = $matches[1];
+  if (preg_match('#<([^:]*:)?RDF\s#ms', $comment_text)) {
+    return $comment_text;
+  }
+  return '<!--' . $comment_text . '-->';
+}
+
+/**
+ * Generate 3 unique namespace prefixes, to avoid collision with existing
+ * namespace prefixes.
+ *
+ * @param Array $namespaces
+ *  Array of current namespaces in use (see SimpleXMLElement::getNamespaces).
+ *
+ * @return Array
+ *   An array of 3 unique 5-character namespace prefixes.
+ */
+function _vinculum_trackback_autodiscovery_generate_unique_prefixes($namespaces) {
+  // Each new prefix will be a random 5-character string using lower-case
+  // alphabetic characters.
+  $character_set = 'abcdefghijklmnopqrstuvwxyz';
+
+  $new_prefixes = array();
+  $prefixes = array_keys($namespaces);
+  while (count($new_prefixes) < 3) {
+    $prefix = $character_set[rand(0,25)]
+            . $character_set[rand(0,25)]
+            . $character_set[rand(0,25)]
+            . $character_set[rand(0,25)]
+            . $character_set[rand(0,25)];
+    if (!(in_array($prefix, $prefixes) || in_array($prefix, $new_prefixes))) {
+      $new_prefixes[] = $prefix;
+    }
+  }
+  return $new_prefixes;
+}

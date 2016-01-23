@@ -1,0 +1,427 @@
+<?php
+/*
+TODO: Add statistics to display how many IP's were successfully blocked both locally and via the crowd source server.
+TODO: Add a source for the ban such as from login attempt or Honeypot
+TODO: Ban based on known bad scanning attempts (404's for things like wp-config.php, etc)
+*/
+
+//Since Drupal's own IP Blocking is done BEFORE hook_boot but AFTER include/require'ing modules, we have to put our whitelist function right in the module itself outside any hooks or functions.  It cannot go in hook_init or hook_boot because drupal's blocking would override it all.  In order to fix that, we have to do it this way.  We also dont want to be checking this during ajax calls, pulling in media like images/videos, etc, so we only do it once every 10 minutes.  10 Minute should be plenty to avoid checking whitelists needlessely.
+if (!drupal_is_cli() && db_table_exists('cbp_whitelist') && cbp_ip_is_whitelisted(ip_address()))
+{
+   //We are whitelisted so remove ALL entries from the flood table as well as the blocked_ips table.  Arent we schneaky ;)
+   cbp_purge_bans(ip_address()); //This purges both flood AND blocked_ips tables.
+}
+
+define('CBP_REMOTE_SEND_ENABLED', 1);
+define('CBP_REMOTE_RECEIVE_ENABLED', 2);
+$GLOBALS['CBP_API_SERVERS'] = array
+         (
+            0 => 'http://api.crystaldawn.net/rest_api.php',
+            1 => 'https://crystaldawn.net:6443/rest_api.php',
+            2 => 'http://crystaldawn.net:6980/rest_api.php',
+         );
+define('CONNECTION_FAILED', t("Connection to the Crowdsouce server has FAILED :/  Please make sure you can make outbound SSL connections on port 443 or 6443 (this module tries to use both ports, if 6443 fails, it will try 443 instead).  Many hosts block all outgoing ports and will only enable them if you ask.  But most of the 'good' hosts have no such restriction as they are able to handle security without such blanket tactics to compensate for lack of security personel experience.  Use the 'test connection' in <a href='{$GLOBALS['base_path']}admin/config/system/cbp'>{$GLOBALS['base_path']}admin/config/system/cbp</a> to continue testing the connection until it works while you fix your server.  Give this link to any tech working to resolve connection issues as it will help a lot."));
+
+function cbp_boot()
+{
+   if (!drupal_is_cli() && cbp_ip_is_blocked(ip_address()))
+   {
+      //The ip was blocked remotely but not locally and it was not in the white list so we block it locally as well.  We know this because we wouldnt be on this line if it were blocked locally :)
+      $expiration = time() + variable_get('user_failed_login_ip_window', 3600);
+      cbp_block_ip(ip_address(), $expiration, $send_to_remote = FALSE);
+   }
+}
+
+function cbp_init()
+{
+   if (VERSION <= 7.34)
+   {
+      drupal_set_message("WARNING:  Crowd Bruteforce Protection module (cbp) is no longer supported for versions of Drupal less than 7.35 due to a security flaw in user_pass_rehash() in Drupal versions of 7.34 or earlier.  Please upgrade Drupal.  If you do not upgrade Drupal to 7.35+, then your password reset links will NOT clear the drupal flood tables.  While this is not critical, it's not good either.  To get rid of this warning message, simply upgrade to Drupal 7.35 or greater.", 'error');
+   }
+
+   $cbp_settings = variable_get('cbp_settings');
+   //We do this here rather than in the install file because it can take a long time to complete and it can sometimes take so long that settings dont get saved or the menu hooks dont run.  This way we know everything saved and dont need to worry about it taking a long time.
+   if ($cbp_settings['initial_connection_check'] == FALSE)
+   {
+      //Save this check before actually trying it in case things time out it will only break the first page load and not ALL of them.
+      $cbp_settings['initial_connection_check'] = TRUE;
+      variable_set('cbp_settings', $cbp_settings);
+
+      //Check connection on initial install to determine best way to contact server if it's even possible.  If its not possible, this will give intermittant warnings ro the user alerting them to the fact that the connection does not work if they are trying to send/receive data to/from the crowd server.
+      cbp_check_connection($debug = TRUE);
+   }
+}
+
+
+function cbp_menu()
+{
+   $items['admin/config/system/cbp'] = array
+   (
+      'title' => t('Crowd Bruteforce Configuration'),
+      'description' => t('Manage Crowd Bruteforce Configuration and test connection'),
+      //'page callback' => 'system_ip_blocking',
+      'page callback' => 'cbp_configuration',
+      'access arguments' => array('block IP addresses'),
+      'file' => 'cbp.admin.inc',
+      'weight' => 10,
+   );
+
+   // IP address blocking.
+   $items['admin/config/people/ip-whitelist'] = array
+   (
+      'title' => t('Whitelist IP Addresses'),
+      'description' => t('Manage Whitelisted IP addresses (This is a Crowd Bruteforce Protection module feature)'),
+      //'page callback' => 'system_ip_blocking',
+      'page callback' => 'cbp_whitelist',
+      'access arguments' => array('block IP addresses'),
+      'file' => 'cbp.admin.inc',
+      'weight' => 10,
+   );
+
+   $items['admin/config/people/ip-whitelist/delete'] = array
+   (
+      'title' => t('Delete IP address'),
+      'page callback' => 'drupal_get_form',
+      //'page arguments' => array('system_ip_blocking_delete', 5),
+      'page arguments' => array('cbp_whitelist_delete', 5),
+      'access arguments' => array('block IP addresses'),
+      'file' => 'cbp.admin.inc',
+   );
+   return $items;
+}
+
+function cbp_cron()
+{
+   //Delete all expired bans
+   cbp_purge_bans($iids = '', $expired_only = TRUE);
+}
+
+function cbp_form_alter(&$form, &$form_state, $form_id)
+{
+   global $user;
+   if (empty($user->name))
+   {
+      $user->name = 'anonymous';
+   }
+
+   if ($form_id == 'system_ip_blocking_delete')
+   {
+      //Since drupal by default doesnt clear the flood table when deleting an IP, we add that here :/
+      $form['#submit'][] = 'cbp_purge_bans';
+   }
+
+   if ($form_id == 'system_ip_blocking_form')
+   {
+      //Drupal doesnt have a whitelist to check against, but we do, so we add validation to disallow adding bans to whitelisted IPs.
+      $form['#validate'][] = 'cbp_manual_ip_block_insert_validation';
+
+      //Drupal also doesnt log when a user blocks an IP,  what the heck? lol  So we add that here with a submit handler
+      $form['#submit'][] = 'system_ip_blocking_form_log_ip_block';
+   }
+
+   if ($form_id == 'user_login_block' || $form_id == 'user_login')
+   {
+      $form['#validate'][1000000000] = 'cbp_user_validate'; //Make sure we are dead last, if u have more user validators than this, you have issues lol.  We do not calculate it because this module may not be the last module loading.  Doing it this way it wont matter if this module is loaded first, second, or last,  our validator will always be last.
+   }
+
+   //Since drupal doesnt remove entries for user based failures from the flood table, we have to do that here.
+   if ($form_id == 'user_pass_reset')
+   {
+      //Extra security check, based on user.pages.inc
+      $uid = arg(2);
+      $timestamp = arg(3);
+      $hashed_pass = arg(4);
+      $account = user_load($uid);
+      if (is_numeric($uid) && is_numeric($timestamp) && $timestamp <= time() && $hashed_pass == user_pass_rehash($account->pass, $timestamp, $account->login, $account->uid))
+      {
+         //It's safe to remove all flood entries for this user since they have just used a 1-time login link.  Drupal does not have this functionality by default.
+         db_delete('flood')->condition('identifier', "{$uid}_%", 'LIKE')->execute();
+         watchdog('crowd brutefore protection', 'User %username cleared their IP from flood via reset pw/one-time login link.', array($user->name, '%username'));
+      }
+   }
+}
+
+//Submit handler for validating whether or not an IP can be added to the block list
+function cbp_manual_ip_block_insert_validation($form, &$form_state)
+{
+   $ip = trim($form_state['values']['ip']);
+   if (cbp_ip_is_whitelisted($ip))
+   {
+      form_set_error('ip', t('This IP address is currently whitelisted and cannot be blocked.'));
+   }
+}
+
+//Submit handler to log when a user inserts a new IP Block from the admin pages.
+function system_ip_blocking_form_log_ip_block($form, &$form_state)
+{
+   watchdog('user', 'Blocked IP address %ip permenantly.', array('%ip' => $form_state['values']['ip']));
+}
+
+function cbp_user_validate(&$form, &$form_state)
+{
+   //User has not passed validation and they have surpassed the allowed threshold so we ban them
+   if (empty($form_state['uid']) && isset($form_state['flood_control_triggered']) && $form_state['flood_control_triggered'] != 'user')
+   {
+      $expiration = time() + variable_get('user_failed_login_ip_window', 3600);
+      cbp_block_ip(ip_address(), $expiration);
+   }
+}
+
+//Honeypot integration, we currently only block types of honeypot and NOT honeypot_timestamp because it's the only 100% surefire way to know that the submission was 100% fake.  No real user would submit a value in the honeypot field, but it's possible that a human could try to submit something to quickly which would set off honeypot_timestamp.
+function cbp_honeypot_reject($form_id, $uid, $type)
+{
+   if ($type == 'honeypot')
+   {
+      //Block this funny guy.
+      $expiration = time() + variable_get('user_failed_login_ip_window', 3600);
+      cbp_block_ip(ip_address(), $expiration);
+   }
+}
+
+function cbp_block_ip($ip, $expiration, $send_to_remote = TRUE)
+{
+   //Dont allow blocking of locally whitelisted IP addresses.
+   if (cbp_ip_is_whitelisted($ip))
+   {
+      return;
+   }
+   //Just in case this IP already exists lets delete it first but only if it's not a permanent ban.
+   db_delete('blocked_ips')->condition('ip', $ip, '=')->condition('expiration', 0, '>')->execute();
+
+   //Add the IP with an expiration
+   db_insert('blocked_ips')->fields(array('ip' => $ip, 'expiration' => $expiration, 'created' => time()))->execute();
+   watchdog('crowd brutefore protection', 'Banned IP address %ip, expiration: %expiration', array('%ip' => $ip, '%expiration' => $expiration));
+
+   //Send the block to the crowd server
+   if ($send_to_remote == TRUE)
+   {
+      $cmd = new stdClass;
+      $cmd->action = 'report_ip';
+      $cmd->sitename = $_SERVER['HTTP_HOST'];
+      $cmd->ip = $ip;
+      $result = execute_cbp_remote_command($cmd);
+   }
+
+   //Force a refresh
+   if (!function_exists('drupal_goto')) { require_once("includes/common.inc"); }
+   drupal_goto("/");
+}
+
+function cbp_ip_is_blocked($ip)
+{
+   //Check whitelists first
+   if (cbp_ip_is_whitelisted($ip))
+   {
+      return FALSE;
+   }
+
+   //Next check local DB
+   $results = db_select('blocked_ips', 'c')->fields('c')->condition('ip', $ip, '=')->execute()->fetchObject();
+   if (isset($results->ip))
+   {
+      return TRUE;
+   }
+
+   //Now check remote DB if it's not 'on hold' AKA 'in queue'
+   if (!cbp_ip_is_in_queue($ip))
+   {
+      $cmd = new stdClass;
+      $cmd->action = 'check_ip';
+      $cmd->sitename = $_SERVER['HTTP_HOST'];
+      $cmd->ip = $ip;
+      $result = execute_cbp_remote_command($cmd);
+
+      //Now that it has been checked, add it to the 'on hold' queue
+      $expiration = time() + 60; //10 mins
+      $results = db_insert('queue')->fields(array('name' => 'cbp_'.$ip, 'expire' => $expiration, 'created' => time()))->execute();
+
+      //While we're at it, might as well clear the queue of our own old items to lessen the load for cron jobs since we add a lot to the queue table
+      db_delete('queue')->condition('name', 'cbp_%', 'LIKE')->condition('expire', time(), '<=')->execute();
+   }
+
+   //The ip was blocked remotely but not locally and it was not in the white list so we block it locally as well.
+   if (isset($result->result) && $result->result == 'blocked')
+   {
+      return TRUE;
+   }
+}
+
+//Use built in Drupal queue system to queue IP's for remote ban checking
+function cbp_ip_is_in_queue($ip)
+{
+   $results = db_select('queue', 'c')->fields('c')->condition('name', 'cbp_'.$ip, '=')->condition('expire', time(), '>')->execute()->fetchObject();
+   if (isset($results->item_id))
+   {
+      return TRUE;
+   }
+
+   return FALSE;
+}
+
+//expired_only is only used when $iids is empty and it will only purge bans that are expired.  Setting it to false clears the entire table so use cautionsly!
+function cbp_purge_bans($ips = '', $expired_only = TRUE)
+{
+   //This is a special case to implement a submit handler for the default drupal ip block page when an IP is deleted, we do this because it doesnt clear the flood table for the IP that is being deleted, so we help it along by doing that here.
+   if (isset($ips['#id']) && $ips['#id'] == 'system-ip-blocking-delete')
+   {
+      $ips = $ips['blocked_ip']['#value']['ip'];
+   }
+
+   //Purge the list of ID's
+   if (!empty($ips))
+   {
+      if (is_array($ips))
+      {
+         foreach ($ips AS $key => $ip)
+         {
+            if ($ip)
+            {
+               //Delete each IP in the array from the blocked_ips and flood tables.
+               db_delete('blocked_ips')->condition('ip', $ip, '=')->execute();
+               db_delete('flood')->condition('identifier', $ip, '=')->execute();
+               watchdog('crowd brutefore protection', 'Un-Banned IP address %ip', array('%ip' => $ip));
+            }
+         }
+      }
+
+      if (filter_var($ips, FILTER_VALIDATE_IP))
+      {
+         //Delete the specified IP from the blocked_ips and flood tables.
+         db_delete('blocked_ips')->condition('ip', $ips, '=')->execute();
+         db_delete('flood')->condition('identifier', $ips, '=')->execute();
+         watchdog('crowd brutefore protection', 'Un-Banned IP address %ip', array('%ip' => $ips));
+      }
+   }
+   else
+   {
+      //For these 2 situations we do not touch the Flood table.  This may or may not change in future versions, for right now I'm deciding not to do it for simplicities sake.
+      if ($expired_only)
+      {
+         //Delete all EXPIRED IPs
+         db_delete('blocked_ips')->condition('expiration', 0, '>')->condition('expiration', time(), '<=')->execute();
+         watchdog('crowd brutefore protection', 'Purged all EXPIRED IPs.');
+      }
+      else
+      {
+         //Delete ALL IPS
+         db_delete('blocked_ips')->execute();
+         watchdog('crowd brutefore protection', 'Purged ALL IPs');
+      }
+   }
+}
+
+//This allows IPs to completely override any bans on their IP whether they are local or from the remote CBP servers.  Use the whitelist wisely.  Dont whitelist untrusted users.  Duh.
+function cbp_ip_is_whitelisted($ip)
+{
+   $results = db_select('cbp_whitelist', 'c')->fields('c')->condition('ip', $ip, '=')->execute()->fetchObject();
+   if (isset($results->ip) && $results->ip == $ip)
+   {
+      return TRUE;
+   }
+   return FALSE;
+}
+
+function execute_cbp_remote_command($cmd)
+{
+   $cbp_settings = variable_get('cbp_settings');
+   $rest_server = cbp_check_connection($debug = FALSE);
+
+   //Silently exit if all servers are unreachable.
+   if (!$rest_server)
+   {
+      return;
+   }
+
+   //Check settings to see if we should even be contacting the server.
+   switch ($cmd->action)
+   {
+      case 'check_ip' : if ($cbp_settings['remote'][CBP_REMOTE_RECEIVE_ENABLED] != CBP_REMOTE_RECEIVE_ENABLED) { return; } 
+      case 'report_ip' : if ($cbp_settings['remote'][CBP_REMOTE_SEND_ENABLED] != CBP_REMOTE_SEND_ENABLED) { return; }
+   }
+
+   //If the connection failed then we dont need to go any further.  This error will be cleared once a successful "Connection check" has been run via the Admin panel.
+   if (isset($cbp_settings['connection_failed']))
+   {
+      drupal_set_message(CONNECTION_FAILED, 'error');
+      return;
+   }
+
+   //Data collection, we may be able to use this to ban against calls to wp-login.php and other paths that wont exist and that are obvious vuln scanning attempts.  For now we just collect data.  We will decide if it returns anything useful at a later date.  Right now we dont do anything with this data other than use it for debugging purposes.
+   $inc_path_var = variable_get('path_inc');
+   if (!empty($inc_path_var) && !function_exists('current_path')) { require_once($inc_path_var); }
+   elseif (!function_exists('current_path')) { require_once("includes/path.inc"); }
+   if (!function_exists('system_get_info')) { require_once("modules/system/system.module"); }
+   $cmd->source_uri = request_uri();
+   $cmd->source_path = request_path();
+   $cmd->current_path = current_path();
+   $cmd->local_ip = $_SERVER['SERVER_ADDR'];
+   $module_info = system_get_info($type = 'module', $name = 'cbp');
+   //Gather version data to help debug possible issues
+   $cmd->module_version = $module_info['version'];
+   $cmd->php = $module_info['php'];
+   $cmd->core = VERSION;
+   $cmd->referer = $_SERVER['HTTP_REFERER'];  //Not always reliable since it comes from the client, but may be useful in catching badly coded worms/spiders and other badness in the future.
+
+   $options = array(
+                'method' => 'POST',
+                'data' => 'cmd='.json_encode($cmd),
+                'timeout' => 2,
+                'headers' => array('Content-Type' => 'application/x-www-form-urlencoded'),
+        );
+   $results = cbp_http_request($rest_server, $options);
+
+   if (isset($results))
+   {
+      return json_decode($results);
+   }
+}
+
+//drupal_http_request() does NOT timeout properly if a server simply does not reply at all (fw rule, ddos, server down, etc) so I have to create one with curl instead.
+function cbp_http_request($rest_server, $options = array())
+{
+   $ch = curl_init();
+
+   curl_setopt($ch, CURLOPT_URL, $rest_server);
+   curl_setopt($ch, CURLOPT_HEADER, false);
+   curl_setopt($ch, CURLOPT_POST, 1);
+   if (isset($options['data']))
+   {
+      curl_setopt($ch, CURLOPT_POSTFIELDS,$options['data']);
+   }
+   curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+   curl_setopt($ch, CURLOPT_CONNECTTIMEOUT ,0); 
+   curl_setopt($ch, CURLOPT_TIMEOUT, 1); //timeout in seconds
+   //curl_setopt($ch, CURLOPT_VERBOSE, true);
+   $response = curl_exec($ch);
+
+   return $response;
+}
+
+//Returns the URL of the server upon successful connection,  false otherwise.
+function cbp_check_connection($debug = FALSE)
+{
+   $cbp_settings = variable_get('cbp_settings');
+   global $CBP_API_SERVERS;
+   foreach ($CBP_API_SERVERS AS $key => $server)
+   {
+      if ($server)
+      {
+         $results = cbp_http_request("{$server}?test_connection=1");
+         if (isset($results) && $results == 'Ok')
+         {
+            if ($debug)
+            {
+               drupal_set_message("Connection to the Crowdsource server works properly.");
+            }
+
+            return $server;
+         }
+      }
+   }
+
+   if ($debug)
+   {
+       drupal_set_message(CONNECTION_FAILED, 'error');
+   }
+   return FALSE;
+}

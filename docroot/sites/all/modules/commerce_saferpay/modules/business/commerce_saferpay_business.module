@@ -1,0 +1,639 @@
+<?php
+
+/**
+ * @file
+ * Process payments using Saferpay Payment Page.
+ *
+ * For API reference see http://www.saferpay.com/help
+ */
+define('COMMERCE_SAFERPAY_ECI_NO_LIABILITYSHIFT', 0);
+define('COMMERCE_SAFERPAY_ECI_3D_AUTHENTICATION', 1);
+define('COMMERCE_SAFERPAY_ECI_3D_NO_AUTHENTICATION', 2);
+
+/**
+ * Implements hook_menu().
+ */
+function commerce_saferpay_business_menu() {
+  $items['commerce/saferpay/scd/%commerce_order/%'] = array(
+    'title' => 'Saferpay SCD Response',
+    'page callback' => 'commerce_saferpay_business_scd_handle_response',
+    'page arguments' => array(3),
+    'access callback' => 'commerce_saferpay_business_redirect_access',
+    'access arguments' => array(3, 4),
+    'type' => MENU_CALLBACK,
+    'file' => 'commerce_saferpay_business.pages.inc',
+  );
+  $items['commerce/saferpay/mpi/%commerce_order/%'] = array(
+    'title' => 'Saferpay MPI Response',
+    'page callback' => 'commerce_saferpay_business_mpi_handle_response',
+    'page arguments' => array(3),
+    'access callback' => 'commerce_saferpay_business_redirect_access',
+    'access arguments' => array(3, 4),
+    'type' => MENU_CALLBACK,
+    'file' => 'commerce_saferpay_business.pages.inc',
+  );
+  return $items;
+}
+
+/**
+ * Acess callback for payment redirect.
+ */
+function commerce_saferpay_business_redirect_access($order, $key) {
+  if (user_access('access checkout') && !empty($_GET['DATA']) && $key == $order->data['payment_redirect_key']) {
+    return commerce_saferpay_confirm_validate($_GET['DATA'], $_GET['SIGNATURE']);
+  }
+}
+
+/**
+ * Implements hook_commerce_payment_method_info().
+ */
+function commerce_saferpay_business_commerce_payment_method_info() {
+
+  $payment_methods = array();
+
+  $payment_methods['commerce_saferpay_business'] = array(
+    'method_id' => 'commerce_saferpay_business',
+    'title' => t('Saferpay business'),
+    'display_title' => t('Credit card'),
+    'description' => t('Handels payments (almost) without redirects to Saferpay. (Hidden Mode)'),
+    'active' => TRUE,
+    'terminal' => FALSE,
+    'offsite' => TRUE,
+    'offsite_autoredirect' => FALSE,
+    'cardonfile' => array(
+      'delete callback' => 'commerce_saferpay_business_cardonfile_delete',
+      'add callback' => 'commerce_saferpay_business_cardonfile_add',
+      'charge callback' => 'commerce_saferpay_business_cardonfile_charge',
+    ),
+  );
+
+  return $payment_methods;
+}
+
+/**
+ * Payment method callback; return the settings form for a payment method.
+ *
+ * @param $settings
+ *   An array of the current settings.
+ * @return
+ *   A form snippet.
+ */
+function commerce_saferpay_business_settings_form($settings = NULL) {
+  $form = commerce_saferpay_settings_form($settings);
+
+  $settings += array(
+    'require_liablityshift' => FALSE,
+    'use_mpi' => TRUE,
+    'amount_on_payment_page' => FALSE,
+  );
+
+  $form['use_mpi'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Use Saferpay Merchant Plug-in'),
+    '#description' => t('If checked, the payment process integrates with Saferpay Merchant Plug-In to support 3-D Secure and therefore liability shift.'),
+    '#default_value' => $settings['use_mpi'],
+  );
+  $form['require_liablityshift'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Require confirmed liability shift for the payments'),
+    '#description' => t('If checked, only payments from credit cards with support for 3-D Secure are accepted.'),
+    '#default_value' => $settings['require_liablityshift'],
+    '#states' => array(
+      'visible' => array(
+        ':input[name="parameter[payment_method][settings][payment_method][settings][use_mpi]"]' => array('checked' => TRUE),
+      ),
+    ),
+  );
+  $form['amount_on_payment_page'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Show the amount on the payment page'),
+    '#description' => t('If checked, the amount is shown on the payment page where the credit card data has to be entered.'),
+    '#default_value' => $settings['amount_on_payment_page'],
+  );
+  return $form;
+}
+
+/**
+ * Payment method callback: checkout form submission.
+ *
+ * This saves the values from the Cardonfile fields into the order, so
+ * it can be reused later.
+ */
+function commerce_saferpay_business_submit_form_submit($payment_method, $pane_form, $pane_values, $order, $charge) {
+  if (module_exists('commerce_cardonfile')) {
+    // First save the values into the order object.
+    if (!empty($pane_values['credit_card']['cardonfile_store'])) {
+      $order->data['cardonfile_store'] = $pane_values['credit_card']['cardonfile_store'];
+    }
+    if (!empty($pane_values['cardonfile'])) {
+      $order->data['cardonfile'] = $pane_values['cardonfile'];
+    }
+    commerce_order_save($order);
+
+    // If the user has selected to use an existing card
+    if (!empty($order->data['cardonfile']) && $order->data['cardonfile'] !== 'new') {
+      $card_data = commerce_cardonfile_data_load($order->data['cardonfile']);
+      $order->data['commerce_saferpay_card_ref_id'] = $card_data['remote_id'];
+      commerce_order_save($order);
+      commerce_saferpay_business_pay_order($order);
+    }
+  }
+}
+
+/**
+ * Payment method callback; generation callback for the payment form.
+ */
+function commerce_saferpay_business_submit_form($payment_method, $pane_values, $checkout_pane, $order) {
+  $form = array();
+  // commerce_cardonfile module only accts if a credit_card container exists.
+  // Trick it into believing it does.
+  if (module_exists('commerce_cardonfile')) {
+    $form['credit_card'] = array(
+      '#type' => 'container',
+      '#access' => FALSE,
+    );
+  }
+  return $form;
+}
+
+/**
+ * Payment method callback; generation callback for the payment redirect form.
+ *
+ * Returns form elements that should be submitted to the redirected payment
+ * service; because of the array merge that happens upon return, the service’s
+ * URL that should receive the POST variables should be set in the #action
+ * property of the returned form array.
+ */
+function commerce_saferpay_business_redirect_form($form, &$form_state, $order, $payment_method) {
+  if (empty($payment_method['settings']['account_id'])) {
+    drupal_set_message(t('Saferpay Business has not been configured. The test account is used. Visit the <a href="!url">payment settings</a> to change this.', array('!url' => url('admin/commerce/config/payment-methods'))), 'warning');
+  }
+
+  $url = _commerce_saferpay_business_initpay($order, $payment_method['settings']);
+  if (empty($url)) {
+    return array();
+  }
+
+  $form['#method'] = 'post';
+  $form['#action'] = $url;
+
+  // Default values.
+  $default = array(
+    'type' => '',
+    'owner' => '',
+    'number' => '',
+    'start_month' => '',
+    'start_year' => date('Y') - 5,
+    'exp_month' => date('m'),
+    'exp_year' => date('Y'),
+    'issue' => '',
+    'code' => '',
+    'bank' => '',
+  );
+
+  // When the test account is used, add a default value for the test credit
+  // card.
+  if (empty($payment_method['settings']['account_id']) || $payment_method['settings']['account_id'] == '99867-94913159') {
+    $default['owner'] = t('Test card');
+    $default['number'] = '9451123100000111';
+  }
+
+  // @todo instead of using drupal_add_css the following should be used:
+  // $form['#attached']['css'][] = array(drupal_get_path('module', 'commerce_saferpay_business') . '/includes/commerce_saferpay_business.css');
+  drupal_add_css(drupal_get_path('module', 'commerce_saferpay_business') . '/includes/commerce_saferpay_business.css');
+
+  // Show the amount if this is not disabled.
+  if (!empty($payment_method['settings']['amount_on_payment_page'])) {
+    $total = field_get_items('commerce_order', $order, 'commerce_order_total');
+
+    $form['amount_preview'] = array(
+      '#type' => 'item',
+      '#title' => t('Amount'),
+      '#markup' => '<span id="preview-amount" class="form-markup">' . commerce_currency_format($total[0]['amount'], $total[0]['currency_code']) . '</span>',
+      '#weight' => 0,
+    );
+  }
+
+  $form['CardHolder'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Card owner'),
+    '#default_value' => $default['owner'],
+    '#attributes' => array('autocomplete' => 'off'),
+    '#required' => TRUE,
+    '#maxlength' => 64,
+    '#size' => 32,
+    '#weight' => 1,
+  );
+
+  $form['sfpCardNumber'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Card number'),
+    '#default_value' => $default['number'],
+    '#attributes' => array('autocomplete' => 'off'),
+    '#required' => TRUE,
+    '#maxlength' => 19,
+    '#size' => 20,
+    '#weight' => 2,
+  );
+
+  $form['sfpCardExpiryMonth'] = array(
+    '#type' => 'select',
+    '#title' => t('Expiration'),
+    '#options' => drupal_map_assoc(array_keys(commerce_months())),
+    '#default_value' => strlen($default['exp_month']) == 1 ? '0' . $default['exp_month'] : $default['exp_month'],
+    '#required' => TRUE,
+    '#prefix' => '<div class="commerce-credit-card-expiration">',
+    '#suffix' => '<span class="commerce-month-year-divider">/</span>',
+    '#weight' => 3,
+  );
+
+  $options = array();
+  $current_year_4 = date('Y');
+  for ($i = 0; $i < 20; $i++) {
+    $options[$current_year_4 + $i] = $current_year_4 + $i;
+  }
+
+  $form['sfpCardExpiryYear'] = array(
+    '#type' => 'select',
+    '#options' => $options,
+    '#default_value' => $default['exp_year'],
+    '#suffix' => '</div>',
+    '#weight' => 4,
+  );
+
+  $form['CVC'] = array(
+    '#type' => 'textfield',
+    '#title' => !empty($fields['code']) ? $fields['code'] : t('Security code'),
+    '#default_value' => $default['code'],
+    '#attributes' => array('autocomplete' => 'off'),
+    '#required' => TRUE,
+    '#maxlength' => 4,
+    '#size' => 4,
+    '#weight' => 5,
+  );
+
+  if (module_exists('commerce_cardonfile') && $GLOBALS['user']->uid > 0) {
+    $storage = variable_get('commerce_cardonfile_storage', 'opt-in');
+    if (in_array($storage, array('opt-in', 'opt-out'))) {
+      $form['cardonfile_store'] = array(
+        '#type' => 'checkbox',
+        '#title' => t('Store this credit card on file for future use.'),
+        '#default_value' => $storage == 'opt-out',
+        '#weight' => 10,
+      );
+    }
+    else {
+      $form['cardonfile_store'] = array(
+        '#type' => 'hidden',
+        '#value' => TRUE,
+      );
+    }
+  }
+
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Proceed with payment'),
+    '#weight' => 50,
+  );
+
+  return $form;
+}
+
+/**
+ * Returns the URL to post the credit card information to.
+ *
+ * @param $order
+ *   The order object.
+ * @param $settings
+ *   Array of payment method settings
+ *
+ * @return
+ *   The URL to point the credit card form action to, FALSE in case of an error.
+ */
+function _commerce_saferpay_business_initpay($order, $settings) {
+  $data = array();
+
+  // @todo: Check this:
+  // * Für die Verwendung von CARDREFID="new" muss bei Saferpay zunächst ein numerischer Startwert für den
+  // Account hinterlegt werden. Kontaktieren Sie hierfür integration@saferpay.com.
+  $data['CARDREFID'] = 'new';
+
+  $data['FAILLINK'] = url('commerce/saferpay/scd/' . $order->order_id . '/' . $order->data['payment_redirect_key'], array('absolute' => TRUE));
+  $data['SUCCESSLINK'] = $data['FAILLINK'];
+  $data['BACKLINK'] = $data['FAILLINK'];
+
+  return commerce_saferpay_initpay($order, $settings, $data);
+}
+
+/**
+ * Stores an error message for later retrieval.
+ *
+ * @param $new_error
+ *   (Optional) Overwrites the currently stored error message.
+ *
+ * @return
+ *   Returns the currently stored error message.
+ */
+function commerce_saferpay_business_error($new_error = NULL) {
+  $error = &drupal_static(__FUNCTION__);
+  if ($new_error) {
+    $error = $new_error;
+  }
+  return $error;
+}
+
+/**
+ * Verifies 3-D Secure enrollment.
+ *
+ * @param $order
+ *   The order object.
+ * @param $scd_response
+ *   The scd_response SimpleXML object containing the CARDREFID, EXPIRYMONTH
+ *   and EXPIRYYEAR attributes.
+ * @param $settings
+ *   The payment method settings.
+ *
+ * @return SimpleXMLElement
+ *   The response object if the verify enrollment call successed, FALSE
+ *   otherwise. The error can be fetched from
+ *   commerce_saferpay_business_error() in that case.
+ */
+function commerce_saferpay_business_verify_enrollment($order, $scd_response, $settings) {
+  $data = array();
+
+  $settings += commerce_saferpay_default_settings();
+
+  // Generic arguments.
+  $data['MSGTYPE'] = 'VerifyEnrollment';
+  $data['ACCOUNTID'] = $settings['account_id'];
+  if (!empty($settings['password'])) {
+    $data['spPassword'] = $settings['password'];
+  }
+  $data['MPI_PA_BACKLINK'] = url('commerce/saferpay/mpi/' . $order->order_id . '/' . $order->data['payment_redirect_key'], array('absolute' => TRUE));
+
+  // Card reference.
+  $data['CARDREFID'] = $scd_response['CARDREFID'];
+  $data['EXP'] = $scd_response['EXPIRYMONTH'] . $scd_response['EXPIRYYEAR'];
+
+  // Order amount.
+  $total = field_get_items('commerce_order', $order, 'commerce_order_total');
+  $data['AMOUNT'] = $total[0]['amount'];
+  $data['CURRENCY'] = $total[0]['currency_code'];
+
+  $url = url('https://www.saferpay.com/hosting/VerifyEnrollment.asp', array('external' => TRUE, 'query' => $data));
+
+  $return = commerce_saferpay_process_url($url);
+  list($code, $response) = explode(':', $return, 2);
+  if ($code == 'OK') {
+    return simplexml_load_string($response);
+  }
+  else {
+    commerce_saferpay_business_error($response);
+  }
+  return FALSE;
+}
+
+/**
+ * Authorizes a payment.
+ *
+ * @param $order
+ *   The order object. Needs to have commerce_saferpay_card_ref_id defined in
+ *   $order->data and optionally commerce_saferpay_mpi_session_id.
+ * @param $settings
+ *   The payment method settings.
+ * @param $method_id
+ *   The payment method id.
+ *
+ * @return
+ *   The transaction object if the authorization succeeded, FALSE
+ *   otherwise. The error can be fetched from
+ *   commerce_saferpay_business_error() in that case.
+ */
+function commerce_saferpay_business_authorize_payment($order, $settings, $method_id) {
+  $data = array();
+
+  $settings += commerce_saferpay_default_settings();
+
+  // Generic arguments.
+  $data['MSGTYPE'] = 'VerifyEnrollment';
+  $data['ACCOUNTID'] = $settings['account_id'];
+  if (!empty($settings['password'])) {
+    $data['spPassword'] = $settings['password'];
+  }
+
+  $data['CARDREFID'] = $order->data['commerce_saferpay_card_ref_id'];
+  // Set the MPI_SESSIONID if existing.
+
+  if (!empty($order->data['commerce_saferpay_mpi_session_id'])) {
+    $data['MPI_SESSIONID'] = $order->data['commerce_saferpay_mpi_session_id'];
+  }
+
+  // If the CVC number is present in the session, use it and then remove it.
+  if (!empty($_SESSION['commerce_saferpay_business_cvc'])) {
+    $data['CVC'] = $_SESSION['commerce_saferpay_business_cvc'];
+    unset($_SESSION['commerce_saferpay_business_cvc']);
+  }
+
+  // Order data.
+  $total = field_get_items('commerce_order', $order, 'commerce_order_total');
+  $data['AMOUNT'] = $total[0]['amount'];
+  $data['CURRENCY'] = $total[0]['currency_code'];
+
+  $order_identifier = token_replace($settings['order_identifier'], array('commerce-order' => $order));
+  $data['ORDERID'] = htmlentities($order_identifier);
+
+  $url = url('https://www.saferpay.com/hosting/execute.asp', array('external' => TRUE, 'query' => $data));
+
+  $return = commerce_saferpay_process_url($url);
+  list($code, $idp_string) = explode(':', $return, 2);
+  if ($code == 'OK') {
+    $idp = simplexml_load_string($idp_string);
+
+    if ((int) $idp['RESULT'] == 0) {
+      $transaction = commerce_saferpay_get_transaction($order, $idp['ID'], $method_id);
+      $transaction->remote_id = (string)$idp['ID'];
+      $transaction->amount = $data['AMOUNT'];
+      $transaction->currency_code = $data['CURRENCY'];
+      $transaction->payload[REQUEST_TIME][] = $idp_string;
+
+      $transaction->status = COMMERCE_PAYMENT_STATUS_PENDING;
+      $transaction->message = t('Transaction has been reserved.');
+
+      // Save the transaction information.
+      commerce_payment_transaction_save($transaction);
+      return $transaction;
+    }
+    else {
+      commerce_saferpay_business_error($idp['AUTHMESSAGE']);
+      return FALSE;
+    }
+  }
+  else {
+    commerce_saferpay_business_error($idp_string);
+  }
+  return FALSE;
+}
+
+/**
+ * Verifies 3-D secure enrollment.
+ *
+ * @param $transaction
+ *   Commerce payment transaction object to be settled.
+ * @param settings
+ *   The payment method settings.
+ *
+ * @return SimpleXMLElement
+ *   TRUE if the settlement succeeded, FALSE otherwise. The error can be fetched
+ *   from commerce_saferpay_business_error() in that case.
+ */
+function commerce_saferpay_business_settle_payment($transaction, $settings) {
+  $data = array();
+
+  $settings += commerce_saferpay_default_settings();
+
+  if (!isset($settings['autocomplete']) || !$settings['autocomplete']) {
+    // If autocomplete is disabled, don't settle the payment but still report
+    // it as a success.
+    return TRUE;
+  }
+
+  // Generic arguments.
+  $data['ACCOUNTID'] = $settings['account_id'];
+  if (!empty($settings['password'])) {
+    $data['spPassword'] = $settings['password'];
+  }
+  $data['ACTION'] = 'Settlement';
+
+  $data['ID'] = $transaction->remote_id;
+
+  $url = url('https://www.saferpay.com/hosting/paycompletev2.asp', array('external' => TRUE, 'query' => $data));
+
+  $return = commerce_saferpay_process_url($url);
+  list($code, $response_string) = explode(':', $return, 2);
+  if ($code == 'OK') {
+    $response = simplexml_load_string($response_string);
+    if ((int) $response['RESULT'] == 0) {
+      $transaction->status = COMMERCE_PAYMENT_STATUS_SUCCESS;
+      $transaction->message = t('Successfully completed the payment.');
+      $transaction->remote_message = (string) $response['MESSAGE'];
+      $transaction->payload[REQUEST_TIME][] = $response_string;
+      commerce_payment_transaction_save($transaction);
+      return TRUE;
+    }
+    else {
+      commerce_saferpay_business_error($response['MESSAGE'] . $response['AUTHMESSAGE']);
+      $transaction->status = COMMERCE_PAYMENT_STATUS_FAILURE;
+      $transaction->message = t('Failed to complete payment.');
+      $transaction->remote_message = (string) $response['MESSAGE'];
+      $transaction->payload[REQUEST_TIME][] = $response_string;
+      commerce_payment_transaction_save($transaction);
+    }
+  }
+  else {
+    commerce_saferpay_business_error($response_string);
+  }
+  return FALSE;
+}
+
+/**
+ * Authorize and optionally settle the payment for an order object.
+ *
+ * This is a user interface function which will use drupal_goto() to redirect
+ * the user, do not use this if there is no user interface involved.x
+ *
+ * @param $order
+ *   The order object. Needs to have commerce_saferpay_card_ref_id defined in
+ *   $order->data and optionally commerce_saferpay_mpi_session_id.
+ */
+function commerce_saferpay_business_pay_order($order) {
+  $payment_method = commerce_payment_method_instance_load($order->data['payment_method']);
+  $transaction = commerce_saferpay_business_authorize_payment($order, $payment_method['settings'], $payment_method['method_id']);
+  if ($transaction !== FALSE) {
+    $complete_response = commerce_saferpay_business_settle_payment($transaction, $payment_method['settings']);
+    if ($complete_response === TRUE) {
+      $cardonfile_exists = module_exists('commerce_cardonfile');
+      if ($cardonfile_exists && isset($order->data['cardonfile']) && $order->data['cardonfile'] == 'new') {
+        $card_data = array(
+          'uid' => $order->uid,
+          'payment_method' => $payment_method['method_id'],
+          'instance_id' => $payment_method['instance_id'],
+          'remote_id' => $order->data['commerce_saferpay_card_ref_id'],
+          'card_type' => $order->data['commerce_saferpay_card_type'],
+          'card_name' => $order->data['commerce_saferpay_card_holder'],
+          'card_number' => $order->data['commerce_saferpay_card_number'],
+          'card_exp_month' => $order->data['commerce_saferpay_expiry_month'],
+          'card_exp_year' => $order->data['commerce_saferpay_expiry_year'],
+          'status' => 1,
+        );
+        // Save new card on file.
+        commerce_cardonfile_data_save($card_data);
+      }
+
+      // If the user has selected to use an existing card we have to set the
+      // Order Status to payment manually because we skipped the payment
+      // redirect.
+      if ($cardonfile_exists && !empty($order->data['cardonfile']) && $order->data['cardonfile'] !== 'new') {
+        commerce_order_status_update($order, 'checkout_payment', FALSE, "Payment via Cardonfile");
+      }
+
+      // Send the customer on to the next checkout page.
+      commerce_payment_redirect_pane_next_page($order);
+      drupal_goto(commerce_checkout_order_uri($order));
+    }
+    else {
+      // Display error and redirect back.
+      drupal_set_message(t('An error occured while settling the payment: @error.', array('@error' => commerce_saferpay_business_error())), 'error');
+      drupal_goto(commerce_checkout_order_uri($order));
+    }
+  }
+  else {
+    drupal_set_message(t('An error occured while processing the payment: @error.', array('@error' => commerce_saferpay_business_error())), 'error');
+    drupal_goto(commerce_checkout_order_uri($order));
+  }
+}
+
+/**
+ * Commerce recurring payment charge callback.
+ *
+ * @param object $order
+ *   New order object for which we want to settle the payment.
+ * @param $parent_order
+ *   Parent order based on which the current one is created.
+ *
+ * @return bool
+ *   The transaction result.
+ */
+function commerce_saferpay_business_cardonfile_charge($order, $parent_order) {
+
+  if (!module_exists('commerce_cardonfile')) {
+    watchdog('commerce_saferpay_business', 'Attempt to enroll cardonfile payment without commerce_cardonfile module enabled.',
+      array(), WATCHDOG_ERROR);
+
+    return FALSE;
+  }
+
+  // Copy payment data from the parent order.
+  $order->data['payment_method'] = $parent_order->data['payment_method'];
+  $order->data['commerce_saferpay_card_ref_id'] = $parent_order->data['commerce_saferpay_card_ref_id'];
+
+  commerce_order_save($order);
+
+  $payment_method = commerce_payment_method_instance_load($order->data['payment_method']);
+  $transaction = commerce_saferpay_business_authorize_payment($order, $payment_method['settings'], $payment_method['method_id']);
+  if ($transaction == FALSE) {
+    watchdog('commerce_saferpay_business', 'An error occurred while processing the payment: @error.',
+      array('@error' => commerce_saferpay_business_error()), WATCHDOG_ERROR, l($order->order_id, entity_uri('commerce_order', $order)));
+
+    return FALSE;
+  }
+
+  $complete_response = commerce_saferpay_business_settle_payment($transaction, $payment_method['settings']);
+  if ($complete_response == FALSE) {
+    watchdog('commerce_saferpay_business', 'An error occurred while settling the payment: @error.',
+      array('@error' => commerce_saferpay_business_error()), WATCHDOG_ERROR, l($order->order_id, entity_uri('commerce_order', $order)));
+
+    return FALSE;
+  }
+
+  return TRUE;
+}

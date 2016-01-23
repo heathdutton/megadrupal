@@ -1,0 +1,284 @@
+<?php
+/**
+ * @file
+ * Custom functions and hooks for commerce_techprocess
+ */
+
+/**
+ * Implements hook_menu()
+ */
+function commerce_techprocess_menu() {
+  $items = array();
+  
+  $items['admin/config/services/payment-method-settings'] = array(
+    'title' => 'Configure Tech Process payment method',
+    'description' => 'Configuration form for payment method using Tech Process',
+    'page callback' => 'commerce_techprocess_configurations',
+    'file' => 'includes/commerce_techprocess.inc',
+    'access arguments' => array('access administration pages'),
+  );
+  return $items;
+}
+
+/**
+ * Implements hook_commerce_payment_method_info().
+ */
+function commerce_techprocess_commerce_payment_method_info() {
+  $payment_methods = array();
+  
+  $logo_url = drupal_get_path('module', 'commerce_techprocess') . '/images/techprocess_logo.png';
+  $display_title = t('!logo  Tech Process payment gateway',
+                    array('!logo' => '<img width="172" height="61" src=' . "/$logo_url" . '>'));
+
+  $payment_methods['tech_process_payment'] = array(
+    'base' => 'commerce_techprocess',
+    'title' => t('Tech Process payment'),
+    'short_title' => t('Tpay'),
+    'display_title' => $display_title,
+    'description' => t('Single URL Integration with TechProcess offers a
+      convenient yet secured way for communicating with it’s Payment 
+      Processing platform. Integration allows an eCommerce site or 
+      mCommerce merchant to send various processing requests to a common
+      URL. Single URL integration with the merchant provides various 
+      functionalities as : Payment Transaction, Transaction 
+      Cross-Verification, Post-Transaction Status, Refund Request'),
+    'terminal' => FALSE,
+    'offsite' => TRUE,
+    'offsite_autoredirect' => TRUE
+  );
+
+  return $payment_methods;
+}
+
+/**
+ * Payment method callback: redirect form, a wrapper around the module's general
+ *   use function for building a techprocess payment notice form.
+ */
+function commerce_techprocess_redirect_form($form, &$form_state, $order, $payment_method) {
+  $settings = commerce_techprocess_url_builder($order, $payment_method);
+  return commerce_techprocess_order_form($form, $form_state, $order, $payment_method['settings'] + $settings);
+}
+
+/**
+ * Custom function to build the urls for the order payment redirection
+ * 
+ */
+function commerce_techprocess_url_builder($order, $payment_method) {
+  $settings = array(
+    // Return to the previous page when payment is canceled
+    'cancel_return' => url('checkout/' . $order->order_id . '/payment/back/' . $order->data['payment_redirect_key'], array('absolute' => TRUE)),
+
+    // Return to the payment redirect page for processing successful payments
+    'return' => url('checkout/' . $order->order_id . '/payment/return/' . $order->data['payment_redirect_key'], array('absolute' => TRUE)),
+
+    // Specify the current payment method instance ID in the notify_url
+    'payment_method' => $payment_method['instance_id'],
+  );
+  return $settings;
+}
+
+/**
+ * Payment method callback: redirect form return validation.
+ */
+function commerce_techprocess_redirect_form_validate($order, $payment_method) {
+  // here we do the verification for a successfull transaction.
+  require_once 'lib/TransactionRequestBean.php';
+  require_once 'lib/TransactionResponseBean.php';
+  $tech_iv = variable_get('commerce_tech_process_iv', 0);
+  $tech_key = variable_get('commerce_tech_process_key', 0);
+  $trans_verf['tpsl_txn_id'] = 0;
+  if (isset($_POST['msg'])) {
+    $response = $_POST;
+    if (is_array($response)) {
+        $str = $response['msg'];
+    }
+    elseif (is_string($response) && strstr($response, 'msg=')) {
+        $outputstr = str_replace('msg=', '', $response);
+        $outputarr = explode('&', $outputstr);
+        $str = $outputarr[0];
+    }
+    else {
+        $str = $response;
+    }
+    $transaction_request_bean = new TransactionResponseBean();
+    $transaction_request_bean->setResponsePayload($str);
+    $transaction_request_bean->setKey($tech_key);
+    $transaction_request_bean->setIv($tech_iv);
+    $response = $transaction_request_bean->getResponsePayload();
+    $order->data['tpsl_response'] = $response;
+    $txn_str = explode('tpsl_txn_id=', $response);
+    if(isset($txn_str[1])) {
+      $txn_arr = explode('|', $txn_str[1]);
+      $payment_method['tpsltxnid'] = $txn_arr[0];
+      $order->data['tpsl_txn_id'] = $txn_arr[0];
+    }    
+    $txn_status_str = str_replace('txn_status=', '', $response);
+    $txn_status_arr = explode('|', $txn_status_str);
+    $txn_status = $txn_status_arr[0];
+    $order->data['tpsl_txn_status'] = $txn_status;
+    if ($txn_status == '0300') {
+      $dual_verify = variable_get('commerce_techprocess_dualverf', TRUE);
+      if ($dual_verify == TRUE) {
+        $trans_verf['tpsl_txn_date'] = date('d-m-Y', $order->created);
+        $settings = commerce_techprocess_url_builder($order, $payment_method);        
+        $verif_response = commerce_techprocess_server_payment($order, $payment_method['settings'] + $settings, $trans_verf, $request = 'S');
+        $txn_status_str = str_replace('txn_status=', '', $verif_response);
+        $txn_status_arr = explode('|', $txn_status_str);
+        $txn_status = $txn_status_arr[0];
+        $order->data['tpsl_txn_status'] = $txn_status;
+        if ($txn_status != '0300') {
+          return FALSE;
+        }
+        else {
+          return TRUE;
+        }
+      }      
+    } 
+    else {
+      return FALSE;
+    }    
+  } 
+}
+
+/**
+ * redirect form submit.
+ * adding payment transaction details against the order
+ */
+function commerce_techprocess_redirect_form_submit($form, &$form_state) {
+  if(isset($form->data['tpsl_txn_id'])) {
+    watchdog('commerce_techprocess', 'Order ' . $form->order_id . ' : ' . $form->data['tpsl_response'], array(), WATCHDOG_INFO);
+
+    // Saving the transaction in to the commerce payment transaction
+    $transaction = commerce_payment_transaction_new('tech_process_payment', $form->order_id);
+    $transaction->instance_id = $form->data['payment_method'];
+    $transaction->remote_id  = $form->data['tpsl_txn_id'];
+    $transaction->amount = $form->commerce_order_total['und'][0]['amount'];
+    $transaction->currency_code = $form->commerce_order_total['und'][0]['currency_code'];
+    $transaction->payload[REQUEST_TIME] = array();
+    $transaction->status = 'success';
+    $transaction->remote_status = 'success';
+    $transaction->message = t('Payment information via techprocess Payment for order: ' . $form->order_id);
+    commerce_payment_transaction_save($transaction);
+    drupal_set_message(t('Thanks! Payment transaction saved against the order: '. $form->order_id), 'status');
+  }
+}
+
+/**
+ * Builds a Website Payments Standard form from an order object.
+ *
+ * @param $order
+ *   The fully loaded order being paid for.
+ * @param $settings
+ *   An array of settings used to build out the form
+ * @return
+ *   A renderable form array.
+ */
+function commerce_techprocess_order_form($form, &$form_state, $order, $settings) {
+  $server = variable_get('commerce_techprocess_mode', 'live');
+  $response_url = commerce_techprocess_server_payment($order, $settings, '', 'T');
+  $form['#action'] = $response_url;
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Proceed to Techno Process Payment'),
+  );
+  return $form;
+
+  
+}
+
+/**
+ * Returns the URL to the specified Tech Process server.
+ *
+ * @param $server
+ *   Either sandbox or live indicating which server to get the URL for.
+ *
+ * @return
+ *   The URL to use to submit requests to the Tech Process Live server.
+ */
+function commerce_techprocess_server_url($server) {
+  switch ($server) {
+    case 'sandbox':
+      return 'https://www.tekprocess.co.in/PaymentGateway/TransactionDetailsNew.wsdl';
+    case 'live':
+      return 'https://www.tpsl-india.in/PaymentGateway/TransactionDetailsNew.wsdl';
+  }
+}
+
+/**
+ * Tech Process Custom payment function.
+ * 
+ * Used for both payment and transaction verification.
+ * 
+ */
+function commerce_techprocess_server_payment($order, $settings, $trans_verf = '', $request = 'S') {
+  require_once 'lib/TransactionRequestBean.php';
+  require_once 'lib/TransactionResponseBean.php';
+  
+    //Setting all values here
+  $server = variable_get('commerce_tech_process_mode', 'live');
+  $tech_iv = variable_get('commerce_tech_process_iv', 0);
+  $tech_key = variable_get('commerce_tech_process_key', 0);
+  $tech_mid = variable_get('commerce_tech_process_mid', 0);
+  $tech_scheme = variable_get('commerce_tech_process_scheme', 0);
+  
+  $wrapper = entity_metadata_wrapper('commerce_order', $order);
+  $order_currency_code = $wrapper->commerce_order_total->currency_code->value();
+  $order_amount = $wrapper->commerce_order_total->amount->value();
+  $amount = commerce_currency_amount_to_decimal($order_amount, $order_currency_code);
+  $commission_mode = variable_get('commerce_tech_process_comm_mode', 'p');
+  $commission = variable_get('commerce_tech_process_comm_amt', 0);
+  if ($commission_mode == 'p') {
+    $commission = $amount * ($commission / 100);
+  }
+  if ($server == 'sandbox') {
+    $amount = '1.00';
+    $commission = '0.00';
+  }
+  $transaction_request_bean = new TransactionRequestBean();  
+  
+  if ($request == 'T') {
+    date_default_timezone_set(date_default_timezone_get());
+    $curdate = date('d-m-Y');
+    $mail = $order->mail;
+    
+    $profile_id = $order->commerce_customer_billing[LANGUAGE_NONE][0]['profile_id'];
+    $billing_profile = commerce_customer_profile_load($profile_id);
+    $name = $billing_profile->commerce_customer_address['und'][0]['name_line'];
+    $phone = $billing_profile->field_billing_phone_number['und'][0]['value'];
+    
+    $transaction_request_bean->setRequestType('T');
+    $itc_value = 'Payment from techprocess for order ' . $order->order_id;
+    $transaction_request_bean->setITC($itc_value);
+    $transaction_request_bean->setAmount($amount);
+    $transaction_request_bean->setCurrencyCode($order_currency_code);
+    $transaction_request_bean->setCustId($profile_id);
+    $tech_scheme = $tech_scheme . '_' . $amount . '_' . $commission;
+    $transaction_request_bean->setShoppingCartDetails($tech_scheme);
+    $transaction_request_bean->setTxnDate($curdate);
+    $transaction_request_bean->setEmail($mail);
+    $transaction_request_bean->setMobileNumber($phone);
+    $transaction_request_bean->setCustomerName($name);
+  }
+  elseif ($request == 'S') {
+    $transaction_request_bean->setRequestType('S');
+    $itc_value = 'Transaction verification for order ' . $order->order_id;
+    $transaction_request_bean->setITC($itc_value);
+    $transaction_request_bean->setTxnDate($trans_verf['tpsl_txn_date']);
+    $transaction_request_bean->setTPSLTxnID($trans_verf['tpsl_txn_id']);
+    $transaction_request_bean->setS2SReturnURL('https://tpslvksrv6046/LoginModule/Test.jsp');
+  }
+  
+  $transaction_request_bean->setMerchantTxnRefNumber('TechProcess' . $order->order_id);
+  $transaction_request_bean->setReturnURL($settings['return']);  
+  $transaction_request_bean->setMerchantCode($tech_mid);
+  $transaction_request_bean->setKey($tech_key);
+  $transaction_request_bean->setIv($tech_iv);
+  $locator_url = commerce_techprocess_server_url($server);
+  $transaction_request_bean->setWebServiceLocator($locator_url);
+  $response_details = $transaction_request_bean->getTransactionToken();
+  $response_details = (array)$response_details;
+  $response = $response_details[0];
+  
+  return $response;
+}
+

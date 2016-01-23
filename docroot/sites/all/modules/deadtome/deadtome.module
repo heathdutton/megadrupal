@@ -1,0 +1,356 @@
+<?php
+
+/**
+ * Implements hook_help().
+ */
+function deadtome_help($path) {
+  if ($path == 'user/%/deadtome') {
+    $output = '<p>' . t('By killing a user, they are dead to you on this site and you will no longer see any content authored by them. You can always resurrect someone you have killed to make them visible again.') . '</p>';
+    return $output;
+  }
+}
+
+/**
+ * Implements hook_permission().
+ */
+function deadtome_permission() {
+  $info['use deadlists'] = array(
+    'label' => t('Kill users'),
+    'description' => t('Allow users to kill other users and thereby hide any content from those users.'),
+  );
+  return $info;
+}
+
+/**
+ * Implements hook_menu().
+ */
+function deadtome_menu() {
+  $items['user/%user/deadtome'] = array(
+    'title' => 'Dead to me',
+    'description' => 'Manage which users whose content you no longer want to see.',
+    'page callback' => 'deadtome_kill_list',
+    'page arguments' => array(1),
+    'access arguments' => array('use deadlists'),
+    'type' => MENU_LOCAL_TASK,
+    'file' => 'deadtome.pages.inc',
+    'weight' => 20,
+  );
+  $items['user/%user/deadtome/kill/%user/%'] = array(
+    'page callback' => 'deadtome_kill_user',
+    'page arguments' => array(1, 4, 5),
+    'access callback' => 'deadtome_access',
+    'access arguments' => array(4, 3, 1),
+    'file' => 'deadtome.pages.inc',
+    'type' => MENU_CALLBACK,
+  );
+  $items['user/%user/deadtome/resurrect/%user/%'] = array(
+    'page callback' => 'deadtome_resurrect_user',
+    'page arguments' => array(1, 4, 5),
+    'access callback' => 'deadtome_access',
+    'access arguments' => array(4, 3, 1),
+    'file' => 'deadtome.pages.inc',
+    'type' => MENU_CALLBACK,
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_admin_paths().
+ */
+function deadtome_admin_paths() {
+  $paths['user/*/deadtome'] = TRUE;
+  return $paths;
+}
+
+/**
+ * Check if a user has been killed.
+ *
+ * @param $uid
+ *   The user ID of the account to check if it has been killed.
+ * @param object $account
+ *   (optional) A user object representing the user who has been the killer.
+ *
+ * @return
+ *   TRUE if the user is dead, FALSE otherwise.
+ */
+function deadtome_user_is_dead($uid, $account = NULL) {
+  if (!isset($account) || !isset($account->deadtome)) {
+    $account = user_load($GLOBALS['user']->uid);
+  }
+  return !empty($account->deadtome) && in_array($uid, $account->deadtome);
+}
+
+function deadtome_access($target, $op, $account = NULL) {
+  if ($op != 'kill' && $op != 'resurrect') {
+    return FALSE;
+  }
+
+  $cache = &drupal_static(__FUNCTION__, array());
+
+  if (!isset($account)) {
+    $account = $GLOBALS['user'];
+  }
+
+  $cid = "{$account->uid}:$op:{$target->uid}";
+  if (!isset($cache[$cid])) {
+    $cache[$cid] = user_access('use deadlists', $account)
+        && $account->uid != $target->uid
+        && (($op == 'kill' && !deadtome_user_is_dead($target->uid, $account)) || ($op == 'resurrect' && deadtome_user_is_dead($target->uid, $account)));
+  }
+
+  return $cache[$cid];
+}
+
+function deadtome_kill_users($account, array $killed_uids) {
+  foreach (user_load_multiple($killed_uids) as $killed) {
+    db_merge('deadtome')
+      ->key(array(
+        'uid' => $account->uid,
+        'dead_uid' => $killed->uid,
+      ))
+      ->fields(array(
+        'killed_on' => REQUEST_TIME,
+      ))
+      ->execute();
+    watchdog('deadtome', '%user has killed %killed.', array('%user' => format_username($account), '%killed' => format_username($killed)));
+  }
+
+  drupal_static_reset('deadtome_access');
+}
+
+function deadtome_resurrect_users($account, array $resurrected_uids) {
+  foreach (user_load_multiple($resurrected_uids) as $resurrectee) {
+    db_delete('deadtome')
+      ->condition('uid', $account->uid)
+      ->condition('dead_uid', $resurrectee->uid)
+      ->execute();
+
+    watchdog('deadtome', '%user has resurrected %resurrectee.', array('%user' => format_username($account), '%resurrectee' => format_username($resurrectee)));
+  }
+
+  drupal_static_reset('deadtome_access');
+}
+
+/**
+ * Return a link to kill or resurrect an account.
+ */
+function deadtome_get_url($target, $op, $account = NULL) {
+  if (!isset($account)) {
+    $account = $GLOBALS['user'];
+  }
+
+  $url = "user/{$account->uid}/deadtome/{$op}/{$target->uid}";
+
+  // Add the unique token which is based on the URL.
+  return $url . '/' . drupal_get_token($url);
+}
+
+/**
+ * Implements hook_user_load().
+ */
+function deadtome_user_load(array $accounts) {
+  foreach ($accounts as $uid => $account) {
+    $accounts[$uid]->deadtome = array();
+  }
+
+  $records = db_query("SELECT uid, dead_uid FROM {deadtome} WHERE uid IN (:uids)", array(':uids' => array_keys($accounts)))->fetchAll();
+  foreach ($records as $record) {
+    $accounts[$record->uid]->deadtome[] = $record->dead_uid;
+  }
+}
+
+/**
+ * Implements hook_user_insert().
+ */
+function deadtome_user_insert(&$edit, $account, $category) {
+  deadtome_user_update($account);
+}
+
+/**
+ * Implements hook_user_update().
+ */
+function deadtome_user_update(&$edit, $account, $category) {
+  // Ensure the dead UID arrays exist.
+  if (!isset($account->deadtome)) {
+    $account->deadtome = array();
+  }
+
+  $original = isset($account->original->deadtome) ? $account->original->deadtome : array();
+
+  if ($killed_uids = array_diff($account->deadtome, $original)) {
+    deadtome_kill_users($account, $killed_uids);
+  }
+  if (!empty($original) && $resurrected_uids = array_diff($original, $account->deadtome)) {
+    deadtome_resurrect_users($account, $resurrected_uids);
+  }
+}
+
+/**
+ * Implements hook_user_delete().
+ */
+function deadtome_user_delete($account) {
+  db_delete('deadtome')
+    ->db_or()
+      ->condition('uid', $account->uid)
+      ->condition('dead_uid', $account->uid)
+    ->execute();
+}
+
+/**
+ * Implements hook_user_view().
+ */
+function deadtome_user_view($account, $view_mode, $langcode) {
+  if (user_access('use deadlists', $account)) {
+    $account->content['deadtome']['murdered'] = array(
+      '#type' => 'user_profile_item',
+      '#title' => t('Has killed'),
+      '#markup' => format_plural(count($account->deadtome), '@count person', '@count people'),
+    );
+  }
+  if ($killed_count = db_query("SELECT COUNT(1) FROM {deadtome} WHERE dead_uid = :uid", array(':uid' => $account->uid))->fetchField()) {
+    $account->content['deadtome']['killed'] = array(
+      '#type' => 'user_profile_item',
+      '#title' => t('Has been killed by'),
+      '#markup' => format_plural($killed_count, '@count person', '@count persons'),
+    );
+  }
+  if (!empty($account->content['deadtome'])) {
+    $account->content['deadtome'] += array(
+      '#type' => 'user_profile_category',
+      '#title' => t('Body count'),
+      '#attributes' => array('class' => array('user-deadtome')),
+      '#weight' => 20,
+    );
+  }
+}
+
+/**
+ * Implements hook_field_extra_fields().
+ */
+function deadtome_field_extra_fields() {
+  $extra['user']['user']['display']['deadtome'] = array(
+    'label' => t('Body count'),
+    'description' => t('Dead to me module view element.'),
+    'weight' => 20,
+  );
+  return $extra;
+}
+
+/**
+ * Implements hook_node_access().
+ */
+function deadtome_node_access($node, $op, $account) {
+  if (is_object($node) && deadtome_user_is_dead($node->uid, $account)) {
+    return NODE_ACCESS_DENY;
+  }
+  return NODE_ACCESS_IGNORE;
+}
+
+/**
+ * Implements hook_query_TAG_alter().
+ */
+function deadtome_query_node_access_alter(QueryAlterableInterface $query) {
+  _deadtome_query_alter($query, 'node');
+}
+
+/**
+ * Implements hook_query_TAG_alter().
+ */
+function deadtome_query_comment_filter_alter(QueryAlterableInterface $query) {
+  _deadtome_query_alter($query, 'comment');
+}
+
+function _deadtome_query_alter(QueryAlterableInterface $query, $table) {
+  // Read meta-data from query, if provided.
+  $account = $query->getMetaData('account');
+  if (!isset($account->deadtome)) {
+    $account = user_load($GLOBALS['user']->uid);
+  }
+  if (empty($account->deadtome)) {
+    return;
+  }
+
+  // @todo Inspect this logic...
+  $tables = $query->getTables();
+  foreach ($tables as $alias => $tableinfo) {
+    if (!($tableinfo['table'] instanceof SelectQueryInterface) && $tableinfo['table'] == $table) {
+      $query->condition("$alias.uid", $account->deadtome, 'NOT IN');
+    }
+  }
+}
+
+/**
+ * Implements hook_entity_view_alter().
+ */
+function deadtome_entity_view_alter(&$build, $type) {
+  if ($uid = _deadtome_extract_entity_uid_from_build($build)) {
+    if (deadtome_user_is_dead($uid)) {
+      // Hide this entity if its author is dead.
+      $build['#access'] = FALSE;
+    }
+    elseif (!empty($build['links'])) {
+      // If this entity's user is not dead, check if the current user can kill them.
+      $target = user_load($uid);
+      if (deadtome_access($target, 'kill')) {
+        // Add a link to kill this entity's user.
+        $links['kill_user'] = array(
+          'title' => t('Kill @user', array('@user' => format_username($target))),
+          'href' => deadtome_get_url($target, 'kill'),
+          'query' => drupal_get_destination(),
+          'attributes' => array(
+            'title' => t('Hide all content created by this user by killing them.'),
+          ),
+        );
+        $build['links']['deadtome'] = array(
+          '#theme' => 'links__' . $type . '__deadtome',
+          '#links' => $links,
+          '#attributes' => array('class' => array('links', 'inline')),
+        );
+      }
+    }
+  }
+}
+
+/**
+ * Extract a user ID from an entity object from its $build array.
+ *
+ * Blatantly stolen and modified from _eva_extract_entity_from_build().
+ *
+ * This is a bit more complicated than it should be, since core entities,
+ * contrib entities, and contrib entities based on EntityAPI all store their
+ * junk in different slots of the build array.
+ *
+ * @see http://drupal.org/node/1170198
+ *
+ * @param array $build
+ *   A renderable array representing the entity content from
+ *   hook_entity_view_alter().
+ *
+ * @return
+ *   A valid user ID if one was found, FALSE otherwise.
+ */
+function _deadtome_extract_entity_uid_from_build($build) {
+  if (!empty($build['#entity']->uid)) {
+    return $build['#entity']->uid;
+  }
+  else {
+    $type = $build['#entity_type'];
+    $keys = array('#' . $type);
+    switch ($type) {
+      case 'user':
+        $keys[] = '#account';
+        break;
+      case 'taxonomy_term':
+        $keys[] = '#term';
+        break;
+    }
+    foreach ($keys as $key) {
+      if (!empty($build[$key]->uid)) {
+        return $build[$key]->uid;
+      }
+    }
+  }
+
+  return FALSE;
+}

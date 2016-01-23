@@ -1,0 +1,382 @@
+<?php
+
+/**
+ * @file
+ * Simple access control by roles based on taxonomy terms.
+ */
+
+/**
+ * Implements hook_menu_alter().
+ */
+function tsa_menu_alter(&$items) {
+  $items['taxonomy/term/%taxonomy_term']['access callback'] = 'tsa_term_access_callback';
+  $items['taxonomy/term/%taxonomy_term']['access arguments'] = array(2, 'access content');
+  $items['node/%node']['access callback'] = 'tsa_node_access_callback';
+}
+
+/**
+ * Determine whether the user has the privileges to view the term.
+ */
+function tsa_term_access_callback($term, $string, $account = NULL, $reset = FALSE) {
+  global $user;
+
+  if (empty($account)) {
+    $account = $user;
+  }
+
+  if ($account->uid == 1) {
+    // Fallback to user_access in case user #1 is restricted by other modules.
+    return user_access($string, $user, $reset);
+  }
+
+  $parents = taxonomy_get_parents_all($term->tid);
+  $terms = array_merge(array($term), $parents);
+  foreach ($terms as $term) {
+    if (!tsa_check_access($term->tid, $account->roles)) {
+      // User has no role that is allowed to access the term.
+      return FALSE;
+    }
+  }
+
+  // We have no reason to shut it down, so let's see if someone else does.
+  return user_access($string, $user, $reset);
+}
+
+/**
+ * Determine whether the user has the privileges to view the node.
+ *
+ * It makes more sense to use a custom access callback as opposed to the
+ * "proper" system of node grants because we don't want to have to rebuild node
+ * access every time a taxonomy term is updated or inserted.
+ *
+ * Instead, we hijack the node access callback and just fall
+ * back to the default node_access() if ours has no reason to kill the request.
+ */
+function tsa_node_access_callback($op, $node, $account = NULL) {
+  global $user;
+  if (empty($account)) {
+    $account = $user;
+  }
+
+  // Get the list of terms for the node.
+  $terms = tsa_node_get_terms($node);
+  if ($terms !== FALSE) {
+    $parents = array();
+    foreach ($terms as $tid => $term) {
+      $parents = array_merge(taxonomy_get_parents_all($tid), $parents);
+    }
+    $terms = array_merge($terms, $parents);
+
+    if ($op == 'view' && $account->uid != 1 && !empty($terms)) {
+      // Check each term associated to the node for access restriction.
+      foreach ($terms as $term) {
+        if (!tsa_check_access($term->tid, $account->roles)) {
+          // All we need is one access denied from any terms or their ancestors to kill everything.
+          return NODE_ACCESS_DENY;
+        }
+      }
+    }
+  }
+
+  // We have no reason to shut it down, so let's see if someone else does.
+  return node_access($op, $node, $account);
+}
+
+/**
+ * Helper function. Given a tid and a set of roles, return FALSE if there is at least 1 required
+ * role for this term and it doesn't match any of the user's roles. Otherwise, return TRUE.
+ *
+ * @param $tid
+ * @param $roles
+ * @return bool
+ */
+function tsa_check_access($tid, $roles) {
+  $grants = $grants = variable_get('tsa_grants', array());
+  if (isset($grants[$tid]) && (count(array_intersect(array_keys($roles), $grants[$tid])) == 0)) {
+    // This term has required roles, none of which match the user's roles, so we have access denied.
+    return FALSE;
+  }
+  return TRUE;
+}
+
+/**
+ * In Drupal 6.x, there was taxonomy_node_get_terms().  Drupal 7.x should
+ * provide the same feature, but doesn't. This is a workaround, based on
+ * https://drupal.org/comment/5573176#comment-5573176.
+ *
+ * @param $node
+ * @return array
+ */
+function tsa_node_get_terms($node) {
+  $terms = &drupal_static(__FUNCTION__);
+  $enabled_vocabulariess = variable_get('tsa_vocabularies', array());
+
+  if (!isset($terms[$node->nid])) {
+    // Get tids from all taxonomy_term_reference fields.
+    $fields = field_info_fields();
+    foreach ($fields as $field_name => $field) {
+      if ($field['type'] == 'taxonomy_term_reference' && field_info_instance('node', $field_name, $node->type)) {
+        if (($items = field_get_items('node', $node, $field_name)) && is_array($items)) {
+          foreach ($items as $item) {
+            // Sometimes $item contains only tid, sometimes entire term. Thanks Drupal! We need the full term to
+            // determine the vocabulary ID, so we load it if it isn't yet loaded.
+            $term = (!empty($item['taxonomy_term'])) ? $item['taxonomy_term'] : taxonomy_term_load($item['tid']);
+            if ($term && isset($enabled_vocabulariess[$term->vid])) {
+              $terms[$node->nid][$term->tid] = $term;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  return isset($terms[$node->nid]) ? $terms[$node->nid] : FALSE;
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function tsa_form_taxonomy_form_term_alter(&$form, $form_state) {
+  // Do not run on the term's delete confirmation form.
+  if (isset($form_state['triggering_element']) && $form_state['triggering_element']['#value'] == t('Delete')) {
+    return;
+  }
+
+  $vocabularies = variable_get('tsa_vocabularies', array());
+  $vid = $form['#vocabulary']->vid;
+  if (empty($vocabularies[$vid])) {
+    // This taxonomy vocabulary does not have access control enabled.
+    return;
+  }
+
+  $tid = isset($form_state['term']) ? $form_state['term']->tid : 0;
+  $grants = variable_get('tsa_grants', array());
+  $defaults = isset($grants[$tid]) ? $grants[$tid] : array();
+
+  $form['tsa'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Access Control'),
+    '#description' => t('Grant access to this term and its children by roles.'),
+    '#collapsible' => TRUE,
+    '#collapsed' => TRUE,
+    '#weight' => 1,
+  );
+
+  $form['tsa']['tsa_view_term'] = array(
+    '#type' => 'checkboxes',
+    '#title' => t('Roles'),
+    '#description' => t('Select the roles which are allowed to access nodes and child-terms of this term, or leave blank to disable access checking.'),
+    '#options' => user_roles(),
+    '#default_value' => $defaults,
+  );
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function tsa_form_taxonomy_form_vocabulary_alter(&$form, $form_state) {
+  if (empty($form_state['vocabulary']->vid)) {
+    // Do not alter vocabulary overview page.
+    return;
+  }
+  $form['tsa'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Access Control'),
+    '#collapsible' => TRUE,
+    '#collapsed' => TRUE,
+    '#weight' => 1,
+  );
+
+  $vocabularies = variable_get('tsa_vocabularies', array());
+  $vid = $form_state['vocabulary']->vid;
+  $tsa_enabled_default = !empty($vocabularies[$vid]);
+  $form['tsa']['tsa_enabled'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Enable access control'),
+    '#description' => t('Check this if you want to allow role-based access control for terms in this vocabulary. This will appear as extra fields when adding/editing terms.'),
+    '#default_value' => $tsa_enabled_default,
+  );
+}
+
+/**
+ * Implements hook_taxonomy_vocabulary_insert().
+ */
+function tsa_taxonomy_vocabulary_insert($vocabulary) {
+  tsa_taxonomy_vocabulary_update($vocabulary);
+}
+
+/**
+ * Implements hook_taxonomy_vocabulary_insert().
+ */
+function tsa_taxonomy_vocabulary_update($vocabulary) {
+  $is_access_controlled = isset($vocabulary->tsa_enabled) ? $vocabulary->tsa_enabled : FALSE;
+  $vocabularies = variable_get('tsa_vocabularies', array());
+
+  if ($is_access_controlled && !empty($vocabularies[$vocabulary->vid])) {
+    // No need to change the values of the variable.
+    return;
+  }
+  elseif (!$is_access_controlled && empty($vocabularies[$vocabularies->vid])) {
+    // No need to change the values of the variable.
+    return;
+  }
+  if ($is_access_controlled) {
+    $vocabularies[$vocabulary->vid] = $vocabulary->vid;
+  }
+  else {
+    unset($vocabularies[$vocabulary->vid]);
+  }
+
+  variable_set('tsa_vocabularies', $vocabularies);
+}
+
+/**
+ * Implements hook_taxonomy_term_update().
+ */
+function tsa_taxonomy_term_update($term) {
+  tsa_taxonomy_term_insert($term);
+}
+
+/**
+ * Implements hook_taxonomy_term_insert().
+ */
+function tsa_taxonomy_term_insert($term) {
+  $role_ids = isset($term->tsa_view_term) ? array_filter($term->tsa_view_term) : array();
+  $grants = variable_get('tsa_grants', array());
+
+  if (empty($role_ids)) {
+    // Empty list of roles, so unset any pre-existing access rules for this term.
+    unset($grants[$term->tid]);
+  }
+  else {
+    $grants[$term->tid] = $role_ids;
+  }
+
+  variable_set('tsa_grants', $grants);
+
+  // @TODO: Maybe a cache flush is needed here, so that things like Views get updated based on new grants?
+}
+
+/**
+ * Implements hook_taxonomy_term_delete().
+ */
+function tsa_taxonomy_term_delete($term) {
+  $grants = variable_get('tsa_grants', array());
+  unset($grants[$term->tid]);
+  variable_set('tsa_grants', $grants);
+}
+
+/**
+ * Implements hook_query_TAG_alter().
+ *
+ * Acts on queries that list terms (generally these should be tagged with 'term_access')
+ * to remove any terms that this user should not be able to see.
+ */
+function tsa_query_term_access_alter(QueryAlterableInterface $query) {
+  $denied_tids = _tsa_fetch_denied_terms();
+
+  if (!empty($denied_tids)) {
+    $primary_table = _tsa_fetch_query_primary_table($query);
+    // Prevent query from finding terms the current user does not have permission to see.
+    $query->condition($primary_table . '.tid', $denied_tids, 'NOT IN');
+  }
+}
+
+/**
+ * Implements hook_query_TAG_alter().
+ *
+ * Acts on queries that list nodes (generally these should be tagged with 'node_access')
+ * to remove any nodes that this user should not be able to see.
+ */
+function tsa_query_node_access_alter(QueryAlterableInterface $query) {
+  $denied_tids = _tsa_fetch_denied_terms();
+
+  if (!empty($denied_tids)) {
+    $primary_table = _tsa_fetch_query_primary_table($query);
+    // Prevent query from finding nodes the current user does not have permission to see.
+    $query->leftJoin('taxonomy_index', 'tsa_td', $primary_table . '.nid = tsa_td.nid');
+    $or = db_or();
+    $or->condition('tsa_td.tid', $denied_tids, 'NOT IN');
+    $or->isNull('tsa_td.tid');
+    $query->condition($or);
+  }
+}
+
+/**
+ * Helper function. Given a query, find the alias of its primary table.
+ *
+ * @TODO: This is crap. Is there a better way of determining the primary table's alias?
+ *
+ * @param QueryAlterableInterface $query
+ * @return string
+ */
+function _tsa_fetch_query_primary_table(QueryAlterableInterface $query) {
+  $primary_table = '';
+  $t = $query->getTables();
+  foreach ($t as $key => $info) {
+    if (!$info['join type']) {
+      $primary_table = $info['alias'];
+    }
+  }
+  return $primary_table;
+}
+
+/**
+ * Helper function. Given a user account, find the tids of terms we need to deny access to.
+ *
+ * @param null $account
+ * @return array
+ */
+function _tsa_fetch_denied_terms($account = NULL) {
+  if (empty($account)) {
+    global $user;
+    $account = $user;
+  }
+
+  if ($account->uid == 1) {
+    return;
+  }
+
+  // Get our vocabularies and schemes from variables. Return if we have none.
+  $grants = variable_get('tsa_grants', NULL);
+  if (empty($grants)) {
+    return;
+  }
+
+  $denied_tids = array();
+  foreach ($grants as $tid => $term_roles) {
+    if (count(array_intersect(array_keys($account->roles), $term_roles)) == 0) {
+      $denied_tids[] = $tid;
+    }
+  }
+
+  if (empty($denied_tids)) {
+    return;
+  }
+
+  // Fetch all children of denied terms, since those need to be denied as well.
+  $child_tids = array();
+  foreach ($denied_tids as $tid) {
+    $child_tids = array_merge($child_tids, _tsa_fetch_child_terms($tid));
+  }
+  return array_merge($denied_tids, $child_tids);
+}
+
+/**
+ * Helper function. Given a parent tid, fetch all child tids.
+ *
+ * This is needed instead of the core taxonomy_get_children() function because that function includes the
+ * "term_access" query tag, which in turn runs our alter hook, which calls the function again, which leads
+ * to an infinite loop. So we have it here without that tag.
+ *
+ * @param $tid
+ * @return array
+ */
+function _tsa_fetch_child_terms($tid) {
+  $query = db_select('taxonomy_term_data', 't');
+  $query->join('taxonomy_term_hierarchy', 'h', 'h.tid = t.tid');
+  $query->addField('t', 'tid');
+  $query->condition('h.parent', $tid);
+  $tids = $query->execute()->fetchCol();
+  return $tids;
+}

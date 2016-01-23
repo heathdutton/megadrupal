@@ -1,0 +1,391 @@
+<?php
+// $Id$
+
+/**
+ * @file
+ * Ubercart integration for PayEx.
+ *
+ * Thanks to Xen the author of uc_quickpay.module for inspiration.
+ *
+ * Ported from uc_payex (Drupal 6 / Ubercart 2) to Drupal 7 / Ubercart 3
+ */
+
+/**
+ * Implementation of hook_init().
+ *
+ * Big warning if UC isn't configured with a supported currency.
+ */
+function uc_payex_init() {
+  if ( !in_array(variable_get('uc_currency_code', 'USD'), array_keys(payex_currencies())) ) {
+    drupal_set_message(t('WARNING: Übercart is set to use a currency not supported by PayEx.'), 'error');
+  }
+}
+
+/**
+ * Implementation of hook_permission().
+ */
+function uc_payex_perm() {
+  return array(
+    'capture uc_payex payments' => array(
+      'title' => t('Capture Übercart PayEx payments'),
+    ),
+  );
+}
+
+/**
+ * Implementation of hook_menu().
+ */
+function uc_payex_menu() {
+  $items = array();
+
+  $items['uc_payex/%uc_payex_transaction'] = array(
+    'title'           => 'Menu item',
+    'description'     => 'The description of the menu item. It is used as title attribute and on the administration overview page.',
+    'page callback'   => 'uc_payex_order_complete',
+    'page arguments'  => array(1),
+    'access callback' => TRUE,
+    'type'            => MENU_CALLBACK
+  );
+
+  $items['admin/uc_payex_capture/%uc_payex_transaction_receipt'] = array(
+    'title'            => 'Capture payment',
+    'page callback'    => 'uc_payex_capture_payment',
+    'page arguments'   => array(2),
+    'access arguments' => array('capture uc_payex payments'),
+    'type'             => MENU_CALLBACK
+  );
+
+  return $items;
+}
+
+/**
+ * Implementation of hook_uc_payment_method().
+ */
+function uc_payex_uc_payment_method() {
+  $path = base_path() . drupal_get_path('module', 'uc_payex');
+  $title = t('PayEx');
+  $title_long = t('Payment using PayEx');
+
+  $methods[] = array(
+    'id'         => 'payex',
+    'name'       => $title,
+    'title'      => $title_long,
+    'review'     => 'PayEx',
+    'desc'       => t('Redirect to PayEx to pay by credit card.'),
+    'callback'   => 'uc_payment_method_payex',
+    'weight'     => 0,
+    'checkout'   => TRUE,
+    'no_gateway' => TRUE,
+  );
+
+  return $methods;
+}
+
+/**
+ * Callback for payex payment method settings.
+ * @param  $op
+ * @param  $arg1
+ * @return array
+ */
+function uc_payment_method_payex($op, &$arg1) {
+  switch ($op) {
+    case 'cart-details':
+    // Doing nothing, form_alter is handling this.
+    return;
+    case 'settings':
+      $form = array();
+      $form['uc_autocapture'] = array(
+        '#type' => 'checkbox',
+        '#title' => t('Instant capture non-shippable'),
+        '#description' => t("Instantly capture payments on transactions that only contains products that aren't shippable. <em>WARNING</em>: Only use if all the available non-shippable products are in effect \"delivered\" on checkout (instant access subscriptions, for instance), this is a requirement from PayEx/PBS."),
+        '#default_value' => variable_get('uc_autocapture', FALSE),
+      );
+      return $form;
+    case 'cart-process':
+      // Should something happen here?
+      return;
+  }
+}
+
+/**
+ * Implementation of hook_form_alter().
+ * @param  $form
+ * @param  $form_state
+ * @param  $form_id
+ * @return
+ */
+function uc_payex_form_alter(&$form, &$form_state, $form_id) {
+  $order_id = 0;
+
+  if (isset($_SESSION['cart_order'])) {
+    $order_id = (int)$_SESSION['cart_order'];
+  }
+
+  // The Payment from checkout/checkout page
+  if ($form_id == 'uc_cart_checkout_form' && $order_id > 0) {
+    $order = uc_order_load($order_id);
+
+    if ($order->payment_method == 'payex') {
+      drupal_set_message(t('Payment using PayEx'), 'status');
+    }
+  }
+
+  // The payment form in the checkout flow. (page cart/checkout/review)
+  if ($form_id == 'uc_cart_checkout_review_form' && $order_id > 0) {
+    $order = uc_order_load($order_id);
+
+    // Set submit buttion action
+    $submit[] = 'uc_payex_start_payment';
+    $form['#submit'] = $submit;
+    return;
+  }
+
+  // A list of payments (page admin/store/orders/ORDER_ID/payments)
+  if ($form_id == 'uc_payment_by_order_form') {
+    $order_id = $form['order_id']['#value'];
+    $order = uc_order_load($order_id);
+
+    if ($order->payment_method == 'payex') {
+      $transaction = uc_payex_transaction_load($order->order_id);
+      if ($transaction->status == 'authorized' && isset($form['payments'][$transaction->receipt_id]['action']['#markup']) && user_access('capture uc_payex payments')) {
+        // Inject a capture link to mark payment as captured
+        $capture_link = l(t('Capture'), 'admin/uc_payex_capture/' . $transaction->receipt_id, array('query' => drupal_get_destination()));
+        $form['payments'][$transaction->receipt_id]['action']['#markup'] = $capture_link . ' ' . $form['payments'][$transaction->receipt_id]['action']['#markup'];
+      }
+    }
+    return;
+  }
+}
+
+/**
+ * Callback for PayEx Order process
+ * Process a PayEx payment for a ubercart shop.
+ *
+ * Three things can happen:
+ *  - Client is here for the first time: Instansiate Payex Order and get redirect url from PayEx.
+ *  - Client is here after failed payment attempt: Get redirect url from db.
+ *  - Client has successfully completed payment: Process order and redirect to order complete.
+ * @param  $form
+ * @param  $form_state
+ * @return void
+ */
+function uc_payex_start_payment(&$form, &$form_state) {
+  $order_id = 0;
+  if (isset($_SESSION['cart_order'])) {
+    $order_id = (int)$_SESSION['cart_order'];
+    $order = uc_order_load($order_id);
+  }
+  else {
+    exit(t('Unable to find order'));
+  }
+
+  // We already have a transaction, see what needs to be done.
+  $transaction = uc_payex_transaction_load($order_id);
+  if ($transaction) {
+    if ($transaction->status == 'captured' || $transaction->status == 'authorized') {
+      drupal_goto($transaction->redirect_url);
+    }
+    else {
+      // TODO, Should there be some check on the order status?.
+      return uc_payex_redirect_complete();
+    }
+  }
+
+  // Set status.
+  uc_order_update_status($order->order_id, uc_order_state_default('in_checkout'));
+
+  global $language;
+
+  $pxo = payex_order_initialize(array(
+    'purchaseOperation' => (!uc_order_is_shippable($order) && variable_get('uc_autocapture', FALSE)) ? 'SALE' : 'AUTHORIZATION',
+    'price'             => (int) ($order->order_total * 100),
+    'currency'          => variable_get('uc_currency_code', 'USD'),
+    'orderID'           => $order->order_id,
+    'clientIPAddress'   => $_SERVER['REMOTE_ADDR'],
+    'returnUrl'         => url('uc_payex/' . $order->order_id, array('absolute' => TRUE)),
+    'view'              => 'CREDITCARD',
+    'clientLanguage'    => payex_get_language($language->language),
+    'productNumber'     => t('Order number: @order_id', array('@order_id' => $order->order_id)), // We don't really know what was bought, so just use order id as this is required.
+    'description'       => t('Payment for order at @site_name', array('@site_name' => variable_get('site_name', "Übercart webshop"))),
+  ));
+
+  // PayEx Error
+  if ( $pxo['status']['code'] != 'OK' ) {
+    $error       = $pxo['status']['errorCode'];
+    $description = $pxo['status']['description'];
+    drupal_set_message(t('Could not instansiate payment process, please try again or contact support. Error code: @errorcode . Description: @description . OrderID: @orderid .', array('@errorcode' => $error, '@description' => $description, '@orderid' => $order->order_id)), 'error');
+    watchdog('PayEx error', t('Could not instansiate payment process, please try again or contact support. Error code: @errorcode . Description: @description . OrderID: @orderid .', array('@errorcode' => $error, '@description' => $description, '@orderid' => $order->order_id)), array(), WATCHDOG_WARNING);
+    return drupal_goto('cart/checkout/checkout');
+  }
+
+  if (isset($pxo['redirectUrl'])) {
+    // Save info on transaction
+    $transaction = array(
+      'order_id'     => $order->order_id,
+      'redirect_url' => $pxo['redirectUrl'],
+      'order_ref'    => $pxo['orderRef'],
+      'status'       => 'in progress'
+    );
+    drupal_write_record('uc_payex_transactions', $transaction);
+    drupal_goto($pxo['redirectUrl']);
+  }
+}
+
+/**
+ * Complete a transaction and update ubercard order status
+ * @param  $transaction
+ * @return void
+ */
+function uc_payex_order_complete($transaction) {
+    // Order is already processed, nothing to do here.
+  if ($transaction->status == 'captured' || $transaction->status == 'authorized') {
+    return uc_payex_redirect_complete();
+  }
+  // Check if the payment has been completed.
+  $pxc = payex_order_complete(array('orderRef' => $transaction->order_ref));
+
+  // Load order
+  $order = uc_order_load($transaction->order_id);
+
+  if ( !isset($pxc['orderStatus']) ) {
+    drupal_set_message(t('An error occured while validating your payment. Please contact technical support or try again.'), 'error');
+    watchdog('PayEx error', t('An error occured while validating your payment. Please contact technical support or try again.'), array(), WATCHDOG_WARNING);
+    // Remove the transaction so we can try again.
+    $transaction->status = 'error';
+    drupal_write_record('uc_payex_transactions', $transaction, 'transaction_id');
+    return drupal_goto('cart/checkout/checkout');
+  }
+  elseif ($pxc['orderStatus'] == 0) { // 0 is a completed order.
+    // Check transaction status is good.
+    if (in_array($pxc['transactionStatus'], array(0, 3, 6))) {
+
+      // Create payment for the order and update status.
+      watchdog('PayEx done', t('A payment from PayEx was accepted. OrderID is @orderid', array('@orderid' => $order->order_id)));
+      $description = t('A payment from PayEx was accepted.');
+      $order_id = $order->order_id;
+      uc_payment_enter($order_id, 'payex', $pxc['amount'] / 100.0, $order->uid, array('order_ref' => $transaction->order_ref), $description);
+      uc_order_comment_save($order_id, $order->uid, $description, 'admin');
+
+      // Since Übercart don't tell us, get the id of the receipt that was just
+      //inserted. In theory if an admin created at this time, we could have a
+      // race condition. But that's practically impossible to happen IRL.
+      $transaction->receipt_id = uc_payex_transaction_receipt_getid($order->order_id);
+
+      // Auth only
+      if ( $pxc['transactionStatus'] == 3 ) {
+          $transaction->status = 'authorized';
+      }
+      else {
+        // Captured
+        $transaction->status = 'captured';
+        // Update order status.
+        uc_order_update_status($order->order_id, uc_order_state_default('completed'));
+      }
+      drupal_write_record('uc_payex_transactions', $transaction, 'transaction_id');
+
+      //$message = uc_cart_complete_sale($order);
+    }
+    else {
+      $error_message = t('An error happened while processing your payment. OrderID is @orderid', array('@orderid' => $order->order_id));
+      drupal_set_message($error_message);
+      watchdog('PayEx error', $error_message, array(), WATCHDOG_WARNING);
+
+      uc_order_comment_save($order->order_id, $order->uid, $error_message, 'admin');
+      uc_order_update_status($order->order_id, uc_order_state_default('canceled'));
+
+      $transaction->status = 'error';
+      drupal_write_record('uc_payex_transactions', $transaction, 'transaction_id');
+      return drupal_goto('cart/checkout/checkout');
+    }
+    return uc_payex_redirect_complete();
+  }
+  elseif ($pxc['orderStatus'] == 1) { // 1 is a non-complete order. Redirect to the payment form.
+    $error_message = t('You did not complete your payment. OrderID is @orderid', array('@orderid' => $order->order_id));
+    drupal_set_message($error_message);
+    watchdog('PayEx error', $error_message, array(), WATCHDOG_WARNING);
+    return drupal_goto('cart/checkout/checkout');
+  }
+  elseif ($pxc['orderStatus'] == 2) { // 2 is an order that was not found, either because it never existed or it is outdated.
+    $error_message = t('Could not detect payment selection, please select again.  OrderID is @orderid', array('@orderid' => $order->order_id));
+    drupal_set_message($error_message, 'error');
+    watchdog('PayEx error', $error_message, array(), WATCHDOG_WARNING);
+
+    uc_order_comment_save($order->order_id, $order->uid, $error_message, 'admin');
+    uc_order_update_status($order->order_id, uc_order_state_default('canceled'));
+
+    $transaction->status = 'error';
+    drupal_write_record('uc_payex_transactions', $transaction, 'transaction_id');
+    return drupal_goto('cart/checkout/checkout');
+  }
+}
+
+/**
+ * Callback to capture a payment.
+ * @note Right now this only changes status.
+ * @param  $transaction
+ * @return void
+ */
+function uc_payex_capture_payment($transaction) {
+  $transaction->status = 'captured';
+  uc_order_update_status($transaction->order_id, uc_order_state_default('completed'));
+  drupal_write_record('uc_payex_transactions', $transaction, 'transaction_id');
+  drupal_set_message(t('Status updated'), 'status');
+  // Trigger redirect destination.
+  return drupal_goto();
+}
+
+/**
+ * Load active transaction based on order.
+ * @param  $order_id
+ * @return
+ */
+function uc_payex_transaction_load($order_id) {
+  $select = db_select('uc_payex_transactions', 'uc_payex_transactions')
+    ->fields('uc_payex_transactions')
+    ->condition('order_id', $order_id, '=')
+    ->condition('status', 'deleted', '<>')
+    ->condition('status', 'error', '<>');
+
+  $rows_obj = $select->execute()->fetch();
+  return $rows_obj;
+}
+
+/**
+ * Load transaction for a ubercart receipt.
+ * @param  $receipt_id
+ * @return
+ */
+function uc_payex_transaction_receipt_load($receipt_id) {
+  $select = db_select('uc_payex_transactions', 'uc_payex_transactions')
+    ->fields('uc_payex_transactions')
+    ->condition('receipt_id', $receipt_id, '=');
+
+  $rows_obj = $select->execute()->fetch();
+  return $rows_obj;
+}
+
+/**
+ * Get Ubercart receipt ID
+ * @param  $order_id
+ * @return
+ */
+function uc_payex_transaction_receipt_getid($order_id) {
+  $select = db_select('uc_payment_receipts', 'uc_payment_receipts')
+    ->fields('uc_payment_receipts')
+    ->condition('order_id', $order_id, '=')
+    ->orderBy('receipt_id', 'DESC');
+
+  $rows_obj = $select->execute()->fetch();
+  if ($rows_obj) {
+    return $rows_obj->receipt_id;
+  }
+  return false;
+}
+
+/**
+ * Utility function used to redirect to checkout complete page.
+ */
+function uc_payex_redirect_complete() {
+    $_SESSION['do_complete'] = TRUE; // Übercart uses this.
+    return drupal_goto('cart/checkout/complete');
+}

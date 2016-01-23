@@ -1,0 +1,719 @@
+<?php
+/**
+ * @file
+ * Core code for the ad module.
+ */
+
+define('AD_IMPRESSION_ID_PLACEHOLDER', 'AD_IMPRESSION_ID');
+
+include_once 'ad.features.inc';
+include_once 'ad.field.inc';
+include_once 'ad.session.inc';
+
+/**
+ * Implements hook_menu().
+ */
+function ad_menu() {
+  $items = array();
+
+  $items['ad/get'] = array(
+    'type' => MENU_CALLBACK,
+    'title' => 'Get ads',
+    'page callback' => 'ad_get_ads',
+    'access callback' => TRUE,
+  );
+
+  $items['ad/click/%/%'] = array(
+    'type' => MENU_CALLBACK,
+    'title' => 'Click ads',
+    'page callback' => 'ad_click',
+    'page arguments' => array(2, 3),
+    'access callback' => TRUE,
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_page_alter().
+ */
+function ad_page_alter(&$page) {
+  // Path to call to serve the ads.
+  // By default it calls the menu item this module defines. With proper
+  // configuration the ad_serve.php script can be used instead, possibly also
+  // linking it with another name, to mask it from ad blockers.
+  drupal_add_js(array('ad' => array(
+    'ServePath' => variable_get('ad_serve_path', 'ad/get'),
+    'UserID' => $GLOBALS['user']->uid,
+  )), 'setting');
+}
+
+/**
+ * Implements hook_node_load().
+ */
+function ad_node_load($nodes, $types) {
+  $nids = array_keys($nodes);
+  $result = db_query('SELECT * FROM {ad_node} WHERE nid IN (:nids)', array(':nids' => $nids));
+  foreach ($result as $record) {
+    $nid = $record->nid;
+    $nodes[$nid]->total_clicks = $record->total_clicks;
+    $nodes[$nid]->total_impressions = $record->total_impressions;
+  }
+}
+
+/**
+ * Implements hook_preprocess_node().
+ */
+function ad_preprocess_node(&$variables, $hook) {
+  $node = $variables['node'];
+  if (ad_is_node_ad($node)) {
+    $variables['ad_total_impressions'] = '<div>' . t('Total impressions: @total_impressions', array('@total_impressions' => !empty($node->total_impressions) ? $node->total_impressions : 0)) . '</div>';
+    $variables['ad_total_clicks'] = '<div>' . t('Total clicks: @total_clicks', array('@total_clicks' => !empty($node->total_clicks) ? $node->total_clicks : 0)) . '</div>';
+  }
+}
+
+/**
+ * Implements hook_menu_local_tasks_alter().
+ *
+ * Add a link to the stats to the node tabs, for ads only.
+ */
+function ad_menu_local_tasks_alter(&$data, $router_item, $root_path) {
+  if (strpos($root_path, 'node/%') === 0) {
+    foreach ($router_item['page_arguments'] as $item) {
+      if (!empty($item->type) && ad_is_node_ad($item)) {
+        $data['tabs'][0]['output'][] = array(
+          '#theme' => 'menu_local_task',
+          '#link' => array(
+            'title' => t('Ad Stats'),
+            'href' => 'admin/ad/stats/' . $item->nid,
+            'localized_options' => array(
+              'attributes' => array(
+                'title' => t('Ad Stats'),
+              ),
+            ),
+          ),
+        );
+      }
+    }
+  }
+}
+
+/**
+ * Callback during a click event.
+ *
+ * @param int $nid
+ *   The id of the ad being clicked.
+ * @param int $impression_unique_id
+ *   The unique id of the impression that generated the click.
+ */
+function ad_click($nid, $impression_unique_id) {
+  $ad = ad_get_advertisement($nid);
+  if (!empty($ad)) {
+    if ($impression_unique_id != AD_IMPRESSION_ID_PLACEHOLDER) {
+      // Do not track clicks from the administration pages.
+      $impression = ad_load_tracked_event_by_unique_id($impression_unique_id);
+      ad_track_event('click', $ad['nid'], $impression_unique_id, $impression['url'], $impression['page_title'], $impression['page_unique_id'], NULL, NULL);
+    }
+    $destination = ad_get_destination($ad);
+    if (variable_get('ad_debug', FALSE)) {
+      drupal_set_message(t('click: ad @nid, destination @destination', array(
+        '@nid' => $nid,
+        '@destination' => $destination
+      )), 'status');
+      drupal_goto($_SERVER['HTTP_REFERER']);
+    }
+    else {
+      drupal_goto($destination);
+    }
+  }
+  else {
+    // @todo: log invalid ad.
+    drupal_set_message(t('Invalid ad.'), 'warning');
+    drupal_goto();
+  }
+}
+
+/**
+ * Callback for the Ajax request to get ads.
+ */
+function ad_get_ads() {
+  $result = array();
+  $page_unique_id = ad_uniqid('page');
+  if (!empty($_POST['ads'])) {
+    if (!empty($_POST['page'])) {
+      $page_url = $_POST['page']['url'];
+      $page_title = $_POST['page']['title'];
+    }
+    $uid = (int) $_POST['uid'];
+    ad_session_start();
+    foreach ($_POST['ads'] as $element_id => $data) {
+      $view_name = $data['view'];
+      $display = isset($data['display']) ? $data['display'] : 'default';
+      // Be sure the view is specifically set for ads.
+      if (ad_is_view_ad_enabled($view_name, $display)) {
+        $view_arguments = array($view_name, $display);
+        if (!empty($data['arguments'])) {
+          $view_arguments = array_merge($view_arguments, explode('/', $data['arguments']));
+        }
+
+        $view_result = ad_get_cache('views_get_view_result', $view_arguments);
+
+        // Finally, return a result.
+        if (!empty($view_result)) {
+          // Choose one.
+          $random_id = $view_result[array_rand($view_result)]['nid'];
+          $view_mode = ad_get_view_view_mode($view_name, $display);
+          $rendered_ad = ad_get_rendered_node($random_id, $view_mode);
+          // Track it.
+          $impression_unique_id = ad_track_event('impression', $random_id, '', $page_url, $page_title, $page_unique_id, NULL, $uid);
+          $rendered_ad = strtr($rendered_ad, array(
+            AD_IMPRESSION_ID_PLACEHOLDER => $impression_unique_id,
+          ));
+          $result[$element_id] = array(
+            'rendered_ad' => $rendered_ad,
+          );
+        }
+      }
+    }
+  }
+  drupal_json_output($result);
+}
+
+/**
+ * Check whether a view is specifically set for ads.
+ *
+ * @param $view_name
+ *   The name of the view.
+ * @param $display
+ *   (optional) The name of the display to check. Defaults to "default".
+ *
+ * @return bool
+ *   TRUE if the view is ad enabled; FALSE otherwise.
+ */
+function ad_is_view_ad_enabled($view_name, $display = 'default') {
+  $enabled = FALSE;
+  foreach (ad_get_info() as $node_type => $info) {
+    if ($info['display_view'] == $view_name) {
+      $enabled = TRUE;
+      continue;
+    }
+  }
+  return $enabled;
+}
+
+/**
+ * Return whether a node is used for ads.
+ *
+ * @param stdClass|array $node
+ *   A node object or array.
+ *
+ * @return bool
+ *   Whether the node is used for ads.
+ */
+function ad_is_node_ad($node) {
+  $type = is_object($node) ? $node->type : $node['type'];
+  return in_array($type, array_keys(ad_get_info()));
+}
+
+/**
+ * Return the info about the node type(s) that implement ads.
+ *
+ * @param bool $cache
+ *   (optional) Whether to use the cache, if possible. Defaults to FALSE.
+ *
+ * @return array
+ *   An array with the info about the ad node types.
+ */
+function ad_get_info($cache = TRUE) {
+  if (!$cache) {
+    $info = array();
+    foreach (module_implements('ad_info') as $module) {
+      $info = array_merge($info, module_invoke($module, 'ad_info'));
+    }
+    return $info;
+  }
+  else {
+    return ad_get_cache('ad_get_info', array(FALSE));
+  }
+}
+
+/**
+ * Load an Ad node from the cache.
+ *
+ * This function is safe to call from a bootstrap phase lower than full, as it
+ * will perform a full bootstrap if needed.
+ *
+ * @param int $nid
+ *   The ad node id.
+ * @param bool $cache
+ *   (optional) Whether to use the cache, if possible. Defaults to TRUE.
+ *
+ * @return array
+ *   The ad node, turned into an array.
+ */
+function ad_get_advertisement($nid, $cache = TRUE) {
+  if (!$cache) {
+    return node_load($nid);
+  }
+  else {
+    return ad_get_cache('ad_get_advertisement', array($nid, FALSE));
+  }
+}
+
+/**
+ * Return a node rendered in a certain view mode, possibly from the cache.
+ *
+ * @param int $nid
+ *   The ID of node to be rendered.
+ * @param string $view_mode
+ *   The view mode to render the node into.
+ * @param bool $cache
+ *   (optional) Whether to use the cache, if possible. Defaults to TRUE.
+ *
+ * @return string
+ *  The rendered node using the provider view mode.
+ */
+function ad_get_rendered_node($nid, $view_mode, $cache = TRUE) {
+  if (!$cache) {
+    $node = node_load($nid);
+    $render_array = node_view($node, $view_mode);
+    return drupal_render($render_array);
+  }
+  else {
+    return ad_get_cache('ad_get_rendered_node', array($nid, $view_mode, FALSE));
+  }
+}
+
+/**
+ * Return the destination URL of an ad.
+ *
+ * This function supports simple text fields and link fields.
+ *
+ * @param stdClass|array $ad
+ *   The ad node as an object or array.
+ *
+ * @return string
+ *   The destination URL.
+ */
+function ad_get_destination($ad) {
+  // We need to cache objects as arrays, so we might get either an object or
+  // an array.
+  $node = is_object($ad) ? ad_object_to_array($ad) : $ad;
+  $node_type = $node['type'];
+  $ad_info = ad_get_info();
+  $link_field = $ad_info[$node_type]['link_field'];
+  if (!empty($node[$link_field][LANGUAGE_NONE][0]['url'])) {
+    return $node[$link_field][LANGUAGE_NONE][0]['url'];
+  }
+  elseif (!empty($node[$link_field][LANGUAGE_NONE][0]['value'])) {
+    return $node[$link_field][LANGUAGE_NONE][0]['value'];
+  }
+  else {
+    return '';
+  }
+}
+
+/**
+ * Return a view, eventually from the cache.
+ *
+ * Note that the view will be turned into an array, as its object properties.
+ * This function is safe to call from a bootstrap phase lower than full, and
+ * will throw a AdCacheNotFoundException eventually.
+ *
+ * @param $view_name
+ *   The name of the view to be retrieved.
+ *
+ * @return array
+ *   The view, turned into an array.
+ */
+function ad_get_cached_view($view_name) {
+  return ad_get_cache('views_get_view', $view_name);
+}
+
+/**
+ * Get the node view mode used in the ad view.
+ *
+ * @param string $view_name
+ *   The name of the view to query.
+ * @param string $display
+ *   The view display to query.
+ *
+ * @return string
+ *   The node view mode used in the view, or FALSE if a view mode was not found.
+ */
+function ad_get_view_view_mode($view_name, $display) {
+  $view = ad_get_cached_view($view_name);
+  if ($found = _ad_recursive_find($view['display'][$display], 'view_mode')) {
+    return $found;
+  }
+  elseif ($found = _ad_recursive_find($view['display']['default'], 'view_mode')) {
+    return $found;
+  }
+  else {
+    return false;
+  }
+}
+
+/**
+ * Recursively search an array for a key, and return its value.
+ *
+ * @param array $array
+ *   The array to be searched.
+ * @param $needle
+ *   The key to search.
+ *
+ * @return mixed
+ *   The value of the key which was found.
+ */
+function _ad_recursive_find(array $array, $needle) {
+  $iterator = new RecursiveArrayIterator($array);
+  $recursive = new RecursiveIteratorIterator($iterator, RecursiveIteratorIterator::SELF_FIRST);
+  foreach ($recursive as $key => $value) {
+    if ($key === $needle) {
+      return $value;
+    }
+  }
+}
+
+/**
+ * Return the eventually cached results of a callback
+ *
+ * @param string $callback
+ *   The callback to call if the result was not found in the cache.
+ * @param mixed $args
+ *   (optional). The parameter(s) to be passed to the callback. Defaults to an
+ *   empty array.
+ *
+ * @return array
+ *   The result of the call. Any object will be turned into an array, to avoid
+ *   issues with autoloaders when a full bootstrap was not performed.
+ *
+ * @throws AdCacheNotFoundException
+ *   Throw a cache not found exception if the bootstrap phase is not full.
+ *   This exception will be caught by the ad.php script, which will then
+ *   initiate a full bootstrap.
+ */
+function ad_get_cache($callback, $args = array()) {
+  $results = &drupal_static(__FUNCTION__);
+  if (!is_array($args)) {
+    $args = array($args);
+  }
+  $cid = implode(':', array_merge(array('ad', $callback), _ad_flatten($args)));
+  if (strlen($cid) > 255) {
+    // We're building the cid dynamically, so we can't be sure it will be less
+    // than 255 chars, which is the max length when using the db cache backend.
+    // Therefore cut the cid, and replace the last part with a hash; this will
+    // hide part of the cid, but it will avoid errors while guaranteeing
+    //// uniqueness.
+    $hash = hash('sha256', $cid);
+    $cid = substr($cid, 0, 255 - strlen($hash)) . $hash;
+  }
+  $cache_lifetime = variable_get('ad_cache_lifetime', 0);
+  if (!isset($results[$cid])) {
+    if ($cache_lifetime > 0) {
+      $cache = cache_get($cid);
+      if (empty($cache) || $cache->expire < REQUEST_TIME) {
+        ad_bootstrap_full();
+        $results[$cid] = ad_object_to_array(call_user_func_array($callback, $args));
+        cache_set($cid, $results[$cid], 'cache', REQUEST_TIME + $cache_lifetime);
+      }
+      else {
+        $results[$cid] = $cache->data;
+      }
+    }
+    else {
+      ad_bootstrap_full();
+      $result = call_user_func_array($callback, $args);
+      $results[$cid] = ad_object_to_array($result);
+    }
+  }
+  return $results[$cid];
+
+}
+
+/**
+ * Flatten a structure into an array suitable to be the base of a cache id.
+ *
+ * @param $parts
+ *   A structure to flatten.
+ *
+ * @return array
+ *   An array which can be imploded to get a cache id.
+ */
+function _ad_flatten($parts) {
+  $result = array();
+  if (is_array($parts)) {
+    foreach ($parts as $key => $value) {
+      $result[] = $key;
+      $result = array_merge($result, _ad_flatten($value));
+    }
+  }
+  elseif (is_object($parts)) {
+    $result = array_merge($result, _ad_flatten(ad_object_to_array($parts)));
+  }
+  else {
+    $result = array($parts);
+  }
+  return $result;
+}
+
+/**
+ * Track an event, like a click or an impression.
+ *
+ * @param string $type
+ *   The type of the event; this is the bundle of the entity, so it needs to be
+ *   defined as such.
+ * @param int $nid
+ *   The ID of the ad node associated with the event.
+ * @param string $parent_unique_id
+ *   (optional) The id of the parent event; e.g. impressions are parents of
+ *   clicks. Defaults to ''.
+ * @param string $url
+ *   (optional) The URL of the page. Defaults to NULL.
+ * @param string $page_title
+ *   (optional) The title of the page. Defaults to NULL.
+ * @param string $page_unique_id
+ *   (optional) A unique ID identifying a page view; all events (impressions and
+ *   clicks) generated in a certain page view will have the same unique ID.
+ *   Defaults to NULL.
+ * @param string $event_unique_id
+ *   (optional) The unique id of the event; if NULL, a unique id will be
+ *   generated. Defaults to NULL.
+ * @param int $uid
+ *   (optional) The ID of the user associated with the event. If NULL, the
+ *   current user will be used. Defaults to NULL.
+ *
+ * @return int
+ *   The unique ID of the newly created event.
+ */
+function ad_track_event($type, $nid, $parent_unique_id = '', $url = NULL, $page_title = NULL, $page_unique_id = NULL, $event_unique_id = NULL, $uid = NULL) {
+  if (is_null($event_unique_id)) {
+    $event_unique_id = ad_uniqid($type);
+  }
+  if (is_null($uid)) {
+    $uid = $GLOBALS['user']->uid;
+  }
+
+  $data = array(
+    'type' => $type,
+    'uid' => $uid,
+    'created' => REQUEST_TIME,
+    'ad' => $nid,
+    'ip_address' => ip_address(),
+    'user_agent' => isset($_SERVER['HTTP_USER_AGENT']) ? $_SERVER['HTTP_USER_AGENT'] : '',
+    'url' => $url,
+    // Drupal guarantees HTTP_REFERER is always populated (worst case it's
+    // empty.
+    'referrer' => $_SERVER['HTTP_REFERER'],
+    'page_title' => $page_title,
+    'page_unique_id' => $page_unique_id,
+    'parent_unique_id' => $parent_unique_id,
+    'session' => ad_session_get(),
+    'unique_id' => $event_unique_id,
+  );
+
+  if ($type == 'impression' && variable_get('ad_queue_impressions', FALSE)) {
+    $queue = DrupalQueue::get('ad');
+    // Store the impression into a queue for later processing.
+    $queue->createItem($data);
+  }
+  else {
+    ad_bootstrap_full();
+    $event = entity_create('tracked_event', $data);
+    $event->save();
+    if (in_array($type, array('click', 'impression'))) {
+      $counter = ($type == 'click') ? 'total_clicks' : 'total_impressions';
+      ad_increase_denormalized_counter($nid, $counter);
+    }
+  }
+
+  // Another implementation might return UUIDs, if that's faster.
+  return $event_unique_id;
+}
+
+/**
+ * Increase one of the denormalized counters of an ad by one.
+ *
+ * @param $nid
+ *   The ID of the affected ad.
+ * @param $type
+ *   The field to increase: 'total_clicks' or 'total_impressions'.
+ */
+function ad_increase_denormalized_counter($nid, $field) {
+  // Denormalize these counters taking advantage of the properties of the base
+  // table. This allows to be quick while still easily avoiding race conditions.
+  $field = db_escape_field($field);
+  db_query("
+    INSERT INTO {ad_node}
+    (nid, $field)
+    VALUES (:nid, 1)
+    ON DUPLICATE KEY UPDATE $field = $field + 1
+  ", array(':nid' => $nid));
+}
+
+/**
+ * Load a tracked event by its unique id.
+ *
+ * @param $unique_id
+ *   The unique id to search for.
+ *
+ * @return array
+ *   The tracked event as an array, or FALSE if it wasn't found.
+ */
+function ad_load_tracked_event_by_unique_id($unique_id) {
+  return db_query('SELECT * FROM {eck_tracked_event} WHERE unique_id = :unique_id', array('unique_id' => $unique_id))->fetchAssoc();
+}
+
+/**
+ * Return a unique string which can be used to identify an event.
+ *
+ * @param string $type
+ *   The type of unique id.
+ *
+ * @return string
+ *   A unique string.
+ */
+function ad_uniqid($type) {
+  // If serving from multiple server, use a different value for each server to
+  // avoid duplicates.
+  $prefix = $type . '.' . variable_get('ad_uniqid_prefix', $_SERVER['HTTP_HOST']);
+  $uniqid = uniqid($prefix . '.', TRUE);
+  return hash('sha256', $uniqid);
+}
+
+/**
+ * Validate the link, eventually setting a form error.
+ */
+function _ad_eck_validate_url($element, &$form_state, $form) {
+  if (!empty($element['#value'])) {
+    $url = $element['#value'];
+    if (function_exists('link_validate_url')) {
+      $validation = link_validate_url($url);
+      if (!$validation) {
+        form_error($element, t('Invalid URL.'));
+      }
+      else if ($validation == LINK_INTERNAL) {
+        // @todo: should we allow internal links?
+        form_error($element, t('The URL cannot be internal.'));
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_eck_entity_type_insert().
+ *
+ * Note that this is triggered when a type is added, not when an entity is
+ * created.
+ */
+function ad_eck_entity_type_insert($entity_type) {
+  // Add an index which is used in the stats view.
+  if ($entity_type->data['name'] == 'tracked_event') {
+    if (!db_index_exists('eck_tracked_event', 'ad')) {
+      // Be optimistic and use a BIGINT as event id.
+      $table = 'eck_tracked_event';
+      $definition = array(
+        'description' => 'The primary identifier for a(n) tracked_event.',
+        'type' => 'serial',
+        'unsigned' => TRUE,
+        'size' => 'big',
+        'not null' => TRUE,
+      );
+      db_change_field($table, 'id', 'id', $definition);
+
+      // Also add an index which is used often.
+      db_add_index($table, 'ad', array('ad'));
+      db_add_index($table, 'unique_id', array('unique_id'));
+      db_add_index($table, 'parent_unique_id', array('parent_unique_id'));
+    }
+  }
+}
+
+/**
+ * Turn an object into an array, eventually also turning any embedded object.
+ *
+ * This is done because when a object is retrieved from the cache, and a full
+ * bootstrap was not performed, class autoloading fails, and the resulting
+ * object is incomplete.
+ *
+ * @param $object
+ *   The object to be turned into the array.
+ * @return array
+ *   The resulting array.
+ */
+function ad_object_to_array($object) {
+  static $known_objects;
+  if (is_object($object)) {
+    // Don't consider objects which can't be serialized, like Queries.
+    if (($object instanceof Query)) {
+      return;
+    }
+    elseif (!empty($known_objects) && array_search(serialize($object), $known_objects)) {
+      return;
+    }
+    else {
+      // Avoid recursion.
+      $known_objects[] = serialize($object);
+      $object = (array) clone $object;
+    }
+  }
+  if (is_array($object)) {
+    $array = array();
+    foreach($object as $key => $val) {
+      $array[$key] = ad_object_to_array($val);
+    }
+  }
+  else {
+    $array = $object;
+  }
+  return $array;
+}
+
+/**
+ * Eventually perform a full Drupal bootstrap.
+ */
+function ad_bootstrap_full() {
+  // Next line requires Drupal 7.33.
+  // See https://www.drupal.org/node/667098#comment-9301931
+  if (drupal_get_bootstrap_phase() != DRUPAL_BOOTSTRAP_FULL) {
+    drupal_bootstrap(DRUPAL_BOOTSTRAP_FULL);
+    drupal_add_http_header('X-Ad-bootstrap-phase', 'full');
+  }
+}
+
+/*
+ * Implements hook_cron_queue_info().
+ */
+function ad_cron_queue_info(){
+  $queues['ad'] = array(
+    'worker callback' => 'ad_delayed_track_impression',
+    'time' => 120,
+  );
+  return $queues;
+}
+
+/**
+ * Worker callback to track the impression from the queue.
+ *
+ * @param $data
+ */
+function ad_delayed_track_impression($data){
+  $event = entity_create('tracked_event', $data);
+  $event->save();
+  ad_increase_denormalized_counter($data['ad'], 'total_impressions');
+
+  // Also denormalize data in any existing click.
+  db_query("
+    UPDATE eck_tracked_event SET
+      url = :url,
+      page_title = :page_title,
+      page_unique_id = :page_unique_id
+    WHERE
+      type = 'click' AND parent_unique_id = :unique_id
+  ", array(
+    ':url' => $data['url'],
+    ':page_title' => $data['page_title'],
+    ':page_unique_id' => $data['page_unique_id'],
+    ':unique_id' => $data['unique_id'],
+  ));
+}

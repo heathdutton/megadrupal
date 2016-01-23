@@ -1,0 +1,369 @@
+<?php
+/**
+ * @file
+ * Provides authentication integration with Portal Plus web service.
+ */
+
+
+/**
+ * Implements hook_menu().
+ */
+function ppauth_menu() {
+  // users
+  $items['admin/config/services/portalplus'] = array(
+    'title' => 'Portal Plus Integration',
+    'description' => 'Settings for the Portal Plus integration module.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('ppauth_settings'),
+    'access arguments' => array('administer site configuration'),
+    'type' => MENU_NORMAL_ITEM,
+  );
+  return $items;
+}
+
+/**
+ * Admin settings form
+ */
+function ppauth_settings() {
+  $form = array();
+
+  // login uri
+  $form['ppauth_login_uri'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Login Uri'),
+    '#default_value' => variable_get('ppauth_login_uri', ''),
+    '#description' => t('The Uri for the authenticating Portal Plus server.'),
+  );  
+  // Client ID
+  $form['ppauth_client_id'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Client ID'),
+    '#default_value' => variable_get('ppauth_client_id', ''),
+    '#description' => t('The client ID for the authenticating Portal Plus server.'),
+  );
+
+  // Overwrite local password, or not
+  $form['ppauth_overwrite_password'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Overwrite local password'),
+    '#default_value' => variable_get('ppauth_overwrite_password', 0),
+    '#description' => t('If authentication for an existing Drupal user fails locally but succeeds on Portal Plus, should the local password be overwritten by the Portal Plus password?'),
+  );
+
+  // No-overwrite failure message
+  $form['ppauth_no_overwrite_pass_fail_msg'] = array(
+    '#type' => 'textarea',
+    '#title' => t('User message due to disabled password overwrite'),
+    '#rows' => 2,
+    '#default_value' => variable_get('ppauth_no_overwrite_pass_fail_msg',
+    'Your access to this site is denied because your Portal Plus password does not match your password on this site.'),
+    '#description' => t('The message to give the user when their login cannot succeed because overwriting the local password is disabled. If blank, the user will receive no information other than normal login failure.' ),
+  );
+
+  // Members only, or not
+  $form['ppauth_members_only'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Only allow Portal Plus members to log in'),
+    '#default_value' => variable_get('ppauth_members_only', 0),
+    '#description' => t('With this option selected, only non-lapsed member users of the Portal Plus system will be able to login. Lapsed members, non-members, and user that only exist locally, will not be able to log in. (Note: An exception is made for User 1 so that this site can still be administered.)'),
+  );
+
+  // Non-member login failure message
+  $form['ppauth_non_member_msg'] = array(
+    '#type' => 'textarea',
+    '#title' => t('User message due to non-member login attempt'),
+    '#rows' => 2,
+    '#default_value' => variable_get('ppauth_non_member_msg',
+    'You are not an active Portal Plus member and do not have access to this site.'),
+    '#description' => t('The message to give to users, other than active Portal Plus members, who fail to log in to a members-only the site. If blank, the user will receive no information other than normal login failure.' ),
+  );
+
+  // Get all roles other than Anonymous and Authenticated
+  $roles = user_roles();
+  unset( $roles[1] );
+  unset( $roles[2] );
+
+  // Add a NULL option to allow deselection of role.
+  $options = array( NULL => '--' . t('Select') . '--' );
+  foreach ( $roles as $key => $value ) {
+    $options[$key] = $value;
+  }
+
+  // Member role assignment
+  $form['ppauth_members_role'] = array(
+    '#type' => 'select',
+    '#options' => $options,
+    '#title' => t('Role to assign to active Portal Plus members'),
+    '#default_value' => variable_get('ppauth_members_role', 0),
+    '#description' => t('Choose which role to assign to active Portal Plus members on successful login.'),
+  );
+
+  // Non-member role removal
+  $form['ppauth_remove_members_role'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Remove the the members role from non-members' ),
+    '#default_value' => variable_get('ppauth_remove_members_role', 0),
+    '#description' => t('With this option selected, any user that successfully logs in, while not being an active Portal Plus member, will have the selected members role removed.'),
+  );
+  
+  return system_settings_form($form);
+}
+
+/**
+ * Implements hook_form_alter()
+ */
+function ppauth_form_alter(&$form, &$form_state, $form_id) {
+  if ($form_id == 'user_login_block' || $form_id == 'user_login') {
+    $form['#validate'] = array(
+      'user_login_name_validate',
+      'ppauth_login_validate',
+      'user_login_final_validate'
+    );
+  }
+}
+
+/**
+ * Login form validation callback.
+ */
+function ppauth_login_validate($form, &$form_state) {
+
+  $username = $form_state['values']['name'];
+  $password = $form_state['values']['pass'];
+
+  if ( _ppauth_log_in_user_1( $username, $password ) ) {
+    $form_state['uid'] = 1;
+    return;
+  }
+
+  $ppauth_result =
+    _ppauth_authenticate_against_portal_plus( $username, $password );
+
+  $is_members_only_site = variable_get( 'ppauth_members_only', FALSE );
+
+  $is_pp_authenticated = $ppauth_result && $ppauth_result->Response;
+
+  $is_active_member = $is_pp_authenticated &&
+    $ppauth_result->CategoryType == 'M' && !$ppauth_result->Lapsed;
+
+  if ( $is_members_only_site  &&  ! $is_active_member ) {
+    _ppauth_report_non_member_login_failure( $is_pp_authenticated );
+    return;
+  }
+
+  $uid = _ppauth_log_in_user( $username, $password, $is_pp_authenticated );
+  if ( $uid ) {
+    $form_state['uid'] = $uid;
+    _ppauth_manage_members_role( $uid, $is_active_member );
+  }
+  else {
+    $msg = t("Could not authenticate against the website or Portal Plus. Please try again.");
+    drupal_set_message( check_plain( $msg ), 'error' );
+    watchdog( 'ppauth', 'authentication error', array(), WATCHDOG_NOTICE );
+  }
+}
+
+/**
+ * Report log
+
+ /**
+  * Log in user 1 if possible.
+  *
+  * @return
+  *   1 on successful authentication, else FALSE.
+ */
+function _ppauth_log_in_user_1( $username, $password ) {
+
+  $account =
+    module_invoke( 'user', 'load_by_name', $username );
+
+  // Is the given login name the name of user 1?
+  if ( $account  &&  $account->uid == 1 ) {
+
+    $uid = module_invoke( 'user', 'authenticate', $username, $password );
+    return $uid;
+  }
+
+  return FALSE;
+}
+
+/**
+ * Authenticate against Portal Plus
+ *
+ * @return
+ *   The result object from the authentication check, or NULL on error.
+ */
+function _ppauth_authenticate_against_portal_plus( $username, $password ) {
+
+  //Get needed variables
+  $auth_url = trim(variable_get('ppauth_login_uri', ''));
+  $client_id = variable_get('ppauth_client_id', '');
+
+  $args = array();
+  $args['ClientID'] = trim($client_id);
+  $args['UserName'] = trim($username);
+  $args['Password'] = trim($password);
+
+  // Try to authenticate user against Portal Plus.
+  try {
+    $client = new SoapClient( $auth_url );
+    $result = $client->CheckAccount( $args );
+    return $result->CheckAccountResult;
+  }
+  catch ( Exception $e ) {
+    drupal_set_message(
+      'SOAP error: ' . check_plain( $e->getMessage() ), 'error' );
+    watchdog( 'ppauth', 'SOAP error: @msg',
+      array( '@msg' => $e->getMessage() ), WATCHDOG_ERROR );
+    return NULL;
+  }
+}
+
+/**
+ * Tell the user why they failed to log in to this members only site.
+ *
+ * @param $is_pp_authenticated
+ *   TRUE if user was authenticated against Portal Plus, else FALSE.
+ */
+function _ppauth_report_non_member_login_failure( $is_pp_authenticated ) {
+
+  if ( $is_pp_authenticated ) {
+
+    $msg = variable_get( 'ppauth_non_member_msg', '' );
+    if ( !empty( $msg ) ) {
+      drupal_set_message( check_plain( $msg ), 'error' );
+    }
+  }
+  else {
+
+    $msg =
+      t("Could not authenticate against Portal Plus. Please try again.");
+    drupal_set_message( check_plain( $msg ), 'error' );
+    watchdog( 'ppauth', 'authentication error', array(), WATCHDOG_NOTICE );
+  }
+
+  return;
+}
+
+/**
+ * Log user in to Drupal.
+ *
+ * If authentication succeeded against Portal Plus then a local user may
+ * be created or updated in order to facilitate the login.
+ *
+ * @param $is_pp_authenticated
+ *   TRUE if user authenticated against Portal Plus, else FALSE.
+ *
+ * @return
+ *   The user ID (uid) if the user was logged in, else FALSE.
+ */
+function _ppauth_log_in_user( $username, $password, $is_pp_authenticated ) {
+
+  $success_message = t('Portal Plus authentication success');
+
+  // Try a standard login first
+  $uid = module_invoke( 'user', 'authenticate', $username, $password );
+  if ( $uid ) {
+    return $uid;
+  }
+
+  // Local login failed. Was user NOT authenticated by Portal Plus?
+  if ( ! $is_pp_authenticated ) {
+    return FALSE;
+  }
+
+  $account = module_invoke( 'user', 'load_by_name', $username );
+
+  // Does this user already exist on the local Drupal system?
+  if ( $account ) {
+
+    // Local account must have different password from Portal Plus account.
+
+    $do_overwrite_password =
+      variable_get( 'ppauth_overwrite_password', FALSE );
+
+    if ( $do_overwrite_password ) {
+
+      // Overwrite local password with Portal Plus password.
+      $user_info = array( 'pass' => $password );
+      $account = user_save( $account, $user_info );
+
+      // Did saving the new password succeed?
+      if ( $account ) {
+        watchdog( 'ppauth', 'Changed password for user: @name',
+          array( '@name' => $username ), WATCHDOG_NOTICE );
+        drupal_set_message( $success_message );
+
+        return $account->uid;
+      }
+      else {
+        watchdog( 'ppauth', 'Failed to change password for user: @name',
+          array( '@name' => $username ), WATCHDOG_ERROR );
+        return FALSE;
+      }
+    }
+    else {
+      $msg = variable_get( 'ppauth_no_overwrite_pass_fail_msg', '' );
+      if ( !empty( $msg ) ) {
+        drupal_set_message( check_plain( $msg ), 'warning' );
+      }
+      return FALSE;
+    }
+  }
+  else {
+
+    // User does not exist locally: Try to create new Drupal user.
+    $userinfo = array(
+      'name' => $username,
+      'pass' => $password,
+      'mail' => $username,
+      'init' => $username,
+      'status' => 1
+    );
+    $account = user_save('', $userinfo);
+
+    // Was user account creation successful?
+    if ( $account ) {
+      watchdog( 'ppauth', 'New user @name created from Portal Plus.',
+        array( '@name' => $username ), WATCHDOG_NOTICE );
+      drupal_set_message( $success_message );
+
+      return $account->uid;
+    }
+    else {
+      watchdog( 'ppauth', 'Failed to create user from details: @info',
+        array( '@info' => serialize($user_info) ), WATCHDOG_ERROR );
+      return FALSE;
+    }
+  }
+}
+
+/**
+ * Add or remove any member role from the given user.
+ *
+ * @param $uid
+ *   The ID of the given user.
+ * @param $is_active_member
+ *   Whether the user is an active Portal Plus member.
+ */
+function _ppauth_manage_members_role( $uid, $is_active_member ) {
+
+  $members_role = variable_get( 'ppauth_members_role', NULL );
+
+  if ( $members_role ) {
+
+    $account = module_invoke('user', 'load', $uid); 
+
+    if ( $is_active_member  &&  ! isset( $account->roles[$members_role] ) ) {
+      $roles = user_roles();
+      $account->roles[$members_role] = $roles[$members_role];
+      $account = module_invoke('user', 'save', $account); 
+    }
+    else { 
+      $is_remove_role = variable_get( 'ppauth_remove_members_role', FALSE );
+      if ( $is_remove_role  &&  isset( $account->roles[$members_role] ) ) {
+        unset( $account->roles[$members_role] );
+        $account = module_invoke('user', 'save', $account); 
+      }
+    }
+  }
+}
