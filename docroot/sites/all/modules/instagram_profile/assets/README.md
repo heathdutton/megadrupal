@@ -1,1 +1,0 @@
-Instagram_Icon_Large.png is sourced from http://instagram.com/press/ and is used in accordance with Instagram's brand assets at http://help.instagram.com/304689166306603.
