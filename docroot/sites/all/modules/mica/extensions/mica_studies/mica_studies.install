@@ -1,0 +1,316 @@
+<?php
+
+/**
+ * @file
+ * Install, update and uninstall functions for the Mica Studies module.
+ */
+
+require_once('mica_studies.migrate.inc');
+include_once(drupal_get_path('module', 'mica_core') . '/mica_core.block.utils.inc');
+
+/**
+ * Implements hook_install().
+ */
+function mica_studies_install() {
+  _mica_import_custom_name_format();
+  _mica_node_reference_block();
+  _mica_studies_create_date_format();
+  _mica_studies_config_blocks();
+}
+
+/**
+ *
+ * Updates the mapping of field_data_sources. Values will be changed from-to:<br>
+ * 'cross_sectional_questionnaires' = 'questionnaires'<br>
+ * 'longitudinal_questionnaires' = 'questionnaires'<br>
+ * 'cross_sectional_physical_measures' = 'physical_measures'<br>
+ * 'longitudinal_physical_measures' = 'physical_measures'<br>
+ * 'cross_sectional_biological_samples' = 'biological_samples'<br>
+ * 'longitudinal_biological_samples' = 'biological_samples'<br><br>
+ * Updates field_dataset_studies from viewreference to node_reference
+ * @param $sandbox
+ * @throws DrupalUpdateException
+ * @return message
+ */
+function mica_studies_update_7120(&$sandbox) {
+  try {
+
+    mica_core_configure_feeds_tamper('mica_studies');
+
+    if (db_table_exists('field_data_field_data_sources')) {
+      $mappings = array('questionnaires', 'physical_measures', 'biological_samples');
+      foreach ($mappings as $mapping) {
+        db_update('field_data_field_data_sources')
+          ->fields(array('field_data_sources_value' => $mapping))
+          ->condition('field_data_sources_value', '%_' . $mapping, 'LIKE')
+          ->execute();
+      }
+    }
+    features_revert(array('mica_studies' => array('field', 'field_group', 'variable', 'views_view')));
+    return st('The field_data_sources mapping update is completed and the field field_dataset_studies has been updated.');
+  } catch (Exception $e) {
+    throw new DrupalUpdateException('Failed to update mica_studies: ' . $e->getMessage());
+  }
+}
+
+/**
+ *
+ * Migrate data from recruitment_procedures to recruitment_sources field.<br>
+ * Apply new permissions.
+ */
+function mica_studies_update_7130(&$sandbox) {
+  features_revert(array('mica_studies' => array('field', 'field_group', 'search_api_index', 'user_permission')));
+
+  // $base_path = drupal_get_path('module', 'mica_studies') . '/taxonomies/';
+  _mica_studies_create_source_of_recruitment_taxonomy();
+
+  // map values from recruitment_procedures to recruitment_sources
+  _mica_studies_migrate_field_recruitment_procedures();
+
+  $config = array(
+    'field_recruitment_sources' => array(
+      'name' => t('Recruitment sources'),
+      'collapsible' => COLLAPSIBLOCK_TYPE_COLLAPSED_BY_DEFAULT
+    ),
+  );
+  mica_core_configure_facet_blocks('studies_index', 'study', $config, 'studies-search');
+}
+
+/**
+ * Create custom date format because Features does not support date_formats yet
+ * @see http://drupal.org/node/1279928
+ */
+function _mica_studies_create_date_format() {
+  $pattern = 'M Y';
+
+  $format = array();
+  $format['format'] = $pattern;
+  $format['type'] = 'custom';
+  $format['locked'] = 0;
+  $format['is_new'] = 1;
+  system_date_format_save($format);
+
+  $machine_name = 'month_year';
+  $format_type = array();
+  $format_type['title'] = 'Month year';
+  $format_type['type'] = $machine_name;
+  $format_type['locked'] = 0;
+  $format_type['is_new'] = 1;
+  system_date_format_type_save($format_type);
+
+  variable_set('date_format_' . $machine_name, $pattern);
+}
+
+function _mica_import_custom_name_format() {
+  // add custom field format for name until next release of views
+  $custom_format = array(
+    'name' => 'Title',
+    'machine_name' => 'title',
+    'format' => 't',
+  );
+  drupal_write_record('name_custom_format', $custom_format);
+}
+
+function _mica_node_reference_block() {
+  db_delete('block_node_type')
+    ->condition('module', 'node_reference_block')
+    ->condition('delta', 'related-content')
+    ->condition('type', 'study%', 'LIKE')
+    ->execute();
+  $query = db_insert('block_node_type')->fields(array('type', 'module', 'delta'));
+  foreach (array('study', 'contact') as $type) {
+    $query->values(array(
+      'type' => $type,
+      'module' => 'node_reference_block',
+      'delta' => 'related-content',
+    ));
+  }
+  $query->execute();
+}
+
+function _mica_studies_create_source_of_recruitment_taxonomy() {
+  $vocabulary = _mica_core_taxonomy_create('sources_of_recruitment.csv', 'Source of Recruitment');
+  $vid = $vocabulary->vid;
+
+  $term = mica_core_taxonomy_term_save($vid, 'General population');
+  mica_core_taxonomy_term_save($vid, 'Volunteer enrolment', $term->tid, 40);
+  mica_core_taxonomy_term_save($vid, 'Selected sample (e.g.: from governmental databases)', $term->tid, 50);
+
+  mica_core_taxonomy_term_save($vid, 'Participants from existing studies');
+
+  $term = mica_core_taxonomy_term_save($vid, 'Specific population');
+  mica_core_taxonomy_term_save($vid, 'Clinic patients', $term->tid, 30);
+  mica_core_taxonomy_term_save($vid, 'Members of specific association (professional association, patients network, etc)', $term->tid, 40);
+  mica_core_taxonomy_term_save($vid, 'Other source', $term->tid, 50);
+}
+
+function _mica_studies_migrate_field_recruitment_procedures() {
+
+  // Move data from field_recruitment_procedures to taxonomy field_recruitment_source
+  $result = db_select('field_data_field_recruitment_procedures', 'r')
+    ->fields('r', array('entity_id', 'field_recruitment_procedures_value'))
+    ->execute();
+
+  while ($record = $result->fetchAssoc()) {
+    $value = $record['field_recruitment_procedures_value'];
+
+    // insert taxonomy data
+    $study = node_load((int) $record['entity_id']);
+    $wrapper = entity_metadata_wrapper('node', $study);
+
+    $sources = $wrapper->field_recruitment_sources->value();
+    $terms = array();
+    switch ($value) {
+      case 'general_population' :
+        $terms = taxonomy_get_term_by_name('General population', 'sources_of_recruitment');
+        break;
+      case 'legacy_studies' :
+        $terms = taxonomy_get_term_by_name('Participants from existing studies', 'sources_of_recruitment');
+        break;
+      case 'specific_population' :
+        $terms = taxonomy_get_term_by_name('Specific population', 'sources_of_recruitment');
+        break;
+      case 'other' :
+        $terms = taxonomy_get_term_by_name('Other source', 'sources_of_recruitment');
+        break;
+    }
+
+    if (!empty($terms)) {
+      $k = array_keys($terms);
+      $tids = array();
+      if (!empty($sources)) {
+        foreach ($sources as $source) {
+          $tids[] = $source->tid;
+        }
+      }
+      array_push($tids, $k[0]);
+      $wrapper->field_recruitment_sources->set($tids);
+      $wrapper->save();
+    }
+  }
+
+  spl_autoload_register('_search_api_solr_autoload');
+  field_delete_field('field_recruitment_procedures');
+}
+
+/**
+ * Replace built-in node title by title_field
+ */
+function mica_studies_update_7500(&$sandbox) {
+  module_load_install('mica_core');
+
+  mica_core_replace_titles(array('contact', 'documents', 'study'));
+
+  field_delete_field('field_complete_name');
+
+  features_revert(array('mica_studies' => array('variable', 'search_api_index', 'views_view')));
+}
+
+/**
+ * Update Mica Studies views
+ */
+function mica_studies_update_7700(&$update) {
+  features_revert(array('mica_studies' => array('views_view')));
+}
+
+/**
+ * Update Mica content types
+ */
+function mica_studies_update_7802(&$update) {
+  _mica_studies_migrate_field_design();
+  features_revert(array(
+    'mica_studies' => array(
+      'node',
+      'variable',
+      'search_api_index',
+      'views_view',
+      'facetapi',
+      'corresponding_node_references',
+      'field_base',
+      'field_group',
+      'field_instance',
+      'user_permission',
+    )
+  ));
+  drupal_set_message(t('To complete the update process, ')
+  . l('click here', 'admin/config/development/mica_studies') . ' ' . t('and click on Run'), 'warning');
+}
+
+/**
+ * Implements hook_update_dependencies().
+ */
+function mica_studies_update_dependencies() {
+  $dependencies = array();
+  $dependencies['mica_studies'][7500] = array('mica_core' => 7500);
+  $dependencies['mica_studies'][7800] = array('search_api_solr' => 7102);
+  return $dependencies;
+}
+
+function _mica_studies_config_blocks() {
+  mica_core_set_block_node_type('study', 'mica_studies', 'study-general-info');
+  mica_core_set_block_node_type('study', 'mica_studies', 'study-general-design');
+  mica_core_set_block_node_type('study', 'mica_studies', 'study-access');
+  mica_core_set_block_node_type('study', 'mica_studies', 'study-marker-paper');
+  mica_core_set_block_node_type('study', 'mica_studies', 'study-documents');
+  mica_core_set_block_node_type('study', 'mica_studies', 'study-supp-infos');
+  mica_core_set_block_node_type('study', 'mica_studies', 'study-populations');
+  mica_core_set_block_node_type('study', 'mica_studies', 'study-timeline');
+  mica_core_set_block_node_type('study', 'mica_studies', 'study-datasets');
+  mica_core_set_block_node_type('study', 'mica_studies', 'study-authorization');
+//  mica_core_set_block_node_type('study', 'mica_studies', 'study-menu');
+}
+
+function _mica_studies_migrate_field_design() {
+  // get all registry design
+  $result = db_select('field_data_field_design', 'f')
+    ->fields('f', array('entity_id'))
+    ->fields('f', array('revision_id'))
+    ->fields('f', array('language'))
+    ->condition('field_design_value', 'registry')
+    ->execute();
+
+  foreach ($result as $row) {
+    $exist = db_select('field_data_field_design_other_sp', 'f')
+      ->fields('f', array('entity_id'))
+      ->fields('f', array('field_design_other_sp_value'))
+      ->condition('entity_id', $row->entity_id)
+      ->condition('deleted', 0)
+      ->execute();
+
+    //verify if 'other' field already exist
+    if ($exist->rowCount() > 0) {
+      foreach ($exist as $res) {
+        //concatenation of the past value and new
+        db_update('field_data_field_design_other_sp')
+          ->fields(array('field_design_other_sp_value' => $res->field_design_other_sp_value . ', Registry Study Design'))
+          ->condition('entity_id', $res->entity_id)
+          ->condition('deleted', 0)
+          ->execute();
+      }
+    }
+    else {
+      // if not exist, insert a new one
+      db_insert('field_data_field_design_other_sp')
+        ->fields(array(
+          'entity_type' => 'node',
+          'bundle' => 'study',
+          'deleted' => 0,
+          'entity_id' => $row->entity_id,
+          'revision_id' => $row->revision_id,
+          'language' => $row->language,
+          'delta' => 0,
+          'field_design_other_sp_value' => 'Registry Study Design',
+        ))->execute();
+      //update his registry design
+      db_update('field_data_field_design')
+        ->fields(array('field_design_value' => 'other'))
+        ->condition('field_design_value', 'registry')
+        ->condition('entity_id', $row->entity_id)
+        ->execute();
+    }
+  }
+  //delete all registry design left
+  db_delete('field_data_field_design')
+    ->condition('field_design_value', 'registry')
+    ->execute();
+}

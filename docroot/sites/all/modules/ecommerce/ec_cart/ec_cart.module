@@ -1,0 +1,998 @@
+<?php
+
+/**
+ * @file
+ * Manage the user selected products (cart), the checkout pages and the checkout
+ * review screen.
+ */
+
+define('EC_CART_SHOW', 0);
+define('EC_CART_HIDE_EMPTY', 1);
+
+define('EC_CART_ITEM_REMOVED', 1);
+define('EC_CART_ITEM_ADDED', 2);
+define('EC_CART_ITEM_UPDATED', 3);
+
+/**
+ * Implements hook_menu().
+ */
+function ec_cart_menu() {
+  $items = array();
+
+  $items['cart/view'] = array(
+    'title' => 'Shopping cart',
+    'page callback' => 'ec_cart_view',
+    'access arguments' => array('access content'),
+    'type' => MENU_SUGGESTED_ITEM,
+  );
+  $items['cart/%/%'] = array(
+    'title' => 'Shopping cart',
+    'page callback' => 'ec_cart_modify',
+    'page arguments' => array(1, 2),
+    'access arguments' => array('access content'),
+    'type' => MENU_CALLBACK,
+  );
+  $items['cart/checkout'] = array(
+    'title' => 'Cart checkout',
+    'page callback' => 'ec_cart_checkout',
+    'access arguments' => array('access content'),
+    'type' => MENU_CALLBACK,
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_theme().
+ */
+function ec_cart_theme() {
+  return array(
+    'ec_cart_empty' => array(
+      'variables' => array(),
+      'path' => drupal_get_path('module', 'ec_cart') . '/templates',
+      'template' => 'ec-cart-empty',
+      'file' => 'theme.inc',
+    ),
+    'ec_cart_view_form' => array(
+      'render element' => 'form',
+      'template' => 'ec-cart-view-form',
+      'path' => drupal_get_path('module', 'ec_cart') . '/templates',
+      'file' => 'theme.inc',
+    ),
+    'ec_cart_display_block' => array(
+      'variables' => array(
+        'cart' => NULL,
+        'items' => NULL,
+      ),
+      'path' => drupal_get_path('module', 'ec_cart') . '/templates',
+      'template' => 'ec-cart-display-block',
+      'file' => 'theme.inc',
+    ),
+    'ec_cart_display_block_empty' => array(
+      'template' => 'ec-cart-display-block-empty',
+      'original hook' => 'ec_cart_display_block',
+      'path' => drupal_get_path('module', 'ec_cart') . '/templates',
+    ),
+    'ec_cart_display_block_cached' => array(
+      'template' => 'ec-cart-display-block-empty',
+      'original hook' => 'ec_cart_display_block',
+      'path' => drupal_get_path('module', 'ec_cart') . '/templates',
+    ),
+    'ec_cart_display_item' => array(
+      'variables' => array(
+        'item' => NULL,
+        'attributes' => array(),
+      ),
+      'path' => drupal_get_path('module', 'ec_cart') . '/templates',
+      'template' => 'ec-cart-display-item',
+      'file' => 'theme.inc',
+    ),
+  );
+}
+
+/**
+ * Implements hook_exit().
+ *
+ * Always clear the cart/view page for anonymous users from the cache otherwise
+ * the cart/view page will be out of sync.
+ */
+function ec_cart_exit() {
+  global $user, $base_root;
+
+  if (isset($_GET['q']) && strstr($_GET['q'], 'cart') && $user->uid == 0 && variable_get('cache', 0)) {
+    cache_clear_all($base_root . request_uri(), 'cache_page', TRUE);
+  }
+}
+
+/**
+ * Implements hook_help().
+ */
+function ec_cart_help($path, $args) {
+  switch ($path) {
+    case 'admin/config/store/checkout':
+      return t('This form is used to control the order the pages are viewed in the checkout process. Drag to change the order you would like these screens to appear and click on save configuration to apply those changes.');
+  }
+}
+
+/**
+ * Implements hook_node_view().
+ */
+function ec_cart_node_view($node, $view_mode, $langcode) {
+  if (variable_get('ec_product_cart_addition_by_link', TRUE) && empty($node->hide_cart_link) && (($view_mode == 'teaser' && variable_get('ec_product_cart_on_teaser', 1)) || !$view_mode != 'teaser') && ($links = ec_cart_build_links($node))) {
+    $node->content['links']['ec_cart'] = array(
+      '#theme' => 'links__ecommerce__cart',
+      '#links' => $links,
+    );
+  }
+}
+
+/**
+ * Implements hook_node_delete().
+ */
+function ec_cart_node_delete($node) {
+  return db_delete('ec_cart')
+    ->condition('nid', $node->nid)
+    ->execute();
+}
+
+/**
+ * Implements hook_cron().
+ *
+ * Remove old items from the cart table.
+ * Remove items from the cart table that haven't been
+ * touched for more than a month.
+ */
+function ec_cart_cron() {
+  db_delete('ec_cart')
+    ->condition('changed', strtotime('Last month'), '<')
+    ->execute();
+}
+
+/**
+ * Implements hook_user_login().
+ */
+function ec_cart_user_login(&$edit, $account) {
+  // Convert their cart session to a permanent user cart at login.
+  db_update('ec_cart')
+    ->fields(array(
+      'cookie_id' => $account->uid,
+    ))
+    ->condition('cookie_id', ec_checkout_get_id())
+    ->execute();
+  unset($_SESSION['ec_checkout_id']);
+  
+  // Re-validate all the items to make sure the registered user can purchase them.
+  if ($items = ec_cart_current()) {
+    foreach ($items as $item) {
+      if (!ec_product_can_purchase($item, 'ec_cart')) {
+        drupal_set_message(t('Now unable to purchase product %title, removing from cart.', array('%title' => $item->title)));
+        ec_cart_update_item($item->nid, 0);
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_link().
+ *
+ * Defines the 'Add to cart' link.
+ */
+function ec_cart_link($type, $node = NULL, $teaser = FALSE, $view = FALSE) {
+  $links = array();
+
+  switch ($type) {
+    case 'checkout':
+      $links = ec_cart_build_links($node);
+      if (empty($links) && ec_product_can_purchase($node, 'ec_cart') && !$node->hide_cart_link) {
+        $links['add-to-cart'] = array(
+          'title' => t('Add to cart'),
+          'href' => 'node/' . $node->nid,
+        );
+      }
+  }
+  return $links;
+}
+
+/**
+ * @todo Please document this function.
+ * @see http://drupal.org/node/1354
+ */
+function ec_cart_build_links($node) {
+  global $user;
+  
+  $links = array();
+  $qty = 1;
+  $data = array();
+
+  if (isset($node->ptype) && ec_product_attributes_get($node, 'no_cart') !== TRUE && ec_product_attributes_get($node, 'use_product_cart_form') !== TRUE) {
+    if (ec_checkout_validate_item($node, 'ec_cart', $qty, $data, EC_VALIDATE_ITEM_SEVERITY_LOW)) {
+      $items = ec_cart_current();
+
+      // Is it already in our cart?
+      if (isset($items[$node->nid])) {
+        $links['view-cart'] = array(
+          'title' => t('This item is in !cart_view.', array('!cart_view' => l(t('Your shopping cart'), 'cart/view'))),
+          'html'  => TRUE,
+        );
+      }
+      else {
+        // In stock, and not in the cart, show a normal link.
+        $links['add-to-cart'] = array(
+          'attributes' => array(
+            'id'    => 'cart-item-'. $node->nid,
+            'class' => 'cart-link',
+            'title' => t('Add this item to your shopping cart.')
+          ),
+          'title'      => t('Add to cart'),
+          'href'       => 'cart/'. $node->nid . '/+1',
+          'query'      => drupal_get_destination(),
+        );
+      }
+    }
+    else {
+      if (!$user->uid) {
+        switch (ec_anon_get_product_policy($node)) {
+          case ECANON_POLICY_NEVER_CART:
+            foreach (ec_cart_current() as $item) {
+              if (ec_anon_get_product_policy($item) == ECANON_POLICY_ALWAYS) {
+                $links['cart-not-available'] = array(
+                  'title' => t('This product is not available with other products you are currently purchasing.'),
+                  'html' => TRUE,
+                );
+              }
+            }
+            break;
+
+          case ECANON_POLICY_ALWAYS:
+            foreach (ec_cart_current() as $item) {
+              if (ec_anon_get_product_policy($item) == ECANON_POLICY_NEVER_CART) {
+                $links['cart-not-available'] = array(
+                  'title' => t('This product is not available with other products you are currently purchasing.'),
+                  'html' => TRUE,
+                );
+              }
+            }
+            break;
+        }
+      }
+    }
+  }
+  return $links;
+}
+
+/**
+ * Implements hook_ec_transaction_insert().
+ * Empty cart when transaction is completed and inserted.
+ */
+function ec_cart_ec_transaction_insert(&$txn) {
+  if ($txn->type == 'ec_cart') {
+    ec_cart_empty();
+  }
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function ec_cart_form_node_form_alter(&$form, &$form_state, $form_id) {
+  $node = & $form['#node'];
+  if (ec_product_can_be_converted($form['#node']->type, TRUE)) {
+    if (empty($form['product']['special_options'])) {
+      if (empty($form['product'])) {
+        $form['product'] = array();
+      }
+      $form['product']['special_options'] = array();
+    }
+
+    $form['product']['special_options']['hide_cart_link'] = array(
+      '#type' => 'radios',
+      '#title' => t('"Add to cart" link'),
+      '#default_value' => isset($node->hide_cart_link) ? $node->hide_cart_link : 0,
+      '#options' => array(t('Visible'), t('Hidden')),
+      '#description' => t('Choose whether or not you want the "Add to cart" link visible for this product.'),
+      '#weight' => -5,
+    );
+  }
+}
+
+/**
+ * Implements hook_form_alter().
+ * for modifying the checkout product form.
+ */
+function ec_cart_form_ec_checkout_product_form_alter(&$form, &$form_state) {
+  $nids = element_children($form['products']);
+  $nid = reset($nids);
+  $node =& $form['products'][$nid]['#node'];
+
+  if (ec_product_attributes_get($node, 'no_cart') !== TRUE && ec_product_can_purchase($node, 'ec_cart')) {
+    $form['submit']['cart'] = array(
+      '#type' => 'submit',
+      '#value' => t('Add to cart'),
+      '#submit' => array('ec_cart_product_form_submit'),
+    );
+  }
+}
+
+/**
+ * The "Add to cart" form with Quantity.
+ *
+ * @param $form_id
+ * @param $form_values
+ * @ingroup form
+ */
+function ec_cart_product_form_submit(&$form, &$form_state) {
+  foreach ($form_state['values']['products'] as $nid => $item) {
+    if (!isset($node)) {
+      $node = node_load($nid);
+    }
+    $event = FALSE;
+
+    if ($status = ec_cart_update_item($nid, isset($item['qty']) ? $item['qty'] : NULL, isset($item['data']) ? $item['data'] : NULL)) {
+      switch ($status) {
+        case EC_CART_ITEM_ADDED:
+          $message = t('Your item has been added.');
+          $event = 'ec_cart_add';
+          break;
+        case EC_CART_ITEM_UPDATED:
+          $message = t('Your item has been updated.');
+          $event = 'ec_cart_edit';
+          break;
+        case EC_CART_ITEM_REMOVED:
+          $message = t('Your item has been removed.');
+          $event = 'ec_cart_delete';
+          break;
+      }
+      if (isset($message)) {
+        drupal_set_message($message);
+      }
+      if ($event) {
+        rules_invoke_event($event, $node);
+      }
+    }
+  }
+}
+
+
+
+/**
+ * Main transition between cart and checkout. Will keep the user on cart/view
+ * if there are errors, but will send to checkout/process and initialize the
+ * cart otherwise.
+ *
+ * Note: this function is a good example of how modules must initialize the cart
+ * before sending the user there. This is possibly legacy of cart/checkout being combined.
+ */
+function ec_cart_checkout() {
+  $txn = new stdClass();
+  $txn->type = 'ec_cart';
+  $txn->items = ec_cart_current();
+
+  if (empty($txn->items)) {
+    // User has no items in their cart, send them to an informative screen.
+    drupal_goto('cart/view');
+  }
+
+  // I think we've already validated the items, but we're doing it again
+  // before sending to the checkout.
+  foreach ($txn->items as $nid => $item) {
+    ec_checkout_validate_item($item, 'ec_cart', $item->qty, $item->data, EC_VALIDATE_ITEM_SEVERITY_HIGH);
+  }
+  $errors = form_get_errors();
+  if (!empty($errors)) {
+    drupal_goto('cart/view');
+  }
+
+  ec_checkout_initialize('ec_cart', $txn);
+
+  drupal_goto('checkout');
+}
+
+/**
+ * The cart view page.  Handles adding, editing, and deleting items from cart.
+ *
+ * @return string
+ *   Page string. Always shows cart if there are items.
+ */
+function ec_cart_view() {
+  rules_invoke_event('ec_cart_view');
+  $items = ec_cart_current();
+  if (!empty($items)) {
+    return drupal_get_form('ec_cart_view_form', $items);
+  }
+  else {
+    return theme('ec_cart_empty');
+  }
+}
+
+/**
+ * This is a form to handle the cart view.
+ */
+function ec_cart_view_form($form, $form_state, $items) {
+  $form['#product_cart_form'] = TRUE;
+  $form['products'] = array(
+    '#tree' => TRUE,
+  );
+  $cart_total = 0;
+  foreach ($items as $item) {
+    $item = ec_cart_item_nodify($item);
+    $item->total = ec_cart_get_item_total($item); // This includes specials.
+    $item->specials = ec_product_specials_get($item, 'ec_cart', TRUE);
+    $form['products'][$item->nid]['#node'] = $item;
+    $form['products'][$item->nid]['title'] = array(
+      '#markup' => l($item->title, 'node/' . $item->nid),
+      '#prefix' => '<p>',
+      '#suffix' => '</p>',
+    );
+    $form['products'][$item->nid]['price'] = array(
+      '#markup' => format_currency(ec_product_get_final_price($item, 'ec_cart')),
+    );
+
+    // Add quantity elements.
+    if (ec_product_has_quantity($item)) {
+      $form['products'][$item->nid]['qty'] = array(
+        '#type' => 'textfield',
+        '#default_value' => $item->qty,
+        '#size' => 4,
+      );
+    }
+    else {
+      $form['products'][$item->nid]['qty'] = array(
+        '#type' => 'value',
+        '#value' => 1,
+      );
+    }
+
+    if (ec_product_attributes_get($item, 'product_form_additional_fields')) {
+      $form['#product_cart_form'] = TRUE;
+      // Add place holder for additional data and fields.
+      $form['products'][$item->nid]['data'] = array();
+    }
+
+    $form['products'][$item->nid]['total'] = array(
+      '#markup' => format_currency($item->total),
+    );
+    $form['products'][$item->nid]['ops'] = array(
+      '#markup' => l(t('Remove'), "cart/{$item->nid}/0", array('query' => drupal_get_destination(), 'attributes' => array('class' => array('ec-cart-remove')))),
+    );
+    $cart_total += $item->total;
+  }
+
+  $form['total'] = array(
+    '#markup' => format_currency($cart_total),
+  );
+
+  $form['buttons'] = array(
+    '#prefix' => '<div class=ec-cart-buttons>',
+    '#suffix' => '</div>',
+  );
+  $form['buttons']['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Update Cart'),
+  );
+  $form['buttons']['checkout'] = array(
+    '#type' => 'submit',
+    '#value' => t('Checkout'),
+    '#submit' => array('ec_cart_checkout_submit'),
+  );
+
+  return $form;
+}
+
+/**
+ * Validate cart updates.
+ */
+function ec_cart_view_form_validate(&$form, &$form_state) {
+  if (!empty($form_state['values']['products'])) {
+    foreach ($form_state['values']['products'] as $nid => $item) {
+      $node = node_load($nid);
+      if (!isset($item['data'])) {
+        // Create a data value to pass by reference.
+        $form_state['values']['products'][$nid]['data'] = '';
+      }
+      ec_checkout_validate_item($node, 'ec_cart', $form_state['values']['products'][$nid]['qty'], $form_state['values']['products'][$nid]['data'], EC_VALIDATE_ITEM_SEVERITY_HIGH);
+    }
+  }
+}
+
+/**
+ * Implements the _submit hook for the cart_view form.
+ */
+function ec_cart_view_form_submit(&$form, &$form_state) {
+  switch ($form_state['values']['op']) {
+    case t('Update Cart'):
+      cache_clear_all();
+      foreach ($form_state['values']['products'] as $nid => $item) {
+        // preserve existing data items
+        $data = isset($item['data']) && $item['data'] ? $item['data'] : array();
+        $old_item = ec_cart_get_cart(ec_checkout_get_id(), $nid);
+        if ($old_item->data) {
+          $old_data = unserialize($old_item->data);
+          if ($old_data) {
+            $data = array_merge($old_data, $data);
+          }
+        }
+        ec_cart_update_item($nid, $item['qty'], $data);
+      }
+      $form_state['redirect'] = 'cart/view';
+      break;
+
+    case t('Checkout'):
+      break;
+  }
+}
+
+/**
+ * @todo Please document this function.
+ * @see http://drupal.org/node/1354
+ */
+function ec_cart_checkout_submit(&$form, &$form_state) {
+  unset($_GET['destination']);
+  $form_state['redirect'] = 'cart/checkout';
+}
+
+/**
+ * Utility for theme_cart_view_form().
+ */
+function _ec_cart_form_filter_extra($var) {
+  if (is_array($var) && isset($var['data'])) {
+    return TRUE;
+  }
+  return FALSE;
+}
+
+/**
+ * Implements hook_block_info().
+ */
+function ec_cart_block_info() {
+  if (TRUE) {
+    $blocks['ec_cart'] = array(
+      'info' => t('Shopping cart'),
+      'pages' => "cart/*\ncheckout\ncheckout/*\nnode/*/checkout\nadmin\nadmin/*",
+    );
+    return $blocks;
+  }
+}
+
+/**
+ * Implements hook_block_view().
+ */
+function ec_cart_block_view($delta) {
+  if (TRUE) {
+    switch ($delta) {
+      case 'ec_cart':
+        $item_count = count(ec_cart_current());
+        if (!$item_count && variable_get('ec_cart_empty_hide', EC_CART_SHOW) == EC_CART_HIDE_EMPTY) {
+          // No items and we don't show empty cart.
+          break;
+        }
+        drupal_add_css(drupal_get_path('module', 'ec_cart') . '/css/cart.css');
+        $block['subject'] = l(t('Shopping Cart'), 'cart/view', array('title' => t('View your cart items.')), NULL, NULL, FALSE, TRUE);
+        $block['content'] = ec_cart_display_block();
+        return $block;
+        break;
+    }
+  }
+}
+
+/**
+ * Implements hook_block_configure().
+ */
+function ec_cart_block_configure($delta) {
+  if (TRUE) {
+    $form['ec_cart_empty_hide'] = array(
+      '#type' => 'radios',
+      '#title' => t('Cart display preferences'),
+      '#default_value' => variable_get('ec_cart_empty_hide', EC_CART_SHOW),
+      '#options' => array(
+        EC_CART_SHOW => t('Always display cart'),
+        EC_CART_HIDE_EMPTY => t('Hide block if cart is empty'),
+      ),
+    );
+    return $form;
+  }
+}
+
+/**
+ * Implements hook_block_save().
+ */
+function ec_cart_block_save($delta, $edit) {
+  if (TRUE && isset($edit['ec_cart_empty_hide'])) {
+    variable_set('ec_cart_empty_hide', $edit['ec_cart_empty_hide']);
+  }
+}
+
+/**
+ * Prepares the cart block for theme_ec_cart_display_block().
+ */
+function ec_cart_display_block() {
+  global $user;
+
+  // Until Drupal can handle partial page caching, We should only display a
+  // View Cart link for anonymous users and the full fancy items and total cart
+  // for authenticated users since those pages aren't cached.
+  if ($user->uid == 0 && (variable_get('cache', 0) != 0 && (defined('CACHE_EXTERNAL') ? variable_get('cache', CACHE_EXTERNAL) != CACHE_EXTERNAL : TRUE))) {
+    // Pass FALSE to the theme to display a link to cart only.
+    return theme('ec_cart_display_block', array('cart' => FALSE));
+  }
+  else {
+    // Get the shopping cart data and prepare the item list.
+    $items = ec_cart_current();
+    $cart_data['total'] = ec_cart_get_total($items);
+    // Prepare themed items to simplify the block theme code.
+    return theme('ec_cart_display_block', array('cart' => $cart_data, 'items' => $items));
+  }
+}
+
+/**
+ * Add/remove/set a quantity in the cart and return to destination (default:
+ * front page).  Passing data from $_REQUEST if it exists.
+ */
+function ec_cart_modify($item_id, $operation = '+1') {
+  $op = drupal_substr($operation, 0, 1);
+  $qty = drupal_substr($operation, 1);
+  $qty = isset($_REQUEST['qty']) ? $_REQUEST['qty'] : $qty;
+  $data = isset($_REQUEST['data']) ? $_REQUEST['data'] : '';
+  $item = ec_cart_get_cart(ec_checkout_get_id(), $item_id);
+
+  if ($item) {
+    switch ($op) {
+      case ' ': // Normally + is translated to space in URLs.
+      case '+': // Also handle +, in case it's been properly encoded.
+        $qty += $item->qty;
+        break;
+      case '-':
+        $qty -= $item->qty;
+        break;
+      case '=':
+        $qty = $item->qty;
+        break;
+    }
+  }
+
+  if ($status = ec_cart_update_item($item_id, $qty, $data)) {
+    switch ($status) {
+      case EC_CART_ITEM_ADDED:
+        $message = t('Your item has been added.');
+        $event = 'ec_cart_add';
+        break;
+      case EC_CART_ITEM_UPDATED:
+        $message = t('Your item has been updated.');
+        $event = 'ec_cart_edit';
+        break;
+      case EC_CART_ITEM_REMOVED:
+        $message = t('Your item has been removed.');
+        $event = 'ec_cart_delete';
+        break;
+    }
+    if (isset($message)) {
+      drupal_set_message($message);
+    }
+  }
+  if (isset($event)) {
+    $node = node_load($item_id);
+    rules_invoke_event($event, $node);
+  }
+  drupal_goto();
+}
+
+/**
+ * Get the total of all items in the cart.
+ */
+function ec_cart_get_total($items = NULL) {
+  $items = empty($items) ? ec_cart_current() : $items;
+  $total = 0;
+  foreach ($items as $item) {
+    $total += ec_cart_get_item_total($item);
+  }
+  return $total;
+}
+
+/**
+ * Get an item total. This will correct quantity per ec_product_has_quantity().
+ */
+function ec_cart_get_item_total($item) {
+  return ec_product_get_final_price($item, 'ec_cart') * (ec_product_has_quantity($item) ? $item->qty : 1);
+}
+
+/**
+ * Take a cart item and add node data.
+ */
+function ec_cart_item_nodify($item) {
+  $node = node_load($item->nid);
+  foreach ($item as $key => $value) {
+    $node->$key = $value;
+  }
+  return $node;
+}
+
+/**
+ * Get the results of ec_cart_get_cart() for current user.
+ */
+function ec_cart_current() {
+  return ec_cart_get_cart(ec_checkout_get_id());
+}
+
+/**
+ * Grab the items of a shopping cart for a user, which can also provide
+ * the data for an individual product.
+ *
+ * ec_cart_current() is a convenient wrapper for this function which
+ * returns the current user cart.
+ *
+ * @param $id integer
+ *   The session or uid.
+ * @param $id integer
+ *   A node id, pass to get data for a single node id.
+ * @param $action string
+ *   If true then reset the entire carts array for rebuilding.
+ *
+ * @return array
+ *   A (possibly empty) array of all items for an id indexed by nid.
+ *   Or an item if $nid was passed, but FALSE if the nid is not in the cart.
+ */
+function ec_cart_get_cart($id, $nid = FALSE, $rebuild = FALSE) {
+  $carts = & drupal_static(__FUNCTION__ . '_carts', array());
+
+  if ($rebuild) {
+    unset($carts[$id]);
+  }
+  // Don't try to load a cart if it's just an empty array because that
+  // means we've already tried to load it.
+  if (!isset($carts[$id])) {
+    $carts[$id] = _ec_cart_load($id);
+  }
+  if ($nid) {
+    // Tell the caller about a specific node.
+    return (isset($carts[$id][$nid])) ? $carts[$id][$nid] : FALSE;
+  }
+  else {
+    // Return items or an empty array.
+
+    return $carts[$id];
+  }
+}
+
+/**
+ * Remove all items from the cart.
+ *
+ * @param $id
+ *   String, the cookie/user id.
+ */
+function ec_cart_empty($id = NULL) {
+  $id = ec_checkout_get_id($id);
+  $items = ec_cart_current($id);
+  // Save nothing to the cart to empty it.
+  _ec_cart_save(FALSE, 0, '', $id);
+  foreach ($items as $item) {
+    ec_product_invoke_productapi($item, 'cart_remove_item', $id);
+    ec_product_invoke_feature_all($item, 'cart_remove_item', $id);
+  }
+  // Rebuild the cart data.
+  ec_cart_get_cart($id, NULL, TRUE);
+  cache_clear_all();
+}
+
+/**
+ * Update quantity only (preserve $data on cart item). This is a convenient
+ * wrapper for ec_cart_update_item().
+ *
+ * @param $nid integer
+ *   The node id to update.
+ * @param $qty integer
+ *   Quantity to update.
+ * @param $id string
+ *   Cookie/user id.
+ */
+function ec_cart_update_qty($nid, $qty, $id = NULL) {
+  $id = ec_checkout_get_id($id);
+  $item = ec_cart_get_cart($id, $nid);
+  return ec_cart_update_item($nid, $qty, ($item) ? $item->data : '', $id);
+}
+
+/**
+ * Update an item in the cart. Use for add, remove, update items and check
+ * the return value to find out what happened. No messages are set in this
+ * function, making it useful to call dynamically.
+ *
+ * @param $nid integer
+ *   The node id to update.
+ * @param $qty integer
+ *   Quantity to update.
+ * @param $data string
+ *   Data array to update (will be serialized).
+ * @param $id string
+ *   Cookie/user id.
+ *
+ * @return integer
+ *   FALSE if update fails, or a status code:
+ *   - EC_CART_ITEM_REMOVED - The action resulted in an item being removed.
+ *   - EC_CART_ITEM_ADDED - An added item was not previously in the cart.
+ *   - EC_CART_ITEM_UPDATED - An existing item was updated, eg. with a new qty.
+ */
+function ec_cart_update_item($nid, $qty, $data = NULL, $id = NULL) {
+  $id = ec_checkout_get_id($id);
+
+  if ($data) {
+    unset($data['form_id'], $data['form_token']);
+  }
+
+  // Validate the item to add.
+  $node = node_load($nid);
+  if ($qty && !ec_checkout_validate_item($node, 'ec_cart', $qty, $data, EC_VALIDATE_ITEM_SEVERITY_HIGH)) {
+    return FALSE;
+  }
+  $qty = ec_product_check_qty($node, $qty);
+
+  // Get existing data for comparison later.
+  $item = ec_cart_get_cart($id, $node->nid);
+  
+  // We are going to be saving the cart item, so save the id just in case.
+  if (empty($_SESSION['ec_checkout_id'])) {
+    $_SESSION['ec_checkout_id'] = $id;
+  }
+  // Save the data.
+  _ec_cart_save($node->nid, $qty, $data, $id);
+
+  if ($qty == 0 && $item) {
+    // Something was removed.
+    ec_product_invoke_productapi($node, 'cart_remove_item', $id);
+    ec_product_invoke_feature_all($node, 'cart_remove_item', $id);
+    $status = EC_CART_ITEM_REMOVED;
+  }
+  elseif ($qty > 0 && !$item) {
+    // Something was added.
+    ec_product_invoke_productapi($node, 'cart_add_item', $id, $data);
+    ec_product_invoke_feature_all($node, 'cart_add_item', $id, $data);
+    $status = EC_CART_ITEM_ADDED;
+  }
+  else {
+    // Something was updated
+    ec_product_invoke_productapi($node, 'cart_update_item', $id, $data);
+    ec_product_invoke_feature_all($node, 'cart_update_item', $id, $data);
+    $status = EC_CART_ITEM_UPDATED;
+  }
+
+  ec_checkout_add_complete($node, $qty, $data);
+
+  // Rebuild the cart data.
+  $items = ec_cart_get_cart($id, NULL, TRUE);
+  if (empty($items) && isset($_SESSION['ec_checkout_id'])) {
+    // Remove ec_checkout_id from session as it is not required, and hopefully the session will get deleted, to 
+    // re-instate default caching
+    unset($_SESSION['ec_checkout_id']);
+  }
+  
+  cache_clear_all();
+  return $status;
+}
+
+// -------------------------------------------------------------------------
+// Internal functions - do not use directly.
+
+/**
+ * An internal function that loads the cart items of a particular user.
+ *
+ * @param $id string
+ *   Cookie/user id.
+ */
+function _ec_cart_load($id) {
+  $all_items = array();
+
+  $nids = db_query('SELECT n.nid FROM {node} n INNER JOIN {ec_cart} c ON n.nid = c.nid WHERE c.cookie_id = :cookie_id', array(':cookie_id' => $id))
+    ->fetchCol('nid');
+
+  if (empty($nids)) {
+    return array();
+  }
+
+  $nodes = node_load_multiple($nids);
+  $items = db_query("SELECT n.nid, c.* FROM {node} n INNER JOIN {ec_cart} c ON n.nid = c.nid WHERE c.cookie_id = :cookie_id", array(':cookie_id' => $id));
+
+  foreach ($items as $item) {
+    $item = drupal_unpack($item, 'data');
+    foreach ($item as $key => $value) {
+      if (!isset($nodes[$item->nid]->{$key})) {
+        $nodes[$item->nid]->{$key} = $value;
+      }
+    }
+    $nodes[$item->nid]->price = ec_product_price_adjust($nodes[$item->nid], 'ec_cart');
+  }
+  return $nodes;
+}
+
+/**
+ * An internal function that updates an item in the cart.
+ *
+ * @param $nid integer
+ *   The node id to update.
+ * @param $qty integer
+ *   Quantity to update.
+ * @param $data string
+ *   Data array to update (will be serialized).
+ * @param $id string
+ *   Cookie/user id.
+ */
+function _ec_cart_save($nid = FALSE, $qty = 0, $data = '', $id = NULL) {
+  // Get current user if none specified.
+  $id = ec_checkout_get_id($id);
+
+  if ($nid) {
+    // Clear product data ready for updated.
+    db_delete('ec_cart')
+      ->condition('cookie_id', $id)
+      ->condition('nid', $nid)
+      ->execute();
+  }
+  else {
+    // No product so clear all data for current user.
+    db_delete('ec_cart')
+      ->condition('cookie_id', $id)
+      ->execute();
+  }
+
+  // Set new data.
+  if ($nid && $qty > 0) {
+    $record = array(
+      'cookie_id' => $id,
+      'nid' => $nid,
+      'qty' => $qty,
+      'changed' => REQUEST_TIME,
+      'data' => $data,
+    );
+    drupal_write_record('ec_cart', $record);
+  }
+}
+
+/**
+ * Implements hook_views_api().
+ */
+function ec_cart_views_api() {
+  return array('api' => 2.0);
+}
+
+/**
+ * Implements hook_feature_info().
+ */
+function ec_cart_feature_info() {
+  return array(
+    'no_cart_check' => array(
+      'name' => t('Exclude this product from being purchased via the cart'),
+      'description' => t('This feature will be automatically loaded when any other feature sets the no_cart attribute'),
+      'module' => 'ec_cart_no_cart',
+      'hidden' => TRUE,
+    ),
+  );
+}
+
+/**
+ * Implements hook_ec_checkout_validate_item().
+ */
+function ec_cart_no_cart_ec_checkout_validate_item($node, $type, $qty, $data, $severity, $return) {
+  if ($qty && $type == 'ec_cart' && ec_product_attributes_get($node, 'no_cart') === TRUE) {
+    if ($severity >= EC_VALIDATE_ITEM_SEVERITY_MEDIUM) {
+      drupal_set_message(t('%title can not be purchased via the cart.', array('%title' => check_plain($node->title))));
+    }
+    return FALSE;
+  }
+  return $return;
+}
+
+/**
+ * Implements hook_ec_ptypes_alter().
+ */
+function ec_cart_ec_ptypes_alter(&$ptypes) {
+  $feature = ec_product_feature_get('type', 'no_cart_check');
+  foreach ($ptypes as $type => $ptype) {
+    if (ec_product_attributes_get($type, 'no_cart') === TRUE) {
+      $feature->ptype = $type;
+      $ptypes[$type]->features[$feature->ftype] = $feature;
+    }
+  }
+}
+
+/**
+ * @todo Please document this function.
+ * @see http://drupal.org/node/1354
+ */
+function ec_cart_ec_transaction_types() {
+  return array('ec_cart' => t('Cart'));
+}

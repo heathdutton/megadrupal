@@ -1,0 +1,1155 @@
+<?php
+/**
+ * @file
+ * Main file for cache_control module. Has the core functionality
+ *
+ */
+
+/**
+ * Implements hook_menu().
+ */
+function cache_control_menu() {
+  $items = array();
+
+  $items['admin/config/development/cache_control'] = array(
+    'title' => 'Cache Control',
+    'description' => 'Configure Cache Control behavior.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('cache_control_admin'),
+    'access arguments' => array('administer site configuration'),
+    'file' => 'includes/cache_control.admin.inc',
+    'type' => MENU_NORMAL_ITEM,
+  );
+
+  $items['admin/config/development/cache_control/settings'] = array(
+    'title' => 'Settings',
+    'description' => 'Cache Control settings',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('cache_control_admin'),
+    'access arguments' => array('administer site configuration'),
+    'type' => MENU_DEFAULT_LOCAL_TASK,
+    'file' => 'includes/cache_control.admin.inc',
+    'weight' => 0,
+  );
+
+  $items['admin/config/development/cache_control/cache_paths'] = array(
+    'title' => 'Paths currently being cached',
+    'description' => 'Paths currently being cached',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('cache_control_define_max_age_paths'),
+    'access arguments' => array('administer site configuration'),
+    'type' => MENU_LOCAL_TASK,
+    'file' => 'includes/cache_control.admin.inc',
+    'weight' => 5,
+  );
+
+
+  $items['admin/config/development/cache_control/available_paths'] = array(
+    'title' => 'Paths not currently cached',
+    'description' => 'Paths not currently cached',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('cache_control_available_paths'),
+    'access arguments' => array('administer site configuration'),
+    'type' => MENU_LOCAL_TASK,
+    'file' => 'includes/cache_control.admin.inc',
+    'weight' => 10,
+  );
+
+  $items['admin/config/development/cache_control/roles'] = array(
+    'title' => 'Cache Control roles',
+    'description' => 'Disable Cache Control for these user roles',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('cache_control_roles'),
+    'access arguments' => array('administer site configuration'),
+    'type' => MENU_LOCAL_TASK,
+    'file' => 'includes/cache_control.admin.inc',
+    'weight' => 15,
+  );
+
+  $items['_cache_control/get_components'] = array(
+    'description' => 'AJAX callback for building parts of the page after pageload',
+    'page callback' => 'cache_control_get_components',
+    'access callback' => 1,
+    'type' => MENU_CALLBACK,
+  );
+
+  $items['_cache_control/rebuild_form/%'] = array(
+    'description' => 'AJAX callback for building a form',
+    'page callback' => 'cache_control_rebuild_form',
+    'page arguments' => array(2),
+    'access callback' => 1,
+    'type' => MENU_CALLBACK,
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_theme().
+ */
+function cache_control_theme() {
+  $theme = array();
+
+  $theme['cache_control_anonymous_wrapper'] = array(
+    'variables' => array('wrapper_id' => FALSE, 'content' => FALSE),
+    'template' => 'templates/cache_control_anonymous_wrapper',
+  );
+
+  return $theme;
+}
+
+
+/**
+ * Implements hook_init().
+ *
+ * Sets Cache-control (and other relevant) HTTP headers based on the current router path
+ * This function effectively overrides the headers set by drupal_page_header() in bootstrap.inc
+ */
+function cache_control_init() {
+  global $user;
+
+  // Cache Control is disabled for the Admin user, unless otherwise configured:
+  if ($user->uid == 1 && !variable_get('cache_control_enable_for_admin_user', FALSE)) {
+    cache_control_send_no_cache_headers('admin user');
+    return;
+  }
+
+  // Check if the current user has a role for which Cache Control is disabled:
+  $cache_control_roles = variable_get('cache_control_roles', array());
+  foreach (array_flip($user->roles) as $user_role) {
+    if (in_array($user_role, $cache_control_roles)) {
+      cache_control_send_no_cache_headers('disabled for role ' . $user_role);
+      return;
+    }
+  }
+
+  // Note also that we need to also make the defined roles skip the cached
+  // content. I.e. the code above makes sure that once a flagged user ends up
+  // here, we won't switch execution context, but if someone else has already
+  // visited the page, it's already in the cache. To prevent cached content from
+  // being served to the defined roles, we set cookie cacheControlDisabled for
+  // such users in cache_control.module:_cache_control_set_cookie() and read it
+  // in the VCL.
+
+  if (!variable_get('cache_control_enabled', FALSE)) {
+    //Cache Control disabled
+    return;
+  }
+
+  // Make sure the cookies are in synch.
+  if (isset($_COOKIE['cacheControlAuthenticated']) && $_COOKIE['cacheControlAuthenticated'] == 1 && $user->uid == 0) {
+    _cache_control_set_cookie($user->uid);
+  }
+  if ((!isset($_COOKIE['cacheControlAuthenticated']) || $_COOKIE['cacheControlAuthenticated'] == 0) && $user->uid > 0) {
+    _cache_control_set_cookie($user->uid);
+  }
+
+  //Responses to POST requests won't be cached ever
+  if ($_SERVER['REQUEST_METHOD'] == 'POST') {
+    cache_control_send_no_cache_headers('POST');
+    return;
+  }
+
+  if (isset($_GET['fresh'])) {
+    // This is a manual override
+    cache_control_send_no_cache_headers('fresh');
+    return;
+  }
+
+  // If there are messages set on the page, we don't want to cache the page.
+  $messages = drupal_set_message();
+  if (!empty($messages)) {
+    cache_control_send_no_cache_headers('Drupal messages on the page');
+    return;
+  }
+
+  //Get the current menu router item
+  $router_item = menu_get_item();
+  $router_path = $router_item['path'];
+
+  if (!$router_item['access']) {
+    //We never cache forbidden pages
+    cache_control_send_no_cache_headers('No access');
+    return;
+  }
+
+  if ($router_path == 'node/%') {
+  	$node = $router_item['page_arguments'][0];
+  	variable_get('cache_control_no_cache_content_types', array());
+  	if (!empty($types[$node->type])) {
+  	  //We're looking at a node and it's of type that shouldn't be cached
+      cache_control_send_no_cache_headers('Node type on no-cache list');
+      return;
+  	}
+  }
+
+  //At this point, we give modules chance to prevent the page from being cached
+  $result = module_invoke_all('cache_control_override_caching');
+  if (in_array(FALSE, $result, TRUE)) {
+    //Someone objected to this page being cached
+    cache_control_send_no_cache_headers('Prevented by hook_cache_control_override_caching');
+    return;
+  }
+
+  $storage = cache_control_get_storage();
+
+  // If the current path is on the list of cacheable paths, make some extra checks and allow caching
+  // if those checks succeed.
+  $cache_item = $storage->getPath($router_path);
+
+  if ($cache_item) {
+    _cache_control_set_original_user($user);
+    _cache_control_set_current_cache_item($cache_item);
+    if ($user->uid > 0) {
+      $session_state = drupal_save_session(FALSE);
+
+      //Switch the user to anonymous, re-execute the access callback for the page and if it's still ok, continue with the pageload _as anonymous user_
+      $user = drupal_anonymous_user();
+      _menu_check_access($router_item, $router_item['map']);
+
+      if ($router_item['access']) {
+        //Anonymous user can view the page, i.e. we have something to cache
+        cache_control_send_cache_headers($cache_item->ttl);
+      }
+      else {
+        //Forbidden for anonymous users, execute the pageload as the original user, no caching allowed
+        $user = _cache_control_get_original_user();
+        drupal_save_session($session_state);
+
+        cache_control_send_no_cache_headers('No anonymous access');
+      }
+      return;
+    }
+    else {
+      cache_control_send_cache_headers($cache_item->ttl);
+      return;
+    }
+  }
+  else {
+    //Unless explicitly set to allow caching, we treat the path as non-cacheable
+    cache_control_send_no_cache_headers('Not defined as cacheable');
+    return;
+  }
+}
+
+/**
+ * Implements hook_user_login().
+ */
+function cache_control_user_login(&$edit, $account) {
+  _cache_control_set_cookie(TRUE);
+}
+
+/**
+ * Implements hook_user_logout().
+ */
+function cache_control_user_logout($account) {
+  _cache_control_set_cookie(FALSE);
+}
+
+/**
+ * Implements hook_exit().
+ */
+function cache_control_exit() {
+  global $user;
+
+  //Restore the original user if the execution context was changed in hook_init so that no sessions get cut
+  if (_cache_control_is_cached_pageload()) {
+    $user = _cache_control_get_original_user();
+    if ($user->uid > 0) {
+      drupal_save_session(TRUE);
+    }
+  }
+}
+
+/**
+ * Implements hook_cron().
+ *
+ * Cleans up old page cache entries
+ */
+function cache_control_cron() {
+  $storage = cache_control_get_storage();
+  $storage->deleteExpiredComponents();
+  $storage->deleteExpiredForms();
+}
+
+/**
+ * Implements hook_module_implements_alter().
+ */
+function cache_control_module_implements_alter(&$implementations, $hook) {
+  $module = 'cache_control';
+  //Make this module always run first
+  if (isset($implementations[$module])) {
+	  $temp = $implementations[$module];
+	  unset($implementations[$module]);
+	  $implementations = array($module => $temp) + $implementations;
+  }
+}
+
+/**
+ * Stores references to components that may need to be regenerated for authenticated users after a cached page has been served
+ *
+ * Usually, you don't want to implement this hook in your own module, rather than invoke it.
+ * Invoking this hook will tell you if the current pageload is being cached so that you can take necessary actions.
+ *
+ * @param string $key The key associated with the component. (Keys are used to tell the difference between calls to same function). The key must be unique for the current pageload.
+ * @param string $function The name of the function needed to generate the content
+ * @param array $arguments optional The arguments to pass to that function in order to generate the content
+ * @param bool $invoke_for_anonymous optional Should the given component be fetched also for anonymous users (i.e. no pre-generated anonymous data available)
+ * @param string $cache_type optional Either 'fresh' or 'user'. 'fresh' components are always executed, 'user' components may be cached under some conditions.  Defaults to 'fresh'.
+ * @param integer $ttl_override optional Override TTL value for the component
+ * @param array $settings optional Extra settings to be passed in the Javascript for the component
+ *
+ * @return bool TRUE if page is being cached
+ */
+function hook_cache_control() {
+  //See cache_control_cache_control() for implementation
+}
+
+/**
+ * Implements hook_cache_control().
+ */
+function cache_control_cache_control($key, $function, array $arguments = array(), $invoke_for_anonymous = FALSE, $ttl_override = 0, array $settings = array()) {
+  // Static flag for indicating if the 'force' parameter should be set on in the JS.
+  // On the front end, the "force" parameter makes the JS use AJAX fetched content for anonymous
+  // users as well.
+  static $force = FALSE;
+
+  // Static counter for times called (needed for component weights and such)
+  static $calls = 0;
+
+  if (!_cache_control_is_cached_pageload()) {
+    //This pageload is not being cached
+    return FALSE;
+  }
+
+  // Note that when the front end "force" parameter is set, both the "authenticated||force" branch
+  // _and_ the anon branch in the Javascript get run; This is because the page may contain anon
+  // content that isn't returned by get_components().
+  if ($invoke_for_anonymous && !$force) {
+    drupal_add_js(array('cacheControl' => array('force' => TRUE)), 'setting');
+    $force = TRUE;
+  }
+
+  // Base64 encoding is needed because the arguments may pretty much anything
+  $arguments = base64_encode(serialize($arguments));
+
+  $path = $_GET['q'];
+
+  //Store GET parameters except for q:
+  $get = $_GET;
+  unset($get['q']);
+  $query = http_build_query(drupal_get_query_parameters($get));
+
+  $cache_item = _cache_control_get_current_cache_item();
+
+  $ttl = $ttl_override > 0 ? $ttl_override : $cache_item->ttl;
+
+  $component = array(
+    'path' => $path,
+    'query' => $query,
+    'key' => $key,
+    'function' => $function,
+    'arguments' => $arguments,
+    'expires' => REQUEST_TIME + $ttl,
+    'weight' => $calls,
+  );
+
+
+  cache_control_get_storage()->addPageComponent($component);
+
+  if (!$calls == 0) {
+    drupal_add_js(array(
+      'cacheControl' => array(
+        'query' => $query,
+      )
+    ), 'setting');
+  }
+
+  $calls++;
+
+  return TRUE;
+}
+
+/**
+ * Makes new storage backends available.
+ *
+ * @return array An associative array with the following format:
+ *    storage module name => array(
+ *       'name' => Human-readable storage name (shown in the admin UI)
+ *       'storage_class' => Name of the storage backend class provided by the module.
+ *                          The class must implement the CacheControlStorage interface.
+ *    )
+ */
+function hook_cache_control_storage_info() {
+  return array(
+    'cache_control_mongodb' => array(
+      'name' => t('MongoDB storage'),
+      'storage_class' => 'CacheControlMongoStorage',
+    ),
+  );
+}
+
+
+/**
+ * Informs other modules that the result of the current pageload will be cached.
+ *
+ * The modules may react e.g. by inserting JS and CSS files that may be required by
+ * authenticated users but are normally not included during an anonymous pageload.
+ *
+ */
+function hook_cache_control_cached_pageload() {
+  //An example implementation:
+  if (module_exists('wysiwyg')) {
+    //Includes needed WYSIWYG JS's
+    $profile = wysiwyg_get_profile(1);
+    if ($profile) {
+      $theme = wysiwyg_get_editor_themes($profile, (isset($profile->settings['theme']) ? $profile->settings['theme'] : ''));
+
+      // Add plugin settings (first) for this input format.
+      wysiwyg_add_plugin_settings($profile);
+      // Add profile settings for this input format.
+      wysiwyg_add_editor_settings($profile, $theme);
+    }
+  }
+
+  drupal_add_js(base_path() . 'misc/collapse.js');
+}
+
+/**
+ * Provides modules a way to prevent the page from being cached.
+ *
+ * @return bool FALSE if this pageload must not be cached
+ */
+function hook_cache_control_override_caching() {
+  return FALSE;
+}
+
+/**
+ * Allows modules to react before a page component is built.
+ *
+ * Implement this hook if you need to load include files, change component arguments etc.
+ *
+ * @param string $key The component key (as provided to hook_cache_control())
+ * @param unknown_type $function The function name (as provided to hook_cache_control())
+ * @param array $args The function arguments (as provided to hook_cache_control()). Can be modified.
+ */
+function hook_cache_control_get_components($key, $function, &$args) {
+  if ($function == 'mymodule_some_function') {
+  	//Load an include file that contains this function
+  	module_load_include('inc', 'mymodule', 'includes/mymodule');
+  }
+}
+
+/**
+ * Adds data necessary to rebuild a form at a later time
+ *
+ * @param string $form_build_id
+ * @param string $form_id
+ * @param array $arguments Arguments that need to be passed to drupal_get_form() in order to rebuild the form
+ */
+function cache_control_add_rebuildable_form($form_build_id, $form_id, array $arguments = array()) {
+  //Prepend the form id in the arguments (for drupal_get_form())
+  array_unshift($arguments, $form_id);
+
+  $cache_item = _cache_control_get_current_cache_item();
+
+  // Base64 encoding is needed because the arguments may contain objects
+  $arguments = base64_encode(serialize($arguments));
+  $expires   = REQUEST_TIME + $cache_item->ttl;
+
+  cache_control_get_storage()->addRebuildableForm($form_build_id, $arguments, $expires);
+}
+
+/**
+ * Gets arguments needed to build a form
+ *
+ * @param string $form_build_id
+ *
+ * @return array Arguments. FALSE if no arguments were found for the form build id
+ */
+function cache_control_get_rebuildable_form_arguments($form_build_id) {
+  $form_data = cache_control_get_storage()->getRebuildableForm($form_build_id);
+
+  $arguments = $form_data['arguments'];
+
+  if ($arguments) {
+    $arguments = unserialize(base64_decode($arguments));
+
+    return $arguments;
+  }
+
+  return FALSE;
+}
+
+
+/**
+ * Gets the current storage object
+ *
+ * @see hook_cache_control_storage_info()
+ *
+ * @return CacheControlStorage object
+ */
+function cache_control_get_storage() {
+  static $storage = NULL;
+
+  if (!$storage) {
+    $storage_class = variable_get('cache_control_storage_class', '');
+    if ($storage_class && class_exists($storage_class)) {
+      $storage = new $storage_class();
+    }
+    else {
+      drupal_set_message(t('Cache Control: No storage backend set, please set one on the configuration page.'), 'error');
+      return new CacheControlDummyStorage();
+    }
+  }
+
+  return $storage;
+}
+
+/**
+ * Gets components for the current page.
+ */
+function cache_control_get_components() {
+ if (variable_get('cache_control_dev_mode', 0)) {
+    sleep(1);
+  }
+
+  if (empty($_GET['_q'])) {
+    exit();
+  }
+
+  global $user;
+
+  $path = $_GET['_q'];
+  unset($_GET['_q']);
+
+  $query = http_build_query(drupal_get_query_parameters($_GET));
+
+  $js = drupal_add_js();
+  $original_settings = drupal_array_merge_deep_array($js['settings']['data']);
+
+  //Change execution context to the one that was present when the components were generated
+  $old_q = $_GET['q'];
+  $_GET['q'] = $path;
+
+  $page_components = cache_control_get_storage()->getPageComponents($path, $query);
+  $components = array();
+
+
+  foreach ($page_components as $component) {
+    $key       = $component['key'];
+    $function  = $component['function'];
+    $arguments = unserialize(base64_decode($component['arguments']));
+
+    //Give others a chance to alter the arguments
+    foreach (module_implements('cache_control_get_components') as $module) {
+      $hook = $module . '_' . 'cache_control_get_components';
+      if (function_exists($hook)) {
+        $hook($key, $function, $arguments);
+      }
+    }
+
+    if (!function_exists($function)) {
+      //Invalid data
+      continue;
+    }
+
+    $components[$key] = call_user_func_array($function, $arguments);
+  }
+
+  $_GET['q'] = $old_q;
+  drupal_static_reset('arg');
+
+  cache_control_send_no_cache_headers('fresh');
+
+  //Include new settings (and only new settings, we don't want to override anything that might already be on the page)
+  //so that AJAX components work correctly
+  $js = drupal_add_js();
+
+  $new_settings = drupal_array_merge_deep_array($js['settings']['data']);
+  $changed_settings = _cache_control_array_diff_assoc_recursive($new_settings, $original_settings);
+
+  $output = array(
+    'settings' => $changed_settings,
+    'components' => $components
+  );
+
+  exit(json_encode($output));
+}
+
+/**
+ * AJAX callback for rebuilding a specific form
+ *
+ * @param string $form_build_id
+ *
+ * @return string form HTML
+ */
+function cache_control_rebuild_form($form_build_id) {
+  $arguments = cache_control_get_rebuildable_form_arguments($form_build_id);
+  $output = '';
+
+  if ($arguments) {
+    $form = call_user_func_array('drupal_get_form', $arguments);
+    $output = drupal_render($form);
+  }
+
+  exit($output);
+}
+
+/**
+ * Sends out HTTP headers that indicate this pageload can be cached
+ *
+ * @param integer $time_in_seconds optional Cache lifetime. If not specified, the value of variable cache_control_expires will be used instead
+ */
+function cache_control_send_cache_headers($time_in_seconds = NULL) {
+  _cache_control_is_cached_pageload(TRUE);
+
+  if ($time_in_seconds == NULL || empty($time_in_seconds)) {
+    $lifetime = intval(variable_get('cache_control_expires', 5));
+    $expires  = strtotime("+$lifetime minutes");
+    $seconds  = $lifetime * 60;
+  }
+  else {
+    $lifetime = intval($time_in_seconds);
+    $expires  = strtotime("+$lifetime seconds");
+    $seconds  = $time_in_seconds;
+  }
+
+  drupal_add_http_header('Last-Modified', gmdate('D, d M Y H:i:s') . ' GMT');
+  drupal_add_http_header('Expires', gmdate('D, d M Y H:i:s', $expires) . ' GMT');
+  drupal_add_http_header('Cache-Control', 'must-revalidate, max-age=' . $seconds);
+}
+
+
+/**
+ * Sends out HTTP headers that indicate this pageload CANNOT be cached
+ */
+function cache_control_send_no_cache_headers($reason = '') {
+  _cache_control_is_cached_pageload(FALSE);
+
+  if (variable_get('cache_control_dev_mode', 0)) {
+    drupal_add_http_header('X-DRCC-No-Cache-Reason', $reason);
+  }
+
+  drupal_add_http_header('Pragma', 'no-cache');
+  drupal_add_http_header('Last-Modified', gmdate('D, d M Y H:i:s') . ' GMT');
+  drupal_add_http_header('Cache-Control', 'no-store, no-cache, must-revalidate, pre-check=0, post-check=0, max-age=0');
+  drupal_add_http_header('Expires', 'Sat, 02 Jan 1971 00:00:00 GMT');
+}
+
+
+/**
+ * Implements hook_form_alter().
+ *
+ * Manipulates some forms (unobtrusively) in order to ensure cache_control compatibility
+ */
+function cache_control_form_alter(&$form, &$form_state, $form_id) {
+  //Ensure captcha compatibility: mark the form as rebuildable for later use
+  //(This means that the form will be rebuilt to suit the current user to ensure it has a valid captcha)
+  if (_cache_control_is_cached_pageload() && module_exists('captcha') && !user_access('skip CAPTCHA')) {
+    module_load_include('inc', 'captcha');
+    $captcha_point = captcha_get_form_id_setting($form_id);
+    if ($captcha_point && $captcha_point->captcha_type) {
+      cache_control_add_rebuildable_form($form['#build_id'], $form_id, $form_state['build_info']['args']);
+    }
+  }
+
+  if ($form_id == 'search_block_form') {
+    //There's absolutely no need for tokens in search forms, even for authenticated users
+    if (isset($form['#token'])) {
+      unset($form['#token']);
+    }
+  }
+
+  if ($form_id == 'block_admin_configure') {
+    //Add our own checkbox in every block configuration form
+    $module = $form_state['build_info']['args'][0];
+    $delta = $form_state['build_info']['args'][1];
+
+    $form['cache_control'] = array(
+      '#title' => t('Cache Control'),
+      '#type' => 'fieldset',
+      '#weight' => 0.1,
+    );
+
+    $mode = variable_get('cache_control_block_' . $module . '_' . $delta . '_enabled', 0);
+
+    $form['cache_control']['cache_control_enable'] = array(
+      '#type' => 'checkbox',
+      '#title' => t('Enable Cache Control for this block.'),
+      '#description' => t('Check this to make this Cache Control compatible'),
+      '#default_value' => $mode ? 1 : 0,
+    );
+
+    $form['cache_control']['cache_control_anonymous'] = array(
+      '#type' => 'checkbox',
+      '#title' => t('Require fresh content (anonymous users).'),
+      '#description' => t('If checked, the block code will be executed on EVERY page load, regardless the user. Use only if absolutely necessary. May have an effect on performance.'),
+      '#default_value' => $mode && $mode == 'anonymous' ? 1 : 0,
+    );
+
+    $form['#submit'][] = 'cache_control_block_admin_configure_submit';
+  }
+}
+
+/**
+ * Submit handler for block configure forms. Saves Cache Control's own settings
+ *
+ * @see cache_control_form_alter()
+ * @see block_admin_configure()
+ */
+function cache_control_block_admin_configure_submit($form, &$form_state) {
+  $module = $form_state['build_info']['args'][0];
+  $delta = $form_state['build_info']['args'][1];
+  $posted_values = $form_state['input'];
+
+  $enabled = isset($posted_values['cache_control_enable']) ? $posted_values['cache_control_enable'] : 0;
+
+  $mode = $enabled;
+  if ($enabled) {
+    if (!empty($posted_values['cache_control_anonymous'])) {
+      $mode = 'anonymous';
+    }
+    else {
+      $mode = 'basic';
+    }
+  }
+
+  variable_set('cache_control_block_' . $module . '_' . $delta . '_enabled', $mode);
+}
+
+/**
+ * Implements block_view_alter().
+ *
+ * If the block we're showing is configured to work with cache control, we make sure it gets shown right
+ */
+function cache_control_block_view_alter(&$data, $block) {
+  if (!_cache_control_is_cached_pageload()) {
+    //No need to do anything if the pageload is not being cached
+    return;
+  }
+
+  $module = $block->module;
+  $delta = $block->delta;
+
+  if (!variable_get('cache_control_block_' . $module . '_' . $delta . '_enabled', 0)) {
+    //No need to do anything if this block doesn't want our services
+    return;
+  }
+
+  $data['cache_control_is_empty'] = FALSE;
+  if (empty($data['content'])) {
+    //This block is not available for anonymous users, but we still want to have it on the page
+    //Let's give it some content and kill the title so that it isn't visible.
+  	$system_menus = menu_list_system_menus();
+    if (isset($system_menus[$delta])) {
+      //Horrible things take place if we don't wrap system menu blocks' content into an array
+      $data['content'] = array('&nbsp;');
+    }
+    else {
+      $data['content'] = '&nbsp;';
+    }
+    $data['subject'] = '';
+    $data['cache_control_is_empty'] = TRUE;
+  }
+
+  //Add the contextual library on the page so that block admin controls work, if needs arises
+  drupal_add_library('contextual', 'contextual-links');
+}
+
+/**
+ * Implements hook_preprocess().
+ *
+ * Preprocesses cache_control-enabled blocks
+ */
+function cache_control_preprocess(&$variables, $hook) {
+  if ($hook == 'block') {
+    $block = $variables['block'];
+
+    $module = $block->module;
+    $delta = $block->delta;
+
+    if (!($mode = variable_get('cache_control_block_' . $module . '_' . $delta . '_enabled', 0))) {
+      //No need to do anything if this block doesn't want our services
+      return;
+    }
+
+    $invoke_for_anonymous = ($mode == 'anonymous');
+
+    $settings = array();
+    //Give others a chance to alter the arguments
+    foreach (module_implements('cache_control_block') as $module) {
+      $hook = $module . '_' . 'cache_control_block';
+      if (function_exists($hook)) {
+        $hook($block, $settings);
+      }
+    }
+
+    $cached = module_invoke('cache_control', 'cache_control', $variables['block_html_id'], "_cache_control_render_block", array($block->module, $delta, $_GET['q']), $invoke_for_anonymous, 0, $settings);
+
+    if ($cached) {
+      //This is a cached pageload, which means the block will contain anonymous user's content
+
+      //E.g. Omega theme seems to add block_html_id in classes.
+      //Let's do that too to ensure the class is there, since we're going to change the id.
+      $variables['classes_array'][] = $variables['block_html_id'];
+      $variables['classes_array'][] = 'cacheControlAnonymous';
+
+      //Empty blocks get special classes so we can get rid of them per need.
+      if ($variables['block']->cache_control_is_empty) {
+      	$variables['classes_array'][] = 'cacheControlAnonymousEmpty';
+      }
+
+      $variables['block_html_id'] .= '-anonymous';
+    }
+  }
+}
+
+/**
+ * Renders a single block
+ *
+ * @param string $module Module name
+ * @param string $delta Block delta
+ * @param string $context optional Where the block is being rendered.
+ */
+function _cache_control_render_block($module, $delta, $context = FALSE) {
+  $output = '';
+
+  //Switch context if requested
+  if ($context !== FALSE) {
+    $old_context = $_GET['q'];
+    $_GET['q'] = $context;
+  }
+
+  $block = block_load($module, $delta);
+
+  if ($block) {
+    $blocks = array("{$block->module}_{$block->delta}" => $block);
+    $elements = _block_get_renderable_array(_block_render_blocks($blocks));
+    $output = render($elements);
+  }
+
+  //Restore original context if it was switched
+  if (isset($old_context)) {
+    $_GET['q'] = $old_context;
+  }
+
+  return $output;
+}
+
+/**
+ * Tells if the current pageload is being cached
+ *
+ * @param bool $set optional Change the value
+ *
+ * @return bool
+ */
+function _cache_control_is_cached_pageload($set = NULL) {
+  static $cached = FALSE;
+
+  if (isset($set)) {
+    $cached = $set ? TRUE : FALSE;
+
+    if ($cached) {
+      $settings = array();
+
+      if (arg(0) == 'node' && variable_get('cache_control_statistic_views', FALSE)) {
+        $settings['cacheNodeId'] = intval(arg(1));
+      }
+
+      //If captcha module is present, let the front controller know if anonymous users' forms need some processing
+      if (module_exists('captcha')) {
+        $settings['processAnonymousCaptchaForms'] = !user_access('skip CAPTCHA', drupal_anonymous_user());
+      }
+
+      $settings['q'] = $_GET['q'];
+      $settings['devMode'] = variable_get('cache_control_dev_mode', 0);
+
+      drupal_add_js(array('cacheControl' => $settings), 'setting');
+      drupal_add_js('misc/jquery.cookie.js');
+      drupal_add_js(drupal_get_path('module', 'cache_control') . '/cache_control.js');
+      drupal_add_css(drupal_get_path('module', 'cache_control') . '/cache_control.css');
+
+      //Give modules a chance to react to the fact that the pageload is cached and run with an anonymous user
+      //(so that the modules may e.g. include JS and CSS that are needed after the pageload if the user happens to be authenticated)
+      module_invoke_all('cache_control_cached_pageload');
+    }
+  }
+
+  return $cached;
+}
+
+/**
+ * Stores an user object (usually the user who loaded the page) for later usage
+ *
+ * @param object $user
+ *
+ * @return object
+ */
+function _cache_control_set_original_user($user = NULL) {
+  static $original_user;
+  if ($user) {
+    $original_user = $user;
+  }
+
+  return $original_user;
+}
+
+/**
+ * Gets the user object stored with _cache_control_set_original_user()
+ */
+function _cache_control_get_original_user() {
+  return _cache_control_set_original_user();
+}
+
+/**
+ * Stores information about the page currently being cached.
+ *
+ * @param object $cache_item
+ *
+ * @return object
+ */
+function _cache_control_set_current_cache_item($item = NULL) {
+  static $cache_item;
+  if ($item) {
+    $cache_item = clone $item;
+    if ($cache_item->ttl == 0) {
+      //Always have non-zero ttl available
+      $cache_item->ttl = intval(variable_get('cache_control_expires', 5)) * 60;
+    }
+  }
+
+  return $cache_item;
+}
+
+/**
+ * Gets the user object stored with _cache_control_set_original_user()
+ */
+function _cache_control_get_current_cache_item() {
+  return _cache_control_set_current_cache_item();
+}
+
+
+/**
+ * Sets cookies for the front-end and Varnish to read
+ *
+ * @param bool $authenticated Is the user authenticated or not
+ */
+function _cache_control_set_cookie($authenticated = FALSE) {
+  global $user;
+  global $cookie_domain;
+
+  // Set cookie lifetime to "0" or the future.
+  $temp = (int)ini_get('session.cookie_lifetime');
+  if ($temp) {
+    $life = REQUEST_TIME + $temp;
+  }
+  else {
+    $life = 0;
+  }
+
+  if ($authenticated) {
+    // If the settings so define, save the user's uid in the cookie for later use in the AJAX URLs.
+    if (variable_get('cache_control_use_uid_in_ajax', 0)) {
+      $uid = $user->uid;
+    }
+    else {
+      $uid = 1;
+    }
+  }
+  else {
+    $uid = 0;
+  }
+  setcookie('cacheControlAuthenticated', $uid, $life, base_path(), $cookie_domain);
+
+  // Set cookie for disabling Cache Control for certain users. Varnish should be
+  // configured to read this cookie, and pass through any users for which this
+  // cookie is set to 1.
+  $disabled = '0';
+
+  if ($authenticated) {
+    // Cache Control is disabled for the Admin user, unless otherwise configured:
+    if ($user->uid == 1 && !variable_get('cache_control_enable_for_admin_user', FALSE)) {
+      $disabled = '1';
+    }
+
+    // Check if the current user has a role for which Cache Control is disabled:
+    $cache_control_roles = variable_get('cache_control_roles', array());
+    foreach (array_flip($user->roles) as $user_role) {
+      if (in_array($user_role, $cache_control_roles)) {
+        $disabled = '1';
+      }
+    }
+  }
+
+  setcookie('cacheControlDisabled', $disabled, $life, base_path(), $cookie_domain);
+}
+
+/**
+ * Recursive version of array_diff_assoc(). Needed to diff settings arrays that can contain arbitrary arrays
+ *
+ * @param array $array1 The array to compare from
+ * @param array $array2 An array to compare against
+ *
+ * @see http://php.net/manual/en/function.array-diff-assoc.php#73972
+ */
+function _cache_control_array_diff_assoc_recursive($array1, $array2) {
+  foreach ($array1 as $key => $value) {
+    if (is_array($value)) {
+      if (!isset($array2[$key])) {
+        $difference[$key] = $value;
+      }
+      else if (!is_array($array2[$key])) {
+        $difference[$key] = $value;
+      }
+      else {
+        $new_diff = _cache_control_array_diff_assoc_recursive($value, $array2[$key]);
+        if($new_diff != FALSE) {
+          $difference[$key] = $new_diff;
+        }
+      }
+    }
+    else if (!isset($array2[$key]) || $array2[$key] != $value) {
+      $difference[$key] = $value;
+    }
+  }
+  return !isset($difference) ? array() : $difference;
+}
+
+/**
+ * Cache control storage interface that all storage modules need to implement.
+ */
+interface CacheControlStorage {
+
+  /**
+   * Returns list of paths (either actual paths such as node/123 or router paths such as node/%) that can be cached
+   *
+   * @return Array of path objects (an empty array should be returned if no paths are set to be cacheable).
+   *         A path object should contain following fields:
+   *          path: The path
+   *          type: Either 'router' (for router items, such as node/%) or 'internal' (for actual paths, such as node/123)
+   *          ttl: Cache TTL for this path, in seconds (0 if global default is to be used)
+   */
+  public function getPaths();
+
+  /**
+   * Gets a cacheable path
+   *
+   * @param string $path
+   *
+   * @return object Path object (see above). Should return FALSE if the path isn't cacheable
+   */
+  public function getPath($path);
+
+  /**
+   * Adds a new cacheable path.
+   *
+   * @param string $path The path
+   * @param string $type optional Either 'router' (for router items, such as node/%) or 'internal' (for actual paths, such as node/123). Default 'router'
+   * @param integer $ttl optional Cache TTL for this path, in seconds (0 if global default is to be used)
+   */
+  public function addPath($path, $type = 'router', $ttl = 0);
+
+  /**
+   * Deletes a cacheable path.
+   *
+   * @param string $path
+   */
+  public function deletePath($path);
+
+  /**
+   * Updates the TTL for a cacheable path.
+   *
+   * @param string $path
+   * @param integer $ttl New TTL in seconds. Pass 0 if global default is to be used
+   */
+  public function setPathTTL($path, $ttl);
+
+  /**
+   * Adds a page component.
+   * A page component is a section of a page that needs to be generated in the get_components() backend for an authenticated user, when a page is served from cache.
+   *
+   * @param array $component Component array. Has the following fields:
+   *  'path' => Internal path of the page,
+   *  'query' => Query string of the current pageload (may be an empty strin),
+   *  'key' => The key associated with the component (@see hook_cache_control()),
+   *  'function' => Name of the function responsible for generating the ,
+   *  'arguments' => Arguments for that function,
+   *  'expires' => Time after which the component expires and can be removed
+   *  'weight' => Weight of the component. The get_components() backend will execute the components ordered by weight.
+   *
+   *  A component can be uniquely identified by the triplet path-query-key.
+   *  The implementation should treat path-query-key as an unique key and update the component entry (or delete before insert) if it already exists.
+   */
+  public function addPageComponent($component);
+
+  /**
+   * Returns a list of components for the given page, ordered by their weight property.
+   *
+   * @param string $path @see addPageComponent()
+   * @param string $query @see addPageComponent()
+   *
+   * @return Array of components (see above). An empty array should be returned if there are no components.
+   */
+  public function getPageComponents($path, $query);
+
+  /**
+   * When called, the storage should delete all components whose expires timestamp is less than REQUEST_TIME.
+   */
+  public function deleteExpiredComponents();
+
+  /**
+   * Adds data necessary to rebuild a form at a later time
+   *
+   * @param string $form_build_id The unique identifier of the form component. Should be treated as such by the storage.
+   * @param array $arguments Arguments for drupal_get_form()
+   * @param integer $expires Time after which the component expires and can be removed
+   */
+  public function addRebuildableForm($form_build_id, $arguments, $expires);
+
+  /**
+   * Returns forms stored by addRebuildableForm().
+   * @param unknown_type $form_build_id
+   *
+   * @return array For keys, see addRebuildableForm(). If nothing is found, should return FALSE.
+   */
+  public function getRebuildableForm($form_build_id);
+
+  /**
+   * When called, the storage should delete all forms whose expires timestamp is less than REQUEST_TIME.
+   */
+  public function deleteExpiredForms();
+}
+
+/**
+ * Dummy storage class used when no valid storage is available (to avoid unnecessary fatal errors etc.).
+ */
+class CacheControlDummyStorage implements CacheControlStorage {
+  public function getPaths() {
+    return array();
+  }
+
+  public function addPath($path, $type = 'router', $ttl = 0) {}
+
+  public function getPath($path) {}
+
+  public function deletePath($path) {}
+
+  public function setPathTTL($path, $ttl) {}
+
+  public function addPageComponent($component) {}
+
+  public function getPageComponents($path, $query) {
+    return array();
+  }
+
+  public function deleteExpiredComponents() {}
+
+  public function addRebuildableForm($form_build_id, $arguments, $expires) {}
+
+  public function getRebuildableForm($form_build_id) {
+    return FALSE;
+  }
+
+  public function deleteExpiredForms() {}
+}

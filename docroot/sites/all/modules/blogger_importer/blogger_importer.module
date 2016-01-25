@@ -1,0 +1,507 @@
+<?php
+
+/**
+ * @file
+ *  Blogger Importer module. See README for more info.
+ */
+
+/*
+ * @todo:
+ *  - put the content type w/ URL field in the module as a feature
+ *    - set as the default
+ *  - detect/avoid duplicate nodes (hash the titles & bodies?) ?
+ *  - optionally process some settings (e.g. site name)?
+ */
+
+/**
+ * Implements hook_permission().
+ */
+function blogger_importer_permission() {
+  return array(
+    'import blogger blog' => array('title' => t('import blogger blog')),
+  );
+}
+
+/**
+ * Implements hook_menu().
+ */
+function blogger_importer_menu() {
+  $items = array();
+
+  $items['admin/content/blogger_importer'] = array(
+    'title' => t('Blogger Importer'),
+    'description' => t('Import a blog from Blogger/Blogspot.'),
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('blogger_importer_settings_form'),
+    'access arguments' => array('import blogger blog'),
+    'type' => MENU_LOCAL_TASK | MENU_NORMAL_ITEM,
+  );
+
+  $items['admin/content/blogger_importer/settings'] = array(
+    'title' => t('Settings & Process XML'),
+    'access arguments' => array('import blogger blog'),
+    'type' => MENU_DEFAULT_LOCAL_TASK,
+    'weight' => 1,
+  );
+
+  $items['admin/content/blogger_importer/results'] = array(
+    'title' => t('Review & Import'),
+    'description' => t('Review and create nodes from the imported posts'),
+    'page callback' => 'blogger_importer_view_results',
+    'page arguments' => array(),
+    'file' => 'results.page.inc',
+    'access arguments' => array('import blogger blog'),
+    'type' => MENU_LOCAL_TASK,
+    'weight' => 2,
+  );
+
+  $items['admin/content/blogger_importer/results/delete'] = array(
+    'title' => t('Delete cached entries'),
+    'page callback' => 'blogger_importer_delete_results',
+    'page arguments' => array(),
+    'access arguments' => array('import blogger blog'),
+    'type' => MENU_CALLBACK,
+  );
+
+  $items['admin/content/blogger_importer/result/%/%'] = array(
+    'title' => t('View individual cached Blogger entry'),
+    'page callback' => 'blogger_importer_view_results',
+    'page arguments' => array(4, 5),
+    'file' => 'results.page.inc',
+    'access arguments' => array('import blogger blog'),
+    'type' => MENU_CALLBACK,
+  );
+
+  return $items;
+}
+
+/**
+ * Form constructor for the blogger_importer settings form.
+ *
+ * @see blogger_importer_settings_form_validate()
+ * @see blogger_importer_settings_form_submit()
+ * @ingroup forms
+ */
+function blogger_importer_settings_form($form, &$form_state) {
+  $form = array();
+
+  $form['#prefix'] = '<strong>' . t('Make sure to read the README file and back up your database before importing anything!')
+      . '<br/>' . t('Use entirely at your own risk!') . '</strong>'
+      . '<br/>' . t('Usage note: processed entries are saved in the cache. If you clear the cache, they might be lost. '
+                  . 'After importing nodes & comments, you can delete the cache entry.');
+
+  // Pull in status report.
+  $form['status'] = blogger_importer_status_report();
+
+  $form['blogger_importer_xml_path'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Local path to Blogger export XML'),
+    '#description' => t('Export your blog from Blogger (see !docs) and upload it to a directory on your server that Drupal can access.',
+        array(
+          '!docs' => l('documentation', 'http://www.google.com/support/blogger/bin/answer.py?hl=en&answer=97416', array('attributes' => array('target' => '_blank'))),
+        )
+      ),
+    '#default_value' => variable_get('blogger_importer_xml_path', ''),
+    '#required' => TRUE,
+  );
+
+  $node_types = node_type_get_names();
+  $default_node_type = array_key_exists('article', $node_types)
+    ? variable_get('blogger_importer_node_type', 'article')
+    : variable_get('blogger_importer_node_type', '');
+  $form['blogger_importer_node_type'] = array(
+    '#type' => 'select',
+    '#title' => t('Content Type for imported nodes'),
+    '#description' => t('Each post will become a node of this type.'),
+    '#options' => $node_types,
+    '#default_value' => $default_node_type,
+    '#required' => TRUE,
+  );
+
+
+  $formats = array();
+  foreach (filter_formats() as $key => $format) {
+    $formats[$key] = $format->name;
+  }
+  $form['blogger_importer_format'] = array(
+    '#type' => 'select',
+    '#title' => t('Input Format for imported posts'),
+    '#description' => t('Will affect the body of created nodes. Only shows formats the user is permitted to use.'),
+    '#options' => $formats,
+    '#default_value' => variable_get('blogger_importer_format', filter_fallback_format()),
+    '#required' => TRUE,
+  );
+
+  $form['blogger_importer_comment_per_node'] = array(
+    '#type' => 'radios',
+    '#title' => t('Set comment settings per-node after creating comment'),
+    '#options' => array(
+      COMMENT_NODE_OPEN => t('Read/Write'),
+      COMMENT_NODE_CLOSED => t('Read only'),
+      COMMENT_NODE_HIDDEN => t('Hidden'),
+    ),
+    '#default_value' => variable_get('blogger_importer_comment_per_node', COMMENT_NODE_OPEN),
+  );
+
+  $form['blogger_importer_limit'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Number of entries to process at a time'),
+    '#description' => t('Processing will run in a batch until all are done, this ensures each run doesn\'t use too much memory or time out.'),
+    '#default_value' => variable_get('blogger_importer_limit', 10),
+    '#required' => TRUE,
+    '#size' => 5,
+  );
+
+  $form['blogger_importer_memory'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Memory Limit for batch (MB)'),
+    '#description' => t('Extra precaution to avoid memory overload, set as high as server will allow.'),
+    '#default_value' => variable_get('blogger_importer_memory', 256),
+    '#size' => 5,
+  );
+
+  if (module_exists('taxonomy') && $default_node_type) {
+    $fields = field_info_instances('node', $default_node_type);
+    $options = array();
+    foreach ($fields as $field) {
+      $options[$field['field_name']] = $field['label'];
+    }
+    $form['blogger_importer_node_tag_field'] = array(
+      '#type' => 'select',
+      '#title' => t('Tags field'),
+      '#description' => t('Import tags to this field. If you have selected a different node type, be sure to save this form first and then select the correct field.'),
+      '#options' => $options,
+      '#default_value' => variable_get('blogger_importer_node_tag_field', ''),
+    );
+  }
+
+  $form['blogger_importer_image_path'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Local path where Blogger images will be stored'),
+    '#description' => t("Images embedded within your blog posts (and currently hosted on Blogger's website) will be downloaded and stored in this folder, and the image references will be replaced. Leave empty to bypass this feature."),
+    '#default_value' => variable_get('blogger_importer_image_path', 'blogger_importer'),
+  );
+
+  $form['actions'] = array('#type' => 'actions');
+
+  $form['actions']['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Save (don\'t process now)'),
+    '#weight' => 1,
+  );
+
+  $form['actions']['import'] = array(
+    '#type' => 'submit',
+    '#value' => t('Save & Process Export XML'),
+    '#weight' => 2,
+  );
+  return $form;
+}
+
+/**
+ * Form validation handler for blogger_importer_settings_form().
+ *
+ * @see blogger_importer_settings_form_submit()
+ */
+function blogger_importer_settings_form_validate($form, &$form_state) {
+  // Check xml path.
+  $xml_path = $form_state['values']['blogger_importer_xml_path'];
+  if (!empty($xml_path) && !_blogger_importer_xml_exists($xml_path)) {
+    form_set_error('blogger_importer_xml_path', t('File @file does not exist or is not readable.', array('@file' => $xml_path)));
+  }
+
+  // Check limit.
+  $limit = $form_state['values']['blogger_importer_limit'];
+  if (!is_numeric($limit)) {
+    form_set_error('blogger_importer_limit', t('Invalid limit.'));
+  }
+
+  // Check memory limit.
+  $memory = $form_state['values']['blogger_importer_memory'];
+  if (!empty($memory) && !is_numeric($memory)) {
+    form_set_error('blogger_importer_memory', t('Invalid memory limit.'));
+  }
+}
+
+/**
+ * Form submission handler for blogger_importer_settings_form().
+ *
+ * @see blogger_importer_settings_form_validate()
+ */
+function blogger_importer_settings_form_submit($form, &$form_state) {
+  // Find the vocabulary vid.
+  $field_name = isset($form_state['values']['blogger_importer_node_tag_field'])
+    ? $form_state['values']['blogger_importer_node_tag_field']
+    : FALSE;
+  if (module_exists('taxonomy') && $field_name && field_info_instance('node', $field_name, $form_state['values']['blogger_importer_node_type'])) {
+    $field = field_info_field($field_name);
+    if (!empty($field['settings']['allowed_values'][0]['vocabulary'])) {
+      $vocabulary = taxonomy_vocabulary_machine_name_load($field['settings']['allowed_values'][0]['vocabulary']);
+      variable_set('blogger_importer_tags_vid', $vocabulary->vid);
+    }
+  }
+
+  // Save settings now because batch_process()
+  // intercepts with redirect before it's saved.
+  // @todo find the actual function core uses to do this & use that!
+  foreach($form_state['values'] as $key => $value) {
+    if (preg_match('/^blogger_importer_/', $key)) {
+      variable_set($key, $value);
+    }
+  }
+
+  // Run processing batch now?
+  if ($form_state['clicked_button']['#value'] == t('Save & Process Export XML')) {
+
+    // trigger the import batch
+    module_load_include('inc', 'blogger_importer', 'batch.xml');
+
+    $xml_path = $form_state['values']['blogger_importer_xml_path'];
+    $limit = $form_state['values']['blogger_importer_limit'];
+
+    $memory = $form_state['values']['blogger_importer_memory'];
+    if (!empty($memory)) {
+      ini_set('memory_limit', "{$memory}M");
+    }
+
+    if (function_exists('querypath_include_code')) {
+      querypath_include_code();
+    }
+
+    if (!function_exists('qp') || !class_exists('QueryPath')) {
+      drupal_set_message( t('!qp module or library not found!',
+          array('!qp' => l('QueryPath', 'http://drupal.org/project/querypath', array('attributes' => array('target' => '_blank' ) ) ) ) ),
+          'error');
+      return;
+    }
+
+    // Run the batch.
+    blogger_importer_batch_xml($xml_path, $limit);
+  }
+}
+
+/**
+ * Verify that the export xml file exists.
+ */
+function _blogger_importer_xml_exists($xml_path) {
+  return (file_exists($xml_path) && is_readable($xml_path));
+}
+
+/**
+ * Count the # of processed entries
+ * 2-level array, 1st level is categories,
+ * we need to count 2nd level
+ */
+function _blogger_importer_count_entries($entries) {
+  $count = 0;
+  foreach((array)$entries as $type => $sub_entries) {
+    $count += count( (array)$sub_entries );
+  }
+  return $count;
+}
+
+/**
+ * internal form to trigger deletion of cached entries
+ */
+function blogger_importer_delete_cache_form() {
+  $form = array();
+  $form['#action'] = url('admin/content/blogger_importer/results/delete');
+
+  $form[] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Delete cached Blogger import data'),
+    '#description' => t('This will delete the cached import data. It will not affect any nodes created by the import process.'),
+    'button' => array(
+      '#type' => 'submit',
+      '#value' => t('Delete cached data'),
+    ),
+    '#collapsible' => TRUE,
+  );
+
+  return $form;
+}
+
+/**
+ * internal form to trigger node creation batch
+ */
+function blogger_importer_create_nodes_form($form, &$form_state) {
+  form_load_include($form_state, 'inc', 'blogger_importer', 'batch.nodes');
+
+  $form = array();
+  $form['fieldset'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Create Nodes from Processed Entries'),
+  );
+
+  $form['fieldset']['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Create Nodes from Processed Entries'),
+    '#attributes' => array('style' => 'font-weight:bold'),
+  );
+
+  $form['#submit'] = array('blogger_importer_trigger_nodes_batch');
+
+  return $form;
+}
+
+/**
+ * internal form to trigger comment creation batch
+ */
+function blogger_importer_create_comments_form($form, &$form_state) {
+  form_load_include($form_state, 'inc', 'blogger_importer', 'batch.comments');
+
+  $form = array();
+  $form['fieldset'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Create Comments from Processed Entries'),
+    '#description' => t('Comments will be attached to the nodes created in the previous step.'),
+  );
+
+  $form['fieldset']['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Create Comments from Processed Entries'),
+    '#attributes' => array('style' => 'font-weight:bold'),
+  );
+
+  $form['#submit'] = array('blogger_importer_trigger_comments_batch');
+
+  return $form;
+}
+
+/**
+ * Generate a status report as part of a form.
+ *
+ * @return
+ *   Form render array (fieldset).
+ */
+function blogger_importer_status_report() {
+  $fieldset = array(
+    '#type' => 'fieldset',
+    '#title' => t('Status Report'),
+    'report' => array('#markup' => ''),
+  );
+  $report = &$fieldset['report']['#markup'];
+
+  $next_step = '';
+
+  $results = blogger_importer_results();
+
+  if (empty($results)) {
+    $report .= t('There are currently no cached entries from the Blogger export XML.') . '<br/>';
+    $next_step = t('Process a Blogger Export XML file.');
+  }
+  elseif (is_array($results['post'])) {
+    $report .= t('@count posts processed from XML.', array('@count' => count($results['post'])) ) . '<br/>';
+    $report .= t('@count comments processed from XML.', array('@count' => count($results['comment'])) ) . '<br/>';
+    $report .= t('@count settings processed from XML.', array('@count' => count($results['settings'])) ) . '<br/>';
+
+    // count nids
+    $post_nid_count = 0;
+    foreach($results['post'] as &$post) {
+      if (isset($post['nid']) && is_numeric($post['nid'])) {
+        $post_nid_count++;
+      }
+    }
+    $report .= t('@count nodes created from imported posts.', array('@count' => $post_nid_count) ) . '<br/>';
+
+    // count comments
+    $comment_cid_count = 0;
+    if (is_array($results['comment'])) {
+      foreach($results['comment'] as &$comment) {
+        //Not very sure about this,but removes the error..probably the isset it is
+        if (isset($post['nid']) && (isset($comment['cid'])) && is_numeric($comment['cid'])) {
+          $comment_cid_count++;
+        }
+      }
+    }
+    $report .= t('@count comments created from imported comments.', array('@count' => $comment_cid_count) ) . '<br/>';
+
+    if ($post_nid_count == 0 && count($results['post']) > 0) {
+      $next_step = t('Create nodes from processed entries.');
+    }
+    elseif ($comment_cid_count == 0 && count($results['comment']) > 0) {
+      $next_step = t('Create comments from processed entries.');
+    }
+  }
+  else {
+    $report .= t('Unknown status, run Process XML batch again to get clean data.');
+  }
+
+  if (! empty($next_step)) $report .= '<strong>' . t('Next Step') . ': ' . $next_step . '</strong>' . '<br/>';
+  elseif ($post_nid_count > 0 && $comment_cid_count > 0) {
+    $report .= '<strong>' . t('All done! (You can now safely delete the cached entries.)') . '</strong>';
+  }
+
+  return $fieldset;
+}
+
+/**
+ * get and set the imported posts from the import batch
+ * put in cache ('permanent')
+ * -- is this a good place to put it...? --
+ */
+function blogger_importer_results($results = NULL) {
+  if (! is_null($results)) {
+    cache_set('blogger_importer_results', $results, 'cache', CACHE_PERMANENT);
+  }
+
+  $cached = cache_get('blogger_importer_results', 'cache');
+
+  return isset($cached->data) ? $cached->data : NULL;
+}
+
+/**
+ * callback for page to delete cached import data
+ */
+function blogger_importer_delete_results() {
+  cache_clear_all('blogger_importer_results', 'cache');
+  drupal_set_message(t("Cached Blogger import data deleted."));
+  drupal_goto('admin/content/blogger_importer');
+}
+
+/**
+ * get the title of an entry/post
+ * if title is empty, use DATE (in default format)
+ * @todo improve on this, make config'able alt titles?
+ */
+function _blogger_importer_post_title($post) {
+  // has an original title
+  if (! empty($post['title'])) {
+    return $post['title'];
+  }
+  // no title, use date
+  if (! empty($post['date'])) {
+    return format_date(strtotime($post['date']));
+  }
+  // no title and no date, use '[Untitled]' (@todo improve on this!)
+  return '[Untitled]';
+}
+
+/**
+ * get the POST connected to a COMMENT
+ *
+ * @param $comment_id an imported entry for a comment
+ * @param &$all_entries all imported entries (to search)
+ * @param $attribute find a specific attribute in the post entry
+ *
+ * @return post entry or attribute if post found, or NULL if not found
+ */
+function _blogger_importer_comment_post($comment_id, &$all_entries, $attribute = NULL) {
+  // find the comment and post ID
+  if (isset($all_entries['comment'][$comment_id]['post_id']) && !empty($all_entries['comment'][$comment_id]['post_id'])) {
+    $post_id = $all_entries['comment'][$comment_id]['post_id'];
+
+    // find the post
+    if (is_array($all_entries['post'][$post_id])) {
+      if (!empty($attribute) && isset($all_entries['post'][$post_id][$attribute])) {
+        $return = $all_entries['post'][$post_id][$attribute];
+      }
+      else {
+        // whole post
+        $return = $all_entries['post'][$post_id];
+      }
+    }
+  }
+
+  return isset($return) ? $return : NULL;
+}

@@ -1,0 +1,348 @@
+<?php
+
+/**
+ * @file
+ * Main functions and hook implementations of the Field Instance Sync module.
+ */
+
+/**
+ * Implements hook_menu().
+ */
+function field_instance_sync_menu() {
+  return array(
+    'admin/config/system/field-instance-sync' => array(
+      'title' => 'Field instance sync',
+      'description' => 'Keep field settings synchronized between entities and bundles.',
+      'page callback' => 'drupal_get_form',
+      'page arguments' => array('field_instance_sync_settings_form'),
+      'access arguments' => array('administer field instance sync'),
+      'file' => 'field_instance_sync.admin.inc',
+      'file path' => drupal_get_path('module', 'field_instance_sync'),
+    ),
+  );
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function field_instance_sync_form_field_ui_field_edit_form_alter(&$form, &$form_state, $form_id) {
+  $settings = $form['#instance']['settings'];
+  $form['instance']['settings']['field_instance_sync'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Sync field settings across different bundles'),
+    '#default_value' => !empty($settings['field_instance_sync']),
+  );
+}
+
+/**
+ * Implements hook_field_attach_create_bundle().
+ */
+function field_instance_sync_field_attach_create_bundle($entity_type, $bundle) {
+  // Only attach fields to bundles of entities that are enabled by the admin.
+  if (in_array($entity_type, array_filter(variable_get('field_instance_sync_field_attach_entities', array())))) {
+    foreach (field_instance_sync_get_master_instances($entity_type, TRUE) as $instance) {
+      $instance['entity_type'] = $entity_type;
+      $instance['bundle'] = $bundle;
+      // Some entity types provide default fields (e.g. the body field on a
+      // node). Update the field if it already exists, otherwise create it.
+      if (field_read_instance($entity_type, $instance['field_name'], $bundle)) {
+        field_update_instance($instance);
+      }
+      else {
+        field_create_instance($instance);
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_permission().
+ */
+function field_instance_sync_permission() {
+  return array(
+    'administer field instance sync' => array(
+      'title' => t('Administer field instance sync'),
+      'description' => t('Grants access to the Field Instance Sync configuration page.'),
+    ),
+  );
+}
+
+/**
+ * Implements hook_features_export_alter().
+ */
+function field_instance_sync_features_export_alter(&$export, $module_name) {
+  // Prevent slave field instances from being exported. These are identical to
+  // the master field instances so this data is duplicated.
+  if (!empty($export['features']['field_instance'])) {
+    foreach ($export['features']['field_instance'] as $component_name) {
+      list ($entity_type, $bundle, $field_name) = explode('-', $component_name);
+      $field_instance = field_read_instance($entity_type, $field_name, $bundle);
+      if (!field_instance_sync_is_master_instance($field_instance)) {
+        unset($export['features']['field_instance'][$component_name]);
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_field_create_instance().
+ */
+function field_instance_sync_field_create_instance($instance) {
+  // Reset the static cache when a new field instance is created.
+  field_instance_sync_static_reset();
+
+  // Check if the field that was created is a master field that was exported
+  // with Features. If this is the case, create the slave fields as well.
+  if (field_instance_sync_is_default_master_instance($instance)) {
+    foreach (field_instance_sync_get_default_slaves($instance) as $slave) {
+      field_create_instance($slave);
+    }
+  }
+}
+
+/**
+ * Implements hook_field_delete_instance().
+ */
+function field_instance_sync_field_delete_instance($instance) {
+  // Reset the static cache when a field instance is deleted.
+  field_instance_sync_static_reset();
+}
+
+/**
+ * Implements hook_field_update_instance().
+ */
+function field_instance_sync_field_update_instance($instance, $prior_instance) {
+  // Get the master field instances. Make sure to clear the static cache, when
+  // this hook fires it means that the field instances have changed.
+  $master_field_instances = field_instance_sync_get_master_instances($instance['entity_type'], TRUE);
+
+  // Check if the updated field is a master field.
+  if (isset($master_field_instances[$instance['field_name']]) && $master_field_instances[$instance['field_name']]['bundle'] == $instance['bundle']) {
+    // Get only the synced instances of the updated master field.
+    $synced_instances = field_instance_sync_get_synced_instances($instance['field_name']);
+
+    // Update the slave fields.
+    foreach ($synced_instances as $synced_instance) {
+      if ($synced_instance['bundle'] != $instance['bundle']) {
+        // Keep the slave bundle in a separate variable to set it back to the
+        // original.
+        $bundle = $synced_instance['bundle'];
+        // We take the entire master instance instead of just the settings,
+        // otherwise the settings like "default value,..." are not copied over
+        // to the slave instances.
+        $synced_instance = $master_field_instances[$instance['field_name']];
+        $synced_instance['bundle'] = $bundle;
+        field_update_instance($synced_instance);
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_features_api().
+ */
+function field_instance_sync_features_api() {
+  return array(
+    'field_instance_sync' => array(
+      'name' => t('Field Instance Sync'),
+      'default_hook' => 'field_instance_sync_defaults',
+      'default_file' => FEATURES_DEFAULTS_INCLUDED,
+      'feature_source' => TRUE,
+      'file' => drupal_get_path('module', 'field_instance_sync') . '/field_instance_sync.features.inc',
+    ),
+  );
+}
+
+/**
+ * Returns synced field instances.
+ *
+ * @param string $field_name
+ *   Optional field name for which to return the synced instances.
+ * @param bool $reset
+ *   Whether or not to reset the internal static cache. Defaults to FALSE.
+ *
+ * @return array
+ *   An array of field instances, keyed by field instance ID.
+ */
+function field_instance_sync_get_synced_instances($field_name = '', $reset = FALSE) {
+  $instances = &drupal_static(__FUNCTION__, array());
+
+  if ($reset) {
+    $instances = array();
+  }
+
+  if (empty($instances[$field_name])) {
+    $instances[$field_name] = array();
+    $params = $field_name ? array('field_name' => $field_name) : array();
+    foreach (field_read_instances($params) as $instance) {
+      if (!empty($instance['settings']['field_instance_sync'])) {
+        $instances[$field_name][$instance['id']] = $instance;
+      }
+    }
+  }
+
+  return $instances[$field_name];
+}
+
+/**
+ * Returns all master field instances for a given entity type.
+ *
+ * @param string $entity_type
+ *   The entity type for which to return the master field instances.
+ * @param bool $reset
+ *   Whether or not to reset the internal static cache. Defaults to FALSE.
+ *
+ * @return array
+ *   An array of field instances.
+ */
+function field_instance_sync_get_master_instances($entity_type, $reset = FALSE) {
+  $master_bundles = variable_get('field_instance_sync_master_bundles', array());
+  $instances = array();
+  foreach (field_instance_sync_get_synced_instances('', $reset) as $instance) {
+    $field_name = $instance['field_name'];
+    // Skip the instance if the field was already added or if it is for a
+    // different entity.
+    if (!array_key_exists($field_name, $instances) && $instance['entity_type'] == $entity_type) {
+      $master_bundle = !empty($master_bundles[$entity_type][$field_name]) ? $master_bundles[$entity_type][$field_name] : NULL;
+      // Use the field instance if it matches the master bundle, or if no master
+      // bundle was defined for this field.
+      if (!$master_bundle || $instance['bundle'] == $master_bundle) {
+        $instances[$field_name] = $instance;
+      }
+    }
+  }
+
+  return $instances;
+}
+
+/**
+ * Checks whether the given field instance is a master field instance.
+ *
+ * @param array $instance
+ *   The field instance to check.
+ *
+ * @return bool
+ *   TRUE if the instance is the master field instance, or if no master instance
+ *   was configured. FALSE if it is a slave instance.
+ */
+function field_instance_sync_is_master_instance($instance) {
+  $bundle = $instance['bundle'];
+  $entity_type = $instance['entity_type'];
+  $field_name = $instance['field_name'];
+
+  $master_bundles = variable_get('field_instance_sync_master_bundles', array());
+
+  return !isset($master_bundles[$entity_type][$field_name]) || $master_bundles[$entity_type][$field_name] == $bundle;
+}
+
+/**
+ * Checks whether the given field instance is synced.
+ *
+ * @param array $instance
+ *   The field instance to check.
+ *
+ * @return bool
+ *   TRUE if the instance is the master field instance, or if no master instance
+ *   was configured. FALSE if it is a slave instance.
+ */
+function field_instance_sync_is_synced($instance) {
+  foreach (field_instance_sync_get_synced_instances() as $synced_instance) {
+    if ($instance['entity_type'] == $synced_instance['entity_type'] && $instance['field_name'] == $synced_instance['field_name'] && $instance['bundle'] == $synced_instance['bundle']) {
+      return TRUE;
+    }
+  }
+
+  return FALSE;
+}
+
+/**
+ * Clears all static caches.
+ */
+function field_instance_sync_static_reset() {
+  drupal_static_reset('field_instance_sync_get_synced_instances');
+}
+
+/**
+ * Checks whether the instance is a master instance in an exported feature.
+ *
+ * @param array $instance
+ *   The instance to check.
+ *
+ * @return bool
+ *   TRUE if the given instance was marked as a master instance in an exported
+ *   feature, FALSE if not.
+ */
+function field_instance_sync_is_default_master_instance($instance) {
+  $identifier = field_instance_sync_get_identifier($instance);
+  $defaults = field_instance_sync_get_defaults();
+
+  // The instance is a default master instance if:
+  // - It is defined in the defaults.
+  // - It is synced.
+  // - It is not a slave.
+  if (array_key_exists($identifier, $defaults) && $defaults[$identifier]['synced']) {
+    return !$defaults[$identifier]['slave'];
+  }
+
+  return FALSE;
+}
+
+/**
+ * Returns slaves that have been exported in a feature for the given instance.
+ *
+ * @param array $instance
+ *   The master instance for which to generate the slaves.
+ *
+ * @return array
+ *   An array of slave field instances.
+ */
+function field_instance_sync_get_default_slaves($instance) {
+  $slaves = array();
+
+  // Loop over all exported field instances.
+  foreach (field_instance_sync_get_defaults() as $identifier => $defaults) {
+    // Check if it is a slave of our instance.
+    if ($defaults['synced'] && $defaults['slave']) {
+      list($entity_type, $bundle, $field_name) = explode('-', $identifier);
+      if ($instance['entity_type'] == $entity_type && $instance['field_name'] == $field_name) {
+        // Copy the master instance as a new slave, making sure to update the
+        // bundle.
+        $slave = $instance;
+        $slave['bundle'] = $bundle;
+        $slaves[] = $slave;
+      }
+    }
+  }
+
+  return $slaves;
+}
+
+/**
+ * Returns the identifier for a field instance in an exported feature.
+ *
+ * @param array $instance
+ *   The field instance for which to return the identifier.
+ *
+ * @return string
+ *   The identifier, in the format '{entity type}-{bundle}-{field name}'.
+ */
+function field_instance_sync_get_identifier($instance) {
+  return implode('-', array(
+    $instance['entity_type'],
+    $instance['bundle'],
+    $instance['field_name'],
+  ));
+}
+
+/**
+ * Returns the default values for instances exported with Features.
+ *
+ * @return array
+ *   An associative array of default values, keyed by field instance identifier.
+ *   Each default value is an associative array with the keys:
+ *   - 'synced': a boolean indicating whether or not the instance is synced.
+ *   - 'slave': a boolean indicating whether or not the instance is a slave.
+ */
+function field_instance_sync_get_defaults() {
+  return module_invoke_all('field_instance_sync_defaults');
+}

@@ -1,0 +1,585 @@
+<?php
+
+/**
+ * @file
+ *   Voip Drupal Call queue handler.
+ */
+
+define('VOIPQUEUE_DIAL', 1);
+define('VOIPQUEUE_TEXT', 2);
+
+define('VOIPQUEUE_STATUS_DELAYED', -2);
+
+/**
+ * Hooks.
+ */
+
+/**
+ * Implements hook_cron().
+ */
+function voipqueue_cron() {
+  // Change status of items that were delayed and now ready.
+  $update = db_update('advancedqueue')
+    ->fields(array(
+      'status' => ADVANCEDQUEUE_STATUS_QUEUED,
+      'expire' => 0,
+    ))
+    ->condition('status', VOIPQUEUE_STATUS_DELAYED)
+    ->condition('expire', time(), '<');
+  $update->execute();
+
+  // Release items that have reached their lease time.
+  // For a dial call this includes issuing a hang up.
+  $voipqueues = variable_get('voipqueue_queues', array());
+  $voipqueues['voipqueue_calls'] = 'voipqueue_calls';
+  foreach ($voipqueues as $queuename) {
+    $queue = DrupalQueue::get($queuename);
+    // Called before full initialization classes not correctly declared yet.
+    if (! is_a($queue, 'VoipQueue')) {
+      continue;
+    }
+    $expired = $queue->retrieveExpiredItems();
+    foreach ($expired as $item) {
+      if ($item->type == VOIPQUEUE_DIAL) {
+        voipqueue_call_hangup($item);
+      }
+      $queue->deleteItem($item);
+      // @todo Set result on the advancedqueue.
+      //There is no sense of retrying a call that exceeded its time limitation
+      /*if ($item->retryPermitted()) {
+        $queue->releaseItem($item);
+      }
+      else {
+        $queue->deleteItem($item);
+      }*/
+    }
+  }
+}
+
+/**
+ * Implements hook_advanced_queue_info().
+ */
+function voipqueue_advanced_queue_info() {
+  // Default queue.
+  $queues['voipqueue_calls'] = array(
+    'worker callback' => 'voipqueue_call',
+    'delete when completed' => FALSE,
+    // We handle repeating, putting back in the queue, and deleting.
+  );
+  // Additional created queues.
+  $voipqueues = variable_get('voipqueue_queues', array());
+  foreach ($voipqueues as $queue) {
+    $queues[$queue] = array(
+      'worker callback' => 'voipqueue_call',
+      'delete when completed' => FALSE,
+    );
+  }
+  return $queues;
+}
+
+function voipqueue_views_api() {
+  return array(
+    'api' => 2,
+    'path' => drupal_get_path('module', 'voipqueue') . '/views',
+  );
+}
+
+/**
+ * Implements hook_action_info().
+ */
+function voipqueue_action_info() {
+  return array(
+    'voipqueue_add_dial_action' => array(
+      'type' => 'system',
+      'label' => t('Outgoing call'),
+      'configurable' => TRUE,
+      'triggers' => array('any'),
+    ),
+    'voipqueue_add_text_action' => array(
+      'type' => 'system',
+      'label' => t('Send SMS'),
+      'configurable' => TRUE,
+      'triggers' => array('any'),
+    ),
+    'voipqueue_hangup_call' => array( // declare the function name to be used. Replace the name with your function name
+      'type' => 'system', // can be node,comment etc
+      'label' => t('Hangup a call'), // the name of the operation which is displayed to the user.
+      'configurable' => FALSE,
+      'vbo_configurable' => FALSE,
+      'pass rows' => TRUE, // this will ensure that the entire views row is passed as part of the context in your action callback.
+    ),
+  );
+}
+
+function voipqueue_hangup_call($entity, $context) {
+  $item = unserialize($entity->data);
+  if ($item->type == VOIPQUEUE_DIAL) {
+    voipqueue_call_hangup($item);
+  }
+
+}
+
+/**
+ * Return a form definition so the Add text action can be configured.
+ *
+ * @param $context
+ *   Default values (if we are editing an existing action instance).
+ *
+ * @return
+ *   Form definition.
+ *
+ * @see voipqueue_add_text_action_validate()
+ * @see voipqueue_add_text_action_submit()
+ */
+function voipqueue_add_text_action_form($context) {
+  // Set default values for form.
+  if (!isset($context['recipient'])) {
+    $context['recipient'] = '';
+  }
+  if (!isset($context['message'])) {
+    $context['message'] = '';
+  }
+
+  $form['recipient'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Recipient'),
+    '#default_value' => $context['recipient'],
+    '#maxlength' => '254',
+    '#description' => t('The number to which the SMS should be sent OR a token [node:author:phone], [comment:author:phone], etc. referencing the phone number field you would like to send to.'),
+  );
+  $form['message'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Mesage'),
+    '#default_value' => $context['message'],
+    '#maxlength' => '140',
+    '#description' => t('The message that should be sent. You may include placeholders like [node:title], [user:name], and [comment:body] to represent data that will be different each time message is sent. Not all placeholders will be available in all contexts.'),
+  );
+  return $form;
+}
+
+/**
+ * Validate system_send_email_action form submissions.
+ */
+function voipqueue_add_text_action_validate($form, $form_state) {
+  $form_values = $form_state['values'];
+  // @todo Validate the phone number or token - if possible.
+}
+
+/**
+ * Process system_send_email_action form submissions.
+ */
+function voipqueue_add_text_action_submit($form, $form_state) {
+  $form_values = $form_state['values'];
+  // Process the HTML form to store configuration. The keyed array that
+  // we return will be serialized to the database.
+  $params = array(
+    'recipient' => $form_values['recipient'],
+    'message'   => $form_values['message'],
+  );
+  return $params;
+}
+
+/**
+ * Action to add an SMS to the queue.
+ *
+ * @param object $entity
+ *   An optional node object, which will be added as $context['node'] if
+ *   provided.
+ * @param array $context
+ *   Array with the following elements:
+ *   - 'recipient': SMS recipient. This will be passed through token_replace().
+ *   - 'message': The message to send. This will be passed through
+ *     token_replace().
+ *   - Other elements will be used as the data for token replacement.
+ *
+ * @ingroup actions
+ */
+function voipqueue_add_text_action($entity, $context) {
+  if (empty($context['node'])) {
+    $context['node'] = $entity;
+  }
+
+  $recipient = token_replace($context['recipient'], $context);
+  $message = token_replace($context['message'], $context);
+
+  voipqueue_add_text($recipient, $message);
+  watchdog('action', 'SMS to %recipient added to queue', array('%recipient' => $recipient));
+}
+
+/**
+ * Return a form definition so the Add dial action can be configured.
+ *
+ * @param $context
+ *   Default values (if we are editing an existing action instance).
+ *
+ * @return
+ *   Form definition.
+ *
+ * @see voipqueue_add_dial_action_validate()
+ * @see voipqueue_add_dial_action_submit()
+ */
+function voipqueue_add_dial_action_form($context) {
+  // Set default values for form.
+  if (!isset($context['recipient'])) {
+    $context['recipient'] = '';
+  }
+  if (!isset($context['voipscript'])) {
+    $context['voipscript'] = '';
+  }
+  if (!isset($context['params'])) {
+    $context['params'] = '';
+  }
+
+  $form['recipient'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Recipient'),
+    '#default_value' => $context['recipient'],
+    '#maxlength' => '254',
+    '#description' => t('The number to which should be sent called OR a token [node:author:phone], [comment:author:phone], etc. referencing the phone number field you would like to call.'),
+  );
+  $form['voipscript'] = array(
+    '#type' => 'select',
+    '#title' => t('Script'),
+    '#options' => VoipScript::getScriptNames(),
+    '#default_value' => $context['voipscript'],
+    '#description' => t("VoIP script to use for call."),
+  );
+  $form['params'] = array(
+    '#type' => 'textarea',
+    '#title' => t('Parameters'),
+    '#default_value' => $context['params'],
+    '#cols' => '80',
+    '#rows' => '20',
+    '#description' => t('JSON of array of parameters to send to the voipscript. You may include placeholders like [node:title], [user:name], and [comment:body] to represent data that will be different each time message is sent. Not all placeholders will be available in all contexts.'),
+  );
+
+  return $form;
+}
+
+/**
+ * Validate system_send_email_action form submissions.
+ */
+function voipqueue_add_dial_action_validate($form, $form_state) {
+  $form_values = $form_state['values'];
+  // @todo Validate the phone number or token - if possible.
+  // @todo Validate JSON parameters.
+}
+
+/**
+ * Process system_send_email_action form submissions.
+ */
+function voipqueue_add_dial_action_submit($form, $form_state) {
+  $form_values = $form_state['values'];
+  // Process the HTML form to store configuration. The keyed array that
+  // we return will be serialized to the database.
+  $params = array(
+    'recipient' => $form_values['recipient'],
+    'voipscript'   => $form_values['voipscript'],
+    'params' => $form_values['params'],
+  );
+  return $params;
+}
+
+/**
+ * Action to add an call to the queue.
+ *
+ * @param object $entity
+ *   An optional node object, which will be added as $context['node'] if
+ *   provided.
+ * @param array $context
+ *   Array with the following elements:
+ *   - 'recipient': Call recipient. This will be passed through token_replace().
+ *   - 'voipscript': Name of script to use for call.
+ *   - 'params': JSON array of pararameters to pass to voipscript. This will be
+ *   passed through token_replace().
+ *   - Other elements will be used as the data for token replacement.
+ *
+ * @ingroup actions
+ */
+function voipqueue_add_dial_action($entity, $context) {
+  if (empty($context['node'])) {
+    $context['node'] = $entity;
+  }
+
+  $recipient = token_replace($context['recipient'], $context);
+  $params = token_replace($context['params'], $context);
+
+  $script = VoipScript::loadScript($context['voipscript'], json_decode($params));
+  $call = new VoipCall(array());
+  $call->setDestNumber($recipient);
+  $call->setScript($script);
+
+  voipqueue_add_dial($call);
+  watchdog('action', 'Call to %recipient added to queue', array('%recipient' => $recipient));
+}
+
+
+/**
+ * Worker callback functions.
+ */
+
+/**
+ * Worker callback for voipqueue_calls queue.
+ */
+function voipqueue_call($item) {
+  if ($item->type == VOIPQUEUE_TEXT) {
+    $result = voipqueue_call_text($item);
+  }
+  else {
+    $result = voipqueue_call_dial($item);
+  }
+
+  $queue = DrupalQueue::get($item->queueName);
+  switch ($result['status']) {
+    case ADVANCEDQUEUE_STATUS_QUEUED:
+      // @todo delayed release.
+      $queue->releaseItem($item);
+      break;
+    case ADVANCEDQUEUE_STATUS_FAILURE:
+    case ADVANCEDQUEUE_STATUS_SUCCESS:
+      $queue->deleteItem($item);
+  }
+
+  return $result;
+}
+
+/**
+ * Dial a call item.
+ *
+ * Note bypasses user permission checks. Do permission check if relevant before
+ * putting it in the queue.
+ */
+function voipqueue_call_dial($item) {
+  $call = $item->getCall();
+  //$voip_server = voip_default_server();
+  //$response = $voip_server->dial($call);
+  $response = voip_dial($call);
+
+  if ($response) {
+    $result = array(
+      'status' => ADVANCEDQUEUE_STATUS_SUCCESS,
+      'result' => 'Dialed ' . $item->item_id,
+    );
+  }
+  else {
+    if ($item->retryPermitted()) {
+      // @todo limit this by type of failure. So unrecoverable failed
+      // calls are not repeated.
+      // ie based on: $call::callStatus.
+      $result = array(
+        'status' => ADVANCEDQUEUE_STATUS_QUEUED,
+        'result' => voip_error_message(),
+      );
+    }
+    else {
+      $result = array(
+        'status' => ADVANCEDQUEUE_STATUS_FAILURE,
+        'result' => voip_error_message(),
+      );
+    }
+  }
+
+  return $result;
+}
+
+/**
+ * Send text message for item.
+ */
+function voipqueue_call_text($item) {
+  $call = $item->getCall();
+  //$text = voipcall_special_chars($item->text);
+
+  //$voip_server = voip_default_server();
+  //$response = $voip_server->send_text($text, $call);
+  $response = voip_text($item->text, $call);
+
+  if ($response) {
+    $result = array(
+      'status' => ADVANCEDQUEUE_STATUS_SUCCESS,
+      'result' => 'Text sent ' . $item->item_id,
+    );
+  }
+  else {
+    if ($item->retryPermitted()) {
+      // @todo limit this by type of failure. So unrecoverable failed
+      // messages are not repeated. How much sense does this even make for
+      // a text message?
+      $result = array(
+        'status' => ADVANCEDQUEUE_STATUS_QUEUED,
+        'result' => voip_error_message(),
+      );
+    }
+    else {
+      $result = array(
+        'status' => ADVANCEDQUEUE_STATUS_FAILURE,
+        'result' => voip_error_message(),
+      );
+    }
+  }
+
+  return $result;
+}
+
+/**
+ * Hangup a dial call.
+ */
+function voipqueue_call_hangup($item) {
+  $call = $item->getCall();
+  $voip_server = voip_default_server();
+
+  // Allow script callback hangup to run.
+  voipcall_process_hangup($call);
+  // Server hangup call.
+  return $voip_server->hangup($call);
+}
+
+/**
+ * Procedural functions for adding items to the default queue.
+ */
+
+/**
+ * Helper, and example, function to add dial call to default queue.
+ *
+ * Options:
+ *   'max_length' => Maximum length in seconds before forcing hangup of
+ *     call (default: 600).
+ *   'retries' => Number of times to redialing the call if it failed
+ *     (default: 2).
+ *   'retry_delay' => Minumum number of seconds to wait between attempts to
+ *     redial (default: 60).
+ *   'delay' => Time to wait until starting to attempt to call in seconds
+ *     (default: 0).
+ *   'queue_name' => The name of the machine name of the queue to use. This
+ *     must be registered as a VoipQueue. (default: 'voipqueue_calls')
+ *
+ * @param VoipCall $call
+ *   Call object. Containing at minimum a VoipScript and a destination
+ *   number to dial.
+ * @param array $options
+ *   Keyed array of options.
+ */
+function voipqueue_add_dial($call, $options = array()) {
+
+  // The queue 'voipqueue_calls' is the default queue and is registered with
+  // Drupal queue as a VoipQueue. If you create a new queue you will need to
+  // register it. See voipqueue_init() for example registering class.
+  $queue_name = isset($options['queue_name']) ? $options['queue_name'] : 'voipqueue_calls';
+  $queue = DrupalQueue::get($queue_name);
+
+  // Create queue can always be called. In this case the queue is fully created;
+  // for a new queue it is needed to make sure that voipqueue will handle
+  // expiring items etc.
+  $queue->createQueue();
+
+  // Creates a VoipQueue item for dialing.
+  $item = new VoipQueueDial($call);
+
+  // Add options if they are required.
+  if (isset($options['max_length'])) {
+    $item->setMaxLength($options['max_length']);
+  }
+
+  if (isset($options['retries'])) {
+    if (isset($options['retry_delay'])) {
+      $item->setRetry($options['retries'], $options['retry_delay']);
+    }
+    else {
+      $item->setRetry($options['retries']);
+    }
+  }
+
+  if (isset($options['delay'])) {
+    if ($options['delay'] instanceof DateTime) {
+      $item->setDelay(time() - $options['delay']->format('U'));
+    }
+    elseif (is_numeric($options['delay'])) {
+      $item->setDelay($options['delay']);
+    }
+  }
+
+  if (isset($options['tags'])) {
+    $item->tags = $options['tags'];
+  }
+
+  // Add the item to the queue.
+  return $queue->createItem($item);
+}
+
+/**
+ * Helper, and example, function to add text to default queue.
+ *
+ * Options:
+ *   'delay' => Number of seconds to wait before sending text (Default: 0),
+ *   'tags' => Array of tags to add to the item.
+ *   'queue_name' => The name of the machine name of the queue to use. This
+ *     must be registered as a VoipQueue. (default: 'voipqueue_texts')
+ *
+ * @param string $number
+ *   Destination number to send text to.
+ * @param string $text
+ *   Text to send.
+ * @param array $options
+ *   Keyed array of options.
+ */
+function voipqueue_add_text($number, $text, $options = array()) {
+
+  // The queue 'voipqueue_calls' is the default queue and is registered with
+  // Drupal queue as a VoipQueue. If you create a new queue you will need to
+  // register it. See voipqueue_init() for example registering class.
+  $queue_name = isset($options['queue_name']) ? $options['queue_name'] : 'voipqueue_texts';
+  $queue = DrupalQueue::get($queue_name);
+  $queue->createQueue();
+
+  // First create a VoipCall object to queue.
+  $call = new VoipCall(array());
+  // Only the destination number need be set.
+  $call->setDestNumber($number);
+
+  // Create a VoipQueue item for sending text.
+  $item = new VoipQueueText($call, $text);
+
+  // Add options if they are required.
+  if (isset($options['delay'])) {
+    $item->setDelay($options['delay']);
+  }
+  if (isset($options['tags'])) {
+    $item->tags = $options['tags'];
+  }
+
+  // Add the item to the queue.
+  $queue->createItem($item);
+}
+
+/**
+ * Implementation of hook_voip_event().
+ */
+//@todo: update status of callblast history if call was requeued
+function voipqueue_voip_event($call, $status) {
+  switch ($status) {
+    case VoipEvent::BUSY:
+    case VoipEvent::NO_ANSWER:
+      $title = $call->getDestNumber() . ':' . $call->getCid();
+      $result = db_query('SELECT data, item_id FROM {advancedqueue} WHERE name = :name AND title = :title',
+        array(':name' => 'voipblast_voice', ':title' => $title));
+      $item = $result->fetchObject();
+      $item->data = unserialize($item->data);
+      if (is_a($item->data, 'VoipQueueJob')) {
+        $item->data->item_id = $item->item_id;
+        $item = $item->data;
+        if ($item->retryPermitted()) {
+          $delay = $item->retryDelay;
+          db_update('advancedqueue')
+            ->fields(array(
+              'status' => $delay ? VOIPQUEUE_STATUS_DELAYED :   ADVANCEDQUEUE_STATUS_QUEUED,
+              'data' => serialize($item),
+              'expire' => $delay,
+            ))
+            ->condition('title', $title)
+            ->condition('name', 'voipblast_voice')
+            ->execute();
+        }
+      }
+
+      break;
+  }
+}

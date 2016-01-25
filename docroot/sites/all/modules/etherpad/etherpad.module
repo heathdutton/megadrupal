@@ -1,0 +1,276 @@
+<?php
+/**
+ * @file
+ * Etherpad Lite integration.
+ * @see https://github.com/ether/etherpad-lite
+ */
+
+/**
+ * Implements hook_menu().
+ */
+function etherpad_menu() {
+  $items['etherpad/get'] = array(
+    'page callback' => 'etherpad_getContent',
+    'access callback' => TRUE,
+    'type' => MENU_CALLBACK,
+  );
+  $items['etherpad/set/%node'] = array(
+    'page callback' => 'etherpad_setContent',
+    'access callback' => 'node_access',
+    'access arguments' => array('update', 2),
+    'type' => MENU_CALLBACK,
+  );
+  $items['admin/config/content/etherpad-lite'] = array (
+    'title' => 'Etherpad-Lite',
+    'description' => 'Default configuration to be used by all etherpad fields.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('etherpad_settings_form'),
+    'access arguments' => array('administer site configuration'),
+    'file' => 'etherpad.admin.inc',
+  );
+  $items['etherpad/%node/%'] = array(
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('etherpad_edit_form', 1, 2),
+    'access callback' => 'etherpad_access_edit',
+    'access arguments' => array(1, 2),
+    'type' => MENU_CALLBACK,
+    'file' => 'etherpad.pages.inc',
+  );
+  return $items;
+}
+
+/**
+ * Access callback for node body etherpad.
+ */
+function etherpad_access_edit($node, $field_name) {
+  if ($field_instance = field_info_instance('node', $field_name, $node->type)) {
+    // Check access to edit field.
+    //$field = field_info_field_by_id($field_instance['field_id']);
+    return node_access('update', $node); // @todo && field_access('edit', $field, 'node', $node);
+  }
+  return FALSE;
+}
+
+/**
+ * Implements hook_field_formatter_info().
+ */
+function etherpad_field_formatter_info() {
+  return array('etherpad' => array(
+    'label' => t('Local Editable'),
+    'field types' => array('text', 'text_long', 'text_with_summary'),
+  ));
+}
+
+/**
+ * Implements hook_field_formatter_view().
+ */
+function etherpad_field_formatter_view($entity_type, $entity, $field, $instance, $langcode, $items, $display) {
+  $element = array();
+  $update = node_access('update', $entity); // @todo && field_access('edit', $field, $entity_type, $entity);
+
+  switch ($display['type']) {
+    // This formatter simply outputs the field as text and with a color.
+    case 'etherpad':
+      $display['type']='text_default';
+      $elem = text_field_formatter_view($entity_type, $entity, $field, $instance, $langcode, $items, $display);
+      foreach ($items as $delta => $item) {
+        if ($update) {
+          $element[$delta]['#markup'] = theme('etherpad_local', array(
+            'content' => $elem[$delta]['#markup'],
+            'link' => url('etherpad/' . $entity->nid. '/' . $field['field_name'], array('absolute' => TRUE)),
+          ));
+        }
+        else {
+          $element[$delta]['#markup'] = $elem[$delta]['#markup'];
+        }
+      }
+      break;
+  }
+
+  return $element;
+}
+
+/**
+ * Implements hook_form_BASE_FORM_ID_alter().
+ */
+function etherpad_form_node_form_alter(&$form, &$form_state, $form_id) {
+  if (isset($form['#entity_type']) && $form['#entity_type'] == 'node') {
+    etherpad_enrich_form($form, $form_state);
+  }
+}
+
+/**
+ * Implements hook_node_presave().
+ */
+function etherpad_node_presave($node) {
+  if (property_exists($node, 'etherpad_gid') && !empty($node->nid)) {
+    $old_egid = etherpad_get_egid($node->nid);
+    if (!isset($old_egid) || strlen($old_egid) == 0) {
+      db_insert('etherpad_node')->fields(array('nid'=> $node->nid, 'egid' => $node->etherpad_gid))->execute();
+    }
+    elseif ($old_egid != $node->etherpad_gid) {
+      db_update('etherpad_node')->fields(array('egid' => $node->etherpad_gid))->condition('nid',$node->nid)->execute();
+    }
+  }
+}
+
+/**
+ * Implements hook_theme().
+ */
+function etherpad_theme($existing, $type, $theme, $path) {
+  return array(
+    'etherpad_local' => array(
+      'render element' => 'element',
+      'template' => 'etherpad_local',
+    ),
+  );
+}
+
+/**
+ * Implements hook_wysiwyg_include_directory().
+ */
+function etherpad_wysiwyg_include_directory($type) {
+  switch ($type) {
+    case 'editors':
+      return $type;
+  }
+}
+
+/**
+ * Creates new instance of client.
+ *
+ * @return EtherpadLiteClient
+ */
+function etherpad_get_client() {
+  $path = libraries_get_path('etherpad-lite-client');
+  if ($path) {
+    require_once($path . '/etherpad-lite-client.php');
+    return new EtherpadLiteClient(variable_get('etherpad_api_key', ''), variable_get('etherpad_base_url', 'http://localhost:9001') . '/api');
+  }
+  watchdog('etherpad', 'Etherpad light client library not found.', array(), WATCHDOG_ERROR);
+}
+
+/**
+ * Fetch the etherpad group name associated with node.
+ *
+ * @param $nid
+ *   Node ID.
+ * @return string|FALSE
+ */
+function etherpad_get_egid($nid) {
+  return db_query('SELECT egid FROM {etherpad_node} WHERE nid = :nid', array(':nid' => $nid))->fetchField();
+}
+
+/**
+ * Ensures to create group, user and session for pad.
+ */
+function etherpad_enrich_form(&$form, &$form_state) {
+  try {
+    $client = etherpad_get_client();
+    if (is_null($client)) {
+      return;
+    }
+
+    if (isset($form['#node']) && property_exists($form['#node'], 'nid')) {
+      $nid = $form['#node']->nid;
+      $egid = $client->createGroupIfNotExistsFor($nid)->groupID;
+    }
+    else {
+      // For new node we have no nid.
+      $egid = $client->createGroup()->groupID;
+    }
+
+    global $user;
+
+    $author = $client->createAuthorIfNotExistsFor($user->uid, isset($user->name) ? $user->name : 'anonymous')->authorID;
+
+    static $sessionID;
+    if (!isset($sessionID)) {
+      // One day in the future.
+      // @todo provide a setting.
+      $validUntil = REQUEST_TIME + 24 * 60 * 60;
+      $sessionID = $client->createSession($egid, $author, $validUntil)->sessionID;
+      // Set a cookie to allow access.
+      $host = parse_url(variable_get('etherpad_base_url', 'http://localhost:9001'), PHP_URL_HOST);
+      setcookie('sessionID', $sessionID, $validUntil, '/', $host);
+    }
+
+    $form['etherpad_gid'] = array(
+      '#type' => 'hidden',
+      '#attributes' => array('id' => array('etherpad_gid')),
+      '#default_value' => $egid,
+    );
+    if (isset($nid)) {
+      $form['etherpad_nid'] = array(
+        '#type' => 'hidden',
+        '#attributes' => array('id' => array('etherpad_nid')),
+        '#default_value' => $nid,
+      );
+    }
+  }
+  catch (Exception $e) {
+    watchdog('etherpad', $e->getMessage(), array(), WATCHDOG_ERROR);
+  }
+}
+
+/**
+ * AJAX callback to get content from pad.
+ */
+function etherpad_getContent() {
+  if (!isset($_POST['padid'])) {
+    echo json_encode(array('status' => 'fail', 'msg' => 'No content set'));
+    return;
+  }
+  $padid = $_POST['padid'];
+  try {
+    $client = etherpad_get_client();
+    if (is_null($client)) {
+      echo json_encode(array('status' => 'fail', 'msg' => 'could not initialize '));
+      return;
+    }
+    // @todo Add setting to choose Text/HTML.
+    //$content = $client->getText($padid)->text;
+    $content = $client->getHTML($padid)->html;
+    $content = html_entity_decode($content, ENT_QUOTES, 'UTF-8');
+  }
+  catch (Exception $e) {
+    echo json_encode(array('status' => 'fail', 'msg' => 'see logs'));
+    watchdog('etherpad', $e->getMessage(), array(), WATCHDOG_ERROR);
+    return;
+  }
+
+  echo json_encode(array('status' => 'ok', 'content' => $content));
+}
+
+/**
+ * AJAX callback to set pad content.
+ */
+function etherpad_setContent() {
+  if (!isset($_POST['content'])) {
+    echo json_encode(array('status' => 'fail', 'msg' => 'No content set'));
+    return;
+  }
+  if (!isset($_POST['padid'])) {
+    echo json_encode(array('status' => 'fail', 'msg' => 'No content set'));
+    return;
+  }
+  $padid = $_POST['padid'];
+  $content = $_POST['content'];
+  try {
+    $client = etherpad_get_client();
+    if (is_null($client)) {
+      echo json_encode(array('status' => 'fail', 'msg' => 'could not initialize '));
+      return;
+    }
+    // @todo Add setting to choose Text/HTML.
+    //$client->setText($padid, $content);
+    $client->setHTML($padid, $content);
+  }
+  catch (Exception $e) {
+    echo json_encode(array('status' => 'fail', 'msg' => 'see logs'));
+    watchdog('etherpad', $e->getMessage(), array(), WATCHDOG_ERROR);
+    return;
+  }
+
+  echo json_encode(array('status' => 'ok'));
+}

@@ -1,0 +1,1600 @@
+<?php
+
+/**
+ * @file
+ * Provides a low-level API and forms for import modules.
+ */
+
+/**
+ * Allow two hours for migration (in seconds).
+ *
+ * Note: this is a deprecated constant, from before Batch API was introduced.
+ */
+define('VBIMPORTAPI_ALLOWED_TIME_FOR_MIGRATE', 7200);
+
+/**
+ * Number of records to process per batch pass.
+ */
+define('VBIMPORTAPI_RECORDS_PER_PASS', 100000);
+
+/**
+ * Minimum required version of MySQL.
+ */
+define('VBIMPORTAPI_MINIMUM_MYSQL', '5.0.15');
+
+/**
+ * Use experimental API for copying multiple files in parallel.
+ */
+define('VBIMPORTAPI_USE_EXPERIMENTAL_COPY', FALSE);
+
+/**
+ * Arbitrary number to add to database id values, stops record collisions.
+ *
+ * Not only does this stop collisions between imported and existing records
+ * but is required to maintain relationships between tables. If data were
+ * imported to new records, with new unique ids, there would be no way to keep
+ * users associated with their files, or nodes with vocabularies, for example.
+ */
+define('VBIMPORTAPI_ADD_TO_IDS', 1000000);
+
+/**
+ * Implementation of hook_permission().
+ */
+function vbimportapi_permission() {
+  $perms = array();
+
+  foreach (module_implements('vbimportapi_importer') as $module) {
+    $importer = vbimportapi_module_invoke_importer($module);
+    $perms['import ' . $module . ' records'] = array(
+      'title' => t('Import ' . $importer['product'] . ' records'),
+    );
+    $perms['delete imported ' . $module . ' records'] = array(
+      'title' => t('Delete imported ' . $importer['product'] . ' records'),
+    );
+  }
+
+  return $perms;
+}
+
+/**
+ * Implementation of hook_menu().
+ */
+function vbimportapi_menu() {
+  $menu = array();
+
+  // Build menu from information supplied by modules implementing
+  // importer_info hook.
+  foreach (module_implements('vbimportapi_importer') as $module) {
+    $importer = vbimportapi_module_invoke_importer($module);
+
+    $module_url_string = str_replace('_', '-', $module);
+
+    $menu['admin/structure/' . $module_url_string] = array(
+      'title' => $importer['title'],
+      'title callback' => 'check_plain',
+      'description' => 'Import records into Drupal',
+      'page callback' => 'drupal_get_form',
+      'page arguments' => array('vbimportapi_settings_form', $module),
+      'access arguments' => array('import ' . $module . ' records'),
+      'weight' => 10,
+    );
+
+    // Default tab: the configuration form, for entering database details.
+    $menu['admin/structure/' . $module_url_string . '/configure'] = array(
+      'title' => '1. Configure',
+      'type' => MENU_DEFAULT_LOCAL_TASK,
+    );
+
+    // Import form, a submit here should start the import.
+    $menu['admin/structure/' . $module_url_string . '/import'] = array(
+      'title' => '2. Test and import from ' . $importer['product'],
+      'page callback' => 'drupal_get_form',
+      'page arguments' => array('vbimportapi_import_form', $module),
+      'access arguments' => array('import ' . $module . ' records'),
+      'type' => MENU_LOCAL_TASK,
+    );
+
+    // Semi-hidden delete function.
+    $menu['admin/structure/' . $module_url_string . '/delete'] = array(
+      'title' => 'Delete data imported from ' . $importer['product'],
+      'page callback' => 'drupal_get_form',
+      'page arguments' => array('vbimportapi_delete_form', $module),
+      'access arguments' => array('delete imported ' . $module . ' records'),
+      'type' => MENU_CALLBACK,
+    );
+  }
+
+  return $menu;
+}
+
+/**
+ * Configure database settings to include import database.
+ *
+ * @param $import_url
+ *   Drupal database configuration url, compatible with parse_url(). If this
+ *   parameter is not supplied the settings are reverted to the site's default.
+ * @param $import_prefix
+ *   Prefix to import database name.
+ */
+function vbimportapi_db_setup($import_db_info = NULL) {
+  // Reset database back to Drupal default.
+  if (!isset($import_db_info)) {
+    db_set_active();
+    Database::removeConnection('import_into');
+    Database::removeConnection('import_from');
+
+    return;
+  }
+
+  $default_db_info = Database::getConnectionInfo();
+  $default_db_info = $default_db_info['default'];
+
+  // Work out whether the username and password should come from the import or
+  // default database. Means users don't have to enter a username/password for
+  // the import database.
+  if (empty($import_db_info['username'])) {
+    $user_pass_db = 'default';
+  }
+  else {
+    $user_pass_db = 'import';
+  }
+  $db_username = ${$user_pass_db . '_db_info'}['username'];
+  $db_password = ${$user_pass_db . '_db_info'}['password'];
+
+  // New database connection, using either the Drupal database username/password
+  // or the import database username/password (should be whichever has access
+  // to both databases).
+  $import_into = array(
+    'driver' => $default_db_info['driver'],
+    'database' => $default_db_info['database'],
+    'username' => $db_username,
+    'password' => $db_password,
+    'host' => (isset($default_db_info['host']) ? $default_db_info['host'] : 'localhost'),
+    'port' => (isset($default_db_info['port']) ? $default_db_info['port'] : '3306'),
+    // A blank prefix is extremely important.
+    // @see vbimportapi_query_vbimport_alter()
+    'prefix' => array('default' => ''),
+  );
+  Database::addConnectionInfo('import_into', 'default', $import_into);
+
+  $import_from = array(
+    'driver' => $default_db_info['driver'],
+    'database' => $import_db_info['database'],
+    'username' => $db_username,
+    'password' => $db_password,
+    'host' => (isset($default_db_info['host']) ? $default_db_info['host'] : 'localhost'),
+    'port' => (isset($default_db_info['port']) ? $default_db_info['port'] : '3306'),
+    'prefix' => array(
+      'default' => $import_db_info['prefix']['default'],
+    ),
+  );
+  Database::addConnectionInfo('import_from', 'default', $import_from);
+
+  // The import database is either the import with the import user or
+  // the import with the default user.
+  db_set_active('import_into');
+}
+
+/**
+ * Restores Drupal database settings back to site original.
+ */
+function vbimportapi_db_restore() {
+  vbimportapi_db_setup();
+}
+
+/**
+ * Routes queries to the appropriate Drupal database query function.
+ *
+ * This adds support for '{{' and '}}' around table names in query strings,
+ * which will automatically be converted to the database and table name of the
+ * import database.
+ *
+ * @param $func
+ *   The Drupal database function to call.
+ * @param $query
+ *   A string containing a SQL query.
+ * @param $args
+ *   An array of arguments which are substituted into the query
+ *   using printf() syntax.
+ *
+ * @return
+ *   A database query result resource, or FALSE if the query was not
+ *   executed correctly.
+ */
+function _vbimportapi_db_router($func, $query, $args = array()) {
+  global $db_url;
+  global $db_type;
+  global $import_db_prefix;
+
+  $db_import = parse_url($db_url['import_from']);
+  $import_db_name = substr(urldecode($db_import['path']), 1);
+
+  if ($db_type == 'mysql' || $db_type == 'mysqli') {
+    $import_db_name = '`' . $import_db_name . '`';
+  }
+  $query = strtr($query, array('{{' => $import_db_name . '.' . $import_db_prefix, '}}' => ''));
+  array_unshift($args, $query);
+
+  return call_user_func_array($func, $args);
+}
+
+/**
+ * Wrapper around Drupal's db_query() function.
+ */
+function vbimportapi_db_query($query) {
+  $args = func_get_args();
+  array_shift($args);
+  return _vbimportapi_db_router('db_query', $query, $args);
+}
+
+/**
+ * Wrapper around Drupal's db_query_range() function.
+ */
+function vbimportapi_db_query_range($query) {
+  $args = func_get_args();
+  array_shift($args);
+  return _vbimportapi_db_router('db_query_range', $query, $args);
+}
+
+/**
+ * Wrapper around Drupal's db_query_temporary() function.
+ */
+function vbimportapi_db_query_temporary($query) {
+  $args = func_get_args();
+  array_shift($args);
+  return _vbimportapi_db_router('db_query_temporary', $query, $args);
+}
+
+/**
+ * Check for the existence of database tables in the import database.
+ */
+function vbimportapi_check_tables($tables) {
+  $import_from = Database::getConnectionInfo('import_from');
+  $import_db_name = $import_from['default']['database'];
+  $import_db_prefix = $import_from['default']['prefix']['default'];
+
+  $import_into = Database::getConnectionInfo('import_into');
+  $target_db_name = $import_into['default']['database'];
+  $target_db_prefix = $import_into['default']['prefix']['default'];
+
+  $out = array();
+  $out['result'] = TRUE;
+  $tables_not_found = array();
+  $trouble_count = 0;
+  $trouble_records = array();
+  $rows = array();
+
+  foreach ($tables as $table_key => $table) {
+    if (is_array($table)) {
+      $table_name = $table_key;
+    }
+    else {
+      $table_name = $table;
+    }
+
+    if (!vbimportapi_import_db_table_exists($table_name)) {
+      $tables_not_found[] = array(
+        'data' => t('Table <strong>%table</strong> could not be found!', array('%table' => $table)),
+      );
+      $out['result'] = FALSE;
+    }
+
+    // If $table is an array it's a field length check, otherwise it should
+    // just be checked to ensure the table exists in the import from database
+    // and we don't need to go any further with this table.
+    if (!$out['result'] || !is_array($table)) {
+      continue;
+    }
+
+    foreach ($table as $check_key => $check_details) {
+      // Get the maximum allowed length of the column in the table being
+      // imported into.
+      $check_table = array_keys($check_details['is checked against']);
+      $check_column = array_values($check_details['is checked against']);
+
+      // We only support checking one column and the extra array was mostly
+      // for the 'is checked against' syntactic sugar.
+      $check_table = $check_table[0];
+      $check_column = $check_column[0];
+
+      $check_column_length = vbimportapi_target_db_column_length($check_column, $check_table);
+
+      // And don't go past this point if the column length cannot be determined.
+      if ($check_column_length == 0) {
+        continue;
+      }
+
+      // Get the primary key of the table being checked, should help the user
+      // identify problem records (rather than just giving them the
+      // field contents).
+      $sql = "SELECT k.column_name
+        FROM information_schema.table_constraints t
+        JOIN information_schema.key_column_usage k
+        ON t.constraint_name = k.constraint_name
+        AND t.table_schema = k.table_schema
+        AND t.table_name = k.table_name
+        WHERE t.constraint_type = :primary_key
+        AND t.table_schema = :table_schema
+        AND t.table_name = :table_name";
+      $primary_key = db_query($sql, array(':primary_key' => 'PRIMARY KEY', ':table_schema' => $import_db_name, ':table_name' => $import_db_prefix . $table_key))->fetchField();
+
+      // Get records from the source table and column where the length of the
+      // data in the field is longer than the maximum length of the column the
+      // data is to be imported into. In other words: are there any records in
+      // the check key column that are longer than the check column.
+      //
+      // $check_key is the column in the Drupal table.
+      // $table_name is the Drupal table.
+      // $check_column_length is the maximum length string the Drupal field
+      // can contain.
+      $query = db_select($table_name, 't')
+        ->addTag('vbimport');
+      $check_field = $query->addField('t', $check_key, 'check_field');
+      $query->addExpression(':field_name', 'field_name', array(':field_name' => $check_key));
+      $query->addExpression(':table_name', 'table_name', array(':table_name' => $table_name));
+      $query->where('LENGTH(' . $check_key . ') > ' . $check_column_length);
+
+      if (!empty($primary_key)) {
+        $check_id = $query->addField('t', $primary_key, 'check_id');
+      }
+
+      $this_trouble_count = $query->countQuery()->execute()->fetchField();
+
+      // Don't go past this point if there are no records in the column being
+      // imported from which exceed the maximum length of the column being
+      // imported into.
+      if (empty($this_trouble_count)) {
+        continue;
+      }
+
+      $trouble_records[] = array(
+        'query' => $query,
+        'count' => $this_trouble_count,
+        'max length' => $check_column_length,
+      );
+      $trouble_count += $this_trouble_count;
+    }
+  }
+
+  $page = pager_default_initialize($trouble_count, 50);
+  $offset = 50 * $page;
+
+  // Cumulative count of all queries' records.
+  $this_trouble_count = 0;
+
+  // The number of printed records (since there's no way to deduce how many
+  // of a previous query's records were printed).
+  $printed_count = 0;
+
+  foreach ($trouble_records as $trouble) {
+    // This condition will be met when the records on the current page
+    // have all been outputted.
+    if ($this_trouble_count > 50 * ($page + 1)) {
+      continue;
+    }
+
+    // Don't go any further if the current query's records do not fall on the
+    // current page.
+    if ($this_trouble_count + $trouble['count'] <= $offset) {
+      $this_trouble_count += $trouble['count'];
+      continue;
+    }
+
+    // If this is a positive figure, some of the current query's records must
+    // have been printed on the previous page.
+    $trouble_start = ($offset + $printed_count) - $this_trouble_count;
+    if ($trouble['count'] <= (50 - $printed_count)) {
+      $trouble_end = $trouble['count'];
+    }
+    else {
+      $trouble_end = 50 - $printed_count;
+    }
+
+    // Restrict the query to between the offset and the offset + 1 page.
+    $trouble['query']->range($trouble_start, $trouble_end);
+    $result = $trouble['query']->execute();
+
+    foreach ($result as $trouble_record) {
+      $rows[] = array(
+          $trouble_record->table_name,
+          $trouble_record->field_name,
+          (empty($check_id) ? '-' : check_plain($trouble_record->{$check_id})),
+          (int) $trouble['max length'],
+          check_plain($trouble_record->{$check_field}),
+      );
+    }
+
+    $printed_count = $trouble_end - $trouble_start;
+    $this_trouble_count += $trouble['count'];
+  }
+
+  $out['html']['missing_tables'] = theme('item_list', array('items' => $tables_not_found));
+
+  if (!empty($rows)) {
+    $table = array(
+      'header' => array(
+        'Table',
+        'Field',
+        'Unique id',
+        'Max length',
+        'Trouble data',
+      ),
+      'rows' => $rows,
+    );
+
+    $out['html']['trouble_records'] = theme('table', $table);
+    $out['html']['trouble_records'] .= theme('pager');
+  }
+
+  return $out;
+}
+
+/**
+ * Importer specific version of module_invoke().
+ *
+ * @param $module
+ *   The name of the module to get importer information from.
+ *
+ * @return
+ *   An array representing importer information.
+ */
+function vbimportapi_module_invoke_importer() {
+  $args = func_get_args();
+  $module = $args[0];
+  unset($args[0]);
+
+  $function = $module . '_vbimportapi_importer';
+  if (module_hook($module, 'vbimportapi_importer')) {
+    $importer = call_user_func_array($function, $args);
+  }
+  else {
+    return;
+  }
+
+  $result = _vbimportapi_implements_sub($module, 'operations');
+  $importer['operations'] = array_merge($importer['operations'], $result);
+  drupal_alter($module . '_importer', $importer);
+  vbimportapi_importer_prepare($module, $importer);
+
+  return $importer;
+}
+
+/**
+ * Add default settings and operations arguments to an importer.
+ */
+function vbimportapi_importer_prepare($module, &$importer) {
+  // Add default importer settings.
+  $importer += array(
+    'db_info' => variable_get($module . '_db_info', array()),
+  );
+
+  // Add default database information as user may not have saved any connection
+  // settings or the connection settings may be incomplete.
+  $connection_info = Database::getConnectionInfo();
+  $importer['db_info'] += array(
+    'driver' => $connection_info['default']['driver'],
+    'database' => $connection_info['default']['database'],
+    'host' => $connection_info['default']['host'],
+    'port' => $connection_info['default']['port'],
+    'username' => '',
+    'password' => '',
+    'prefix' => array(
+      'default' => $connection_info['default']['prefix']['default'],
+    ),
+  );
+
+  foreach ($importer['operations'] as &$operation) {
+    // @todo: only add default arguments when import function is 'vbimportapi'.
+    // This will impact functions that use this API.
+    $operation[1] += _vbimportapi_importer_default_args($module, $module);
+  }
+}
+
+/**
+ * Default arguments for importer batch operations.
+ *
+ * @param $importer_module
+ *   Name of the module responsible for database settings and creating the
+ *   initial array of batch items.
+ * @param $sub_module
+ *   Name of module adding operations to importer module's batch operations.
+ */
+function _vbimportapi_importer_default_args($importer_module, $sub_module) {
+  // Default arguments for operations. The structure of this array is:
+  // function, number of records to process, sub-module, importer module.
+  return array('', VBIMPORTAPI_RECORDS_PER_PASS, $importer_module, $sub_module);
+}
+
+/**
+ * Recursively get sub-module implementations of operations hooks.
+ *
+ * @param $module
+ *   The parent module.
+ * @param $hook
+ *   Either 'operations' or 'delete_import' are supported.
+ */
+function _vbimportapi_implements_sub($module, $hook) {
+  $return = array();
+
+  if (!in_array($hook, array('operations', 'delete_import'))) {
+    return;
+  }
+
+  foreach (module_implements($module . '_' . $hook) as $sub_module) {
+    $function = implode('_', array($sub_module, $module, $hook));
+    $result = $function();
+    if (isset($result) && is_array($result)) {
+      // This part is specific to the 'operations' hook, without this the
+      // function could support more hooks.
+      foreach ($result as &$operation) {
+        $operation[1] += _vbimportapi_importer_default_args($module, $sub_module);
+      }
+      $return = array_merge($return, $result);
+    }
+    // Stop infinite recursion if the module is implementing its own hook.
+    if ($module != $sub_module) {
+      $result = _vbimportapi_implements_sub($sub_module, $hook);
+      $return = array_merge($return, $result);
+    }
+  }
+
+  return $return;
+}
+
+/**
+ * Version of module_invoke() for module delete hooks.
+ *
+ * @param $module
+ *   The name of the module who's delete hook should be called.
+ */
+function vbimportapi_module_invoke_delete() {
+  $args = func_get_args();
+  $module = $args[0];
+  unset($args[0]);
+
+  if (module_hook($module, 'vbimportapi_delete')) {
+    $function = $module . '_vbimportapi_delete';
+    $importer = call_user_func_array($function, $args);
+  }
+  else {
+    return;
+  }
+
+  _vbimportapi_implements_sub($module, 'delete_import');
+}
+
+/**
+ * Import API specific version of module_invoke_all().
+ *
+ * This only works with select few hooks, on purpose, so that:
+ *   * there is clear delineation between Drupal's and Import API's hooks;
+ *   * it's possible to make this vB Import API specific.
+ *
+ * Currently, the supported hooks are 'importer' and 'delete'.
+ *
+ * @param $module
+ *   Name of the parent module which the hook is being called for.
+ *   Allows sub-modules to add their own import operations onto parent modules.
+ * @param $hook
+ *   The name of the hook to invoke.
+ *
+ * @see vbimportapi_module_invoke_importer()
+ * @see vbimportapi_module_invoke_delete()
+ */
+function vbimportapi_module_invoke_all() {
+  $args = func_get_args();
+  $module = $args[0];
+  $hook = $args[1];
+  unset($args[0]);
+  $hook = $module . '_' . $hook;
+  $return = array();
+
+  foreach (module_implements($hook) as $module) {
+    $function = 'vbimportapi_module_invoke_' . $hook;
+    $result = $function($module);
+    $return = array_merge_recursive($return, $result);
+  }
+
+  return $return;
+}
+
+/**
+ * Generate form API array definition for vbtodrupal_settings.
+ *
+ * @param $form_state
+ *   Array representing the form's state.
+ * @param $module
+ *   The module name, used as the prefix when saving the database settings URL
+ *   and database prefix.
+ *
+ * @see vbimportapi_settings_form_validate()
+ * @see vbimportapi_settings_form_submit()
+ */
+function vbimportapi_settings_form($form, &$form_state, $module) {
+  $importer = vbimportapi_module_invoke_importer($module);
+  $db = $importer['db_info'];
+
+  // Database name
+  $form['basic_options']['database'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Database name'),
+    '#default_value' => $db['database'],
+    '#size' => 45,
+    '#maxlength' => 45,
+    '#required' => TRUE,
+  );
+
+  // Table prefix
+  $form['basic_options']['prefix'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Table prefix'),
+    '#default_value' => $db['prefix'],
+    '#size' => 45,
+    '#maxlength' => 45,
+  );
+
+  $form['advanced_options'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Advanced options'),
+    '#collapsible' => TRUE,
+    '#collapsed' => empty($db['username']) ? TRUE : FALSE,
+    '#description' => t("These options are only necessary for some sites. If you're not sure what you should enter here, leave the default settings or check with your hosting provider."),
+  );
+
+  // Database username
+  $form['advanced_options']['username'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Database username'),
+    '#default_value' => $db['username'],
+    '#size' => 45,
+    '#maxlength' => 45,
+  );
+
+  // Database password
+  $form['advanced_options']['password'] = array(
+    '#type' => 'password',
+    '#title' => t('Database password'),
+    '#default_value' => $db['password'],
+    '#size' => 45,
+    '#maxlength' => 45,
+  );
+
+  // Database type: not editable due to limitations of database abstraction layer.
+  $form['advanced_options']['driver'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Database type'),
+    '#value' => $db['driver'],
+    '#size' => 45,
+    '#disabled' => TRUE,
+    '#required' => TRUE,
+  );
+
+  // Database host
+  $form['advanced_options']['host'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Database host'),
+    '#value' => $db['host'],
+    '#size' => 45,
+    // Hostnames can be 255 characters long.
+    '#maxlength' => 255,
+    '#required' => TRUE,
+    '#disabled' => TRUE,
+  );
+
+  // Database port
+  $form['advanced_options']['port'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Database port'),
+    '#value' => $db['port'],
+    '#size' => 45,
+    '#maxlength' => 45,
+    '#disabled' => TRUE,
+  );
+
+  $form['module'] = array(
+    '#type' => 'value',
+    '#value' => $module,
+  );
+
+  $form['save'] = array(
+    '#type' => 'submit',
+    '#value' => t('Save and continue'),
+    '#weight' => 10,
+  );
+
+  return $form;
+}
+
+/**
+ * Form API validate for vbtodrupal_settings form.
+ *
+ * @see vbimportapi_settings_form()
+ * @see vbimportapi_settings_form_submit()
+ */
+function vbimportapi_settings_form_validate($form, &$form_state) {
+  $db_prefix = $form_state['values']['prefix'];
+  $db_port = $form_state['values']['port'];
+
+  // Verify the table prefix.
+  if (!empty($db_prefix) && is_string($db_prefix) && !preg_match('/^[A-Za-z0-9_.]+$/', $db_prefix)) {
+    form_set_error('prefix', t('The database table prefix you have entered, %db_prefix, is invalid. The table prefix can only contain alphanumeric characters, full stops, or underscores.', array('%db_prefix' => $db_prefix)), 'error');
+  }
+
+  if (!empty($db_port) && !is_numeric($db_port)) {
+    form_set_error('port', t('Database port must be a number.'));
+  }
+}
+
+/**
+ * Form API submit for install_settings form.
+ *
+ * @see vbimportapi_settings_form_validate()
+ * @see vbimportapi_settings_form()
+ */
+function vbimportapi_settings_form_submit($form, &$form_state) {
+  if (!isset($form_state['redirect'])) {
+    $form_state['redirect'] = 'admin/structure/' . $form_state['values']['module'] . '/import';
+  }
+
+  $info_elements = array(
+    'driver',
+    'database',
+    'username',
+    'password',
+    'host',
+    'port',
+  );
+
+  $db_info = array();
+  foreach ($info_elements as $element) {
+    $db_info[$element] = $form_state['values'][$element];
+  }
+
+  $db_info['prefix'] = array(
+    'default' => $form_state['values']['prefix']
+  );
+
+  $module = $form_state['values']['module'];
+  variable_set($module . '_db_info', $db_info);
+}
+
+/**
+ * Import form, tests setup before importing data.
+ *
+ * Other modules should use hook_form_vbimportapi_import_form_alter()
+ * to add tests of their own. If the tests fail do the following:
+ * @code
+ *   $form['tests_passed']['#access'] = FALSE;
+ * @endcode
+ * To remove the 'Tests passed' message and hide the submit button.
+ */
+function vbimportapi_import_form($form, &$form_state, $module) {
+  $importer = vbimportapi_module_invoke_importer($module);
+
+  $form['module'] = array(
+    '#type' => 'value',
+    '#value' => $module,
+  );
+
+  $form['tests_passed']['#weight'] = 10;
+  $form['tests_passed']['details'] = array(
+    '#markup' => '<p>' . t('@module tested your setup successfully, you are ready to run the import.', array('@module' => $importer['title'])) . '</p>',
+    '#access' => TRUE,
+  );
+  $form['tests_passed']['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Import from @product', array('@product' => $importer['product'])),
+    '#weight' => 10,
+  );
+
+  $module_tables = module_invoke($module, 'vbimportapi_table_check');
+  if (!empty($module_tables)) {
+    vbimportapi_db_setup($importer['db_info']);
+    try {
+      $table_check = vbimportapi_check_tables($module_tables);
+    }
+    catch (PDOException $e) {
+      vbimportapi_db_restore();
+      drupal_set_message(t('There appears to be a problem with your database settings. Please click the back button and check the settings on the previous page.'), 'warning');
+      throw $e;
+    }
+    vbimportapi_db_restore();
+  }
+
+  if (!$table_check['result']) {
+    $form['table_test']['heading'] = array(
+      '#markup' => '<h3>' . t('Testing for @product tables', array('@product' => $importer['product'])) . '</h3>',
+    );
+    if (!empty($table_check['html']['missing_tables'])) {
+      $form['table_test']['details'] = array('#markup' => $table_check['html']['missing_tables']);
+    }
+  }
+
+  if (!$table_check['result']) {
+    $form['table_test']['result'] = array('#markup' => '<p><strong class="marker">' . t('Test failed: The database settings are probably incorrect') . '</strong></p>');
+    $form['tests_passed']['#access'] = FALSE;
+  }
+
+  if (!empty($table_check['html']['trouble_records'])) {
+    $form['table_test']['trouble_records']['heading'] = array(
+      '#markup' => '<h3>' . t('Testing for long records') . '</h3>',
+    );
+    $form['table_test']['trouble_records']['warning'] = array(
+      '#markup' => '<p>' .  t('<strong>Some vBulletin fields will not fit into their Drupal equivalents</strong>. No action is necessary, but please be aware that the data show belown will be shortened during the import.') . '</p>',
+    );
+    $form['table_test']['trouble_records']['result'] = array(
+      '#title' => t('Details'),
+      '#type' => 'fieldset',
+      '#collapsible' => TRUE,
+      '#collapsed' => (empty($_GET['page']) ? TRUE : FALSE),
+    );
+    $form['table_test']['trouble_records']['result']['details'] = array('#markup' => $table_check['html']['trouble_records']);
+  }
+
+  return $form;
+}
+
+/**
+ * Import submit handler.
+ *
+ * Sets up batch process, callbacks for Drupal to execute for each step in the
+ * batch.
+ */
+function vbimportapi_import_form_submit($form, &$form_state) {
+  $module = $form_state['values']['module'];
+  if (!user_access('import ' . $module . ' records')) {
+    return drupal_access_denied();
+  }
+  $importer = vbimportapi_module_invoke_importer($module);
+
+  $batch = array(
+    'title' => t('Importing from @product', array('@product' => $importer['product'])),
+    'operations' => $importer['operations'],
+    'finished' => 'vbimportapi_import_finished',
+  );
+
+  // Set the place to redirect to when the import is finished.
+  array_unshift($batch['operations'], array('vbimportapi_set_redirect', array(array('module' => $module))));
+
+  $batch['operations'][] = array('drupal_flush_all_caches', array());
+  batch_set($batch);
+}
+
+/**
+ * Given a module name, sets place to redirect user following import.
+ *
+ * Redirect a user to a given page following import, for example:
+ * if the module name is 'vbtodrupal' the user will be redirected to
+ * 'q=admin/build/vbtodrupal' when the import process has completed.
+ *
+ * Note: this should be called as a batch operation, or have the batch $context
+ * passed in the parameters.
+ *
+ * @param $options
+ *   An associative array of options, with the following elements:
+ *   - 'module': Name of the module.
+ *   - 'path': Specify an alternate path, the default is 'admin/structure'.
+ *     do not include a trailing '/'.
+ * @param $context
+ *   Batch operation context.
+ *
+ * @see vbimportapi_import_form_submit()
+ * @see vbimportapi_import_finished()
+ */
+function vbimportapi_set_redirect($options, &$context) {
+  // Add default options.
+  $options += array(
+    'path' => 'admin/structure',
+  );
+
+  $context['results']['redirect'] = $options['path'] . '/' . $options['module'];
+}
+
+/**
+ * Called when the batch operation has completed.
+ */
+function vbimportapi_import_finished($success, $results, $operations) {
+  if ($success) {
+    $message = t('Import complete!');
+    drupal_set_message($message);
+  }
+  else {
+    $error_operation = reset($operations);
+    $message = t('An error occurred while processing %error_operation with arguments: @arguments', array('%error_operation' => $error_operation[0], '@arguments' => print_r($error_operation[1], TRUE)));
+    drupal_set_message($message, 'error');
+  }
+  drupal_goto($results['redirect']);
+}
+
+/**
+ * Menu callback for deleting imported records.
+ */
+function vbimportapi_delete_form($form, &$form_state, $module) {
+  $form = array();
+  $form['module'] = array(
+    '#type' => 'value',
+    '#value' => $module,
+  );
+  $importer = vbimportapi_module_invoke_importer($module);
+  $module_url_string = str_replace('_', '-', $module);
+
+  return confirm_form($form,
+  t('Are you sure you want to delete all data since the last @product import?', array('@product' => $importer['product'])),
+    'admin/structure/' . $module_url_string,
+    t('This will delete @product data and anything created after the import. <strong>Do not run this if you have created any content (posts, comments etc.) after running a @product import</strong>.', array('@product' => $importer['product'])),
+    t('I understand the warnings, please just delete everything'), t('Cancel')
+  );
+}
+
+/**
+ * Form submit handler for deleting imported records.
+ */
+function vbimportapi_delete_form_submit($form, &$form_state) {
+  $module = $form_state['values']['module'];
+  if (!user_access('delete imported ' . $module . ' records')) {
+    return drupal_access_denied();
+  }
+
+  vbimportapi_module_invoke_delete($module);
+  drupal_set_message(t('Imported data deleted.'));
+  $module_url_string = str_replace('_', '-', $module);
+  drupal_goto('admin/structure/' . $module_url_string);
+}
+
+/**
+ * Wrapper around all import functions, responsible for database setup.
+ */
+function vbimportapi_import($function, $records_per_pass, $importer_module, $sub_module, &$context) {
+  $pre_function = $sub_module . '_' . $function . '_pre_import';
+  $main_function = $sub_module . '_' . $function . '_import';
+  $post_function = $sub_module . '_' . $function . '_post_import';
+  $importer = vbimportapi_module_invoke_importer($importer_module);
+
+  if (!isset($context['sandbox']['progress'])) {
+    $context['sandbox']['progress'] = 0;
+    $context['sandbox']['current'] = 0;
+    $context['sandbox']['max'] = 0;
+    $context['sandbox']['records_per_pass'] = $records_per_pass;
+  }
+  $txn = db_transaction();
+
+  // Run pre and post-import functions for any work that needs to be done
+  // before and after the database is setup.
+  if (function_exists($pre_function)) {
+    $pre_function($context);
+  }
+
+  vbimportapi_db_setup($importer['db_info']);
+
+  try {
+    // Call the importer function that will setup import and select queries
+    // so the data may be retrieved.
+    //
+    // Try to be flexible when dealing with the results from this, since under
+    // certain circumstances this function may import the data itself, just
+    // provide an InsertQuery object or some other combination.
+    $main_function($context);
+
+    if (!empty($context['query_select'])) {
+      $context['query_select']->addTag('vbimport');
+    }
+
+    if ($context['sandbox']['max'] == 0 && !empty($context['query_select'])) {
+      $context['sandbox']['max'] = $context['query_select']
+        ->countQuery()
+        ->execute()
+        ->fetchField();
+    }
+
+    // There may or may not be a select query, if there is it should be used
+    // as the from in the insert query.
+    //
+    // Note: just a select query in the sandbox means the importing of data
+    // is happening in the function above, so the range will have already been
+    // added to the select query.
+    if (!empty($context['query_select']) && !empty($context['query_insert'])) {
+      $context['query_select']
+        ->range($context['sandbox']['progress'], $context['sandbox']['records_per_pass']);
+
+      // If the select query is not executed, but cast as a string, the
+      // alter hook is never called, meaning tables from the import database
+      // are not prepended with the import database name and prefix. To get
+      // around this, clone the select query and run it through the alter
+      // hook here instead. This may need to be reverted if Drupal ever
+      // starts allowing hook_query_alter() implementations during its
+      // __tostring() magic function.
+      $select_copy = clone $context['query_select'];
+      vbimportapi_query_vbimport_alter($select_copy);
+      $context['query_insert']
+        ->from($select_copy);
+    }
+
+    // There may or may not be an insert query to run.
+    if (!empty($context['query_insert'])) {
+      $context['query_insert']
+        ->execute();
+    }
+  }
+  catch (PDOException $e) {
+    $txn->rollback();
+    vbimportapi_db_restore();
+    drupal_set_message(t('Problem importing from %product, please check your settings or <a href="!issue_url">raise an issue</a>.', array('%product' => $importer['product'], '!issue_url' => url('http://drupal.org/project/vbtodrupal'))));
+    throw $e;
+  }
+
+  vbimportapi_db_restore();
+  if (function_exists($post_function)) {
+    $post_function($context);
+  }
+
+  if ($context['sandbox']['progress'] < $context['sandbox']['max']) {
+    $context['finished'] = $context['sandbox']['progress'] / $context['sandbox']['max'];
+    $context['sandbox']['progress'] += $context['sandbox']['records_per_pass'];
+  }
+  else {
+    $context['finished'] = 1;
+  }
+}
+
+/**
+ * Merge duplicate taxonomy terms.
+ *
+ * This is designed to be a first class import step, which can be included
+ * in the import process in this way:
+ * @code
+ * mymodule_vbimportapi_importer() {
+ *   return array(
+ *     'title' => t('Test importer'),
+ *     'product' => 'Test',
+ *     'operations' => array(
+ *       array('vbimportapi_import', array('test')),
+ *       array('vbimportapi_taxonomy_merge_duplicates', array(variable_get('mymodule_vocabulary', 0), VBIMPORTAPI_RECORDS_PER_PASS, 'FIELD_NAME', 'NODE_TYPE')),
+ *     ),
+ *   );
+ * @endcode
+ * If a different message is required, wrap the call to this function.
+ *
+ * The mymodule_vocabulary variable is the numeric taxonomy vocabulary to
+ * work on.
+ *
+ * @param $vid
+ *   Which vocabulary to merge terms of.
+ * @param $records_per_pass
+ *   The number of records to process every time this function is called.
+ * @param $field_name
+ *   Name of the taxonomy field to update.
+ * @param $node_type
+ *   Type of the node the field is attached to.
+ * @param &$context
+ *   The batch process context.
+ */
+function vbimportapi_taxonomy_merge_duplicates($vid, $records_per_pass, $field_name, $node_type, &$context) {
+  if (empty($context['message'])) {
+    $context['message'] = t('Merging duplicate taxonomy terms.');
+  }
+  $field_name = check_plain($field_name);
+
+  // The first {taxonomy_term_data} record of a set of duplicates becomes the
+  // canonical record.
+  $select = db_select('taxonomy_term_data', 'td')
+    ->fields('td', array('name'))
+    ->condition('vid', $vid)
+    ->groupBy('name')
+    ->having('COUNT(td.tid) > 1');
+
+  // Set things up (the select query above is required for this).
+  if (!isset($context['sandbox']['progress'])) {
+    $context['sandbox']['max'] = $select->countQuery()->execute()->fetchField();
+
+    if (empty($context['sandbox']['max'])) {
+      $context['finished'] = 1;
+      return;
+    }
+
+    $context['sandbox']['progress'] = 0;
+    $context['sandbox']['records_per_pass'] = $records_per_pass;
+  }
+  else if ($context['sandbox']['progress'] >= $context['sandbox']['max']) {
+    $context['finished'] = 1;
+    return;
+  }
+
+  $select->addExpression('MIN(td.tid)', 'canonical_tid');
+  $select->range($context['sandbox']['progress'], $context['sandbox']['records_per_pass']);
+
+  $canonical_tids = db_query_temporary((string) $select, $select->getArguments());
+  unset($select);
+
+  // Get every duplicate tid (excepting canonical tids) and their corresponding
+  // canonical tids from {taxonomy_term_data}. Canonical tids are not included because
+  // this table is used to delete {taxonomy_term_data} records (see below).
+  $select = db_select('taxonomy_term_data', 'td')
+    ->fields('td', array('tid'))
+    ->fields('ct', array('canonical_tid'))
+    ->condition('td.vid', $vid);
+  $select->join($canonical_tids, 'ct', 'td.name = ct.name AND td.tid <> ct.canonical_tid');
+
+  $duplicate_tids = db_query_temporary((string) $select, $select->getArguments());
+  unset($select);
+  // Free some space.
+  db_drop_table($canonical_tids);
+
+  // Find nids (in {taxonomy_term_node}) that would be attached to the same tid multiple
+  // times after the transform. Since the primary key of {taxonomy_term_node} is
+  // (nid, tid) having multiple rows with the same nid and tid is disallowed.
+
+  // Where there would be duplicates, after {taxonomy_term_data} records have been
+  // merged, get nids and canonical tids.
+  $select = db_select('taxonomy_index', 'ti')
+    ->fields('ti', array('nid', 'sticky', 'created'))
+    ->fields('dt', array('canonical_tid'))
+    ->distinct();
+  $select->join($duplicate_tids, 'dt', 'ti.tid = dt.tid OR ti.tid = dt.canonical_tid');
+
+  $temp_taxonomy_index = db_query_temporary((string) $select, $select->getArguments());
+  unset($select);
+
+  $txn = db_transaction();
+
+  // Warning: the following section contains DELETE queries that are static
+  // and MySQL specific. Converting these to use the portable dynamic query
+  // objects made the resulting queries intolerably slow.
+
+  try {
+    // Delete every canonical {taxonomy_term_node} record with duplicates, making it
+    // possible to join with the duplicates table.
+    //
+    // Note: the {taxonomy_term_node} records with a particular nid may only be linked
+    // with a canonical tid once, due to the primary key.
+    db_query("DELETE ti FROM {taxonomy_index} ti
+      INNER JOIN {" . $temp_taxonomy_index . "} tti
+      ON ti.nid = tti.nid AND ti.tid = tti.canonical_tid");
+
+    // Delete all duplicate tids.
+    db_query("DELETE ti FROM {taxonomy_index} ti
+      INNER JOIN {" . $duplicate_tids . "} dt
+      ON ti.tid = dt.tid");
+
+    // Insert nids plus -- only canonical -- tids.
+    // @todo do this for fields too.
+    $index_insert = db_insert('taxonomy_index')
+      ->fields(array('nid', 'tid', 'sticky', 'created'));
+    $sub_select = db_select($temp_taxonomy_index, 'ti')
+      ->fields('ti', array('nid', 'canonical_tid', 'sticky', 'created'));
+    $index_insert->from($sub_select)->execute();
+
+    // Delete superfluous term_data records.
+    db_query("DELETE td FROM {taxonomy_term_data} td
+      INNER JOIN {" . $duplicate_tids . "} dt ON td.tid = dt.tid");
+
+    foreach (array('field_data_taxonomy_', 'field_revision_taxonomy_') as $type) {
+      db_query("DELETE f FROM {" . $type . $field_name . "} f
+        INNER JOIN {" . $temp_taxonomy_index . "} tti
+        ON f.entity_id = tti.nid AND f." . 'taxonomy_' . $field_name . "_tid = tti.canonical_tid");
+
+      db_query("DELETE f FROM {" . $type . $field_name . "} f
+        INNER JOIN {" . $duplicate_tids . "} dt
+        ON f." . 'taxonomy_' .  $field_name . "_tid = dt.tid");
+
+      $field_insert = db_insert($type . $field_name)
+        ->fields(array('entity_type', 'bundle', 'entity_id', 'revision_id', 'language', 'delta', $field_name . '_tid'));
+      $sub_select = db_select($temp_taxonomy_index, 'ti');
+      // Just add all fields as expressions to avoid ordering worries.
+      $sub_select->addExpression("'node'", 'entity_type');
+      $sub_select->addExpression($node_type, 'bundle');
+      $sub_select->addExpression('ti.nid', 'entity_id');
+      $sub_select->addExpression('ti.nid', 'revision_id');
+      $sub_select->addExpression("'und'", 'language');
+      $sub_select->addExpression(0, 'delta');
+      $sub_select->addExpression('ti.canonical_tid', $field_name . '_tid');
+    }
+  }
+  catch (PDOException $e) {
+    $txn->rollback();
+    throw $e;
+  }
+
+  // Drop temporary tables, in case this is called more than once during
+  // the same page request.
+  db_drop_table($duplicate_tids);
+  db_drop_table($temp_taxonomy_index);
+
+  if ($context['sandbox']['progress'] < $context['sandbox']['max']) {
+    $context['finished'] = $context['sandbox']['progress'] / $context['sandbox']['max'];
+    $context['sandbox']['progress'] += $context['sandbox']['records_per_pass'];
+  }
+  else {
+    $context['finished'] = 1;
+  }
+}
+
+/**
+ * Find whether a table in the database to be imported from exists.
+ */
+function vbimportapi_import_db_table_exists($table) {
+  $import_from = Database::getConnectionInfo('import_from');
+
+  // Bail out if the database has not been setup.
+  // @see: vbimportapi_db_setup()
+  if (empty($import_from)) {
+    return;
+  }
+
+  $import_db_name = $import_from['default']['database'];
+  $import_db_prefix = $import_from['default']['prefix']['default'];
+
+  return (bool) db_query("SELECT COUNT(TABLE_NAME)
+    FROM information_schema.tables
+    WHERE TABLE_NAME = :table_name
+      AND TABLE_SCHEMA = :table_schema", array(':table_name' => $import_db_prefix . $table, ':table_schema' => $import_db_name))->fetchField();
+}
+
+/**
+ * Find whether a field of a table exists.
+ */
+function vbimportapi_import_db_column_exists($field, $table) {
+  $import_from = Database::getConnectionInfo('import_from');
+
+  // Bail out if the database has not been setup.
+  // @see: vbimportapi_db_setup()
+  if (empty($import_from)) {
+    return;
+  }
+
+  $import_db_name = $import_from['default']['database'];
+  $import_db_prefix = $import_from['default']['prefix']['default'];
+
+  return (bool) db_query("SELECT COUNT(COLUMN_NAME)
+    FROM information_schema.columns
+    WHERE COLUMN_NAME = :column_name
+      AND TABLE_NAME = :table_name AND TABLE_SCHEMA = :table_schema", array(':column_name' => $field, ':table_name' => $import_db_prefix . $table, ':table_schema' => $import_db_name))->fetchField();
+}
+
+/**
+ * Find the length of a field in the target db.
+ */
+function vbimportapi_target_db_column_length($field, $table) {
+  $import_into = Database::getConnectionInfo('import_into');
+
+  // Bail out if the database has not been setup.
+  // @see: vbimportapi_db_setup()
+  if (empty($import_into)) {
+    return;
+  }
+
+  $target_db_name = $import_into['default']['database'];
+  $target_db_prefix = $import_into['default']['prefix']['default'];
+
+
+  return (int) db_query("SELECT character_maximum_length
+    FROM information_schema.columns
+    WHERE table_schema = :table_schema
+    AND table_name = :table_name
+    AND column_name = :column_name", array(':table_schema' => $target_db_name, ':table_name' => $target_db_prefix . $table, ':column_name' => $field))->fetchField();
+}
+
+/**
+ * Update MIME types of imported files.
+ *
+ * Note: this will only update records where the {file_managed}.filemime is set
+ * to 'vbimportapi'. The only parameter used is $records_per_pass.
+ *
+ * This is designed to be a first class import step, which can be included
+ * in the import process in this way:
+ * @code
+ * mymodule_vbimportapi_importer() {
+ *   return array(
+ *     'title' => t('Test importer'),
+ *     'product' => 'Test',
+ *     'operations' => array(
+ *       array('vbimportapi_import', array('test')),
+ *       array('vbimportapi_mime_types_repair', array('', VBIMPORTAPI_RECORDS_PER_PASS)),
+ *     ),
+ *   );
+ * @endcode
+ * If a different message is required, wrap the call to this function.
+ *
+ * @param $records_per_pass
+ *   The number of records to process every time this function is called.
+ */
+function vbimportapi_mime_types_repair($message = NULL, $records_per_pass = NULL, $importer_module = '', $sub_module = '', &$context) {
+  // Set up a temporary table containing MIME types and extensions.
+  module_load_include('inc', 'vbimportapi', 'vbimportapi_setup_mime_mapping');
+  $mime_table = vbimportapi_setup_mime_mapping();
+  if (!isset($records_per_pass) && !empty($context['sandbox']['records_per_pass'])) {
+    $records_per_pass = $context['sandbox']['records_per_pass'];
+  }
+  else if (!isset($records_per_pass)) {
+    $records_per_pass = VBIMPORTAPI_RECORDS_PER_PASS;
+  }
+
+  if (!isset($context['message']) && !isset($message)) {
+    $context['message'] = t('Determining imported file types.');
+  }
+  else {
+    $context['message'] = $message;
+  }
+
+  db_query("CREATE TEMPORARY TABLE files_mime_mapping (
+    fid int(10) unsigned NOT NULL default '0',
+    extension varchar(255) NOT NULL default '')");
+
+  $insert_sub = db_select('file_managed', 'f')
+    ->fields('f', array('fid'))
+    ->condition('f.filemime', 'vbimportapi');
+  $insert_sub->addExpression("SUBSTR(LOWER(f.filename) FROM (LOCATE('.', REVERSE(f.filename)) * -1) + 1)", 'extension');
+
+  if (!isset($context['sandbox']['progress'])) {
+    $context['sandbox']['max'] = $insert_sub->countQuery()->execute()->fetchField();
+
+    if (empty($context['sandbox']['max'])) {
+      $context['finished'] = 1;
+      return;
+    }
+
+    $context['sandbox']['progress'] = 0;
+  }
+
+  $insert_sub->range(0, $records_per_pass);
+
+  db_insert('files_mime_mapping')
+    ->from($insert_sub)
+    ->execute();
+
+  db_query("ALTER TABLE files_mime_mapping
+    ADD CONSTRAINT fid_extension PRIMARY KEY (fid, extension)");
+
+  // Should strictly use a dynamic query here, but it's a multi-table update
+  // and using a sub-select here is intolerably slow.
+  db_query("UPDATE {file_managed} f, files_mime_mapping fmm, $mime_table mm
+    SET f.filemime = mm.mime
+    WHERE f.fid = fmm.fid AND fmm.extension = mm.extension");
+
+  db_query("DROP TABLE files_mime_mapping");
+  db_query("DROP TABLE $mime_table");
+
+  if ($context['sandbox']['progress'] < $context['sandbox']['max']) {
+    // Finished is when all the records first identified have been processed,
+    // it's possible to keep going until all records have a MIME type, but
+    // this may lead to the process getting stuck on an unknown file extension.
+    $context['finished'] = $context['sandbox']['progress'] / $context['sandbox']['max'];
+    $context['sandbox']['progress'] += $records_per_pass;
+  }
+  else {
+    $context['finished'] = 1;
+  }
+}
+
+/**
+ * Implements hook_query_import_db_alter().
+ *
+ * Tables are prefixed here, either with the import from database or
+ * Drupal's table prefix.
+ */
+function vbimportapi_query_vbimport_alter(QueryAlterableInterface $query) {
+  $import_into = Database::getConnectionInfo('default');
+  $import_into = $import_into['default'];
+  $import_from = Database::getConnectionInfo('import_from');
+  $import_from = $import_from['default'];
+  $tables =& $query->getTables();
+
+  // Tables in the database that is the target for the import (and the
+  // currently selected database) should not have the name of the source
+  // database prepended to them.
+  $import_into_tables = $query->getMetaData('import_into_tables');
+
+  foreach ($tables as $alias => &$table) {
+    // If the table is in 'import_into_tables' it's in the database we're
+    // importing into, so should use the default prefix.
+    if (!empty($import_into_tables) && in_array($alias, $import_into_tables)) {
+      $table_target = 'import_into';
+    }
+    else {
+      $table_target = 'import_from';
+    }
+
+    // This ghastly '${$table_target}' is turned into either:
+    // $import_into or $import_from, depending on whether the table has been
+    // flagged as being in the database being imported into.
+    if (empty(${$table_target}['prefix']['default']) && empty(${$table_target}['prefix'][$table['table']])) {
+      $prefix = '';
+    }
+    else if (!empty(${$table_target}['prefix'][$table['table']]) && ${$table_target}['prefix'][$table['table']] != 'default') {
+
+      $prefix = ${$table_target}['prefix'][$table['table']];
+    }
+    else {
+      $prefix = ${$table_target}['prefix']['default'];
+    }
+
+    if ($table_target == 'import_from') {
+      $table['table'] = $import_from['database'] . '.' . $prefix . $table['table'];
+    }
+    else {
+      $table['table'] = $prefix . $table['table'];
+    }
+  }
+}
+
+/**
+ * Implements hook_query_alter().
+ *
+ * @todo what about slave databases?
+ */
+function vbimportapi_query_alter(QueryAlterableInterface $query) {
+  // Only do something if a vB import database has been setup.
+  $import_from = Database::getConnectionInfo('import_from');
+  if (!isset($import_from)) {
+    return;
+  }
+
+  // Only do something for queries not targeting the import database.
+  if ($query->hasTag('vbimport')) {
+    return;
+  }
+
+  $connection_default = Database::getConnectionInfo('default');
+  $connection_default = $connection_default['default'];
+
+  $tables =& $query->getTables();
+
+  foreach ($tables as $alias => $table) {
+    // Get the right prefix, note: table may be a string or an array (it's an
+    // array when the table is a sub-query).
+    if (empty($connection_default['prefix']['default']) && is_string($table) && empty($connection_default['prefix'][$table])) {
+      $prefix = '';
+    }
+    else if (!empty($connection_default['prefix'][$table['table']]) && is_array($table) && $connection_default['prefix'][$table['table']] != 'default') {
+      $prefix = $connection_default['prefix'][$table['table']];
+    }
+    else {
+      $prefix = $connection_default['prefix']['default'];
+    }
+
+    $table['table'] = $prefix . $table['table'];
+  }
+}
+
+/**
+ * Copy multiple files.
+ *
+ * This determines whether files should be copied using experimental parallel
+ * copying or using PHP's built-in copy function.
+ *
+ * @param $files
+ *   An array of files to copy, in the form:
+ *   @code
+ *   $files[] = array(
+ *     'source' = '/file/to/copy.jpeg',
+ *     'desination' = 'place/to/copy/to.jpeg',
+ *   );
+ *   @endcode
+ */
+function vbimportapi_multi_copy(array $files) {
+  // If experimental parallel copy is enabled, defer to that function.
+  if (VBIMPORTAPI_USE_EXPERIMENTAL_COPY) {
+    vbimportapi_parallel_copy($files);
+    return;
+  }
+
+  // If experimental copy is disabled, just use PHP's standard copy() function.
+  foreach ($files as $file) {
+    if (is_file($file['source']) && !file_exists($file['destination'])) {
+      copy($file['source'], $file['destination']);
+    }
+  }
+}
+
+/**
+ * Copy multiple files in parallel.
+ *
+ * Imports often require the copying of many files, in some cases this can be
+ * sped up by copying the files in parallel instead of sequentially.
+ *
+ * If the files are small, this can actually be slower than copying
+ * sequentially due to the overhead of tracking the copy processes.
+ */
+function vbimportapi_parallel_copy(array $files) {
+  // escapeshellarg() strips out special characters (like © for example) if
+  // the current locale is not set to UTF. This is only set for the duration
+  // of this function, it could be finer grained but not sure of any
+  // performance implications, particularly since we'll be switching locale
+  // thousands of times in a short period.
+  $current_locale = setlocale(LC_CTYPE, 0);
+  setlocale(LC_CTYPE, 'en_GB.UTF8', 'en_GB.UTF-8', 'en_US.UTF8', 'en_US.UTF-8', 'C.utf8', 'C.utf-8');
+
+  $sem_key = ftok(__FILE__, 'V');
+
+  // Working out the size of the shared memory required to save an integer
+  // is harder than might be expected.
+
+  // PHP writes a header to every shared memory segment.
+  $shm_header_size = (PHP_INT_SIZE * 4) + 8;
+  // Maximum size required for an integer (plus 4 bytes to account for worst
+  // case byte alignment and another PHP header).
+  $shm_int_size = (((strlen(serialize(PHP_INT_MAX)) + (4 * PHP_INT_SIZE)) / 4 ) * 4 ) + 4;
+  $shm_size = $shm_header_size + $shm_int_size;
+
+  $shm = shm_attach($sem_key, $shm_size);
+  $sem = sem_get($sem_key);
+
+  // Initialise the shared memory segment.
+  sem_acquire($sem);
+  shm_put_var($shm, 1, 0);
+  sem_release($sem);
+
+  $path = file_default_scheme() . '://vbimportapi';
+  file_prepare_directory($path, FILE_CREATE_DIRECTORY);
+  $realpath = drupal_realpath($path);
+  $log = drupal_realpath($path . '/vbimportapi.log');
+  if (is_file($log)) {
+    drupal_unlink($log);
+  }
+
+  foreach ($files as $file) {
+    // Populate the $source and $destination variables.
+    foreach (array('source', 'destination') as $var) {
+      $file[$var] = str_replace("'", "\\'", $file[$var]);
+    }
+    // Give the source and destination variables nicer names so the PHP code
+    // below isn't completely undreadable.
+    $source = $file['source'];
+    $destination = $file['destination'];
+
+    // This is a chunk of PHP code to be executed in parallel.
+    $copy_code = <<<COPY_CODE
+function vbimportapi_sem_acquire(\$sem) {
+  if (!sem_acquire(\$sem)) {
+    print "Could not acquire semaphore.\n";
+    exit(1);
+  }
+}
+if (is_file('$source') && !file_exists('$destination')) {
+  \$sem = sem_get($sem_key);
+  \$shm = shm_attach($sem_key, $shm_size);
+
+  try {
+    vbimportapi_sem_acquire(\$sem);
+    shm_put_var(\$shm, 1, shm_get_var(\$shm, 1) + 1);
+    sem_release(\$sem);
+
+    copy('$source', '$destination');
+
+    vbimportapi_sem_acquire(\$sem);
+    shm_put_var(\$shm, 1, shm_get_var(\$shm, 1) - 1);
+    sem_release(\$sem);
+    shm_detach(\$shm);
+
+    exit(0);
+  }
+  catch (Exception \$e) {
+    @sem_release(\$sem);
+    @shm_detach(\$shm);
+    throw \$e;
+  }
+}
+COPY_CODE;
+
+    // Execute code in parallel. Input from /dev/null is to fix a problem with
+    // Ubuntu stopping the process after it is backgrounded.
+    // See: http://ubuntuforums.org/showthread.php?t=977332
+    //
+    // Output is logged to the Drupal files directory/vbtodrupal.log. This is
+    // a bit rough-and-ready, as the logfile will be overwritten every time
+    // a group of files are copied.
+    exec('php -r ' . escapeshellarg($copy_code) . ' < /dev/null >> ' . $log . ' 2>&1 &');
+  }
+
+  do {
+    usleep(250);
+    if (sem_acquire($sem)) {
+      $transferring_count = shm_get_var($shm, 1);
+      sem_release($sem);
+    }
+  } while ($transferring_count > 0);
+
+  // Clean up.
+  shm_remove($shm);
+  sem_remove($sem);
+  setlocale(LC_CTYPE, $current_locale);
+}

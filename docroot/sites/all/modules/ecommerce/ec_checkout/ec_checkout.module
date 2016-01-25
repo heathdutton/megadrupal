@@ -1,0 +1,588 @@
+<?php
+
+/**
+ * @file
+ * Provides checkout functionality.
+ */
+
+/**
+ * Define severity levels for ec_checkout_validate_item().
+ * This is used for hook_ec_checkout_validate_item() to determine how to
+ * respond to it being called.
+ */
+define('EC_VALIDATE_ITEM_SEVERITY_LOW', 1);
+define('EC_VALIDATE_ITEM_SEVERITY_MEDIUM', 2);
+define('EC_VALIDATE_ITEM_SEVERITY_HIGH', 3);
+
+/**
+ * Implements hook_menu().
+ */
+function ec_checkout_menu() {
+  $items = array();
+
+  $items['checkout'] = array(
+    'title' => 'Checkout',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('ec_checkout_form'),
+    'access callback' => 1,
+    'type' => MENU_CALLBACK,
+  );
+
+  $items['admin/config/store/checkout'] = array(
+    'title' => 'Checkout',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('ec_checkout_admin_screen_form'),
+    'description' => 'Determine the order of your checkout screens.',
+    'access arguments' => array(EC_PERM_SETTINGS),
+    'file' => 'ec_checkout.admin.inc',
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_theme().
+ */
+function ec_checkout_theme() {
+  return array(
+    'ec_checkout_checkout_review_form' => array(
+      'render element' => 'form',
+      'file' => 'ec_checkout.theme.inc',
+    ),
+    'ec_checkout_admin_screen_form' => array(
+      'render element' => 'form',
+      'file' => 'ec_checkout.theme.inc',
+    ),
+  );
+}
+
+/**
+ * Implements hook_checkout_info().
+ */
+function ec_checkout_checkout_info() {
+  return array(
+    'summary' => array(
+      'name' => t('Transaction Summary'),
+      'description' => t('Provide summary of the product and charges of the checkout'),
+      'module' => 'ec_checkout',
+      'file' => 'ec_checkout.checkout.inc',
+      'weight' => 10,
+    ),
+  );
+}
+
+/**
+ * Implements hook_node_view().
+ */
+function ec_checkout_node_view($node, $view_mode = 'full') {
+  // Add an 'add cart' link or form if applicable.
+  if (isset($node->ptype) && ($view_mode == 'teaser' || variable_get('ec_product_cart_on_teaser', TRUE)) && (!variable_get('ec_product_cart_addition_by_link', TRUE) || ec_product_attributes_get($node, 'use_product_cart_form')) && ec_product_can_purchase($node, 'ec_checkout_product_form')) {
+    $node->content['ec_checkout'] = drupal_get_form('ec_checkout_product_form', $node);
+    $node->content['ec_checkout']['#weight'] = 99;
+  }
+}
+
+/**
+ * Start the checkout process for a user
+ */
+function ec_checkout_initialize($type, $txn = NULL, $params = array()) {
+  ctools_include('object-cache');
+  ctools_object_cache_clear('transaction', 'ec_checkout');
+
+  if (!isset($txn)) {
+    $txn = new stdClass;
+    $txn->type = $type;
+  }
+  else {
+    $txn->type = $type;
+  }
+
+  $txn->allocation = EC_ALLOC_PENDING;
+  $workflows = ec_store_transaction_workflow();
+  $txn->workflow = reset(array_keys($workflows));
+
+  foreach (ec_checkout_get_all_functions('init') as $function) {
+    $function($txn, $params);
+  }
+
+  ctools_object_cache_set('transaction', 'ec_checkout', $txn);
+  return $txn;
+}
+
+/**
+ * Builds the checkout forms.
+ * Moves through screens relating to each appropriate checkout api making sure
+ * the cart doesn't get out of sync and keeping track of the transacion
+ * structure.
+ */
+function ec_checkout_form($form, &$form_state) {
+  ctools_include('object-cache');
+  
+  // Disable Page Caching
+  $GLOBALS['conf']['cache'] = 0;
+
+  $txn = ctools_object_cache_get('transaction', 'ec_checkout', TRUE);
+  if (isset($txn)) {
+    $form_state['txn'] = & $txn;
+
+    // If this is the first time this page as been displayed then we need to
+    // store the txn away for later use.
+    $form = array();
+    $form['#attached'] = array(
+      'css' => array(
+        drupal_get_path('module', 'ec_checkout') . '/css/checkout.css',
+      ),
+      'js' => array(
+        drupal_get_path('module', 'ec_checkout') . '/js/checkout.js',
+      ),
+    );
+
+    // perform all calculations for the checkout page
+    foreach (ec_checkout_get_all_functions('calculate') as $function) {
+      $function($form_state);
+    }
+
+    // perform all custom form elements for checkout
+    foreach (ec_checkout_get_all_functions('form') as $function) {
+      $function($form, $form_state);
+    }
+
+    if (isset($txn->gross) && $txn->gross != ec_store_transaction_calc_gross($txn)) {
+      $form_state['txn_changed'] = TRUE;
+    }
+
+    if (isset($txn->additional)) {
+      $form['additional'] = $txn->additional;
+    }
+
+    $form['buttons'] = array(
+      '#prefix' => '<div class="ec-checkout-submit">',
+      '#suffix' => '</div>',
+    );
+    $form['buttons']['update'] = array(
+      '#type' => 'submit',
+      '#value' => t('Update order'),
+    );
+    $form['buttons']['order'] = array(
+      '#type' => 'submit',
+      '#value' => t('Place your order'),
+      '#submit' => array('ec_checkout_form_process_order'),
+      '#create_txn' => TRUE,
+    );
+
+    ctools_object_cache_set('transaction', 'ec_checkout', $txn);
+    return $form;
+  }
+}
+
+/**
+ * @todo Please document this function.
+ * @see http://drupal.org/node/1354
+ */
+function ec_checkout_form_validate(&$form, &$form_state) {
+  ctools_include('object-cache');
+  $txn = ctools_object_cache_get('transaction', 'ec_checkout');
+  $form_state['txn'] = & $txn;
+
+  // invoke all the validation functions that each module provides
+  foreach (ec_checkout_get_all_functions('validate') as $function) {
+    $function($form, $form_state);
+  }
+  
+  // check that all the fields have been used and create errors if needed.
+  ec_store_fields_checkout_post_validate($form, $form_state);
+
+  // invoke all the update functions that each module provides
+  if (!form_get_errors()) {
+    foreach (ec_checkout_get_all_functions('update') as $function) {
+      $function($form, $form_state);
+    }
+
+    if (isset($form_state['clicked_button']['#create_txn']) && $form_state['clicked_button']['#create_txn']) {
+      if (isset($form_state['txn_changed']) && $form_state['txn_changed']) {
+        form_set_error('', t('Transaction charges has changed. Please check charges and place order again.'));
+      }
+      if (!form_get_errors() && (!isset($form_state['txn_changed']) || !$form_state['txn_changed'])) {
+        foreach (ec_checkout_get_all_functions('post_update') as $function) {
+          $function($form, $form_state);
+        }
+      }
+    }
+    ctools_object_cache_set('transaction', 'ec_checkout', $txn);
+  }
+}
+
+/*
+ * This is normally a _form_submit function but we need to gather all the
+ * *submit* functions from all the various functions found by calling
+ * ec_checkout_get_all_functions('submit')
+ */
+/**
+ * @todo Please document this function.
+ * @see http://drupal.org/node/1354
+ */
+function ec_checkout_form_process_order($form, &$form_state) {
+  foreach (ec_checkout_get_all_functions('submit') as $function) {
+    $function($form, $form_state);
+  }
+
+  $txn = & $form_state['txn'];
+
+  if ($txn_id = ec_store_transaction_save($txn)) {
+    $new_txn = ec_store_transaction_load($txn_id);
+
+    foreach ($new_txn as $key => $value) {
+      $txn->{$key} = $value;
+    }
+  }
+
+  // invoke all the post_submit functions that each module provides
+  foreach (ec_checkout_get_all_functions('post_submit') as $function) {
+    $goto = $function($txn, $form_state);
+    if (isset($goto)) {
+      $form_state['redirect'] = $goto;
+    }
+  }
+
+  if (empty($form_state['redirect'])) {
+    $form_state['redirect'] = 'node';
+    drupal_set_message(t('Your order has been submitted.'));
+  }
+
+  rules_invoke_event('ec_checkout_after_process', $txn);
+
+  ctools_include('object-cache');
+  ctools_object_cache_clear('transaction', 'ec_checkout');
+}
+
+/**
+ * The "Add to cart" form with Quantity.
+ *
+ * @param $node
+ *   Object. The node.
+ * @ingroup form
+ */
+function ec_checkout_product_form($form, &$form_state, $node, $minimal = FALSE) {
+  $items = module_invoke('ec_cart', 'current');
+  $items = isset($items) ? $items : array();
+
+  $form['#product_cart_form'] = TRUE;
+  $form['#minimal'] = $minimal;
+  $form['#prefix'] = '<div id="product-add-item">';
+  $form['#suffix'] = '</div>';
+  $form['#cache'] = TRUE;
+  $form['products'] = array(
+    '#tree' => TRUE,
+  );
+  $form['products'][$node->nid]['nid'] = array(
+    '#type' => 'value',
+    '#value' => $node->nid,
+  );
+  if (ec_product_has_quantity($node)) {
+    $form['products'][$node->nid]['qty'] = array(
+      '#type' => 'textfield',
+      '#title' => t('Quantity'),
+      '#default_value' => isset($items[$node->nid]) ? $items[$node->nid]->qty : 1,
+      '#size' => 5,
+    );
+  }
+  else {
+    $form['products'][$node->nid]['qty'] = array(
+      '#type' => 'value',
+      '#value' => 1,
+    );
+  }
+  $form['products'][$node->nid]['#node'] = !empty($items[$node->nid]) ? $items[$node->nid] : $node;
+  if (ec_product_attributes_get($node, 'product_form_additional_fields')) {
+    // Add place holder for Additional information to be added to the cart.
+    $form['products'][$node->nid]['data'] = array(
+      '#tree' => TRUE,
+    );
+  }
+  $form['submit'] = array(
+    '#prefix' => '<div class="ec-checkout-buttons">',
+    '#suffix' => '</div>',
+    '#weight' => 99,
+  );
+  $form['submit_callback'] = array(
+    '#type' => 'value',
+  );
+  return $form;
+}
+
+/**
+ * @todo Please document this function.
+ * @see http://drupal.org/node/1354
+ */
+function ec_checkout_product_form_validate(&$form, &$form_state) {
+  $item['qty'] = !empty($item['qty']) ? $item['qty'] : '1';
+  if (!is_numeric($item['qty'])) {
+    form_set_error("products[{$nid}][qty]", t('Quantity must be a numeric value'));
+  }
+}
+
+/**
+ * @todo Please document this function.
+ * @see http://drupal.org/node/1354
+ */
+function ec_checkout_product_form_submit(&$form, &$form_state) {
+  $args = func_get_args();
+  $return = NULL;
+  foreach ($form_state['values']['submit_callback'] as $function) {
+    $ret = call_user_func_array($function, $args);
+    if (isset($ret)) {
+      $return = $ret;
+    }
+  }
+  $form_state['redirect'] = $return;
+}
+
+/**
+ * Given new data for saving in the shopping cart, validate the
+ * data via the productapi and feature api. This allows modules
+ * which implement features to invalidate the cart change.
+ *
+ * @param $node
+ *  Product node that is to be validated.
+ * @param $type
+ *  Specifies what type of purchase is taking place.
+ * @param $qty
+ *  Number of items to be added to the cart.
+ * @param $data
+ *  Assocated data that is added to the cart with the product.
+ */
+function ec_checkout_validate_item(&$node, $type, &$qty, &$data, $severity = EC_VALIDATE_ITEM_SEVERITY_MEDIUM) {
+  $valid_change = NULL;
+
+  if ($func = ec_product_productapi_get_function($node, 'ec_checkout_validate_item')) {
+    $valid_change = $func($node, $type, $qty, $data, $severity);
+  }
+  if ($valid_change !== FALSE) {
+    $funcs = ec_product_feature_get_all_functions($node, 'ec_checkout_validate_item');
+    foreach ($funcs as $func) {
+      $return = $func($node, $type, $qty, $data, $severity, $valid_change);
+      if (isset($return)) {
+        $valid_change = $return;
+      }
+      if ($valid_change === FALSE) {
+        if (variable_get('ec_checkout_debug', FALSE)) {
+          drupal_set_message(t('Product feature validate item (@func): Item %title not validated for %type', array('@func' => $func, '%title' => $node->title, '%type' => $type)));
+        }
+        return FALSE;
+      }
+    }
+  }
+  else {
+    if (variable_get('ec_checkout_debug', FALSE)) {
+      drupal_set_message(t('Product API validate item (@func): Item %title not validated for %type', array('@func' => $func, '%title' => $node->title, '%type' => $type)));
+    }
+  }
+
+  return !isset($valid_change) ? TRUE : $valid_change;
+}
+
+/**
+ * @todo Please document this function.
+ * @see http://drupal.org/node/1354
+ */
+function ec_checkout_add_complete($node, $qty, $data = NULL) {
+  ec_product_invoke_productapi($node, 'ec_checkout_add_complete', $qty, $data);
+  ec_product_invoke_feature_all($node, 'ec_checkout_add_complete', $qty, $data);
+}
+
+/**
+ * Get the ordered screens for the checkout process.
+ */
+function ec_checkout_get_screens($op = 'form') {
+  $old_screens = variable_get('ec_checkout_screens', '');
+  if (is_array($old_screens)) {
+    array_pop($old_screens);
+  }
+
+  // Merge any new screens with the old one, while preserving old screen order.
+  if (is_array($old_screens)) {
+    foreach ($old_screens as $i => $module) {
+      if ($module == 'ec_checkout') {
+        unset($old_screens[$i]);
+      }
+      elseif (is_scalar($key = array_search($module, $fresh_screens))) {
+        unset($fresh_screens[$key]);
+      }
+    }
+    $screens = array_merge($old_screens, $fresh_screens);
+  }
+  else {
+    $screens = $fresh_screens;
+  }
+  // Cart is always the last screen. It generates the final overview page.
+  $screens[] = 'ec_checkout';
+
+  return $screens;
+}
+
+/**
+ * Return the unique id (and hence the cart_id) of the user.
+ */
+function ec_checkout_get_id($try = NULL) {
+  // For convenience to the caller, we check the id and return it if applicable.
+  // Possibly add a smarter check.
+  if (!empty($try)) {
+    return $try;
+  }
+
+  global $user;
+  if (isset($_SESSION['ec_checkout_id'])) {
+    return $_SESSION['ec_checkout_id'];
+  }
+  // If a user is logged in, their cart_id is their user id.
+  elseif (!empty($user->uid)) {
+    return $user->uid;
+  }
+  else {
+    // There is no cart ATM, return a key that can be used but don't save it.
+    return drupal_get_token('ec_checkout_'. time());
+  }
+}
+
+/**
+ * Get all the different checkout plugins.
+ */
+function ec_checkout_get_types($op = 'types', $type = NULL) {
+  $_checkout_types = & drupal_static(__FUNCTION__ . '__checkout_types');
+  $_checkout_names = & drupal_static(__FUNCTION__ . '__checkout_names');
+
+  if (!isset($_checkout_types)) {
+    $_checkout_types = array();
+    $weights = variable_get('ec_checkout_weights', array());
+    foreach (module_implements('checkout_info') as $module) {
+      $path = drupal_get_path('module', $module);
+
+      $types = module_invoke($module, 'checkout_info');
+      foreach ($types as $ctype => $info) {
+        if (isset($weights[$ctype])) {
+          $info = $weights[$ctype] + $info;
+        }
+        if (isset($info['file'])) {
+          $info['include'] = $path . '/' . $info['file'];
+        }
+        $info['type'] = $ctype;
+        $_checkout_types[$ctype] = (object) $info;
+        $_checkout_names[$ctype] = $info['name'];
+      }
+    }
+
+    if (!empty($_checkout_types)) {
+      uasort($_checkout_types, 'ec_sort');
+      asort($_checkout_names);
+    }
+  }
+
+  if (isset($type) && !isset($_checkout_types[$type])) {
+    return FALSE;
+  }
+
+  switch ($op) {
+    case 'types':
+      return $_checkout_types;
+      break;
+
+    case 'type':
+      return $_checkout_types[$type];
+      break;
+
+    case 'names':
+      return $_checkout_names;
+      break;
+
+    case 'name':
+      return $_checkout_names[$type];
+      break;
+
+    case 'module':
+      return $_checkout_names[$type]->module;
+      break;
+  }
+}
+
+/**
+ * Get Checkout function.
+ */
+function ec_checkout_get_function($type, $hook) {
+  if ($info = ec_checkout_get_types('type', $type)) {
+    if (isset($info->include) && file_exists($info->include)) {
+      include_once DRUPAL_ROOT . '/' . $info->include;
+    }
+    $function = $info->module . '_checkout_' . $hook;
+    if (function_exists($function)) {
+      return $function;
+    }
+  }
+}
+
+/**
+ * Get all checkout functions for a hook.
+ */
+function ec_checkout_get_all_functions($hook) {
+  $functions = array();
+
+  foreach (ec_checkout_get_types() as $type => $info) {
+    if ($function = ec_checkout_get_function($info->type, $hook)) {
+      $functions[] = $function;
+    }
+  }
+
+  return $functions;
+}
+
+/**
+ * Implements hook_views_api().
+ */
+function ec_checkout_views_api() {
+  return array('api' => 2.0);
+}
+
+/**
+ * Allow modules to create transactions without needing a user interface.
+ */
+function ec_checkout_create_transaction($type, $params = array()) {
+  $form_state = array();
+
+  $txn = new stdClass;
+  $txn->type = $type;
+
+  $txn->no_interface = TRUE;
+
+  if (isset($params['ecid'])) {
+    $txn->ecid = $params['ecid'];
+  }
+  elseif (isset($params['customer'])) {
+    $txn->customer = $params['customer'];
+  }
+
+  if (isset($params['items'])) {
+    $txn->items = $params['items'];
+  }
+
+  $form_state['txn'] = & $txn;
+  foreach (ec_checkout_get_all_functions('init') as $function) {
+    $function($txn, $params);
+  }
+
+  foreach (ec_checkout_get_all_functions('calculate') as $function) {
+    $function($form_state);
+  }
+
+  $txn->gross = $txn->balance = ec_store_transaction_calc_gross($txn);
+
+  if (!isset($params['trial']) || !$params['trial']) {
+    if ($txn_id = ec_store_transaction_save($txn)) {
+      $new_txn = ec_store_transaction_load($txn_id);
+
+      foreach ($new_txn as $key => $value) {
+        $txn->{$key} = $value;
+      }
+    }
+  }
+
+  return $txn;
+}

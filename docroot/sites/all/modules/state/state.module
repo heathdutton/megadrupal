@@ -1,0 +1,645 @@
+<?php
+/**
+ * @file
+ *  Drupal State module
+ */
+
+/**
+ * Implements hook_permission().
+ *
+ * Define permission types (Drupal API function).
+ *
+ * @return array
+ */
+function state_permission() {
+  return array(
+    'state administer' => array(
+      'title' => t('Administer session management'),
+      'restrict access' => TRUE,
+    ),
+  );
+}
+
+/**
+ * Implements hook_menu().
+ *
+ * Declares configuration page.
+ *
+ * @return array
+ */
+function state_menu() {
+  return array(
+    'admin/config/people/state' => array(
+      'title' => 'State session control', // Avoid wrong translation?
+      'description' => 'Configure session management',
+      'page callback' => 'drupal_get_form', // hook to implement
+      'page arguments' => array('_state_admin_form'), // name of implementing function
+      'access arguments' => array('state administer'), // permission required
+      'file' => 'admin/state.admin.inc',
+      'type' => MENU_NORMAL_ITEM,
+    ),
+    'state/ajax/%' => array( // % ~ page response number
+      'page callback' => 'state_ajax_callback',
+      'page arguments' => array(2), // start at that bucket index
+      'access callback' => TRUE,
+      'type' => MENU_CALLBACK,
+    ),
+  );
+}
+
+/**
+ * @param array $form
+ * @param array &$form_state
+ * @return void
+ */
+function state_admin_form_submit($form, &$form_state) {
+  module_load_include('inc', 'state', 'state.admin');
+  _state_admin_form_submit($form, $form_state);
+}
+
+/*
+function state_status_messages($vars) {
+  inspect_log_message(__FUNCTION__);
+}*/
+
+/**
+ * Implements hook_init().
+ *
+ * @return void
+ */
+function state_init() {
+  //  Initialize cookie defaults.
+  $cookie_defaults = State::cookieDefaults();
+
+  //  Delete frontend session check/prolongation's session id hash cookie, if no session.
+  //  Obsoletes the need to implement hook_user_logout(), which btw wouldnt solve the problem for non-login sessions.
+  if (!($started = drupal_session_started())
+    && !empty($GLOBALS['_COOKIE']) && array_key_exists('state__sid' . $cookie_defaults['namespace'], $_COOKIE)
+  ) {
+    State::cookieRemove('state__sid');
+  }
+
+  //  Setup request counting, if desired.
+  if (variable_get('state__cntreqs')) {
+    State::_initRequestCounting($started);
+  }
+
+  //  Enforce session timeout for logged in users?
+  if ($started && user_is_logged_in() && variable_get('state__nfrclgt', FALSE)) {
+    //  User logged in before this request.
+    if (!empty($_SESSION['module']['state']['latest_request'])) {
+      //  Update latest request time record, if the previously recorded time plus session timeout is more than now.
+      if ($_SESSION['module']['state']['latest_request']
+        + min( ini_get('session.gc_maxlifetime'), ($v = variable_get('state__srvrlife', '')) ? $v : 200000 )
+        > REQUEST_TIME
+      ) {
+        $_SESSION['module']['state']['latest_request'] = REQUEST_TIME;
+      }
+      //  Session has timed out: log out the user.
+      elseif (!State::isPageRequest()) { // Non-page request.
+        State::sessionDestroy();
+        // Skip passing state_set_message.
+        return;
+      }
+      else { // Page request.
+        if (!empty($_GET['q'])) {
+          //  If not requesting index page: make sure the user is redirected to same page after logout.
+          $_GET['destination'] = $_GET['q'];
+        }
+        // Don't tell user (via state_set_message); we only do that when logging out from frontend (because here last visit may be ages ago).
+        module_load_include('pages.inc', 'user');
+        user_logout();
+        // Skip passing state_set_message.
+        return;
+      }
+    }
+    //  User logged in now, in this request.
+    else {
+      State::sessionSet('module', 'state', 'latest_request', REQUEST_TIME);
+    }
+  }
+
+  // Pass messages set in 'state_set_message' cookie to session var, if any (and isnt an AJAX request).
+  if (!empty($GLOBALS['_COOKIE']) && array_key_exists('state_set_message' . $cookie_defaults['namespace'], $_COOKIE)
+    && (!($args = arg()) || $args[0] !== 'user' || empty($args[1]) || $args[1] !== 'logout')
+    && State::isPageRequest()
+    && ($messages = State::cookieRemove('state_set_message', array('httponly' => TRUE))) && ($messages = unserialize($messages))
+  ) {
+    if (($session_messages = State::sessionGet('messages'))) {
+      State::sessionSet('messages', array_merge_recursive($session_messages, $messages));
+    }
+    else {
+      foreach ($messages as $type => $msgs_by_type) {
+        State::sessionSet('messages', $type, $msgs_by_type);
+      }
+    }
+  }
+}
+
+/**
+ * Adds state javascript library, and commands session checking and/or prolongation (if applicable for current visitor).
+ *
+ * Implements hook_preprocess_html() - because most requests ought to result in actual page response when this hook gets executed.
+ * And it seem this hook always gets called, and only once.
+ *
+ * @staticvar boolean $called
+ * @return void
+ */
+function state_preprocess_html() {
+  static $called = 0;
+  if (!$called) {
+    $called = TRUE;
+    State::_frontend();
+  }
+}
+
+/**
+ * Set Drupal message that survives session destruction (user logout).
+ *
+ * Don't use this for messages that may contain sensitive information.
+ * Because the messages are stored clientside, in a (httponly) cookie.
+ * And because these messages may be set when the user is logged in, and displayed after the user logged out.
+ *
+ * Algo, parameters and return values like drupal_set_message().
+ *
+ * @see drupal_set_message()
+ * @param string|NULL $message
+ * @param string $type
+ *  - default: status
+ * @param boolean $repeat
+ *  - default: TRUE
+ * @return array|NULL
+ */
+function state_set_message($message = NULL, $type = 'status', $repeat = TRUE) {
+  if (($messages = State::cookieGet('state_set_message'))) {
+    $messages = unserialize($messages);
+  }
+  if ($message) {
+    if (!$messages) {
+      $messages = array(
+        $type => array($message)
+      );
+    }
+    elseif (!array_key_exists($type, $messages)) {
+      $messages[$type] = array($message);
+    }
+    elseif ($repeat || !in_array($message, $messages[$type])) {
+      $messages[$type][] = $message;
+    }
+    State::cookieSet('state_set_message', serialize($messages), array('httponly' => TRUE));
+  }
+  return $messages ? $messages : NULL;
+}
+
+/**
+ * Set session variable, with low risk of collision.
+ *
+ * Starts drupal session, if no $_SESSION.
+ *
+ * Cannot set NULL as value.
+ * Last non-NULL argument is considered value.
+ *
+ *  Breaks if something else has set a non-array session variable for one of the name spaces, like:
+ *  - $_SESSION['system'] = non-array
+ *  - $_SESSION['module'] = non-array
+ *  - $_SESSION['application'] = non-array
+ *
+ * @see State::sessionSet()
+ * @throws Exception
+ *  - always caught and logged
+ *  - if bad argument
+ *  - if too few non-NULL arguments (requires 3 for name-spaced context types, 2 for other contexts)
+ *  - if session started and $_SESSION isnt array
+ *  - if $context_type is falsy
+ *  - if $context_type is name-spaced and $_SESSION[$context_type] exists and isnt array
+ *  - if $context_type is name-spaced and arg $context_name used and is numeric
+ * @param string|array $context_type
+ *  - string, name-spaced value: system|module|application
+ *  - string, non-namespaced value: anything else, like 'theme'
+ *  - array: all arguments
+ * @param mixed $context_name
+ *  - default: empty string
+ *  - empty or numeric not allowed if name-spaced $context_type (system|module|application)
+ * @param mixed $key,...
+ *  - any number of arguments
+ *  - default: no argument
+ *  - last argument is considered value of the session array being set
+ * @return boolean|NULL
+ *  - NULL: session not started, and could not be started
+ *  - FALSE on error
+ */
+function state_session_set($context_type, $context_name = '', $key = NULL/*,...*/) {
+  return State::_access(10, is_array($context_type) ? $context_type : func_get_args());
+}
+
+/**
+ * Increase session variable, with low risk of collision.
+ *
+ * Sets the session var using the increment value, if the var doesnt exist.
+ *
+ * Starts drupal session, if no $_SESSION.
+ *
+ * Last non-NULL argument is considered the increment value.
+ *
+ *  Breaks if something else has set a non-array session variable for one of the name spaces, like:
+ *  - $_SESSION['system'] = non-array
+ *  - $_SESSION['module'] = non-array
+ *  - $_SESSION['application'] = non-array
+ *
+ * @see State::sessionIncrease()
+ * @throws Exception
+ *  - always caught and logged
+ *  - if bad argument
+ *  - if too few non-NULL arguments (requires 3 for name-spaced context types, 2 for other contexts)
+ *  - if session started and $_SESSION isnt array
+ *  - if $context_type is falsy
+ *  - if $context_type is name-spaced and $_SESSION[$context_type] exists and isnt array
+ *  - if $context_type is name-spaced and arg $context_name used and is numeric
+ * @param string|array $context_type
+ *  - string, name-spaced value: system|module|application
+ *  - string, non-namespaced value: anything else, like 'theme'
+ *  - array: all arguments
+ * @param mixed $context_name
+ *  - default: empty string
+ *  - empty or numeric not allowed if name-spaced $context_type (system|module|application)
+ * @param mixed $key,...
+ *  - any number of arguments
+ *  - default: no argument
+ *  - last argument is considered the increment value of the session array being set
+ * @return number|NULL|boolean
+ *  - number: the value after increment
+ *  - NULL: session not started, and could not be started
+ *  - FALSE on error
+ */
+function state_session_increase($context_type, $context_name = '', $key = NULL/*,...*/) {
+  return State::_access(11, is_array($context_type) ? $context_type : func_get_args());
+}
+
+/**
+ * Get session variable, with low risk of collision.
+ *
+ *  Breaks if something else has set a non-array session variable for one of the name spaces, like:
+ *  - $_SESSION['system'] = non-array
+ *  - $_SESSION['module'] = non-array
+ *  - $_SESSION['application'] = non-array
+ *
+ * Asking for key in a key path that isnt array is not considered an error; example:
+ * @code
+ *   state_session_get('theme') ~ 'current theme name', swell
+ *   state_session_get('theme', 'whatever') ~ NULL, no error
+ * @endcode
+ * @see State::sessionGet()
+ * @throws Exception
+ *  - always caught and logged
+ *  - if bad argument
+ *  - if session started and $_SESSION isnt array
+ *  - if $context_type is falsy
+ *  - if $context_type is name-spaced and $_SESSION[$context_type] exists and isnt array
+ *  - if $context_type is name-spaced and arg $context_name used and is numeric
+ * @param string|array $context_type
+ *  - string, name-spaced value: system|module|application
+ *  - string, non-namespaced value: anything else, like 'theme'
+ *  - array: all arguments
+ * @param string|integer|NULL $context_name
+ *  - default: no argument
+ *  - numeric not allowed if name-spaced $context_type (system|module|application)
+ * @param string|integer|NULL $key,...
+ *  - any number of arguments
+ *  - default: no argument
+ * @return mixed
+ *  - NULL: session not started, or that session array key doesnt exist, or it's value is NULL
+ *  - FALSE: error, or that session array value is FALSE
+ *  - otherwise the value of that array
+ */
+function state_session_get($context_type, $context_name = NULL, $key = NULL/*,...*/) {
+  return State::_access(0, is_array($context_type) ? $context_type : func_get_args());
+}
+
+/**
+ * Get and unset session variable, with low risk of collision.
+ *
+ * Acts precisely like state_session_get(), except removes that session variable.
+ *
+ * Uses array_splice() - re-indexing the array - if the last argument is an integer (not 'integer'),
+ * and that index is placed correctly in the (presumably numerically indexed) array.
+ *
+ * @see State::sessionRemove()
+ * @throws Exception
+ *  - always caught and logged
+ *  - if bad argument
+ *  - if session started and $_SESSION isnt array
+ *  - if $context_type is falsy
+ *  - if $context_type is name-spaced and $_SESSION[$context_type] exists and isnt array
+ *  - if $context_type is name-spaced and arg $context_name used and is numeric
+ * @param string|array $context_type
+ *  - string, name-spaced value: system|module|application
+ *  - string, non-namespaced value: anything else, like 'theme'
+ *  - array: all arguments
+ * @param string|integer|NULL $context_name
+ *  - default: no argument
+ *  - numeric not allowed if name-spaced $context_type (system|module|application)
+ * @param string|integer|NULL $key,...
+ *  - any number of arguments
+ *  - default: no argument
+ * @return mixed
+ *  - NULL: session not started, or that session array key doesnt exist, or it's value is NULL
+ *  - FALSE: error, or that session array value is FALSE
+ *  - otherwise the value of that array
+ */
+function state_session_remove($context_type, $context_name = NULL, $key = NULL/*,...*/) {
+  return State::_access(1, is_array($context_type) ? $context_type : func_get_args());
+}
+
+
+/**
+ * Get list of domain-safe cookie defaults.
+ *
+ * Buckets:
+ * - (integer) expire; zero ~ session
+ * - (string) path; '/' or '/path-without-traling-slash' (checked copy of $GLOBALS['base_path'])
+ * - (string) domain; '.domain' (checked copy of $GLOBALS['cookie_domain'])
+ * - (boolean) secure ~ $GLOBALS['is_https']
+ * - (boolean) httponly; FALSE
+ * - (string) namespace; hash of http|https + domain + path (see State::cookieSet() for explanation)
+ *
+ * Called by hook_init() implementation.
+ *
+ * @see State::cookieDefaults()
+ * @return array
+ */
+function state_cookie_defaults() {
+  return State::cookieDefaults();
+}
+
+/**
+ * Set domain-safe cookie.
+ *
+ * Do not use this function for cookies that actually _should_ share cookie domain with another site.
+ * Nor usable for setting a cookie for another protocol (http|https) or domain than the global site settings.
+ * But can set cookie below base_path.
+ *
+ * Cookie namespace prevents collisions between different sites having same or similar base cookie domain.
+ * If the cookie domain of site B is .sub.domain.tld, and that of site A is .domain.tld (a subset of B's domain),
+ * then site B will read cookies set for site A.
+ * Appending a string to cookie names - which reflects protocol (http|https), cookie domain and base path - prevents collisions.
+ *
+ * @see State::cookieSet()
+ * @param string $name
+ *  - without cookie namespace appendix
+ * @param mixed $value
+ *  - will be stringed
+ * @param array|boolean|NULL $options
+ *  - TRUE: httponly
+ *  - array (integer) expire: default session (zero), non-session is unix timestamp
+ *  - array (string) path: default base_path, non-empty value is interpretated as relative to base_path
+ *  - array (boolean) httponly: default FALSE
+ * @return boolean
+ *  - FALSE: failed to set the cookie
+ */
+function state_cookie_set($name, $value, $options = NULL) {
+  return State::cookieSet($name, $value, $options);
+}
+
+/**
+ * Increase value of domain-safe cookie; see state_cookie_set() for explanation.
+ *
+ * Is aware of cookies set/removed previously in same request (normally you cannot 'see' a cookie set in same request, only in a later request).
+ *
+ * @see State::cookieIncrease()
+ * @throws Exception
+ *  - caught (to get trace) if cookie value or arg $increment is not empty or a number
+ * @param string $name
+ *  - without cookie namespace appendix
+ * @param integer|float $increment
+ *  - default: one
+ * @param array|boolean|NULL $options
+ *  - TRUE: httponly
+ *  - array (integer) expire: default session (zero), non-session is unix timestamp
+ *  - array (string) path: default base_path, non-empty value is interpretated as relative to base_path
+ *  - array (boolean) httponly: default FALSE
+ * @return number|boolean
+ *  - number: the new value of the cookie
+ *  - FALSE: cookie value or arg $increment is not empty or a number, or failed to set the cookie
+ */
+function state_cookie_increase($name, $increment = 1, $options = NULL) {
+  return State::cookieIncrease($name, $increment, $options);
+}
+
+/**
+ * Get domain-safe cookie; see state_cookie_set() for explanation.
+ *
+ * Is aware of cookies set/removed previously in same request (normally you cannot 'see' a cookie set in same request, only in a later request).
+ *
+ * @see State::cookieGet()
+ * @param string $name
+ *  - without cookie namespace appendix
+ * @return mixed|NULL
+ *  - NULL: not set
+ */
+function state_cookie_get($name) {
+  return State::cookieGet($name);
+}
+
+/**
+ * Remove domain-safe cookie; see state_cookie_set() for explanation.
+ *
+ * Is aware of cookies set/removed previously in same request (normally you cannot 'see' a cookie set in same request, only in a later request).
+ *
+ * @see State::cookieRemove()
+ * @param string $name
+ *  - without cookie namespace appendix
+ * @param array|boolean|NULL $options
+ *  - TRUE: httponly
+ *  - array (string) path: default base_path, non-empty value is interpretated as relative to base_path
+ *  - array (boolean) httponly: default FALSE
+ * @return string|NULL
+ *   - string: value of the cookie if it existed
+ *   - NULL: the cookie didnt exist
+ */
+function state_cookie_remove($name, $options = NULL) {
+  return State::cookieRemove($name, $options);
+}
+
+/**
+ * Not AJAX-, iframe- and other non-page requests.
+ *
+ * @see State::isPageRequest()
+ * @return boolean
+ */
+function state_is_page_request() {
+  return State::isPageRequest();
+}
+
+/**
+ * Request number in session (the whole browser session, not only $_SESSION).
+ *
+ * Only valid (> -1) if State is configured to detect (and count by) request type.
+ *
+ * 'logged_in' request number is not available when current request is a non-page request (then returns -1).
+ *
+ * A page redirect counts as a page request.
+ *
+ * @see State::requestNumber()
+ * @param string $type
+ *  - default: 'page'
+ *  - allowed values: page | non_page | all (~ page + non_page) | logged_in (~ page request since user logged in) | list
+ * @return integer|array|boolean
+ *  - FALSE: unsupported $type value
+ *  - minus 1: module not configured to detect and count requests, or is non-page request and $type is 'logged_in'
+ *  - 1: first request is one, not zero
+ *  - array: $type 'list', [ 'page': N0, 'non_page': N1, 'logged_in': N2 ]
+ */
+function state_request_number($type = 'page') {
+  return State::requestNumber($type);
+}
+
+/**
+ * Number of page responses delivered in session (the whole browser session, not only $_SESSION) - until now (current response not counted).
+ *
+ * Always fairly reliable, and doesnt depend on State being configured to detect (and count by) request type
+ * - because counts responses that included hook_preprocess_html() execution.
+ *
+ * @see State::pageResponses()
+ * @return integer
+ *  - zero: nono yet
+ */
+function state_page_responses() {
+  return State::pageResponses();
+}
+
+/**
+ * Get the frontend session control mode - checking/prolongation - which applys to current visitor.
+ *
+ * Reflects prolongation suggestion, if state_suggest_prolongation() has been called.
+ *
+ * Not called in init, because it should only be called on demand (and available to everybody).
+ * Will eventually be called during page generation, via the hook_preprocess_html() implementation.
+ *
+ * @see state_suggest_prolongation()
+ * @see State::prolongation()
+ * @return integer|boolean
+ *  - FALSE: session not started yet, frontend checking/prolongation may apply if session gets started later
+ *  - 0: none
+ *  - 1: checks session/form expiration
+ *  - 2: prolongs session, when visitor is active (mousemove etc.)
+ *  - 3: prolongs session unconditionally
+ */
+function state_prolongation() {
+  State::prolongation();
+}
+
+/**
+ * Suggest less (safer) session checking/prolongation mode, for current page.
+ *
+ * Has no effect if called later or at execution of hook_preprocess_html() implementations.
+ *
+ * Is disregarded if current visitor's mode is more restrictive than suggested;
+ * e.g. if current visitor (by role) is set to get no prolongation and the suggestion is conditional prolongation.
+ *
+ * @see State::suggestProlongation()
+ * @param integer|string|NULL $prolong
+ *  - default: NULL (~ no suggestion)
+ *  - 0|none: dont check nor prolong
+ *  - 1|check: checks session/form expiration
+ *  - 2|conditional: prolongs session, when visitor is active (mousemove etc.)
+ *  - 3|unconditional: prolongs session unconditionally
+ * @return void
+ */
+function state_suggest_prolongation($prolong = NULL) {
+  State::suggestProlongation($prolong);
+}
+
+/**
+ * For completely AJAX-driven pages, which solely uses custom AJAX mechanisms, not Drupal form API's AJAX procedures.
+ *
+ * Makes frontend session prolongation skip checking for form expiration.
+ *
+ * Has to be called per page (like in theme hook) because it's unlikely that all forms in a Drupal site are completely AJAX-driven.
+ *
+ *  Why 'custom AJAX' and not 'Drupal form API's AJAX'?
+ *  - because Drupal's conventional form AJAX procedures - probably - are constrained by Drupal form expiration (6 hours)
+ *
+ * @see State::unlimitFormExpire()
+ * @return void
+ */
+function state_unlimit_form_expire() {
+  State::unlimitFormExpire();
+}
+
+/**
+ * Destroy current visitor's session (if any) and log current user out (if logged in).
+ *
+ * Usable when you want to log out the user, but don't want that redirect which user_logout() performs.
+ * A redirect prevents setting/changing cookies. And a redirect during a non-page (AJAX, file upload etc.) response doesn't make much sense.
+ *
+ * Called by frontend State, when it detects that the session has expired; to help session garbage collection.
+ *
+ * @see State::sessionDestroy()
+ * @param string $session_id
+ *  - default: empty
+ *  - non-empty: destroy only if value equals current session id
+ * @param string $session_id_hash
+ *  - default: empty
+ *  - non-empty: destroy only if value equals hash of current session id
+ * @param string $log_reason
+ *  - default: 'session_timeout'
+ * @return void
+ */
+function state_session_destroy($session_id = '', $session_id_hash = '', $log_reason = 'session_timeout') {
+  State::sessionDestroy($session_id, $session_id_hash, $log_reason);
+}
+
+/**
+ * Expects (requires) POST vars: action, arg.
+ *
+ * @param mixed $page_resp_no
+ *  - page response number
+ * @return void
+ *  - sends 403 header if the expected POST vars arent set or their sanitized values evaluates to empty
+ */
+function state_ajax_callback($page_resp_no) {
+  if (!drupal_session_started()
+      //  The only purpose of the GET var page_resp_no is to make request urls in the server's access log display which page request sent current AJAX request.
+      //  Thus we only check that the page_resp_no argument isnt falsy.
+      || !$page_resp_no
+      //  The POST var action has three accepted values: prolong | getTimeout | destroySession.
+      || !array_key_exists('action', $_POST)
+      || !($le = strlen($action = $_POST['action'])) || $le > 32
+      || !($action === 'prolong' || $action === 'getTimeout' || $action === 'destroySession')
+      //  The POST var arg is currently only needed when action is 'destroySession', and in that case it represents the session id hash.
+      //  We check that the session id hash is a hex string of an appropriate length.
+      || ($action === 'destroySession'
+            && (!array_key_exists('arg', $_POST) || !($sessionIdHash = $_POST['arg']) || !preg_match('/^[a-fA-F\d]{50,100}$/', $sessionIdHash))
+         )
+  ) {
+    header('HTTP/1.1 403 Forbidden');
+    exit;
+  }
+  $response = new stdClass();
+  $response->action = check_plain($action); // check_plain(), because some people may overlook the accepted values check (above).
+  $response->success = TRUE;
+  $response->error = '';
+  if ($action == 'getTimeout') {
+    $serverLife_ini = ini_get('session.gc_maxlifetime');
+    $serverLife_overrider = variable_get('state__srvrlife');
+    $response->sessionTimeout = (int) (
+        //  If overrider is set, use the smaller of ini setting and overrider.
+        $serverLife_overrider ? min($serverLife_ini, $serverLife_overrider) : (
+            //  Otherwise, if ini setting doesnt make sense, use default.
+            $serverLife_ini < State::FORM_EXPIRE ? $serverLife_ini : State::SERVER_LIFE_DEFAULT
+        )
+    );
+  }
+  elseif ($action == 'destroySession') {
+    State::sessionDestroy('', $sessionIdHash);
+  }
+  //  else... prolong.
+
+  header('Content-Type: application/json; charset=utf-8');
+  header('Cache-Control: private, no-store, no-cache, must-revalidate');
+  header('Expires: Thu, 01 Jan 1970 00:00:01 GMT');
+  //  No reason to use drupal_json_encode(), because we dont send html strings.
+  echo json_encode($response);
+  flush();
+  exit;
+}

@@ -1,0 +1,567 @@
+<?php
+
+/**
+ * @file
+ * Module file for Search by Page Attachments, a sub-module for Search by Page.
+ *
+ * Allows you to add file attachments to Search by Page.
+ * @ingroup search_by_page
+ */
+
+/**
+ * Implements Search by Page hook_sbp_paths().
+ *
+ * Returns a list of all the files that should be indexed, and
+ * also saves information in a DB table for future reference.
+ */
+function sbp_attach_sbp_paths($environment) {
+  // Make a list of the previously-existing information, so we can remove
+  // any we don't still need at the end.
+  $prev_objs = db_query('SELECT * FROM {sbpa_attachments} WHERE environment = :env', array(':env' => $environment))->fetchAll();
+  $previous = array();
+  $indx = 0;
+  foreach ($prev_objs as $item) {
+    $previous[$item->objtype][$item->bundle][$item->fieldname][$item->objid][$item->fileid] = $indx;
+    $indx++;
+  }
+
+  $ret = array();
+
+  // Make a list of content types they wanted to index.
+  // Read from setting, and convert to an array of just the 1 values
+  // Setting is from checkboxes, so it's like array('mytype' => 'mytype',
+  // 'othertype' => 0).
+
+  $typelist = search_by_page_setting_get('sbp_attach_node_types', $environment, array());
+  if (!is_array($typelist) || !count($typelist)) {
+    return $ret;
+  }
+
+  $bundles = array();
+
+  foreach ($typelist as $key => $item) {
+    if ($item) {
+      $bundles[] = $key;
+    }
+  }
+  if (!count($bundles)) {
+    return $ret;
+  }
+
+  // Make a list of fields they wanted to index.
+  // Read from setting, and convert to an array of just the 1 values
+  // Setting is from checkboxes, so it's like array('myfield' => 'myfield',
+  // 'otherfield' => 0).
+
+  $fieldlist = search_by_page_setting_get('sbp_attach_field_types', $environment, array());
+  if (!is_array($fieldlist) || !count($fieldlist)) {
+    return $ret;
+  }
+  $fieldtypes = array();
+  foreach ($fieldlist as $key => $value) {
+    if ($value) {
+      $fieldtypes[] = $key;
+    }
+  }
+  if (!count($fieldtypes)) {
+    return $ret;
+  }
+
+  $role = search_by_page_setting_get('sbp_attach_role', $environment, DRUPAL_ANONYMOUS_RID);
+  $langs = language_list();
+  $langs = array_keys($langs);
+
+  $min_time = search_by_page_setting_get('sbp_attach_min_time', $environment, 0);
+  $max_time = search_by_page_setting_get('sbp_attach_max_time', $environment, 0);
+
+  // Find all file attachments on those types, build array of paths,
+  // and save info in DB.
+
+  // Note that we don't want to check for access permissions here! We
+  // want to index everything, independent of access rights. Access
+  // permission checking is done during the search step -- see
+  // hook_sbp_query_modify() implementation below.
+
+  // Important: Make sure to refresh the entity loading cache, because other
+  // cron things could have loaded and then modified the objects. For
+  // instance, doing a node_view() will remove all non-displayed files from
+  // file fields, sigh.
+  entity_get_controller('node')->resetCache();
+
+  foreach ($fieldtypes as $field_name) {
+    $query = new EntityFieldQuery;
+    $query
+      ->entityCondition('entity_type', 'node', '=')
+      ->entityCondition('bundle', $bundles, 'IN')
+      ->fieldCondition($field_name);
+
+    $results = $query->execute();
+    if (!$results) {
+      continue;
+    }
+    $objs = entity_load('node', array_keys($results['node']));
+    if (!count($objs)) {
+      continue;
+    }
+
+    foreach ($objs as $id => $obj) {
+      // If this object has a language, use that; otherwise, all languages.
+      $retlangs = $langs;
+      if (isset($obj->language) && $obj->language && $obj->language != LANGUAGE_NONE) {
+        $retlangs = array($obj->language);
+      }
+
+      $fields = _sbp_attach_object_fields($obj, $field_name);
+      $bundle = $obj->type;
+
+      foreach ($fields as $field) {
+        $file = file_load($field['fid']);
+        $display = 1;
+        if (isset($field['display']) && !$field['display']) {
+          $display = 0;
+        }
+
+        // Save this file as information in our database of files we've indexed.
+        if (isset($previous['node'][$bundle][$field_name][$id][$file->fid])) {
+          $indx = $previous['node'][$bundle][$field_name][$id][$file->fid];
+          $prev = $prev_objs[$indx];
+
+          $newid = $prev->sbpaid;
+
+          db_update('sbpa_attachments')
+            ->fields(array(
+                'objtype' => 'node',
+                'objid' => $id,
+                'bundle' => $bundle,
+                'fieldname' => $field_name,
+                'fileid' => $file->fid,
+                'environment' => $environment,
+                'display' => $display,
+              ))
+            ->condition('sbpaid', $newid)
+            ->execute();
+          unset($prev_objs[$indx]);
+          unset($previous['node'][$bundle][$field_name][$id][$file->fid]);
+        }
+        else {
+          $newid = db_insert('sbpa_attachments')
+            ->fields(array(
+                'objtype' => 'node',
+                'objid' => $id,
+                'bundle' => $bundle,
+                'fieldname' => $field_name,
+                'fileid' => $file->fid,
+                'environment' => $environment,
+                'display' => $display,
+              ))
+            ->execute();
+        }
+
+        // Add it to the information for Search by Page.
+
+        $ret[$file->uri] = array(
+          'id' => $newid,
+          'role' => $role,
+          'languages' => $retlangs,
+          'min_time' => $min_time,
+          'max_time' => $max_time,
+        );
+      }
+    }
+  }
+
+  // Now take care of anything left over in $prev_objs - should be removed
+  // now from our table. Search by Page will take care of removing from
+  // the search index and its tables.
+  $toremove = array();
+  foreach ($prev_objs as $item) {
+    $toremove[] = $item->sbpaid;
+  }
+
+  if (count($toremove)) {
+    db_delete('sbpa_attachments')
+      ->condition('sbpaid', $toremove)
+      ->execute();
+  }
+
+  return $ret;
+}
+
+/**
+ * Implements Search by Page hook_sbp_query_modify().
+ *
+ * Adds to the Search by Page query.
+ */
+function sbp_attach_sbp_query_modify($environment, $query) {
+
+  // Note: At the moment, this function is assuming that we're only
+  // searching for files attached to nodes. So we use the node access
+  // permissions, and assume tacitly that the object type is node.
+  // If this module is ever expanded to do other attachments, this will
+  // need to be addressed!
+
+  $cond = db_and();
+
+  if (!user_access('access content')) {
+    // This user cannot access content, so don't bother with the query
+    // mods, they should not see anything from this module.
+    $cond->where('0=1');
+    return $cond;
+  }
+
+  // Attach to our attachments table and the node table, using a subquery.
+  $subquery = db_select('sbpa_attachments', 'sbpa_sq');
+  $subquery->condition('sbpa_sq.objtype', 'node');
+  $subquery->condition('sbpa_sq.environment', $environment);
+  $subquery->leftJoin('node', 'sbpa_n', 'sbpa_sq.objid = sbpa_n.nid');
+  $subquery->addTag('node_access');
+  $subquery->condition('sbpa_n.status', 1);
+  $subquery->addField('sbpa_sq', 'sbpaid', 'sbpaid');
+
+  // If we're only looking for listed attachments, add condition.
+  $listed_only = search_by_page_setting_get('sbp_attach_only_listed', $environment, 0);
+  if ($listed_only) {
+    $subquery->condition('sbpa_sq.display', 1);
+  }
+
+  $query->leftJoin($subquery, 'sbpa_a', 'sbpa_a.sbpaid = sp.modid');
+
+  return $cond;
+}
+
+/**
+ * Implements Search by Page hook_sbp_details().
+ *
+ * Returns details for a particular file ID, for particular search keys.
+ */
+function sbp_attach_sbp_details($id, $environment, $keys = NULL) {
+
+  // Find the information from our table for this item.
+
+  $id = intval($id);
+  if (!$id) {
+    // no ID given to us
+    return NULL;
+  }
+
+  $info = db_query('SELECT * FROM {sbpa_attachments} WHERE sbpaid=:id', array(':id' => $id))->fetchObject();
+  if (!$info) {
+    // We have no record of this ID.
+    return NULL;
+  }
+
+  // Load the file (we need file name, at a minimum)
+  $file = file_load($info->fileid);
+  if (!$file) {
+    // File no longer exists.
+    return NULL;
+  }
+
+  // Load the object (i.e. $node) this is attached to, making sure
+  // to reset the object cache in case someone else did a node_view(),
+  // which might have removed our non-displayed files!
+  $obj = @entity_load($info->objtype, array($info->objid), array(), TRUE);
+  if (!$obj || !isset($obj[$info->objid]) || !$obj[$info->objid]) {
+    // Item we're attached to can't be found.
+    return NULL;
+  }
+  $obj = $obj[$info->objid];
+
+  // Locate the info about this file attached to this object.
+  $fields = _sbp_attach_object_fields($obj, $info->fieldname);
+  foreach ($fields as $stuff) {
+    if ($stuff['fid'] == $info->fileid) {
+      $fieldstuff = $stuff;
+      break;
+    }
+  }
+  if (is_null($fieldstuff)) {
+    // field is no longer on this node/object.
+    return NULL;
+  }
+
+  $only_listed = search_by_page_setting_get('sbp_attach_only_listed', $environment, 0);
+  if ($only_listed && isset($fieldstuff['display']) && !$fieldstuff['display']) {
+    // Asked for only displayed files and this one isn't.
+    return NULL;
+  }
+
+  $fullpath = drupal_realpath($file->uri);
+  if (!$fullpath || !is_file($fullpath)) {
+    // file was not in an acceptable location or doesn't exist
+    return NULL;
+  }
+
+  // Construct information for this entry.
+  $ret = array();
+
+  $use_desc = search_by_page_setting_get('sbp_attach_use_description', $environment, 0);
+  $prepend_node_title = search_by_page_setting_get('sbp_attach_prepend_node_title', $environment, 0);
+
+  $ret['title'] = $file->filename;
+  if ($use_desc && isset($fieldstuff['description']) && $fieldstuff['description']) {
+    $ret['title'] = $fieldstuff['description'];
+  }
+  if ($prepend_node_title) {
+    $sep = search_by_page_setting_get('sbp_attach_title_sep', $environment, '/');
+    if (isset($obj->title) && $obj->title) {
+      $ret['title'] = $obj->title . $sep . $ret['title'];
+    }
+  }
+  $ret['title'] = check_plain($ret['title']);
+
+  // Set the content to an empty string, in case we cannot extract it.
+  // In this case, we'll just return the title we've constructed.
+  $ret['content'] = '';
+
+  // Extract file content, using helper function
+  $helpers = search_files_get_helpers();
+  $fileinfo = pathinfo($file->filename);
+  $extension = strtolower($fileinfo['extension']);
+
+  if (!isset($helpers[$extension])) {
+    // no text extraction function for this file extension defined
+    return $ret;
+  }
+  $help = $helpers[$extension];
+
+  $quoted_file_path = '"' . escapeshellcmd($fullpath) . '"';
+  $helper_command = preg_replace('/%file%/', $quoted_file_path, $help);
+  $content = search_files_convert_to_utf8(shell_exec($helper_command));
+  if (!$content) {
+    // no text in file
+    return $ret;
+  }
+
+  if (!$keys) {
+    // Return file content, if there are no search keys
+    $ret['content'] = $content;
+  }
+  else {
+    // If there are search keys, return a snippet, user name, date, type, etc.
+    $ret['user'] = theme('username', array('account' => $obj));
+    if (isset($obj->changed)) {
+      $ret['date'] = $obj->changed;
+    }
+    $ret['snippet'] = search_by_page_excerpt($keys, $content);
+    $ret['related_node'] = $obj;
+  }
+
+  return $ret;
+}
+
+/**
+ * Implements Search by Page hook_sbp_settings().
+ *
+ * Adds a node type selection form to the Search by Page settings page,
+ * and some options related to presentation.
+ */
+function sbp_attach_sbp_settings($environment) {
+
+  $form = array();
+  $form[ 'sbp_attach' ] = array(
+    '#type' => 'fieldset',
+    '#collapsible' => TRUE,
+    '#weight' => -70,
+    '#title' => t('Attachments'),
+  );
+
+  // Explanation
+
+  $form['sbp_attach']['explain'] = array(
+    '#type' => 'markup',
+    '#value' => '<p>' . t('Search by Page Attachments indexes file attachments on your content types for searching. The attachments are added to content types via the core File field or similar fields. Choose the content types you want to index attachments of below, and also choose which fields you would like to index.') . '</p>',
+    '#weight' => -10,
+  );
+
+  $form['sbp_attach']['explain2'] = array(
+    '#type' => 'markup',
+    '#value' => '<p>' . t('You must choose at least one content type to index, and at least one field type, or no attachments will be indexed. Clear all content and field types or disable the Search by Page Attachments module to stop indexing file attachments.') . '</p>',
+    '#weight' => -9,
+  );
+
+  // Which node types to index attachments for
+
+  $form[ 'sbp_attach'][ 'sbp_attach_node_types' ] = array(
+    '#type' => 'select',
+    '#multiple' => TRUE,
+    '#title' => t('Content types to index attachments of'),
+    '#default_value' => search_by_page_setting_get('sbp_attach_node_types', $environment, array()),
+    '#options' => node_type_get_names(),
+    '#description' => t('Choose the content types whose file field attachments you would like to have indexed by Search by Page. Use the Control or Command key to select multiple types or undo your selections.'),
+    '#weight' => 0,
+  );
+
+  // Which field types to index.
+  // Note: Don't check for File type itself - leave it open to other
+  // field modules that use 'fid', and let the user decide
+
+  $fields = field_info_fields();
+  $opts = array();
+  foreach ($fields as $field) {
+    $columns = $field['columns'];
+    // See if this field has an 'fid' column. Assume it's a potential file
+    // field if so.
+    if (isset($field['columns']['fid'])) {
+      $name = check_plain($field['field_name']);
+      $opts[$name] = check_plain($name);
+    }
+  }
+
+  if (count($opts)) {
+    $form[ 'sbp_attach'][ 'sbp_attach_field_types' ] = array(
+      '#type' => 'select',
+      '#multiple' => TRUE,
+      '#title' => t('Fields to index'),
+      '#default_value' => search_by_page_setting_get('sbp_attach_field_types', $environment, array()),
+      '#options' => $opts,
+      '#description' => t('Choose which field types contain attachments you would like to have indexed by Search by Page. Use the Control or Command key to select multiple types or undo your selections.'),
+      '#weight' => 1,
+    );
+  }
+  else {
+    $form['sbp_attach']['no_field_info'] = array(
+    '#type' => 'markup',
+    '#value' => '<p>' . t('No field types supporting file attachments were found. No attachments will be indexed.') . '</p>',
+    '#weight' => 1,
+
+    );
+  }
+
+  // Other options
+
+  $form['sbp_attach']['sbp_options_section_markup'] = array(
+    '#type' => 'markup',
+    '#value' => '<p><strong>' . t('Options:') . '</strong></p>',
+    '#weight' => 2,
+  );
+
+  $form['sbp_attach']['sbp_attach_only_listed'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Limit to displayed files'),
+    '#default_value' => search_by_page_setting_get('sbp_attach_only_listed', $environment, 0),
+    '#description' => t('The File field allows you to specify whether a particular attached file should be displayed on the site. If you check this option, Search by Page Attachments will only search for files that have been marked as Displayed. Otherwise, all attached files will be searched.'),
+    '#weight' => 3,
+  );
+
+  $form['sbp_attach']['sbp_attach_prepend_node_title'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Prepend content item title to file name'),
+    '#default_value' => search_by_page_setting_get('sbp_attach_prepend_node_title', $environment, 0),
+    '#description' => t('When an attached file is presented to the user in search results, the results will display a title, which defaults to the file name. If you check this box, the content item title will be prepended to the file name.'),
+    '#weight' => 4,
+  );
+
+  $form['sbp_attach']['sbp_attach_title_sep'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Content item title separator'),
+    '#default_value' => search_by_page_setting_get('sbp_attach_title_sep', $environment, '/'),
+    '#description' => t('If you have chosen to prepend the content item title to the file name, this separator will be put between the item title and the file name.'),
+    '#weight' => 5,
+  );
+
+  $form['sbp_attach']['sbp_attach_use_description'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Substitute description for file name'),
+    '#default_value' => search_by_page_setting_get('sbp_attach_use_description', $environment, 0),
+    '#description' => t('When an attached file is presented to the user in search results, the results will display a title, which is the file name by default. If you check this box, and the file has a description defined, the description will be substituted for the file name in the search result title.'),
+    '#weight' => 6,
+  );
+
+  $form['sbp_attach']['sbp_attach_role'] = array(
+    '#type' => 'radios',
+    '#title' => t('Role for indexing'),
+    '#options' => user_roles(),
+    '#default_value' => search_by_page_setting_get('sbp_attach_role', $environment, DRUPAL_ANONYMOUS_RID),
+    '#weight' => 7,
+    '#description' => t("When Search by Page indexes attached files for searching, the files will be viewed from the perspective and permissions of a user with this role."),
+  );
+
+  $times = array(
+    '1' => t('1 second'),
+    '3600' => t('1 hour'),
+    '86400' => t('1 day'),
+    '604800' => t('1 week'),
+    '31449600' => t('1 year'),
+    '0' => t('Never'),
+  );
+
+  $form['sbp_attach']['sbp_attach_min_time'] = array(
+    '#type' => 'select',
+    '#title' => t('Minimum reindexing time'),
+    '#options' => $times,
+    '#default_value' => search_by_page_setting_get('sbp_attach_min_time', $environment, 0),
+    '#weight' => 8,
+    '#description' => t("Search by Page automatically indexes attachments on new content items, and reindexes attachments if the content item they are attached to is updated. After indexing these updated attachments, Search by Page can also cycle through previously-indexed attachments, in case the file may have been updated without the content item it is attached to being updated. This would be necessary if files on the site are maintained and updated by a separate process (e.g., log files, replacement files added by FTP, etc.). By default, Search by Page will not reindex an attachment until the content item it is attached to is updated, but if you need attachments to be reindexed, you can set the minimum indexing cycle time here. In this case, attachments will be reindexed periodically, along with other Search by Page content, after waiting at least the minimum time set here before reindexing."),
+  );
+
+  $form['sbp_attach']['sbp_attach_max_time'] = array(
+    '#type' => 'select',
+    '#title' => t('Maximum reindexing time'),
+    '#options' => $times,
+    '#default_value' => search_by_page_setting_get('sbp_attach_max_time', $environment, 0),
+    '#weight' => 9,
+    '#description' => t("Conversely to the minimum reindexing time (see above), Search by Page can be set to prioritize reindexing each attachment (by marking it as needing immediate reindexing) after this amount of time has passed. This has higher priority than the cycle-through reindexing of the setting above.") . ' ' . t('But be careful with this setting! If you set it too small, it can interfere with new content being indexed, because the reindexed content will have equal priority to content that has never been indexed. So make sure your settings allow for enough time for new content to be indexed before forcing reindexing.'),
+  );
+
+  // Add a link to helper function config page
+
+  $form['sbp_attach']['helpers'] = array(
+    '#type' => 'markup',
+    '#value' => '<p>' . l(t('Configure helper functions for extracting text from attachment files'),
+      'admin/config/search/search_files/helpers') . '</p>',
+    '#weight' => 10,
+  );
+
+  return $form;
+}
+
+/**
+ * Returns an array of the given fields on the given object.
+ */
+function _sbp_attach_object_fields($obj, $field_name) {
+  $fields = $obj->$field_name;
+
+  $objlang = LANGUAGE_NONE;
+  if (isset($obj->language) && $obj->language) {
+    $objlang = $obj->language;
+  }
+
+  if (isset($fields[$objlang])) {
+    return $fields[$objlang];
+  }
+
+  if (isset($fields[LANGUAGE_NONE])) {
+    return $fields[LANGUAGE_NONE];
+  }
+
+  return array();
+}
+
+/**
+ * Implements hook_node_update().
+ *
+ * When a node is updated, sets any attached files for reindexing at the next
+ * cron run.
+ */
+function sbp_attach_node_update($node) {
+  // Find the sbp_attach IDs in our database associated with this node ID.
+  $res = db_query("SELECT sbpaid FROM {sbpa_attachments} WHERE objtype = 'node' AND objid = :nid", array(':nid' => $node->nid))->fetchCol();
+  foreach ($res as $id) {
+    search_by_page_force_reindex('sbp_attach', $id);
+  }
+}
+
+/**
+ * Implements hook_node_delete().
+ *
+ * When a node is deleted, remove its attached files from the search index.
+ */
+function sbp_attach_node_delete($node) {
+  // Find the sbp_attach IDs in our database associated with this node ID.
+  $res = db_query("SELECT sbpaid FROM {sbpa_attachments} WHERE objtype = 'node' AND objid = :nid", array(':nid' => $node->nid))->fetchCol();
+  foreach ($res as $id) {
+    search_by_page_force_remove('sbp_attach', $id);
+  }
+}
+

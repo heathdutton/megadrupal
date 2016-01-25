@@ -1,0 +1,374 @@
+<?php
+
+/**
+ * @file
+ * Provides a BitPay payment method for Drupal Commerce.
+ */
+
+/**
+ * Implements hook_libraries_info().
+ */
+function commerce_bitpay_libraries_info() {
+  $libraries['php-client'] = array(
+    'name' => 'BitPay php-client',
+    'vendor url' => 'https://bitpay.com/bitcoin-payment-gateway-api',
+    'download url' => 'https://github.com/bitpay/php-client',
+    'files' => array(
+      'php' => array('bp_lib.php'),
+    ),
+    'version arguments' => array(
+      'file' => 'bp_lib.php',
+      'pattern' => '/VERSION\D+(\d+.?\d+)/',
+      'lines' => 44,
+    ),
+  );
+  return $libraries;
+}
+
+/**
+ * Implements hook_menu().
+ */
+function commerce_bitpay_menu() {
+  // Define an always accessible path to receive IPNs.
+  $items['bitpay/ipn/%commerce_order/%commerce_payment_transaction'] = array(
+    'title' => 'BitPay IPN',
+    'page callback' => 'commerce_bitpay_verify_ipn',
+    'page arguments' => array(2, 3),
+    'access callback' => TRUE,
+    'type' => MENU_CALLBACK,
+    'file' => 'includes/commerce_bitpay.ipn.inc',
+  );
+
+  // Limit access for confirming offline payments to only pending transactions.
+  $items['admin/commerce/orders/%commerce_order/payment/%commerce_payment_transaction/bitpay-confirm'] = array(
+    'title' => 'Confirm payment',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('commerce_bitpay_confirm_form', 3, 5),
+    'access callback' => 'commerce_bitpay_transaction_confirm_access',
+    'access arguments' => array(3, 5),
+    'type' => MENU_DEFAULT_LOCAL_TASK,
+    'context' => MENU_CONTEXT_INLINE,
+    'weight' => 2,
+    'file' => 'includes/commerce_bitpay.admin.inc',
+  );
+
+  // This is where user goes after clicking "Go Back" on payment page.
+  $items['checkout/%commerce_order/commerce_bitpay/cancel_payment'] = array(
+    'title' => 'Cancel checkout payment',
+    'page callback' => 'commerce_bitpay_cancel_payment',
+    'page arguments' => array(1),
+    'access callback' => 'commerce_checkout_access',
+    'access arguments' => array(1),
+    'type' => MENU_CALLBACK,
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_commerce_payment_method_info().
+ */
+function commerce_bitpay_commerce_payment_method_info() {
+  $payment_methods['bitpay'] = array(
+    'base' => 'commerce_bitpay',
+    'title' => t('BitPay'),
+    'display_title' => t('Bitcoin'),
+    'short_title' => t('Bitcoin'),
+    'description' => t('BitPay Bitcoin Gateway'),
+    // Whether or not payments can be processed via this payment method through
+    // the administrative payment terminal on an order’s Payment tab.
+    'terminal' => FALSE,
+    // Whether or not the customer must be redirected offsite to put in their
+    // payment information;
+    // used specifically by the offsite payment redirect checkout pane.
+    'offsite' => TRUE,
+    // Whether or not the customer should be automatically redirected
+    // to an offsite payment site on the payment step of checkout.
+    'offsite_autoredirect' => FALSE,
+    'file' => 'includes/commerce_bitpay.callbacks.inc',
+  );
+
+  return $payment_methods;
+}
+
+
+/**
+ * Returns an array of all possible currency codes for BitPay payment.
+ *
+ * @link https://bitpay.com/bitcoin-exchange-rates Supported currencies @endlink
+ * @link https://bitpay.com/api/rates JSON exchange rate feed @endlink
+ *
+ * @return array
+ *   An array of supported currencies with indexed keys. Values are an array of
+ *   currency code (code), currency name (name), and exchange rate (rate).
+ */
+function commerce_bitpay_currencies() {
+  $currencies_json = file_get_contents('https://bitpay.com/api/rates');
+  if ($currencies_json === FALSE) {
+    // BitPay is having some connectivity issues.
+    return FALSE;
+  }
+
+  $currencies = json_decode($currencies_json, TRUE);
+  if ($currencies && is_array($currencies)) {
+    for ($i = 0, $j = count($currencies); $i < $j; $i++) {
+      $return[$currencies[$i]['code']] = array('name' => $currencies[$i]['name'], 'rate' => $currencies[$i]['rate']);
+    }
+  }
+  return $return;
+}
+
+/**
+ * Returns the default settings for the BitPay payment method.
+ *
+ * @return array
+ *   Returns the default settings to populate the configuration form.
+ */
+function commerce_bitpay_default_settings() {
+  return array(
+    // An API key is required eventually for proper function.
+    'apiKey' => '',
+    // Show text, icon, or both on payment choice page.
+    'checkout_display' => 'both',
+    // Redirect to /checkout/%order_id/complete by default.
+    'redirectURL' => '',
+    // Use the setting in the bitpay.com merchant account configuration.
+    'notificationEmail' => '',
+    // Use the setting in the bitpay.com merchant account configuration.
+    'transactionSpeed' => '',
+    // Changes the verbosity of IPN replies.
+    'fullNotifications' => 'true',
+    // Options: post = hosted checkout; iframe = embedded on payment page.
+    'redirect_mode' => 'iframe',
+  );
+}
+
+/**
+ * Access callback function to limit use to non-completed payments.
+ *
+ * @return bool
+ *   Returns TRUE if user has access to confirm a transaction, FALSE otherwise.
+ */
+function commerce_bitpay_transaction_confirm_access($order, $transaction = NULL, $account = NULL) {
+  $access = commerce_payment_transaction_access('update', $transaction, $account);
+  if ($access && $transaction) {
+    if ($transaction->payment_method != 'bitpay') {
+      $access = FALSE;
+    }
+    elseif ($transaction->status == COMMERCE_PAYMENT_STATUS_SUCCESS) {
+      $access = FALSE;
+    }
+  }
+  return $access;
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function commerce_bitpay_form_commerce_checkout_form_alter(&$form, &$form_state) {
+  // If this checkout form contains the payment method radios.
+  if (!empty($form['commerce_payment']['payment_method']['#options'])) {
+    // Loop over its options array looking for a Bitcoin option.
+    foreach ($form['commerce_payment']['payment_method']['#options'] as $key => &$value) {
+      list($method_id, $rule_name) = explode('|', $key);
+
+      switch ($method_id) {
+        case 'bitpay':
+          // Prepare the replacement radio button text with icons.
+          $variables = array(
+            'path' => drupal_get_path('module', 'commerce_bitpay') . '/images/bitcoin.png',
+            'title' => t('Bitcoin accepted by BitPay'),
+            'alt' => t('Bitcoin logo'),
+            'attributes' => array(
+              'class' => array('commerce-bitpay-icon'),
+            ),
+          );
+          $icons['bitcoin'] = theme('image', $variables);
+
+          $payment_method = commerce_payment_method_instance_load($key);
+
+          if (isset($payment_method['settings']['checkout_display'])) {
+            $value = '';
+            if (in_array($payment_method['settings']['checkout_display'], array('both', 'text'))) {
+              $value .= t('Bitcoin');
+            }
+            if (in_array($payment_method['settings']['checkout_display'], array('both', 'icon'))) {
+              $value .= '<span class="commerce-bitpay-icons">' . implode(' ', $icons) . '</span>';
+            }
+          }
+
+          // Add the CSS to place the icon after the radio button text.
+          $form['commerce_payment']['payment_method']['#attached']['css'][] = drupal_get_path('module', 'commerce_bitpay') . '/theme/commerce_bitpay.theme.css';
+
+          break;
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_cron().
+ *
+ * Must implement some arbitrary limit on queries for stale transactions
+ * because API queries are rate limited to 200/hour by BitPay.
+ *
+ * Check for expired invoices first, then probably mark the transaction failed.
+ * 900 seconds is 15 minutes, so 930 gives BitPay a few seconds for fuzzy math.
+ *
+ * Check for invalid secibd, then probably mark the transaction failed.
+ * 3600 seconds is 1 hour. 60 seconds gives some time for fuzzy math.
+ */
+function commerce_bitpay_cron() {
+  $result = db_select('commerce_payment_transaction', 'cpt')
+    ->fields('cpt', array('transaction_id', 'order_id', 'remote_id'))
+    ->condition('cpt.payment_method', 'bitpay')
+    ->condition('cpt.remote_status', 'new')
+    ->condition('cpt.changed', REQUEST_TIME - 930, '<')
+    ->orderBy('cpt.transaction_id', 'ASC')
+    ->range(0, 15)
+    ->addTag('commerce_bitpay_cron_expired')
+    ->execute();
+  if ($result) {
+    _commerce_bitpay_cron_transaction($result);
+  }
+
+  $result = db_select('commerce_payment_transaction', 'cpt')
+    ->fields('cpt', array('transaction_id', 'order_id', 'remote_id'))
+    ->condition('cpt.payment_method', 'bitpay')
+    ->condition('cpt.remote_status', 'paid')
+    ->condition('cpt.changed', REQUEST_TIME - 3660, '<')
+    ->orderBy('cpt.transaction_id', 'ASC')
+    ->range(0, 15)
+    ->addTag('commerce_bitpay_cron_invalid')
+    ->execute();
+  if ($result) {
+    _commerce_bitpay_cron_transaction($result);
+  }
+}
+
+/**
+ * Process the result of a custom query in cron to update stale transactions.
+ *
+ * @param object $result
+ *   Result from a database query containing transaction information.
+ */
+function _commerce_bitpay_cron_transaction($result) {
+  libraries_load('php-client');
+
+  while ($row = $result->fetchAssoc()) {
+    $transaction = commerce_payment_transaction_load($row['transaction_id']);
+    $payment_method = commerce_payment_method_instance_load($transaction->instance_id);
+    $invoice = bpGetInvoice($row['remote_id'], $payment_method['settings']['apiKey']);
+    $order = commerce_order_load($row['order_id']);
+    if (is_array($invoice)) {
+      commerce_bitpay_update_transaction($order, $transaction, $invoice);
+    }
+  }
+}
+
+/**
+ * Load an existing transaction to update the status.
+ *
+ * @param object $order
+ *   Commerce order.
+ * @param object $transaction
+ *   Commerce transaction.
+ * @param array $ipn
+ *   Decoded JSON transaction information sourced from BitPay.
+ */
+function commerce_bitpay_update_transaction($order, $transaction, $ipn) {
+  switch ($ipn['status']) {
+    case 'new':
+      $transaction->status = COMMERCE_PAYMENT_STATUS_PENDING;
+      $transaction->message = t("Waiting for payment.");
+      break;
+
+    case 'paid':
+      commerce_checkout_complete($order);
+      $transaction->status = COMMERCE_PAYMENT_STATUS_PENDING;
+      $transaction->message = t('Paid, waiting for blockchain confirmation.');
+      break;
+
+    case 'confirmed':
+      commerce_checkout_complete($order);
+      $transaction->status = COMMERCE_PAYMENT_STATUS_SUCCESS;
+      $transaction->message = t('Payment confirmed.');
+      break;
+
+    case 'complete':
+      commerce_checkout_complete($order);
+      $transaction->status = COMMERCE_PAYMENT_STATUS_SUCCESS;
+      $transaction->message = t('Merchant account credited. Invoice complete.');
+      break;
+
+    case 'expired':
+      // Expired invoices don't generate an automatic IPN reply.
+      // Expired invoices must be queried.
+      $transaction->status = COMMERCE_PAYMENT_STATUS_FAILURE;
+      $transaction->message = t('Payment was not received within 15 minutes from invoice generation.');
+      break;
+
+    case 'invalid':
+      $transaction->status = COMMERCE_PAYMENT_STATUS_FAILURE;
+      $transaction->message = t('Payment was received but was not confirmed within 1 hour.');
+      break;
+
+    default:
+      watchdog('commerce_bitpay', 'Unknown payment status for transaction @id: @status', array('@id' => $transaction->transaction_id, '@status' => $ipn['status']), WATCHDOG_WARNING);
+      return;
+  }
+  $transaction->remote_status = $ipn['status'];
+  $transaction->payload = $ipn;
+
+  commerce_payment_transaction_save($transaction);
+}
+
+/**
+ * Implements hook_commerce_checkout_pane_info_alter().
+ */
+function commerce_bitpay_commerce_checkout_pane_info_alter(&$checkout_panes) {
+  /*
+  When users try to click the "Complete checkout" button on the iframe payment
+  page, but the paid IPN hasn't been received yet, there's a drupal_set_message
+  warning accompanied by "Off-site payment redirect".
+  This alter un-sets that redirect title so that it just shows the warning.
+  */
+  $checkout_panes['commerce_payment_redirect']['title'] = '';
+}
+
+/**
+ * Page callback for "Go Back" button on payment page.
+ *
+ * @param object $order
+ *   Commerce order object.
+ */
+function commerce_bitpay_cancel_payment($order) {
+  $order = commerce_order_status_update($order, 'checkout_review');
+  drupal_goto(commerce_checkout_order_uri($order));
+}
+
+/**
+ * Creates a payment transaction for the specified charge amount.
+ *
+ * @param array $payment_method
+ *   The payment method instance object used to charge this payment.
+ * @param object $order
+ *   The order object the payment applies to.
+ * @param array $charge
+ *   An array indicating the amount and currency code to charge.
+ */
+function commerce_bitpay_transaction($payment_method, $order, $charge) {
+  $transaction = commerce_payment_transaction_new('bitpay', $order->order_id);
+  // Expected value: bitpay|commerce_payment_bitpay.
+  $transaction->instance_id = $payment_method['instance_id'];
+  $transaction->remote_id = 'Default';
+  // An order amount of $1.00 probably shows here as simply 100.
+  $transaction->amount = $charge['amount'];
+  // Default Commerce currency code value: USD.
+  $transaction->currency_code = $charge['currency_code'];
+  $transaction->status = COMMERCE_PAYMENT_STATUS_PENDING;
+  $transaction->message = 'Initialized transaction';
+  $transaction->message_variables = array();
+
+  commerce_payment_transaction_save($transaction);
+}

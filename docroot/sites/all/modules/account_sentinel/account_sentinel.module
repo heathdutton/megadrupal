@@ -1,0 +1,911 @@
+<?php
+
+/**
+ * @file
+ * Detects changes made to selected roles' accounts.
+ */
+
+/**
+ * Indicates that the username was changed.
+ */
+define('ACCOUNT_SENTINEL_EVENT_TYPE_NAME', 'name');
+
+/**
+ * Indicates that the password was changed.
+ */
+define('ACCOUNT_SENTINEL_EVENT_TYPE_PASS', 'pass');
+
+/**
+ * Indicates that the e-mail address was changed.
+ */
+define('ACCOUNT_SENTINEL_EVENT_TYPE_MAIL', 'mail');
+
+/**
+ * Indicates that a monitored role was added.
+ */
+define('ACCOUNT_SENTINEL_EVENT_TYPE_ROLE_ADD', 'role_add');
+
+/**
+ * Indicates that a monitored role was revoked.
+ */
+define('ACCOUNT_SENTINEL_EVENT_TYPE_ROLE_REMOVE', 'role_remove');
+
+/**
+ * Indicates that the snapshot of the user was not valid.
+ *
+ * This is a critical event.
+ */
+define('ACCOUNT_SENTINEL_EVENT_TYPE_SNAPSHOT_INVALID', 'snapshot_invalid');
+
+/**
+ * Indicates that the snapshot of the user should already exist but it does not.
+ *
+ * This is a critical event.
+ */
+define('ACCOUNT_SENTINEL_EVENT_TYPE_SNAPSHOT_MISSING', 'snapshot_missing');
+
+/**
+ * Indicates that a new user was created with one or more monitored permissions.
+ */
+define('ACCOUNT_SENTINEL_EVENT_TYPE_USER_ADD', 'user_add');
+
+/**
+ * Indicates that the user was deleted.
+ */
+define('ACCOUNT_SENTINEL_EVENT_TYPE_USER_DELETE', 'user_delete');
+
+/**
+ * Indicates that the user got blocked.
+ */
+define('ACCOUNT_SENTINEL_EVENT_TYPE_USER_BLOCK', 'user_block');
+
+/**
+ * Indicates that the user got unblocked.
+ */
+define('ACCOUNT_SENTINEL_EVENT_TYPE_USER_UNBLOCK', 'user_unblock');
+
+/**
+ * Indicates that the change was caught via hooks inside Drupal.
+ */
+define('ACCOUNT_SENTINEL_EVENT_ORIGIN_HOOK', 'drupal');
+
+/**
+ * Indicates that the change was caught by checking the database.
+ *
+ * This is a critical event.
+ */
+define('ACCOUNT_SENTINEL_EVENT_ORIGIN_DB_CHECK', 'database');
+
+/**
+ * Implements hook_help().
+ */
+function account_sentinel_help($path, $arg) {
+  switch ($path) {
+    case 'admin/help#account_sentinel':
+      $help = t("Account Sentinel perceives changes made to a configurable set of monitored roles' accounts, even those that are results of direct database modification (e.g. SQL injection). A set of e-mail addresses can be configured to be notified when such a change is detected, also a log of changes can be viewed in Drupal and via Drush for manual review.");
+      return '<p>' . $help . '</p>';
+  }
+}
+
+/**
+ * Implements hook_permission().
+ */
+function account_sentinel_permission() {
+  return array(
+    'access account sentinel logs' => array(
+      'title' => t('Access Account Sentinel logs'),
+    ),
+    'administer account sentinel' => array(
+      'title' => t("Change Account Sentinel's configuration"),
+    ),
+  );
+}
+
+/**
+ * Implements hook_menu().
+ */
+function account_sentinel_menu() {
+  // Report page.
+  $items['admin/reports/account-sentinel'] = array(
+    'title' => 'Account Sentinel log',
+    'description' => 'List of changes to monitored roles\' accounts perceived by Account Sentinel.',
+    'page callback' => 'account_sentinel_page_report',
+    'access arguments' => array('access account sentinel logs'),
+    'file' => 'account_sentinel.pages.inc',
+    'type' => MENU_NORMAL_ITEM,
+  );
+
+  // Settings page.
+  $items['admin/config/system/account-sentinel'] = array(
+    'title' => 'Account Sentinel settings',
+    'description' => 'Manage Account Sentinel settings.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('account_sentinel_page_settings'),
+    'access arguments' => array('administer account sentinel'),
+    'file' => 'account_sentinel.pages.inc',
+  );
+
+  // Cron handler.
+  $items['system/account-sentinel-cron'] = array(
+    'title' => 'Run Account Sentinel DB check',
+    'page callback' => 'account_sentinel_callback_cron',
+    'access callback' => TRUE,
+    'file' => 'account_sentinel.pages.inc',
+    'type' => MENU_CALLBACK,
+  );
+
+  // Cron key reset handler.
+  $items['system/account-sentinel-reset-cron-key'] = array(
+    'title' => "Reset Account Sentinel's cron key",
+    'page callback' => 'account_sentinel_callback_reset_cron_key',
+    'access callback' => TRUE,
+    'access arguments' => array('administer account sentinel'),
+    'file' => 'account_sentinel.pages.inc',
+    'type' => MENU_CALLBACK,
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_theme().
+ */
+function account_sentinel_theme($existing, $type, $theme, $path) {
+  return array(
+    'account_sentinel_username' => array(
+      'variables' => array(
+        'uid' => 0,
+      ),
+      'file' => 'account_sentinel.themes.inc',
+    ),
+  );
+}
+
+/**
+ * Implements hook_user_update().
+ */
+function account_sentinel_user_update(&$edit, $account, $category) {
+  $new = account_sentinel_monitored_account_data($account);
+  $original = account_sentinel_monitored_account_data($account->original);
+
+  if ($new['monitored'] || $original['monitored']) {
+    $changes = account_sentinel_detect_changes($new, $original);
+    if (!empty($changes)) {
+      account_sentinel_record_events($account->uid, ACCOUNT_SENTINEL_EVENT_ORIGIN_HOOK, $changes);
+      account_sentinel_update_snapshot($new);
+    }
+  }
+}
+
+/**
+ * Implements hook_password_strength_change().
+ */
+function account_sentinel_password_strength_change($account, $strength) {
+  // Store password strength for $account for later use.
+  account_sentinel_password_strength($account->uid, password_strength_get_score($strength['score']));
+}
+
+/**
+ * Provides static storage for password strengths.
+ *
+ * @param int $uid
+ *   UID of the user.
+ * @param string $score
+ *   Password's strength.
+ *
+ * @return mixed
+ *   Returns the score for UID's new password or FALSE if not set.
+ */
+function account_sentinel_password_strength($uid, $score = NULL) {
+  static $strengths = array();
+
+  // Update score.
+  if (isset($score)) {
+    $strengths[$uid] = $score;
+  }
+
+  // Return score.
+  if (isset($strengths[$uid])) {
+    return $strengths[$uid];
+  }
+
+  // Return FALSE if score is not available.
+  return FALSE;
+}
+
+/**
+ * Implements hook_account_sentinel_changes_alter().
+ */
+function account_sentinel_account_sentinel_changes_alter(array &$changes, array &$new, array &$original) {
+  // Include password strength information if available.
+  $strength = account_sentinel_password_strength($original['uid']);
+  if ($strength) {
+    foreach ($changes as &$change) {
+      if ($change['type'] == ACCOUNT_SENTINEL_EVENT_TYPE_PASS && !isset($change['data']['strength'])) {
+        $change['data']['strength'] = $strength;
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_user_insert().
+ */
+function account_sentinel_user_insert(&$edit, $account, $category) {
+  $account = account_sentinel_monitored_account_data($account);
+  if ($account['monitored']) {
+    $events[] = array(
+      'type' => ACCOUNT_SENTINEL_EVENT_TYPE_USER_ADD,
+      'data' => array(
+        'uid' => $account['uid'],
+        'name' => $account['name'],
+        'mail' => $account['mail'],
+      ),
+    );
+    foreach ($account['roles'] as $rid) {
+      $events[] = array(
+        'type' => ACCOUNT_SENTINEL_EVENT_TYPE_ROLE_ADD,
+        'data' => array('rid' => $rid),
+      );
+    }
+    account_sentinel_record_events($account['uid'], ACCOUNT_SENTINEL_EVENT_ORIGIN_HOOK, $events);
+    account_sentinel_update_snapshot($account);
+  }
+}
+
+/**
+ * Implements hook_user_delete().
+ */
+function account_sentinel_user_delete($account) {
+  $account = account_sentinel_monitored_account_data($account);
+  if ($account['monitored']) {
+    $events[] = array(
+      'type' => ACCOUNT_SENTINEL_EVENT_TYPE_USER_DELETE,
+      'data' => array(
+        'uid' => $account['uid'],
+        'name' => $account['name'],
+        'mail' => $account['mail'],
+      ),
+    );
+    account_sentinel_record_events($account['uid'], ACCOUNT_SENTINEL_EVENT_ORIGIN_HOOK, $events);
+    account_sentinel_delete_snapshot($account['uid']);
+  }
+}
+
+/**
+ * Implements hook_cron().
+ */
+function account_sentinel_cron() {
+  if (variable_get('account_sentinel_cron_method', 'drupal') == 'drupal') {
+    watchdog('account_sentinel', "Invoked database audit from Drupal's cron.");
+    module_load_include('inc', 'account_sentinel', 'account_sentinel.audit');
+    account_sentinel_audit();
+  }
+}
+
+/**
+ * Implements hook_mail().
+ */
+function account_sentinel_mail($key, &$message, $params) {
+  switch ($key) {
+    // Compose notification e-mail.
+    case 'notification':
+      // Collect information parameters.
+      $uid = $params['uid'];
+      $origin = $params['origin'];
+      $events = $params['events'];
+
+      // Get user's name.
+      $user = user_load($uid);
+      if ($user !== FALSE) {
+        $user_name = $user->name;
+      }
+      else {
+        $user_name = 'unknown';
+      }
+
+      // Get changed by user's name.
+      $by_user = user_load($params['meta_data']['by_uid']);
+      if ($by_user !== FALSE) {
+        $by_name = $by_user->name;
+      }
+      else {
+        $by_name = 'unknown';
+      }
+
+      // Compose e-mail.
+      if (!empty($events)) {
+        $message['subject'] = t(
+          '[AS] User #@uid (@name) was changed',
+          array(
+            '@uid' => $uid,
+            '@name' => $user_name,
+          )
+        );
+        if ($origin != ACCOUNT_SENTINEL_EVENT_ORIGIN_HOOK) {
+          $message['body'][] = '<strong>' . t('Warning: these changes were made outside of Drupal!') . '</strong>';
+        }
+        $message['body'][] = t(
+          'User #@uid (@name) was changed by user #@by_uid (@by_name) (@ip) at @timestamp.',
+          array(
+            '@uid' => $uid,
+            '@name' => $user_name,
+            '@by_uid' => $params['meta_data']['by_uid'],
+            '@by_name' => $by_name,
+            '@ip' => $params['meta_data']['ip'],
+            '@timestamp' => format_date($params['meta_data']['timestamp']),
+          )
+        );
+        $message['body'][] = t('The following changes were made to the account:');
+        foreach ($events as $event) {
+          $message['body'][] = account_sentinel_get_event_message($event['type'], $event['data']);
+        }
+      }
+      break;
+  }
+}
+
+/**
+ * Returns the ID's of monitored roles.
+ *
+ * If the monitored roles have not been set yet, it will return the
+ * administrator role.
+ *
+ * @return int[]
+ *   Array of monitored roles' ids.
+ */
+function account_sentinel_get_monitored_roles() {
+  $roles = variable_get('account_sentinel_monitored_roles', NULL);
+  if ($roles === NULL) {
+    return array(
+      variable_get('user_admin_role', 3),
+    );
+  }
+  return $roles;
+}
+
+/**
+ * Returns the module's cron key.
+ *
+ * @return string
+ *   The cron key.
+ */
+function account_sentinel_get_cron_key() {
+  $key = variable_get('account_sentinel_cron_key', NULL);
+  if ($key === NULL) {
+    return account_sentinel_reset_cron_key();
+  }
+  return $key;
+}
+
+/**
+ * Returns the relevant monitored data of an $account object.
+ *
+ * The output is an associative array which only stores data needed by Account
+ * Sentinel.
+ *
+ * @param object $account
+ *   A user entity.
+ *
+ * @return array
+ *   An associative array containing the monitored data.
+ */
+function account_sentinel_monitored_account_data($account) {
+  // Only work with role IDs.
+  $roles = array_keys($account->roles);
+
+  // Only work with monitored roles.
+  $monitored = account_sentinel_get_monitored_roles();
+  $roles = array_intersect($monitored, $roles);
+
+  $output = array(
+    'uid' => $account->uid,
+    'name' => $account->name,
+    'pass' => $account->pass,
+    'mail' => $account->mail,
+    'status' => $account->status,
+    'roles' => $roles,
+    'monitored' => !empty($roles),
+  );
+
+  return $output;
+}
+
+/**
+ * Returns an array of event type string - human-readable string associations.
+ *
+ * @return array
+ *   Array of translatable strings mapped by their event type constants.
+ */
+function account_sentinel_event_type_strings() {
+  return array(
+    ACCOUNT_SENTINEL_EVENT_TYPE_NAME => t('name changed'),
+    ACCOUNT_SENTINEL_EVENT_TYPE_PASS => t('password changed'),
+    ACCOUNT_SENTINEL_EVENT_TYPE_MAIL => t('mail changed'),
+    ACCOUNT_SENTINEL_EVENT_TYPE_ROLE_ADD => t('role added'),
+    ACCOUNT_SENTINEL_EVENT_TYPE_ROLE_REMOVE => t('role removed'),
+    ACCOUNT_SENTINEL_EVENT_TYPE_SNAPSHOT_INVALID => t('invalid snapshot'),
+    ACCOUNT_SENTINEL_EVENT_TYPE_SNAPSHOT_MISSING => t('missing snapshot'),
+    ACCOUNT_SENTINEL_EVENT_TYPE_USER_ADD => t('user added'),
+    ACCOUNT_SENTINEL_EVENT_TYPE_USER_DELETE => t('user deleted'),
+    ACCOUNT_SENTINEL_EVENT_TYPE_USER_BLOCK => t('blocked'),
+    ACCOUNT_SENTINEL_EVENT_TYPE_USER_UNBLOCK => t('unblocked'),
+  );
+}
+
+/**
+ * Returns an array of event origin string - human-readable string associations.
+ *
+ * @return array
+ *   Array of translatable strings mapped by their event origin constants.
+ */
+function account_sentinel_event_origin_strings() {
+  return array(
+    ACCOUNT_SENTINEL_EVENT_ORIGIN_HOOK => t('Drupal'),
+    ACCOUNT_SENTINEL_EVENT_ORIGIN_DB_CHECK => t('database'),
+  );
+}
+
+/**
+ * Gets the human-readable name of a given event type.
+ *
+ * @param string $event_type
+ *   The event's type.
+ *
+ * @return string
+ *   The event type's human-readable name.
+ */
+function account_sentinel_event_type_get_string($event_type) {
+  $event_type_strings = account_sentinel_event_type_strings();
+  if (isset($event_type_strings[$event_type])) {
+    return $event_type_strings[$event_type];
+  }
+  return t('unknown');
+}
+
+/**
+ * Gets the human-readable name of a given event origin.
+ *
+ * @param string $event_origin
+ *   The event's origin.
+ *
+ * @return string
+ *   The event origin's human-readable name.
+ */
+function account_sentinel_event_origin_get_string($event_origin) {
+  $event_origin_strings = account_sentinel_event_origin_strings();
+  if (isset($event_origin_strings[$event_origin])) {
+    return $event_origin_strings[$event_origin];
+  }
+  return t('unknown');
+}
+
+/**
+ * Generates an event's detailed human-readable message.
+ *
+ * @param string $event_type
+ *   The event's type.
+ * @param array $data
+ *   Additional data from the database used to generate informative messages.
+ *
+ * @return string
+ *   The generated detailed event message.
+ */
+function account_sentinel_get_event_message($event_type, array $data) {
+  switch ($event_type) {
+    case ACCOUNT_SENTINEL_EVENT_TYPE_NAME:
+      return t('Changed name from <strong>@name_old</strong> to <strong>@name_new</strong>.', array(
+        '@name_old' => $data['old'],
+        '@name_new' => $data['new'],
+      ));
+
+    case ACCOUNT_SENTINEL_EVENT_TYPE_PASS:
+      $msg = t('Changed password.');
+      // Append strength information if set.
+      if (isset($data['strength'])) {
+        $msg .= ' ' . t('New strength: @strength.', array(
+          '@strength' => $data['strength'],
+        ));
+      }
+      return $msg;
+
+    case ACCOUNT_SENTINEL_EVENT_TYPE_MAIL:
+      return t('Changed mail from <strong>@mail_old</strong> to <strong>@mail_new</strong>.', array(
+        '@mail_old' => $data['old'],
+        '@mail_new' => $data['new'],
+      ));
+
+    case ACCOUNT_SENTINEL_EVENT_TYPE_ROLE_ADD:
+      $role = user_role_load($data['rid']);
+      return t('Granted role <strong>@role</strong>.', array(
+        '@role' => $role->name,
+      ));
+
+    case ACCOUNT_SENTINEL_EVENT_TYPE_ROLE_REMOVE:
+      $role = user_role_load($data['rid']);
+      return t('Revoked role <strong>@role</strong>.', array(
+        '@role' => $role->name,
+      ));
+
+    case ACCOUNT_SENTINEL_EVENT_TYPE_SNAPSHOT_INVALID:
+      return t("The user's snapshot was altered.");
+
+    case ACCOUNT_SENTINEL_EVENT_TYPE_SNAPSHOT_MISSING:
+      return t("The user's snapshot is missing.");
+
+    case ACCOUNT_SENTINEL_EVENT_TYPE_USER_ADD:
+      return t('Created user <em>#@uid</em> <strong>@name</strong> (<strong>@mail</strong>).', array(
+        '@uid' => $data['uid'],
+        '@name' => $data['name'],
+        '@mail' => $data['mail'],
+      ));
+
+    case ACCOUNT_SENTINEL_EVENT_TYPE_USER_DELETE:
+      return t('Deleted user <em>#@uid</em> <strong>@name</strong> (<strong>@mail</strong>).', array(
+        '@uid' => $data['uid'],
+        '@name' => $data['name'],
+        '@mail' => $data['mail'],
+      ));
+
+    case ACCOUNT_SENTINEL_EVENT_TYPE_USER_BLOCK:
+      return t('Blocked user.');
+
+    case ACCOUNT_SENTINEL_EVENT_TYPE_USER_UNBLOCK:
+      return t('Unblocked user.');
+
+    default:
+      return t('Unknown event.');
+  }
+}
+
+/**
+ * Resets the cron key.
+ *
+ * @return string
+ *   Returns the new cron key.
+ */
+function account_sentinel_reset_cron_key() {
+  $new_key = drupal_random_key();
+  variable_set('account_sentinel_cron_key', $new_key);
+  watchdog('account_sentinel', 'Cron key reset.');
+  return $new_key;
+}
+
+/**
+ * Compares a user account's two states and returns the list of differences.
+ *
+ * @param array $new
+ *   The new state of the user.
+ * @param array $original
+ *   The original state of the user.
+ *
+ * @return array
+ *   Array of changes.
+ *
+ * @see account_sentinel_monitored_account_data($account)
+ */
+function account_sentinel_detect_changes(array $new, array $original) {
+  $changes = array();
+
+  // Check whether name was changed.
+  if (isset($new['name']) && $new['name'] != $original['name']) {
+    $changes[] = array(
+      'type' => ACCOUNT_SENTINEL_EVENT_TYPE_NAME,
+      'data' => array(
+        'old' => $original['name'],
+        'new' => $new['name'],
+      ),
+    );
+  }
+
+  // Check whether pass was changed.
+  if (isset($new['pass']) && $new['pass'] != $original['pass']) {
+    $changes[] = array(
+      'type' => ACCOUNT_SENTINEL_EVENT_TYPE_PASS,
+      'data' => array(),
+    );
+  }
+
+  // Check whether mail was changed.
+  if (isset($new['mail']) && $new['mail'] != $original['mail']) {
+    $changes[] = array(
+      'type' => ACCOUNT_SENTINEL_EVENT_TYPE_MAIL,
+      'data' => array(
+        'old' => $original['mail'],
+        'new' => $new['mail'],
+      ),
+    );
+  }
+
+  // Check whether status was changed.
+  if (isset($new['status']) && $new['status'] != $original['status']) {
+    if ($original['status']) {
+      $type = ACCOUNT_SENTINEL_EVENT_TYPE_USER_BLOCK;
+    }
+    else {
+      $type = ACCOUNT_SENTINEL_EVENT_TYPE_USER_UNBLOCK;
+    }
+    $changes[] = array(
+      'type' => $type,
+      'data' => array(),
+    );
+  }
+
+  if (isset($new['roles'])) {
+    // Check whether roles were changed.
+    $roles_added = array_diff($new['roles'], $original['roles']);
+    $roles_removed = array_diff($original['roles'], $new['roles']);
+
+    foreach ($roles_added as $rid) {
+      $changes[] = array(
+        'type' => ACCOUNT_SENTINEL_EVENT_TYPE_ROLE_ADD,
+        'data' => array('rid' => $rid),
+      );
+    }
+
+    foreach ($roles_removed as $rid) {
+      $changes[] = array(
+        'type' => ACCOUNT_SENTINEL_EVENT_TYPE_ROLE_REMOVE,
+        'data' => array('rid' => $rid),
+      );
+    }
+  }
+
+  drupal_alter('account_sentinel_changes', $changes, $new, $original);
+
+  return $changes;
+}
+
+/**
+ * Records events.
+ *
+ * Stores account changes in the database, sets the new snapshot, sends an email
+ * notification and invokes hook_account_sentinel_change().
+ *
+ * @param int $uid
+ *   The UID of the account.
+ * @param string $origin
+ *   The origin of the event.
+ * @param array $events
+ *   The array of changes.
+ */
+function account_sentinel_record_events($uid, $origin, array $events) {
+  global $user;
+  $by_uid = ($origin == ACCOUNT_SENTINEL_EVENT_ORIGIN_HOOK) ? $user->uid : 0;
+
+  $meta_data = array(
+    'uid' => $uid,
+    'origin' => $origin,
+    'by_uid' => $by_uid,
+    'ip' => ip_address(),
+    'timestamp' => REQUEST_TIME,
+  );
+
+  // Store changes.
+  foreach ($events as $event_key => $event) {
+    $record = $meta_data;
+    $record['type'] = $event['type'];
+    $record['data'] = $event['data'];
+
+    // Log to database.
+    drupal_write_record('account_sentinel_logs', $record);
+
+    // Inform other modules.
+    module_invoke_all('account_sentinel_change', $record);
+  }
+
+  // Send one e-mail notification per account.
+  account_sentinel_send_notification($uid, $origin, $events, $meta_data);
+}
+
+/**
+ * Sends e-mail notification about events.
+ *
+ * @param int $uid
+ *   The UID of the account.
+ * @param string $origin
+ *   The origin of the event.
+ * @param array $events
+ *   The array of changes.
+ * @param array $meta_data
+ *   Additional meta data about the change events.
+ */
+function account_sentinel_send_notification($uid, $origin, array $events, array $meta_data) {
+  if (!empty($events)) {
+    $to = variable_get('account_sentinel_email_to', '');
+    if ($to != '') {
+      drupal_mail(
+          'account_sentinel',
+          'notification',
+          $to,
+          language_default(),
+          array(
+              'uid' => $uid,
+              'origin' => $origin,
+              'events' => $events,
+              'meta_data' => $meta_data,
+          )
+      );
+    }
+  }
+}
+
+/**
+ * Rebuilds the snapshot tables.
+ *
+ * Invoked after changing which roles are monitored.
+ *
+ * @param array $roles_old
+ *   Array of previously monitored role IDs.
+ * @param array $roles_new
+ *   Array of monitored role IDs.
+ */
+function account_sentinel_rebuild_snapshots(array $roles_old, array $roles_new) {
+  $roles_added = array_diff($roles_new, $roles_old);
+  $roles_removed = array_diff($roles_old, $roles_new);
+  $auth_in_old = array_search(DRUPAL_AUTHENTICATED_RID, $roles_old) !== FALSE;
+  $auth_in_new = array_search(DRUPAL_AUTHENTICATED_RID, $roles_new) !== FALSE;
+  $hash_key = drupal_get_hash_salt();
+
+  // Check if we don't have to modify anything.
+  if ($auth_in_old && $auth_in_new) {
+    // Every user is in the database, and will remain there.
+    return;
+  }
+
+  // Check if we have to create new user snapshots.
+  if (!$auth_in_old && !empty($roles_added)) {
+    // Select users' data.
+    $select = db_select('users', 'u')
+      ->fields('u', array('uid', 'name', 'pass', 'mail', 'status'))
+      ->condition('u.uid', '0', '<>')
+      ->groupBy('u.uid');
+
+    // Filter by users of added roles.
+    if (!$auth_in_new) {
+      $select_include = db_select('users_roles', 'ur')
+        ->fields('ur', array('uid'))
+        ->condition('rid', $roles_added);
+      $select->condition('uid', $select_include, 'IN');
+    }
+
+    // Exclude users of previous roles.
+    if (!empty($roles_old)) {
+      $select_exclude = db_select('users_roles', 'ur')
+        ->fields('ur', array('uid'))
+        ->condition('rid', $roles_old);
+      $select->condition('uid', $select_exclude, 'NOT IN');
+    }
+
+    // Add checksum.
+    $select->addExpression(
+      'md5(concat(u.uid, u.name, u.pass, u.mail, u.status, :hash_key))', 'checksum',
+      array(':hash_key' => $hash_key)
+    );
+
+    // Insert.
+    $insert = db_insert('account_sentinel_users')
+      ->fields(array('uid', 'name', 'pass', 'mail', 'status', 'checksum'))
+      ->from($select);
+    $insert->execute();
+  }
+
+  // Check if we have to remove users snapshots.
+  if (!$auth_in_new && !empty($roles_removed)) {
+    // Delete records.
+    $delete = db_delete('account_sentinel_users');
+
+    // Exclude users of monitored roles.
+    if (!empty($roles_new)) {
+      $delete_exclude = db_select('users_roles', 'ur')
+        ->fields('ur', array('uid'))
+        ->condition('rid', $roles_new);
+      $delete->condition('uid', $delete_exclude, 'NOT IN');
+    }
+
+    // Execute query.
+    $delete->execute();
+  }
+
+  // Check if we have to create new users_roles snapshots.
+  $roles_added = array_diff($roles_added, array(DRUPAL_AUTHENTICATED_RID));
+  if (!empty($roles_added)) {
+    // Select added roles' records.
+    $select = db_select('users_roles', 'ur');
+    $select->fields('ur', array('uid', 'rid'))
+      ->condition('rid', $roles_added);
+
+    // Add checksum.
+    $select->addExpression(
+      'md5(concat(ur.uid, ur.rid, :hash_key))', 'checksum',
+      array(':hash_key' => $hash_key)
+    );
+
+    // Insert.
+    $insert = db_insert('account_sentinel_users_roles')
+      ->fields(array('uid', 'rid', 'checksum'))
+      ->from($select);
+    $insert->execute();
+  }
+
+  // Check if we have to remove users_roles snapshots.
+  $roles_removed = array_diff($roles_removed, array(DRUPAL_AUTHENTICATED_RID));
+  if (!empty($roles_removed)) {
+    // Delete removed roles' records.
+    $delete = db_delete('account_sentinel_users_roles');
+    $delete->condition('rid', $roles_removed);
+    $delete->execute();
+  }
+}
+
+/**
+ * Updates a modified user's snapshot.
+ *
+ * @param array $account
+ *   Account details.
+ *
+ * @see account_sentinel_monitored_account_data($account)
+ */
+function account_sentinel_update_snapshot(array $account) {
+  $uid = $account['uid'];
+  account_sentinel_delete_snapshot($uid);
+  account_sentinel_create_snapshot($account);
+}
+
+/**
+ * Deletes a user's snapshots from the database.
+ *
+ * @param int $uid
+ *   UID of user.
+ */
+function account_sentinel_delete_snapshot($uid) {
+  // Reset user's snapshot.
+  db_delete('account_sentinel_users')
+    ->condition('uid', $uid)
+    ->execute();
+
+  // Reset users_roles snapshots.
+  db_delete('account_sentinel_users_roles')
+    ->condition('uid', $uid)
+    ->execute();
+}
+
+/**
+ * Creates a snapshot of the given account's state in the database.
+ *
+ * @param array $account
+ *   The account.
+ *
+ * @see account_sentinel_monitored_account_data($account)
+ */
+function account_sentinel_create_snapshot(array $account) {
+  $uid = $account['uid'];
+  $hash_key = drupal_get_hash_salt();
+
+  // Update account_sentinel_users.
+  if ($account['monitored']) {
+    $checksum = md5($uid . $account['name'] . $account['pass'] . $account['mail'] . $account['status'] . $hash_key);
+    db_insert('account_sentinel_users')
+      ->fields(array(
+        'uid' => $uid,
+        'name' => $account['name'],
+        'pass' => $account['pass'],
+        'mail' => $account['mail'],
+        'status' => $account['status'],
+        'checksum' => $checksum,
+      ))
+      ->execute();
+  }
+
+  // Fill users_roles snapshots.
+  foreach ($account['roles'] as $rid) {
+    $checksum = md5($uid . $rid . $hash_key);
+    db_insert('account_sentinel_users_roles')
+      ->fields(array(
+        'uid' => $uid,
+        'rid' => $rid,
+        'checksum' => $checksum,
+      ))
+      ->execute();
+  }
+}

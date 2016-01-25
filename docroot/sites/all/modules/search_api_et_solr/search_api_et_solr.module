@@ -1,0 +1,503 @@
+<?php
+
+/**
+ * @file
+ * Adds multilingual dynamic fields support to the Search API Solr search.
+ */
+
+/**
+ * Implements hook_menu().
+ */
+function search_api_et_solr_menu() {
+  $items['admin/config/search/search_api/server/%search_api_server/files/download/%'] = array(
+    'page callback' => 'search_api_et_solr_extra_files_download',
+    'page arguments' => array(5, 8),
+    'access callback' => 'search_api_access_server_files',
+    'access arguments' => array(5),
+    'type' => MENU_CALLBACK,
+  );
+  return $items;
+}
+
+/**
+ * Implements hook_module_implements_alter().
+ */
+function search_api_et_solr_module_implements_alter(&$implementations, $hook) {
+  // Move this module's hook_search_api_solr_query_alter() implementation to the
+  // end of the list, so that it is called as the very last, to make sure that
+  // if other modules add any new fields to the query's "qf" parameter, we add
+  // their multilingual variants too if needed.
+  if ($hook == 'search_api_solr_query_alter') {
+    $implementation = $implementations['search_api_et_solr'];
+    unset($implementations['search_api_et_solr']);
+    $implementations['search_api_et_solr'] = $implementation;
+  }
+  // Move this module's hook_search_api_solr_search_results_alter()
+  // implementation to the beginning of the list, so that it is called as the
+  // very first, to make sure that all values from solr language-based dynamic
+  // fields are rewritten back to the default ones before other modules get
+  // access to them.
+  if ($hook == 'search_api_solr_search_results_alter') {
+    $implementation = $implementations['search_api_et_solr'];
+    unset($implementations['search_api_et_solr']);
+    $implementations = array('search_api_et_solr' => $implementation) + $implementations;
+  }
+}
+
+/**
+ * Implements hook_search_api_solr_documents_alter().
+ *
+ * For multilingual indexes provided by search_api_et module, store the values
+ * of all multilingual Drupal fields in relevant language-based solr dynamic
+ * fields instead of the default ones.
+ *
+ * For example, when indexing "body:value" field, solr would normally store its
+ * value in "tm_body:value" field. With this hook (assuming that body field
+ * is translatable and comes from translatable entity, and that currently being
+ * processed content language is "fr") it will be stored in "tm_fr_body:value"
+ * instead, with nothing saved to default "tm_body:value" field.
+ */
+function search_api_et_solr_search_api_solr_documents_alter(&$documents, $index, $items) {
+  // Run this only for multilingual indexes provided by search_api_et module.
+  $controller = search_api_get_datasource_controller($index->item_type);
+  $server = $index->server();
+  if ($controller instanceof SearchApiEtDatasourceController) {
+    $entity_type = str_replace('search_api_et_', '', $index->item_type);
+
+    foreach ($documents as $delta => $document) {
+      // Get the current document language.
+      $document_language_field = $document->getField('ss_search_api_language');
+      $document_language = $document_language_field['value'];
+
+      foreach ($document->getFieldNames() as $solr_field_name) {
+        if (strpos($solr_field_name, '_') !== FALSE) {
+          list($solr_prefix, $field_name) = explode('_', $solr_field_name, 2);
+
+          // For translatable fields, store the value in relevant multilingual
+          // solr field instead of the default one.
+          if (search_api_et_solr_field_is_translatable($field_name, $entity_type, $index)) {
+            $old_solr_field = $document->getField($solr_field_name);
+            $multilingual_solr_field_name = implode('_', array($solr_prefix, $document_language, $field_name));
+            $document->setField($multilingual_solr_field_name, $old_solr_field['value'], $old_solr_field['boost']);
+          }
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_search_api_solr_query_alter().
+ *
+ * For multilingual indexes provided by search_api_et module, when a search is
+ * executed, this hook implementation makes sure that all multilingual fields
+ * are added to the query to be searched (in the "qf" parameter).
+ *
+ * In the situation when query was set to search only on specific languages
+ * (through "languages" option), only fields in those languages will be added
+ * to the "qf" parameter.
+ */
+function search_api_et_solr_search_api_solr_query_alter(array &$call_args, SearchApiQueryInterface $query) {
+  $index = $query->getIndex();
+  $controller = search_api_get_datasource_controller($index->item_type);
+  if ($controller instanceof SearchApiEtDatasourceController) {
+    $entity_type = str_replace('search_api_et_', '', $index->item_type);
+
+    // Get languages the query is supposed to search through.
+    $query_languages = $query->getOption('languages');
+
+    $qf_multilang = array();
+    foreach ($call_args['params']['qf'] as $query_field) {
+      // First extract the basic field name.
+      $boost = '';
+      if (strpos($query_field, '^') !== FALSE) {
+        list($query_field, $boost) = explode('^', $query_field);
+      }
+      list($field_type_prefix, $field_name) = explode('_', $query_field, 2);
+
+      // Make sure the field is translatable, otherwise we don't want to add
+      // anything.
+      if (search_api_et_solr_field_is_translatable($field_name, $entity_type, $index)) {
+        // Add multilingual field variations for each language
+        // enabled on the site.
+        foreach (array_keys(search_api_et_languages(TRUE, TRUE)) as $langcode) {
+          // If query is configured to run on specific languages only, there is
+          // no need to include fields in other languages.
+          if (!empty($query_languages) && !in_array($langcode, $query_languages)) {
+            continue;
+          }
+          // Build multilingual field name variation to be added to the query.
+          $new_field_name = implode('_', array(
+            $field_type_prefix,
+            $langcode,
+            $field_name,
+          ));
+          if (!empty($boost)) {
+            $new_field_name .= '^' . $boost;
+          }
+          // Temproarily store those new names in the separate array so we don't
+          // get caught in the never-ending loop.
+          $qf_multilang[] = $new_field_name;
+        }
+      }
+    }
+    // Finally add all new multilingual variants to the main query parameters.
+    $call_args['params']['qf'] = array_merge($call_args['params']['qf'], $qf_multilang);
+  }
+}
+
+/**
+ * Implements hook_search_api_solr_search_results_alter().
+ *
+ * For multilingual indexes provided by search_api_et module, it tries to
+ * retrieve values for all multilingual fields from relevant multilingual solr
+ * dynamic fields instead of the default ones.
+ *
+ * For example, when retrieving value of "body:value" field, by default it would
+ * be stored by solr in "tm_body:value" field. With this hook (assuming that
+ * body field is translatable and comes from translatable entity, and that
+ * currently being processed document language is "fr") it will look for
+ * "tm_fr_body:value" field in the solr document, and if it was found, replace
+ * previously extracted default value with this multilingual one.
+ *
+ * @see search_api_et_solr_search_api_solr_search_results_alter_process_doc()
+ */
+function search_api_et_solr_search_api_solr_search_results_alter(&$results, $query, $response) {
+  // Run this only for multilingual indexes provided by search_api_et module.
+  $index = $query->getIndex();
+  $controller = search_api_get_datasource_controller($index->item_type);
+  if ($controller instanceof SearchApiEtDatasourceController) {
+    $entity_type = str_replace('search_api_et_', '', $index->item_type);
+    $server = $index->server();
+    $fields = $server->getFieldNames($index);
+
+    // If field collapsing has been enabled for this query, we need to process
+    // the results differently.
+    $grouping = $query->getOption('search_api_grouping');
+    if (!empty($grouping['use_grouping']) && !empty($response->grouped)) {
+      $results['result count'] = 0;
+      foreach ($grouping['fields'] as $field) {
+        if (!empty($response->grouped->{$fields[$field]})) {
+          $results['result count'] += $response->grouped->{$fields[$field]}->ngroups;
+          foreach ($response->grouped->{$fields[$field]}->groups as $group) {
+            foreach ($group->doclist->docs as $document) {
+              search_api_et_solr_search_api_solr_search_results_alter_process_doc($entity_type, $fields, $document, $results, !empty($server->options['clean_ids']));
+            }
+          }
+        }
+      }
+    }
+    else {
+      if (!empty($response->response->docs)) {
+        foreach ($response->response->docs as $document) {
+          search_api_et_solr_search_api_solr_search_results_alter_process_doc($entity_type, $fields, $document, $results, !empty($server->options['clean_ids']));
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Processes a search result document and sets the proper result id.
+ *
+ * This is a separate function to make it reusable for normal and grouped
+ * results.
+ *
+ * @see search_api_et_solr_search_api_solr_search_results_alter()
+ */
+function search_api_et_solr_search_api_solr_search_results_alter_process_doc($entity_type, $fields, $document, &$results, $clean_ids = FALSE) {
+  // Do the processing only if language is available in the solr document.
+  if (!empty($document->ss_search_api_language)) {
+    $document_language = $document->ss_search_api_language;
+    // For all fields, check if they are translatable, and if solr returned
+    // relevant multilingual value.
+    foreach ($fields as $search_api_field_name => $solr_field_name) {
+      // No point in processing fields like 'score'.
+      if (strpos($solr_field_name, '_') !== FALSE) {
+        list($solr_prefix, $field_name) = explode('_', $solr_field_name, 2);
+        // For translatable fields, get the value from relevant multilingual
+        // solr field if available.
+        if (search_api_et_solr_field_is_translatable($field_name, $entity_type, $index)) {
+          $multilingual_solr_field_name = implode('_', array(
+            $solr_prefix,
+            $document_language,
+            $field_name
+          ));
+          if (isset($document->{$multilingual_solr_field_name})) {
+            $results['results'][$document->item_id]['fields'][$search_api_field_name] = $document->{$multilingual_solr_field_name};
+          }
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Checks if a specific field is translatable.
+ *
+ * @param string $field_name
+ *   Name of the field.
+ * @param string $entity_type
+ *   Name of the entity type the field belongs to.
+ * @param boolean $clean_ids
+ *   Whether or not the field name uses clean ids.
+ *
+ * @return bool
+ *   A boolean indicating whether the field is translatable or not.
+ */
+function search_api_et_solr_field_is_translatable($field_name, $entity_type, $index) {
+  $server = $index->server();
+  $clean_ids = $server->options['clean_ids'];
+
+  $property_separator = $clean_ids ? '$' : ':';
+  if (strpos($field_name, $property_separator) !== FALSE) {
+    list($field_name, $nested_field_name) = explode($property_separator, $field_name);
+  }
+
+  $field_is_translatable = &drupal_static(__FUNCTION__);
+  if (
+    !isset($field_is_translatable)
+    || !isset($field_is_translatable[$entity_type])
+    || !isset($field_is_translatable[$entity_type][$field_name])
+  ) {
+    // First check if we are dealing with Search API aggregate field here,
+    // which requires different approach from standard fields.
+    if (
+      strpos($field_name, 'search_api_aggregation_') === 0
+      && !empty($index->options['data_alter_callbacks']['search_api_alter_add_aggregation']['settings']['fields'][$field_name]['fields'])
+    ) {
+      // Start with assumption that this aggregate field is not translatable...
+      $field_is_translatable[$entity_type][$field_name] = FALSE;
+      // ...but mark is as translatable if at least one of its source fields
+      // is translatable.
+      foreach ($index->options['data_alter_callbacks']['search_api_alter_add_aggregation']['settings']['fields'][$field_name]['fields'] as $source_field) {
+        if (search_api_et_solr_field_is_translatable($source_field, NULL, $index)) {
+          $field_is_translatable[$entity_type][$field_name] = TRUE;
+        }
+      }
+      // For aggregate fields there is no need to process the rest of this
+      // function, we can just return here.
+      return $field_is_translatable[$entity_type][$field_name];
+    }
+
+    $field_info = field_info_field($field_name);
+    // For top-level fields we know entity type, so we can do the proper check.
+    if (!empty($entity_type)) {
+      $field_is_translatable[$entity_type][$field_name] = field_is_translatable($entity_type, $field_info);
+    }
+    // For nested fields we don't really know their entity type. It is going
+    // to be one of types stored in 'bundles' property, but we don't know which
+    // one. Is there an easy way to check it, considering that nesting could
+    // come from different types of entity reference fields? (entity_reference,
+    // commerce_product_reference, taxonomy_term_reference etc.)
+    else {
+      $field_is_translatable[$entity_type][$field_name] = $field_info['translatable'];
+    }
+  }
+
+  // If field is translatable at its top level, there is no need to check
+  // for any nested sub-fields.
+  if ($field_is_translatable[$entity_type][$field_name]) {
+    return TRUE;
+  }
+
+  // If top-level field is not translatable, but there is a nested field (which
+  // means that top-level field is one of entity reference types), we need to
+  // check its translatability too.
+  if (!empty($nested_field_name)) {
+    return search_api_et_solr_field_is_translatable($nested_field_name, NULL, $index);
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter() for search_api_solr_solr_config_form().
+ *
+ * Alter solr server admin configuration files form to add extra configuration
+ * files that should be created for new dynamic multilingual solr fields.
+ *
+ * @see search_api_solr_solr_config_form()
+ */
+function search_api_et_solr_form_search_api_solr_solr_config_form_alter(&$form, &$form_state) {
+  $server = $form_state['build_info']['args'][0];
+  $extra_files = search_api_et_solr_extra_files_generate($server);
+
+  $info = '<p>' . t('New solr configuration files to be created: %files', array('%files' => implode(', ', array_keys($extra_files)))) . '</p>';
+  $info .= '<p>' . t('See <a href="@lang_doc_url">Changing the language of a fulltext field</a> documentation page for information on how to configure new text fields and field types for different languages.', array('@lang_doc_url' => url('https://drupal.org/node/2009760#change-field-language'))) . '</p>';
+  $form['title']['#markup'] = $info . $form['title']['#markup'];
+
+  foreach ($extra_files as $file_name => $file_content) {
+    $escaped_file_name = check_plain($file_name);
+
+    $form['files'][$file_name] = array(
+      '#type'  => 'fieldset',
+      '#title' => $escaped_file_name,
+    );
+
+    if ($file_name == 'schema_extra_types.xml') {
+      $form['files'][$file_name]['info']['#markup'] = t('Note that content of this file was generated based on existing type definitions found in <em>schema.xml</em> solr configuration file, and all filters, tokenizers etc should be most probably changed for each of defined languages.');
+    }
+
+    $form['files'][$file_name]['data'] = array(
+      '#type' => 'textarea',
+      '#title' => $escaped_file_name,
+      '#value' => $file_content,
+      '#rows' => 20,
+      '#description' => l(t('Download %filename', array('%filename' => $file_name)), 'admin/config/search/search_api/server/' . $server->machine_name . '/files/download/' . $file_name, array('html' => TRUE)),
+    );
+  }
+}
+
+/**
+ * Generates content for schema_extra_types.xml and schema_extra_fields.xml
+ * solr configuration files based on indexed fields and existing schema.xml.
+ *
+ * @param object $server
+ *   SearchApiServer object for which extra solr configuration files are to be
+ *   created.
+ *
+ * @return array
+ *   An array which keys are solr configuration file names which need to be
+ *   created, and values are content of those files.
+ *
+ * @see search_api_et_solr_form_search_api_solr_solr_config_form_alter()
+ */
+function search_api_et_solr_extra_files_generate(SearchApiServer $server) {
+  $schema_types = $schema_fields = array();
+
+  // Get all available languages.
+  $languages = array_keys(search_api_et_languages(FALSE, TRUE));
+
+  // Get all field types defined in main schema.xml file.
+  $defined_field_types = array();
+  $response = $server->getFile();
+  $filename = 'schema.xml';
+  if (!empty($response->files->$filename)) {
+    $schema = $server->getFile($filename);
+    $schema_xml = $schema->data;
+    $parsed_schema = simplexml_load_string($schema_xml);
+    foreach ($parsed_schema->xpath('//fieldType') as $type_definition) {
+      $type_name = (string) $type_definition['name'];
+      $defined_field_types[$type_name] = $type_definition;
+    }
+  }
+
+  // Process all indexes created for this server.
+  $indexes = search_api_index_load_multiple(FALSE, array(
+    'server' => $server->machine_name,
+  ));
+  foreach ($indexes as $index) {
+    // Ok, not really all, only those provided by Search API Entity Translation.
+    $controller = search_api_get_datasource_controller($index->item_type);
+    if ($controller instanceof SearchApiEtDatasourceController) {
+      $entity_type = str_replace('search_api_et_', '', $index->item_type);
+
+      $service_info = search_api_get_service_info($server->class);
+      $service_class = $service_info['class'];
+      $service = new $service_class($server);
+      $fields = $service->getFieldNames($index);
+      $solr_fields = $service->getFields();
+
+      foreach ($fields as $search_api_field_name => $solr_field_name) {
+        // No point in processing fields like 'score'.
+        if (strpos($solr_field_name, '_') !== FALSE) {
+
+          // Make sure the field is translatable, otherwise we don't need new
+          // types or dynamic fields in solr.
+          if (search_api_et_solr_field_is_translatable($search_api_field_name, $entity_type, $index)) {
+            list($solr_prefix, $field_name) = explode('_', $solr_field_name, 2);
+
+            // We don't want to get field type from solr definitions, as it might
+            // happen that if the field was dynamically created in solr, it might
+            // have had no type provided, and in such case its type will be
+            // 'ignored'. Instead let's just use type from index field definition.
+            $field_type = $index->options['fields'][$search_api_field_name]['type'];
+
+            // Only text fields require new solr field type definitions and new
+            // dynamic fields to be created.
+            if ($field_type == 'text') {
+
+              // Try to get solr field details (if available).
+              if (!empty($solr_fields[$solr_field_name])) {
+                $solr_field = $solr_fields[$solr_field_name];
+                $solr_field_schema = $solr_field->getSchema();
+              }
+
+              foreach ($languages as $language) {
+                // In both new field type and new field definitions, let's use
+                // 'name' value as an array key to avoid duplicates, and we will
+                // remove those keys later on, before passing the whole array
+                // to format_xml_elements() to have correct XML built.
+
+                // New field type definition.
+                if (!empty($defined_field_types[$field_type])) {
+                  $type = $field_type . '_' . $language;
+                  $field_definition = $defined_field_types[$field_type];
+                  $field_definition['name'] = $type;
+                  $schema_types[$type] = $defined_field_types[$field_type]->asXML();
+                }
+
+                // New field definition.
+                $name = $solr_prefix . '_' . $language . '_*';
+                $schema_fields[$name] = array(
+                  'key' => 'dynamicField',
+                  'attributes' => array(
+                    'name' => $name,
+                    'type' => $type,
+                  ),
+                );
+
+                // Get extra field attributes from solr field definition
+                // (if available).
+                if (!empty($solr_fields[$solr_field_name])) {
+                  $schema_fields[$name]['attributes'] += array(
+                    'indexed' => (!empty($solr_field_schema['I'])) ? 'true' : 'false',
+                    'stored' => (!empty($solr_field_schema['S'])) ? 'true' : 'false',
+                    'multiValued' => (!empty($solr_field_schema['M'])) ? 'true' : 'false',
+                    'termVectors' => (!empty($solr_field_schema['V'])) ? 'true' : 'false',
+                  );
+                }
+
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // In case of field type definitions, we cannot just pass prepared array to
+  // format_xml_elements(), as we are using have copied the definitions from
+  // schema.xml, and they contain XML code, which would be messed up completely
+  // when passed to format_xml_elements(), as it uses check_plain() on all
+  // element values - therefore we need that not-very-nice handling below...
+  return array(
+    'schema_extra_types.xml' => '<types>' . PHP_EOL . implode(PHP_EOL . PHP_EOL, $schema_types) . PHP_EOL . '</types>',
+    'schema_extra_fields.xml' => format_xml_elements(array('fields' => array_values($schema_fields))),
+  );
+}
+
+/**
+ * Pushes download of the configuration file.
+ *
+ * @param object $server
+ *   SearchApiServer object for which extra solr configuration files are to be
+ *   created.
+ * @param string $file_name
+ *   A name of the solr configuration file to be downloaded.
+ */
+function search_api_et_solr_extra_files_download(SearchApiServer $server, $file_name) {
+  $extra_files = search_api_et_solr_extra_files_generate($server);
+
+  header('Pragma: public');
+  header('Expires: 0');
+  header('Cache-Control: must-revalidate, post-check=0, pre-check=0');
+  header('Last-Modified: ' . date('r'));
+  header('Cache-Control: private', FALSE);
+  header('Content-Type: text/xml');
+  header('Content-Disposition: attachment; filename="' . $file_name . '"');
+  header('Content-Transfer-Encoding: binary');
+  header('Content-Length: ' . strlen($extra_files[$file_name]));
+  header('Connection: close');
+
+  echo $extra_files[$file_name];
+}

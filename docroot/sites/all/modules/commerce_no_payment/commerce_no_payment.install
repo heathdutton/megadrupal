@@ -1,0 +1,140 @@
+<?php
+
+/**
+ * @file
+ * Installation and uninstallation functions.
+ */
+
+/**
+ * Converts a Commerce Payment transaction status to a Payment status.
+ *
+ * @param string $transaction_status
+ *
+ * @return string
+ */
+function commerce_no_payment_status_convert($transaction_status) {
+  $map = array(
+    COMMERCE_PAYMENT_STATUS_SUCCESS => PAYMENT_STATUS_SUCCESS,
+    COMMERCE_PAYMENT_STATUS_FAILURE => PAYMENT_STATUS_FAILED,
+    COMMERCE_PAYMENT_STATUS_PENDING => PAYMENT_STATUS_PENDING,
+  );
+
+  return isset($map[$transaction_status]) ? $map[$transaction_status] : PAYMENT_STATUS_UNKNOWN;
+}
+
+
+/**
+ * Creates a Basic Payment payment method.
+ */
+function commerce_no_payment_update_7200(&$sandbox) {
+  // Install dependencies.
+  $modules = array('paymentmethodbasic', 'payment_commerce');
+  module_enable($modules);
+  foreach ($modules as $module) {
+    if (!module_exists($module)) {
+      throw new DrupalUpdateException(t('Module @module could not be installed.', array(
+        '@module' => $module,
+      )));
+    }
+  }
+
+  // Create the payment method.
+  $payment_method = new PaymentMethod(array(
+    'controller' => payment_method_controller_load('PaymentMethodBasicController'),
+    'controller_data' => array(
+      'status' => PAYMENT_STATUS_SUCCESS,
+    ),
+    'title_specific' => t('No payment required'),
+    'uid' => 1,
+  ));
+  entity_save('payment_method', $payment_method);
+  variable_set('commerce_no_payment_2_migration_pmid',  $payment_method->pmid);
+  drupal_static_reset();
+  drupal_flush_all_caches();
+  _commerce_payment_default_rules_reset(array('payment'));
+}
+
+/**
+ * Creates Payment payments for Commerce Payment payment transactions that use
+ * Commerce No Payment.
+ */
+function commerce_no_payment_update_7201(&$sandbox) {
+  if (!isset($sandbox['run'])) {
+    $sandbox['run'] = 0;
+    // Count the number of Commerce Payment payment transactions for which
+    // Payment payments need to be created.
+    $sandbox['transaction_count'] = commerce_no_payment_commerce_payment_transaction_count('commerce_no_payment');
+  }
+  else {
+    $sandbox['run']++;
+  }
+  if ($sandbox['transaction_count']) {
+    $sandbox['#finished'] = 1 / ceil($sandbox['transaction_count'] / (($sandbox['run'] + 1) * COMMERCE_NO_PAYMENT_MIGRATE_PER_RUN));
+
+    $payment_method = entity_load_single('payment_method', variable_get('commerce_no_payment_2_migration_pmid'));
+
+    // Load the transaction IDs for this run.
+    $payment_method_name = 'payment_commerce_' . $payment_method->pmid;
+    $transaction_ids = db_select('commerce_payment_transaction', 'cpt')
+      ->fields('cpt', array('transaction_id'))
+      ->condition('payment_method', 'commerce_no_payment')
+      ->condition('instance_id', 'commerce_no_payment|commerce_payment_commerce_no_payment')
+      ->range($sandbox['run'] * COMMERCE_NO_PAYMENT_MIGRATE_PER_RUN, COMMERCE_NO_PAYMENT_MIGRATE_PER_RUN)
+      ->execute()
+      ->fetchCol();
+
+    // Load the transactions for this run.
+    $transactions = commerce_payment_transaction_load_multiple($transaction_ids);
+
+    // Create a Payment payment per transaction.
+    foreach ($transactions as $transaction) {
+      // The Payment creation is mostly copied from
+      // payment_commerce_payment_create().
+      $payment = new Payment(array(
+        'context' => 'payment_commerce',
+        'context_data' => array(
+          'balance_amount' => $transaction->amount,
+          'order_id' => $transaction->order_id,
+        ),
+        'description' => t('Order #!order_id', array(
+          '!order_id' => $transaction->order_id,
+        )),
+        'currency_code' => $transaction->currency_code,
+        'method' => $payment_method,
+        'finish_callback' => 'payment_commerce_payment_finish',
+      ));
+      $currency = commerce_currency_load($payment->currency_code);
+      $amount = ((float) $transaction->amount) / pow(10, $currency['decimals']);
+      $payment->setLineItem(new PaymentLineItem(array(
+        'amount' => $amount,
+        'description' => 'Order !order_id',
+        'description_arguments' => array(
+          '!order_id' => $transaction->order_id,
+        ),
+        'name' => 'payment_commerce',
+      )));
+      $payment->statuses = array(
+        new PaymentStatusItem(PAYMENT_STATUS_NEW, $transaction->created),
+        new PaymentStatusItem(PAYMENT_STATUS_PENDING, $transaction->created),
+        new PaymentStatusItem(commerce_no_payment_status_convert($transaction->status), $transaction->changed),
+      );
+      entity_save('payment', $payment);
+    }
+  }
+}
+
+/**
+ * Updates Commerce Payment transactions to use the new Commerce Payment
+ * payment method.
+ */
+function commerce_no_payment_update_7202(&$sandbox) {
+  $pmid = variable_get('commerce_no_payment_2_migration_pmid');
+  db_update('commerce_payment_transaction')
+    ->condition('payment_method', 'commerce_no_payment')
+    ->condition('instance_id', 'commerce_no_payment|commerce_payment_commerce_no_payment')
+    ->fields(array(
+      'instance_id' => 'payment_commerce_' . $pmid . '|commerce_payment_payment_commerce_' . $pmid,
+      'payment_method' => 'payment_commerce_' . $pmid,
+    ))
+    ->execute();
+}

@@ -1,0 +1,288 @@
+<?php
+
+include_once 'autoslave/defines.inc';
+
+/**
+ * Implements hook_menu().
+ */
+function autoslave_menu() {
+  $items = array();
+  $items['admin/config/system/autoslave'] = array(
+    'title' => 'AutoSlave',
+    'description' => 'AutoSlave settings',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('autoslave_settings_form'),
+    'access arguments' => array('administer site configuration'),
+  );
+  $items['admin/config/system/autoslave/settings'] = array(
+    'type' => MENU_DEFAULT_LOCAL_TASK,
+    'title' => 'Settings',
+    'weight' => 1,
+  );
+  $items['admin/config/system/autoslave/status'] = array(
+    'title' => 'Status',
+    'description' => 'AutoSlave status',
+    'page callback' => 'autoslave_status_page',
+    'access arguments' => array('administer site configuration'),
+    'type' => MENU_LOCAL_TASK
+  );
+  $items['admin/config/system/autoslave/affected-tables'] = array(
+    'title' => 'Affected tables',
+    'description' => 'AutoSlave affected tables',
+    'page callback' => 'autoslave_affected_tables_page',
+    'access arguments' => array('administer site configuration'),
+    'type' => MENU_LOCAL_TASK
+  );
+  return $items;
+}
+
+/**
+ * Settings form
+ */
+function autoslave_settings_form() {
+  if (!file_exists(DRUPAL_ROOT . '/includes/database/autoslave/database.inc')) {
+    drupal_set_message(t('AutoSlave driver is not installed'), 'error');
+  }
+  elseif (!autoslave_is_driver_loaded()) {
+    drupal_set_message(t('AutoSlave driver is not loaded'), 'warning');
+  }
+  $form['autoslave_assumed_replication_lag'] = array(
+    '#title' => t('Maximum assumed replication lag'),
+    '#description' => t('Time in seconds to use the master db for after issuing a write query. Note: This may cause a session being created for anonymous users and could have impact on reverse proxy caching. NOTE: This is setting is deprecated and should be configured on the autoslave connection in settings.php!'),
+    '#type' => 'textfield',
+    '#default_value' => variable_get('autoslave_assumed_replication_lag', AUTOSLAVE_ASSUMED_REPLICATION_LAG),
+  );
+  return system_settings_form($form);
+}
+
+/**
+ * Status page for all autoslave setups
+ */
+function autoslave_status_page() {
+  if (!file_exists(DRUPAL_ROOT . '/includes/database/autoslave/database.inc')) {
+    drupal_set_message(t('AutoSlave driver is not installed'), 'error');
+    return '';
+  }
+  if (!autoslave_is_driver_loaded()) {
+    drupal_set_message(t('AutoSlave driver is not loaded'), 'warning');
+  }
+
+  // Load .install files
+  include_once DRUPAL_ROOT . '/includes/install.inc';
+  $tasks = db_installer_object('autoslave');
+
+  global $databases;
+  $output = '';
+  foreach ($databases as $key => $targets) {
+    foreach ($targets as $target => $conninfo) {
+      $conninfos = empty($conninfo['driver']) ? $conninfo : array($conninfo);
+      foreach ($conninfos as $conninfo) {
+        if ($conninfo['driver'] != 'autoslave') {
+          continue;
+        }
+        $output .= "<h2>[$key][$target]</h2>";
+        try {
+          $output .= $tasks->connectionStatusTable(Database::getConnection($target, $key));
+        }
+        catch (Exception $e) {
+          drupal_set_message(t('Error connecting to: [@key][@target]', array(
+            '@key' => $key,
+            '@target' => $target
+          )), 'error');
+        }
+        $output .= '<br>';
+      }
+    }
+  }
+
+  return $output;
+}
+
+/**
+ * Status page for the affected tables
+ */
+function autoslave_affected_tables_page() {
+  if (!file_exists(DRUPAL_ROOT . '/includes/database/autoslave/database.inc')) {
+    drupal_set_message(t('AutoSlave driver is not installed'), 'error');
+  }
+  elseif (!autoslave_is_driver_loaded()) {
+    drupal_set_message(t('AutoSlave driver is not loaded'), 'warning');
+  }
+
+  $active = array();
+  $inactive = array();
+  global $databases;
+  foreach ($databases as $key => $targets) {
+    foreach ($targets as $target => $conninfos) {
+      if (isset($conninfos['driver'])) {
+        $conninfos = array($conninfos);
+      }
+      foreach ($conninfos as $conninfo) {
+        if ($conninfo['driver'] !== 'autoslave' || (isset($conninfo['global replication lag']) && !$conninfo['global replication lag'])) {
+          continue;
+        }
+        try {
+          $tables = Database::getConnection($target, $key)->getAffectedTables(time());
+          foreach ($tables as $row) {
+            $desc = t('expires in @expires_in seconds', array('@expires_in' => $row['expires'] - time()));
+            $row['expires'] = date('Y-m-d H:i:s', $row['expires']) . " ($desc)";
+
+            $desc = t('invalidated @age seconds ago', array('@age' => time() - $row['invalidated']));
+            $row['invalidated'] = date('Y-m-d H:i:s', $row['invalidated']) . " ($desc)";
+
+            $active[$row['db_key'] . ':' . $row['db_target'] . ':' . $row['affected_table']] = array(
+              'key' => $row['db_key'],
+              'target' => $row['db_target'],
+              'table' => $row['affected_table'],
+              'invalidated' => $row['invalidated'],
+              'expires' => $row['expires'],
+              'in_sync' => isset($row['wcnt1_slave']) ? ($row['wcnt1_slave'] === $row['wcnt1'] ? t('Yes') : t('No')) : t('N/A'),
+            );
+          }
+        }
+        catch (Exception $e) {
+          drupal_set_message(t('Error connecting to: [@key][@target]', array(
+            '@key' => $conninfo['key'],
+            '@target' => $conninfo['target']
+          )), 'error');
+        }
+      }
+    }
+  }
+
+  $output = '';
+  $header = array('Key', 'Target', 'Table', 'Invalidated', 'Expires', 'In sync.');
+  $output .= "<h2>Active</h2>";
+  $output .= theme('table', array('header' => $header, 'rows' => $active));
+
+  return $output;
+}
+
+
+/**
+ * Implements hook_cron().
+ * Check invalidated connections and update their status.
+ */
+function autoslave_cron() {
+  global $databases;
+  foreach ($databases as $key => $targets) {
+    foreach ($targets as $target => $conninfo) {
+      $conninfos = empty($conninfo['driver']) ? $conninfo : array($conninfo);
+      foreach ($conninfos as $conninfo) {
+        if ($conninfo['driver'] != 'autoslave') {
+          continue;
+        }
+        $conn = Database::getConnection($target, $key);
+        if ($conn->driver() != 'autoslave') {
+          continue;
+        }
+
+        $pool = $conn->getPool();
+        foreach ($pool['all'] as $id => $conninfo) {
+          if ($conninfo['driver'] == 'autoslave') {
+            continue;
+          }
+          if (isset($conninfo['status']) && $conninfo['status'] === FALSE) {
+            $status = $conn->checkConnection($id);
+            $dsn = $conninfo['driver'] . '://' . $conninfo['host'];
+            if ($status === TRUE || $status === FALSE) {
+              watchdog('autoslave', "!dsn is up again!", array('!dsn' => $dsn), WATCHDOG_NOTICE);
+              $conn->updateInvalidationFile($conninfo['key'], $conninfo['target'], $conninfo['idx'], TRUE);
+            }
+            else {
+              watchdog('autoslave', "!dsn is still down: !status", array('!dsn' => $dsn, '!status' => $status->getMessage()), WATCHDOG_ERROR);
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+function autoslave_is_driver_loaded() {
+  return Database::getConnection('default', 'default')->driver() === 'autoslave';
+}
+
+/**
+ * Implements hook_batch_alter().
+ *
+ * SimpleTest renames/copies the default connection. This will fail with the AutoSlave
+ * driver. If a simpletest is about to run switch very hard to the master!
+ */
+function autoslave_batch_alter(&$batch) {
+  // It's not necessary to do anything, if AutoSlave driver is not loaded
+  if (!autoslave_is_driver_loaded()) {
+    return;
+  }
+
+  // Make sure we wrap the simpletest batch operation, so that we may
+  // switch to the master permanently
+  foreach ($batch['sets'] as &$set) {
+    if (!empty($set['operations'])) {
+      foreach ($set['operations'] as &$operation) {
+        // This is a simpletest batch operation. Hijack it, so that
+        // we may perform a hard switch to the master before it runs.
+        if ($operation[0] == '_simpletest_batch_operation') {
+          $operation = array('_autoslave_batch_operation', $operation);
+        } 
+      }
+    }
+  }
+}
+
+/**
+ * Wrapper for simpletest batch operations.
+ * Make sure that the master is defined as the 'default' target, otherwise
+ * simpletest won't make it ...
+ */
+function _autoslave_batch_operation($callback, $args, &$context) {
+  $connection = Database::getConnection();
+  if ($connection->driver() == 'autoslave') {
+    $connection->hardSwitch();
+  }
+  $args[] = &$context;
+  call_user_func_array($callback, $args);
+}
+
+/**
+ * Implements hook_query_TAG_alter().
+ */
+function autoslave_query_autoslave_alter($query) {
+  if (!$query instanceOf SelectQuery) {
+    return;
+  }
+  list($target, $key) = $query->getMetaData('autoslave_connection');
+  $autoslave = Database::getConnection($target, $key);
+
+  // Determine master/slave based on intersection of $query->getTables() and $connection->getInternalAffectedTables()
+  $tables = $autoslave->findTablesInQuery($query);
+  $connection = array_intersect($tables, $autoslave->getInternalAffectedTables()) ? $autoslave->getMasterConnection() : $autoslave->getSlaveConnection();
+
+  $autoslave->changeQueryConnection($query, $connection);
+}
+
+/**
+ * Implements hook_book().
+ * Dummy implementation for ensuring early module load
+ */
+function autoslave_boot() {
+}
+
+/**
+ * Implements hook_exit().
+ */
+function autoslave_exit($destination = NULL) {
+  $conn = Database::getConnection();
+  // If default connection is an autoslave driver, then we check if we should reset the
+  // "ignore_slave_server" session var to a more reasonable value.
+  // We always use float ourselves, so if "ignore_slave_server" is not a float, then
+  // someone else must have set it.
+  if (
+    $conn->driver() == 'autoslave' &&
+    isset($_SESSION['ignore_slave_server']) &&
+    !is_float($_SESSION['ignore_slave_server']) &&
+    $conn->max_expires
+  ) {
+    $_SESSION['ignore_slave_server'] = (float)($conn->max_expires + $conn->getReplicationLag());
+  }
+}

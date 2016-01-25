@@ -1,0 +1,217 @@
+<?php
+
+/**
+ * @file
+ * Implements MoIP HTML Integration payment method for Drupal Commerce.
+ */
+
+/**
+ * Implements hook_commerce_payment_method_info().
+ */
+function commerce_moip_html_commerce_payment_method_info() {
+  $payment_methods = array();
+
+  $payment_methods['moip_html'] = array(
+    'base' => 'commerce_moip_html',
+    'title' => t('MoIP HTML Integration'),
+    'short_title' => t('MoIP'),
+    'description' => t('MoIP HTML Integration'),
+    'terminal' => FALSE,
+    'offsite' => TRUE,
+    'offsite_autoredirect' => TRUE,
+  );
+
+  return $payment_methods;
+}
+
+/**
+ * Payment method callback: settings form.
+ */
+function commerce_moip_html_settings_form($settings = NULL) {
+  $settings = (array) $settings + array(
+    'id_carteira' => '',
+    'server' => 'sandbox',
+  );
+
+  $form = array();
+  $form['id_carteira'] = array(
+    '#type' => 'textfield',
+    '#title' => t('MoIP account'),
+    '#description' => t('The account identifier for the MoIP account you want to receive payments. It can be your MoIP login name, main email address or verified cellphone number.'),
+    '#default_value' => $settings['id_carteira'],
+    '#required' => TRUE,
+  );
+  // TODO: Add a way to generate a new NASP URL.
+  $form['nasp_url'] = array(
+    '#type' => 'item',
+    '#title' => t('NASP URL'),
+    '#description' => t('The URL to use for receiving NASP (Notificação de Alteração de Status de Pagamento/Notification of Payment Status Change) posts.'),
+    // Payment method instance is hardcoded to arg(7) since currently there's
+    // no other way to get this in this hook.
+    '#markup' => commerce_moip_nasp_url('moip_html|' . arg(5)),
+  );
+  $form['server'] = array(
+    '#type' => 'radios',
+    '#title' => t('MoIP server'),
+    '#options' => array(
+      'sandbox' => ('Sandbox - use for testing, requires a MoIP Sandbox account'),
+      'production' => ('Production - use for processing real transactions'),
+    ),
+    '#default_value' => $settings['server'],
+  );
+
+  return $form;
+}
+
+/**
+ * Builds a MoIP HTML Integration form from an order object.
+ *
+ * @return
+ *   A renderable form array.
+ */
+function commerce_moip_html_redirect_form($form, &$form_state, $order, $payment_method) {
+  $settings = $payment_method['settings'];
+
+  // Return an error if the enabling action's settings haven't been configured.
+  if (empty($settings['id_carteira'])) {
+    drupal_set_message(t('MoIP HTML Integration is not configured for use. No MoIP e-mail address has been specified.'), 'error');
+    return array();
+  }
+
+  $wrapper = entity_metadata_wrapper('commerce_order', $order);
+
+  $amount = $wrapper->commerce_order_total->amount->value();
+  $currency_code = $wrapper->commerce_order_total->currency_code->value();
+
+  // Build the data array that will be translated into hidden form values.
+  $data = array(
+    // Set MoIP email used to send payments to.
+    'id_carteira' => $settings['id_carteira'],
+
+    // Set order total. It should be an integer.
+    'valor' => $amount,
+
+    // Set reason of payment.
+    'nome' => t('Order @order_number at @store', array('@order_number' => $order->order_number, '@store' => variable_get('site_name', url('<front>', array('absolute' => TRUE))))),
+
+    // Set order id.
+    'id_transacao' => $order->order_id,
+
+    // Return to the payment redirect page for processing successful payments
+    'url_retorno' => url('checkout/' . $order->order_id . '/payment/return/' . $order->data['payment_redirect_key'], array('absolute' => TRUE)),
+
+    // Add some info about the customer.
+    'pagador_email' => $order->mail,
+    'pagador_telefone' => '',
+  );
+
+  // Add address so users don't have to type this twice.
+  $params_map = array(
+    'pagador_nome' => 'name_line',
+    'pagador_logradouro' => 'thoroughfare',
+    'pagador_numero' => 'premise',
+    'pagador_complemento' => 'sub_premise',
+    'pagador_bairro' => 'dependent_locality',
+    'pagador_cidade' => 'locality',
+    'pagador_estado' => 'administrative_area',
+    'pagador_cep' => 'postal_code',
+    'pagador_pais' => 'country',
+  );
+  foreach ($params_map as $key => $value) {
+    if (isset($wrapper->commerce_customer_billing->commerce_customer_address->$value)) {
+      $data[$key] = $wrapper->commerce_customer_billing->commerce_customer_address->$value->value();
+    }
+  }
+
+  $form['#action'] = commerce_moip_html_server_url($settings['server']);
+
+  // MoIP only accepts ISO-8859-1 charset.
+  $form['#attributes'] = array('accept-charset' => 'ISO-8859-1');
+
+  foreach ($data as $name => $value) {
+    if (!empty($value)) {
+      $form[$name] = array('#type' => 'hidden', '#value' => $value);
+    }
+  }
+
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Proceed to MoIP'),
+  );
+
+  return $form;
+}
+
+/**
+ * Payment method callback: process an NASP.
+ */
+function commerce_moip_html_moip_nasp_process($order, $payment_method, &$nasp) {
+  // Discard NASP if payment status is no recognized.
+  if (!in_array($nasp['status_pagamento'], array_keys(commerce_moip_statuses()))) {
+    return FALSE;
+  }
+
+  // If this is a prior authorization capture NASP for which we've already
+  // created a transaction...
+  if (!empty($nasp['cod_moip']) && $auth_nasp = commerce_moip_nasp_load($nasp['cod_moip'])) {
+    // Load the prior NASP's transaction and update that with the capture values.
+    $transaction = commerce_payment_transaction_load($auth_nasp['transaction_id']);
+  }
+  else {
+    // Create a new payment transaction for the order.
+    $transaction = commerce_payment_transaction_new('moip_html', $order->order_id);
+    $transaction->instance_id = $payment_method['instance_id'];
+  }
+
+  $transaction->remote_id = $nasp['cod_moip'];
+  $transaction->amount = $nasp['valor'];
+  // MoIP supports only Brazilian Reais.
+  $transaction->currency_code = 'BRL';
+  $transaction->payload[REQUEST_TIME] = $nasp;
+
+  // Set the transaction's statuses based on the NASP's status_pagamento.
+  $transaction->remote_status = $nasp['status_pagamento'];
+
+  switch ($nasp['status_pagamento']) {
+    case COMMERCE_MOIP_STATUS_AUTHORIZED:
+    case COMMERCE_MOIP_STATUS_INITIALIZED:
+    case COMMERCE_MOIP_STATUS_PRINTED:
+    case COMMERCE_MOIP_STATUS_PENDING:
+      $transaction->status = COMMERCE_PAYMENT_STATUS_PENDING;
+      break;
+
+    case COMMERCE_MOIP_STATUS_COMPLETED:
+      $transaction->status = COMMERCE_PAYMENT_STATUS_SUCCESS;
+      break;
+
+    case COMMERCE_MOIP_STATUS_CANCELED:
+      $transaction->status = COMMERCE_PAYMENT_STATUS_FAILURE;
+      break;
+  }
+
+  $transaction->message = commerce_moip_statuses($nasp['status_pagamento']);
+
+  // Save the transaction information.
+  commerce_payment_transaction_save($transaction);
+  $nasp['transaction_id'] = $transaction->transaction_id;
+
+  watchdog('commerce_moip_html', 'NASP processed for Order @order_number with ID @cod_moip.', array('@cod_moip' => $nasp['cod_moip'], '@order_number' => $order->order_number), WATCHDOG_INFO);
+}
+
+/**
+ * Returns the HTML Integration POST URL to the specified MoIP server.
+ *
+ * @param $server
+ *   Either 'sandbox' or 'production' indicating which server to get the URL for.
+ *
+ * @return
+ *   The URL to use to submit requests to the MoIP HTML Integration server.
+ */
+function commerce_moip_html_server_url($server) {
+  switch ($server) {
+    case 'sandbox':
+      return 'https://desenvolvedor.moip.com.br/sandbox/PagamentoMoIP.do';
+    case 'production':
+      return 'https://www.moip.com.br/PagamentoMoIP.do';
+  }
+}

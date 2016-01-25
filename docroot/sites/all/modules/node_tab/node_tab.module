@@ -1,0 +1,655 @@
+<?php
+
+/**
+ * @file
+ * Provides per content-type tabs functionality.
+ */
+
+/**
+ * Implements hook_ctools_plugin_directory().
+ */
+function node_tab_ctools_plugin_directory($module, $plugin) {
+  if ($module == 'ctools' && !empty($plugin)) {
+    return "plugins/$plugin";
+  }
+}
+
+/**
+ * Implements hook_help().
+ */
+function node_tab_help($path, $arg) {
+  // Remind site administrators about tab paths being flagged for rebuild.
+  // We don't need to issue the message on the confirm form, or while the
+  // rebuild is being processed.
+  $correct_path = ($path != 'admin/reports/status/tab-path-rebuild' && $path != 'batch');
+  $access = user_access('administer content types');
+  $rebuild = variable_get('node_tab_rebuild', array());
+  if ($correct_path && $access && $rebuild) {
+    $message = t('The tab paths need to be rebuilt. <a href="@node_tab_rebuild">Rebuild paths</a>.', array('@node_tab_rebuild' => url('admin/reports/status/tab-path-rebuild')));
+    drupal_set_message($message, 'error');
+  }
+}
+
+/**
+ * Implements hook_menu().
+ */
+function node_tab_menu() {
+  $items['admin/reports/status/tab-path-rebuild'] = array(
+    'title' => 'Rebuild tab paths',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('node_tab_rebuild_confirm'),
+    'access arguments' => array('administer content types'),
+    'type' => MENU_CALLBACK,
+  );
+
+  return $items;
+}
+
+/**
+ * Menu callback: confirm rebuilding of tab paths.
+ */
+function node_tab_rebuild_confirm() {
+  return confirm_form(array(), t('Are you sure you want to rebuild the tab paths?'),
+                  'admin/structure/types', t('This action rebuilds tab paths for all site content, and may be a lengthy process. This action cannot be undone.'), t('Rebuild tab paths'), t('Cancel'));
+}
+
+/**
+ * Triggers tab path rebuilding.
+ *
+ * @see node_tab_rebuild_confirm()
+ */
+function node_tab_rebuild_confirm_submit($form, &$form_state) {
+  $rebuild = variable_get('node_tab_rebuild', array());
+  $node_types = array_keys($rebuild);
+  node_tab_rebuild_all($node_types);
+  $form_state['redirect'] = 'admin/structure/types';
+}
+
+/**
+ * Implements hook_page_alter().
+ *
+ * Adds the tabs link to the Operations column on admin/structure/types.
+ */
+function node_tab_page_alter(&$page) {
+  // drupal_render_page() does this after hook_page_alter() has fired, making
+  // the hook useless for sites which have disabled the system_main block.
+  if (!drupal_static('system_main_content_added', FALSE)) {
+    $page['content']['system_main'] = drupal_set_page_content();
+  }
+
+  if (isset($page['content']['system_main']['node_table'])) {
+    $table = &$page['content']['system_main']['node_table'];
+    // Calculate the index of the operations column to account
+    // for modules which add additional columns into this table.
+    $header_indexes = array_keys($table['#header']);
+    $operations_header_index = end($header_indexes);
+    // Increase the colspan of the Operations column to create space.
+    $table['#header'][$operations_header_index]['colspan'] = module_exists('field_ui') ? '5' : '3';
+
+    $types = node_type_get_types();
+    $names = array_keys(node_type_get_names());
+    foreach ($names as $index => $name) {
+      $type = $types[$name];
+      if (node_hook($type->type, 'form')) {
+        $type_url_str = str_replace('_', '-', $type->type);
+        // Add the tabs column to the third place (right after "edit").
+        $tabs_pos = $operations_header_index + 1;
+        $row = &$table['#rows'][$index];
+        $first_part = array_slice($row, 0, $tabs_pos);
+        $second_part = array_slice($row, $tabs_pos);
+        $tabs_column = array(array('data' => l(t('tabs'), 'admin/structure/types/manage/' . $type_url_str . '/tabs')));
+        $row = array_merge($first_part, $tabs_column, $second_part);
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_theme().
+ */
+function node_tab_theme($existing, $type, $theme, $path) {
+  return array(
+    'node_tabs' => array(
+      'template' => 'node-tabs',
+      'path' => drupal_get_path('module', 'node_tab') . '/theme',
+      'variables' => array('tabs' => NULL),
+    ),
+  );
+}
+
+/**
+ * Implements hook_entity_info().
+ */
+function node_tab_entity_info() {
+  $items = array();
+  $items['node_tab'] = array(
+    'label' => t('Node Tab'),
+    'controller class' => 'NodeTabController',
+    'entity class' => 'NodeTab',
+    'base table' => 'node_tab',
+    'fieldable' => FALSE,
+    'entity keys' => array(
+      'id' => 'tab_id',
+      'label' => 'label',
+      'name' => 'name',
+    ),
+    'exportable' => TRUE,
+    'export' => array(
+      'default hook' => 'default_node_tab',
+    ),
+    'module' => 'node_tab',
+    'access callback' => 'node_tab_access',
+    'i18n controller class' => 'NodeTabI18nStringController',
+    'metadata controller class' => 'NodeTabMetadataController',
+    'views controller class' => 'EntityDefaultViewsController',
+    'admin ui' => array(
+      'path' => 'admin/structure/types/manage/%node_type/tabs',
+      'file' => 'includes/node_tab.admin.inc',
+      'controller class' => 'NodeTabUIController',
+    ),
+  );
+
+  return $items;
+}
+
+/**
+ * Access control for node_tab entities.
+ *
+ * @param $op
+ *   The operation being performed. One of 'view', 'update', 'create' or
+ *   'delete'.
+ * @param $entity
+ *   Optionally an entity to check access for. If no entity is given, it will be
+ *   determined whether access is allowed for all entities of the given type.
+ * @param $account
+ *   The user to check for. Leave it to NULL to check for the global user.
+ * @param $entity_type
+ *   The entity type of the entity to check for.
+ *
+ * @see entity_access()
+ */
+function node_tab_access($op, $entity, $account, $entity_type, $node = NULL) {
+  global $user;
+  $account = isset($account) ? $account : $user;
+
+  // The admin always has full access.
+  if (user_access('administer content types', $account)) {
+    return TRUE;
+  }
+
+  $access_results = module_invoke_all('node_tab_tab_access', $entity, $op, $account, $node);
+  // Allow hook_node_tab_tab_access() implementations to deny access.
+  if (in_array(FALSE, $access_results, TRUE)) {
+    return FALSE;
+  }
+
+  return TRUE;
+}
+
+/**
+ * Returns whether the provided node type has at least one tab defined.
+ *
+ * @param $type
+ *   The node type.
+ *
+ * @return
+ *   TRUE if the node type has at least one tab defined, FALSE otherwise.
+ */
+function node_tab_type_has_tabs($type) {
+  $query = new EntityFieldQuery;
+  $query
+    ->entityCondition('entity_type', 'node_tab')
+    ->propertyCondition('node_type', $type)
+    ->count();
+  $result = $query->execute();
+  return $result > 0;
+}
+
+/**
+ * Loads a single tab entity.
+ *
+ * @param string $node_type
+ *   The node type machine name.
+ * @param string $name
+ *   The tab machine name.
+ *
+ * @return bool|mixed
+ *   The tab entity, or FALSE.
+ */
+function node_tab_load($node_type, $name) {
+  $conditions = array(
+    'node_type' => $node_type,
+    'name' => $name,
+  );
+  $tabs = entity_load('node_tab', FALSE, $conditions);
+  return reset($tabs);
+}
+
+/**
+ * Loads multiple tab entities.
+ *
+ * @param $node_type
+ *   The node type machine name.
+ * @param $names
+ *   An array of tab machine names, or FALSE to load all tabs for the passed
+ *   node type.
+ *
+ * @return
+ *   An array of tab entities indexed by their ids.
+ */
+function node_tab_load_multiple($node_type, $names = FALSE) {
+  // The $conditions entity_load() parameter returns entities out of order
+  // if some are fetched from cache, so we use EntityFieldQuery instead.
+  $query = new EntityFieldQuery();
+  $query
+    ->entityCondition('entity_type', 'node_tab')
+    ->propertyCondition('node_type', $node_type)
+    ->propertyOrderBy('weight', 'ASC')
+    ->propertyOrderBy('name', 'ASC');
+  if ($names) {
+    $query->propertyCondition('name', $names);
+  }
+  $results = $query->execute();
+  $ids = isset($results['node_tab']) ? array_keys($results['node_tab']) : array();
+  return $ids ? entity_load('node_tab', $ids) : array();
+}
+
+/**
+ * Loads the default tab entity for the provided node type.
+ *
+ * @param $type
+ *   The node type.
+ *
+ * @return
+ *   The default tab entity for the provided node type, or FALSE if not found.
+ */
+function node_tab_load_default($type) {
+  $default_tabs = &drupal_static(__FUNCTION__);
+
+  if (!isset($default_tabs[$type])) {
+    // The default tab is always the one with the lowest weight.
+    $query = new EntityFieldQuery;
+    $query
+      ->entityCondition('entity_type', 'node_tab')
+      ->propertyCondition('node_type', $type)
+      ->propertyOrderBy('weight', 'ASC')
+      ->range(0, 1);
+    $result = $query->execute();
+    if ($result) {
+      $tab_ids = array_keys($result['node_tab']);
+      $default_tabs[$type] = entity_load_single('node_tab', reset($tab_ids));
+    }
+    else {
+      $default_tabs[$type] = FALSE;
+    }
+  }
+
+  return $default_tabs[$type];
+}
+
+/**
+ * Implements hook_node_tab_insert().
+ *
+ * i18n_string integration for node_tab.
+ */
+function node_tab_node_tab_insert($tab) {
+  if (module_exists('i18n_string')) {
+    i18n_string_object_update('node_tab', $tab);
+  }
+}
+
+/**
+ * Implements hook_node_tab_update().
+ *
+ * i18n_string integration for node_tab.
+ */
+function node_tab_node_tab_update($tab) {
+  if (module_exists('i18n_string')) {
+    // Account for name changes.
+    if ($tab->original->name != $tab->name) {
+      $old_context = "node_tab:node_tab:{$tab->original->name}:*";
+      $new_context = "node_tab:node_tab:{$tab->name}:*";
+      i18n_string_update_context($old_context, $new_context);
+    }
+    i18n_string_object_update('node_tab', $tab);
+  }
+}
+
+/**
+ * Implements hook_node_tab_delete().
+ *
+ * i18n_string integration for node_tab.
+ */
+function node_tab_node_tab_delete($tab) {
+  if (module_exists('i18n_string')) {
+    i18n_string_object_remove('node_tab', $tab);
+  }
+}
+
+/**
+ * Implements hook_path_insert().
+ *
+ * When a node alias has been created, if the node has tabs, create an alias
+ * for each tab.
+ */
+function node_tab_path_insert($path) {
+  // If this is a node alias...
+  if (!isset($path['node_tab']) && substr($path['source'], 0, 5) == 'node/') {
+    $source_parts = explode('/', $path['source']);
+    // And we can get the numeric node id...
+    if (count($source_parts) == 2 && is_numeric($source_parts[1])) {
+      $node = node_load($source_parts[1]);
+      node_tab_rebuild($path, $node);
+    }
+  }
+}
+
+/**
+ * Implements hook_path_update().
+ *
+ * When a node alias has been updated, if the node has tabs, update the alias
+ * for each tab.
+ */
+function node_tab_path_update($path) {
+  // If this is a node alias...
+  if (!isset($path['node_tab']) && substr($path['source'], 0, 5) == 'node/') {
+    $source_parts = explode('/', $path['source']);
+    // The alias hasn't changed, abort.
+    if ($path['alias'] == $path['original']['alias']) {
+      return;
+    }
+    if (count($source_parts) == 2 && is_numeric($source_parts[1])) {
+      $node = node_load($source_parts[1]);
+      node_tab_rebuild($path, $node);
+    }
+  }
+}
+
+/**
+ * Implements hook_path_delete().
+ *
+ * When a node alias has been deleted, if the node has tabs, update the alias
+ * for each tab.
+ */
+function node_tab_path_delete($path) {
+  // If this is a node alias...
+  if (!isset($path['node_tab']) && substr($path['source'], 0, 5) == 'node/') {
+    $source_parts = explode('/', $path['source']);
+    // And we can get the numeric node id...
+    if (is_numeric($source_parts[1])) {
+      $node = node_load($source_parts[1]);
+      // Create a list of tab machine names for which aliases should be removed.
+      // Include both current tabs and deleted tabs.
+      $tab_names = array();
+      $tabs = node_tab_load_multiple($node->type);
+      foreach ($tabs as $tab) {
+        $tab_names[] = $tab->name;
+      }
+      $deleted_tabs = variable_get('node_tab_deleted', array());
+      if (isset($deleted_tabs[$node->type])) {
+        foreach ($deleted_tabs[$node->type] as $deleted_tab_name) {
+          $tab_names[] = $deleted_tab_name;
+        }
+      }
+
+      // If there are tabs, delete the path for each one.
+      if ($tab_names) {
+        node_tab_path_delete_multiple($path['source'], $tab_names);
+      }
+    }
+  }
+}
+
+/**
+ * Rebuild tab paths for the provided node.
+ *
+ * @param $path
+ *   The node path alias array.
+ * @param $node
+ *   The node entity.
+ */
+function node_tab_rebuild($path, $node) {
+  // If there are deleted tabs, remove their paths.
+  $deleted_tabs = variable_get('node_tab_deleted', array());
+  if (isset($deleted_tabs[$node->type])) {
+    node_tab_path_delete_multiple($path['source'], $deleted_tabs[$node->type]);
+  }
+
+  $path_source = isset($path['original']) ? $path['original']['source'] : $path['source'];
+  $tabs = node_tab_load_multiple($node->type);
+  // If there are tabs, update the path for each one.
+  foreach ($tabs as $tab) {
+    $tab_source = $path_source . '/' . $tab->name;
+    $tab_path = path_load($tab_source);
+    // The tab path doesn't exist yet. Create it.
+    if (!$tab_path) {
+      $tab_path = $path;
+      $tab_path['pid'] = NULL;
+    }
+
+    $tab_path['source'] = $path['source'] . '/' . $tab->name;
+    $tab_path['alias'] = $path['alias'] . '/' . $tab->name;
+    // The node_tab property is set to avoid recursion, later discarded.
+    $tab_path['node_tab'] = TRUE;
+    path_save($tab_path);
+  }
+}
+
+/**
+ * Rebuilds the tab paths for all nodes.
+ *
+ * @param $node_types
+ *   An array of node type machine names.
+ */
+function node_tab_rebuild_all($node_types) {
+  $batch = array(
+    'title' => t('Rebuilding tab paths'),
+    'operations' => array(
+      array('_node_tab_rebuild_batch_operation', array($node_types)),
+    ),
+    'finished' => '_node_tab_rebuild_batch_finished',
+  );
+  batch_set($batch);
+}
+
+/**
+ * Performs batch operation for node_tab_rebuild_all().
+ *
+ * Loads nodes of the specified node types in groups of 5 and rebuilds path
+ * aliases for each node.
+ *
+ * @param $node_types
+ *   An array of node type machine names.
+ */
+function _node_tab_rebuild_batch_operation($node_types, &$context) {
+  if (empty($context['sandbox'])) {
+    // Initiate multistep processing.
+    $context['sandbox']['progress'] = 0;
+    $context['sandbox']['current_node'] = 0;
+    // Get the number of nodes for all types that need to be rebuilt.
+    $query = new EntityFieldQuery;
+    $query
+      ->entityCondition('entity_type', 'node')
+      ->entityCondition('bundle', $node_types)
+      ->count();
+    $context['sandbox']['max'] = $query->execute();
+  }
+
+  // Process the next 5 nodes.
+  $query = new EntityFieldQuery;
+  $query
+    ->entityCondition('entity_type', 'node')
+    ->entityCondition('bundle', $node_types)
+    ->entityCondition('entity_id', $context['sandbox']['current_node'], '>')
+    ->entityOrderBy('entity_id', 'ASC')
+    ->range(0, 5);
+  $result = $query->execute();
+  $nids = array_keys($result['node']);
+  $nodes = node_load_multiple($nids, array(), TRUE);
+  foreach ($nodes as $nid => $node) {
+    $conditions = array('source' => 'node/' . $node->nid);
+    $path = path_load($conditions);
+    if ($path) {
+      node_tab_rebuild($path, $node);
+    }
+
+    $context['sandbox']['progress']++;
+    $context['sandbox']['current_node'] = $nid;
+  }
+
+  // Multistep processing: report progress.
+  if ($context['sandbox']['progress'] != $context['sandbox']['max']) {
+    $context['finished'] = $context['sandbox']['progress'] / $context['sandbox']['max'];
+  }
+}
+
+/**
+ * Performs post-processing for node_tab_rebuild_all().
+ *
+ * @param bool $success
+ *   A boolean indicating whether the re-build process has completed.
+ * @param array $results
+ *   An array of results information.
+ * @param array $operations
+ *   An array of function calls (not used in this function).
+ */
+function _node_tab_rebuild_batch_finished($success, $results, $operations) {
+  if ($success) {
+    drupal_set_message(t('The tab paths have been rebuilt.'));
+    variable_set('node_tab_deleted', array());
+    variable_set('node_tab_rebuild', array());
+  }
+  else {
+    drupal_set_message(t('The tab paths have not been properly rebuilt.'), 'error');
+  }
+  cache_clear_all();
+}
+
+/**
+ * Delete all path aliases for the passed node path alias and tab names.
+ *
+ * @param $node_path
+ *   The node path alias.
+ * @param $tab_names
+ *   An array of tab machine names.
+ */
+function node_tab_path_delete_multiple($node_path, $tab_names) {
+  foreach ($tab_names as $tab_name) {
+    $original_tab_source = $node_path . '/' . $tab_name;
+    $tab_path = path_load($original_tab_source);
+    if ($tab_path) {
+      // We are duplicating path_delete() here in order to avoid recursion.
+      $query = db_delete('url_alias');
+      $query->condition('pid', $tab_path['pid']);
+      $query->execute();
+      // The node_tab property is set to avoid recursion, later discarded.
+      $tab_path['node_tab'] = TRUE;
+      module_invoke_all('path_delete', $tab_path);
+      drupal_clear_path_cache($tab_path['source']);
+    }
+  }
+}
+
+/**
+ * Returns the path for the passed node (alias if found, the default otherwise).
+ *
+ * @param $node
+ *   The node entity.
+ *
+ * @return
+ *   The node path.
+ */
+function node_tab_get_node_path($node) {
+  $conditions = array('source' => 'node/' . $node->nid);
+  $langcode = entity_language('node', $node);
+  if ($langcode != LANGUAGE_NONE) {
+    $conditions['language'] = $langcode;
+  }
+  $path = path_load($conditions);
+
+  return $path ? $path['alias'] : 'node/' . $node->nid;
+}
+
+/**
+ * Returns the machine name of the current tab.
+ *
+ * @param $tab_arg_pos
+ *   The position of the tab argument in the url.
+ * @param $tabs
+ *   An array of all available tabs.
+ *
+ * @return
+ *   The machine name of the current tab, or NULL if not found.
+ */
+function node_tab_get_current_tab($tab_arg_pos, $tabs) {
+  $tab_arg = arg($tab_arg_pos);
+  $current_tab = NULL;
+  if ($tab_arg) {
+    foreach ($tabs as $tab) {
+      if ($tab->name == $tab_arg) {
+        $current_tab = $tab_arg;
+        break;
+      }
+    }
+  }
+
+  return $current_tab;
+}
+
+/**
+ * Implements hook_block_info().
+ */
+function node_tab_block_info() {
+  $blocks['node_tab'] = array(
+    'info' => t('Node Tab'),
+    'cache' => DRUPAL_CACHE_CUSTOM,
+  );
+
+  return $blocks;
+}
+
+/**
+ * Implements hook_block_view().
+ */
+function node_tab_block_view($delta = '') {
+  $block = array();
+
+  switch ($delta) {
+    case 'node_tab':
+      $node = menu_get_object('node');
+      if (!$node) {
+        return $block;
+      }
+      $tabs = node_tab_load_multiple($node->type);
+      if (!$tabs) {
+        return $block;
+      }
+      $default_tab = reset($tabs);
+      $path = node_tab_get_node_path($node);
+      $tab_arg_pos = 2;
+      $current_tab = node_tab_get_current_tab($tab_arg_pos, $tabs);
+      if (!$current_tab) {
+        return $block;
+      }
+
+      $path = url($path, array('absolute' => TRUE));
+      $theme_tabs = array();
+      foreach ($tabs as $tab) {
+        if (node_tab_access('view', $tab, NULL, NULL, $node)) {
+          $theme_tabs[] = array(
+            'path' => $path . '/' . $tab->name,
+            'label' => $tab->getTranslation('label'),
+            'active' => $tab->name == $current_tab,
+          );
+        }
+      }
+      $theme_args = array(
+        'tabs' => $theme_tabs,
+      );
+      $block['subject'] = '';
+      $block['content'] = theme('node_tabs', $theme_args);
+      break;
+
+  }
+  return $block;
+}

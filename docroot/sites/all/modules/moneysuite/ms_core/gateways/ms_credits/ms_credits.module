@@ -1,0 +1,1014 @@
+<?php
+
+/**
+ * @file
+ * Credits gateway lets users purchase and checkout with Credits. You can also
+ * grant credits using Rules. There is also a one-click-purchase button when
+ * using credits.
+ *
+ * Original author: Leighton Whiting - Released under GENERAL PUBLIC LICENSE
+ * Current maintenance by multiple MoneySuite users.
+ * Re: new initiative: https://www.drupal.org/node/2315653 
+ */
+
+/**
+* Implements hook_help().
+*/
+function ms_credits_help($path, $arg) {
+  $output = '';
+  switch ($path) {
+    case "admin/moneysuite/gateways/ms_credits":
+    case "admin/help#ms_credits":
+      $output = '<p>' . t("This allows your users to pay
+      for products using their !creditsname balance. This gateway supports both Recurring and Non-Recurring Orders.
+      Users are also able to purchase !creditsname using a different payment method, such as PayPal.",
+      array('!creditsname' => variable_get('ms_credits_name', 'Credits'))) . '</p>';
+      break;
+  }
+  return $output;
+}
+
+/**
+ * Implements  hook_perm().
+ */
+function ms_credits_permission() {
+  return array(
+    'purchase ms credits' => array(
+      'title' => t('Purchase !creditsname', array('!creditsname' => variable_get('ms_credits_name', 'Credits'))),
+      'description' => t('Allows the user to purchase !creditsname.', array('!creditsname' => variable_get('ms_credits_name', 'Credits'))),
+    ),
+    'spend ms credits' => array(
+      'title' => t('Spend !creditsname', array('!creditsname' => variable_get('ms_credits_name', 'Credits'))),
+      'description' => t('Allows the user to spend !creditsname on products that support it.', array('!creditsname' => variable_get('ms_credits_name', 'Credits'))),
+    )
+  );
+}
+
+/**
+ * Implements hook_menu().
+ */
+function ms_credits_menu() {
+  $items = array();
+  $items['user/%user/ms_credits'] = array(
+    'title' => 'Credits',
+    'page callback' => 'ms_credits_user_page',
+    'page arguments' => array(1),
+    'type' => MENU_LOCAL_TASK,
+    'access callback' => 'ms_credits_access_test',
+    'access arguments' => array(1),
+  );
+  $items['ms_credits/cancel/%'] = array(
+    'title' => 'Cancel Payments',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('ms_credits_cancel_page_confirm', 2),
+    'access callback' => 'ms_credits_cancel_test',
+    'access arguments' => array(2),
+    'type' => MENU_VISIBLE_IN_BREADCRUMB,
+  );
+  $items['ms_credits/purchase_package'] = array(
+    'title' => 'Purchase Credits',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('ms_credits_purchase_package_form'),
+    'access arguments' => array('purchase ms credits'),
+    'type' => MENU_NORMAL_ITEM,
+  );
+
+  return $items;
+}
+
+/**
+ * Access test to see if the user can access the credits tab.
+ *
+ * @param $account
+ *   The account.
+ *
+ * @return bool
+ *   Returns TRUE if the user has access, FALSE otherwise
+ */
+function ms_credits_access_test($account) {
+  global $user;
+  return (user_access('administer users') OR ($account->uid == $user->uid && user_access('spend ms credits')));
+}
+
+/**
+ * Access callback to see if the user can cancel an order
+ */
+function ms_credits_cancel_test($oid) {
+  global $user;
+  $order = ms_core_order_load($oid);
+  if ($user->uid == $order->uid OR user_access('administer moneysuite orders')) {
+    return TRUE;
+  }
+  return FALSE;
+}
+
+/**
+ * Implements hook_cron().
+ */
+function ms_credits_cron() {
+  // Process recurring payments
+  $result = db_query("SELECT * FROM {ms_recurring_schedules} WHERE gateway = :gateway
+    AND status = :status AND next_payment <> :zero AND next_payment < :next_payment",
+    array(':gateway' => 'ms_credits', ':status' => 'active', ':zero' => 0, ':next_payment' => REQUEST_TIME));
+
+  foreach ($result as $recurring_schedule) {
+    // Load some variables
+    $order = ms_core_order_load($recurring_schedule->oid);
+
+    // Process the next payment
+    $response = ms_credits_charge_recurring($order, $order->recurring_schedule, FALSE);
+
+    if ($response['approved']) {
+      ms_core_log('ms_credits', 'Processed Recurring Charge for Order #!num. Here are the details: @message',
+          array('!num' => $order->oid, '@message' => ms_core_print_r($recurring_schedule)));
+
+      // Insert the rec_payment Payment to the database
+      $payment = ms_core_new_payment($order->oid, 'ms_credits', 'rec_payment');
+
+      $payment->transaction = $response['data']['transaction'];
+      $payment->amount = $response['data']['amount'];
+      $payment->currency = variable_get('ms_credits_name', 'Credits');
+      $payment->data = $response['data'];
+
+      // Add the Payment to the Order
+      ms_core_enter_payment($payment);
+
+      // Check if the recurring_schedule is done, send rec_eot
+      if ($recurring_schedule->total_occurrences != 0 AND $recurring_schedule->total_occurrences <= ($recurring_schedule->current_payments + 1)) {
+        $payment->type = 'rec_eot';
+        $payment->amount = 0;
+        ms_core_enter_payment($payment);
+      }
+    }
+    else {
+      // Log the error
+      ms_core_log_error('ms_credits', 'Error Processing Recurring Charge: @message',
+        array('@message' => $response['message']));
+
+      // Insert the rec_cancel Payment to the database
+      $payment = ms_core_new_payment($order->oid, 'ms_credits', 'rec_cancel');
+
+      $payment->transaction = drupal_get_token(serialize($order));
+      $payment->data = $response['data'];
+
+      // Add the Payment to the Order
+      ms_core_enter_payment($payment);
+    }
+  }
+}
+
+/**
+ * Admin Settings Form
+ */
+function ms_credits_admin() {
+  $form['main'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Main Settings'),
+  );
+  $form['main']['ms_credits_override_add_to_cart_button'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Replace add to cart buttons with one-click-checkout buttons?'),
+    '#default_value' => variable_get('ms_credits_override_add_to_cart_button', FALSE),
+    '#ms_override' => TRUE,
+  );
+  $form['main']['ms_credits_name'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Credits Name'),
+    '#default_value' => variable_get('ms_credits_name', t('Credits')),
+    '#description' => t('Enter the name of the credits.'),
+  );
+  $form['main']['ms_credits_credit_value'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Credit Value'),
+    '#default_value' => variable_get('ms_credits_credit_value', 100),
+    '#description' => t('How many credits are equal to 1 unit of currency?
+      (Dollar, Euro, etc as defined in MS Core Currency setting). You can use
+      decimals if you need to. Credits will be rounded up.'),
+    '#ms_override' => TRUE,
+  );
+  $form['sell'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Sell Credits Settings'),
+    '#description' => t("Users who have permission to will be able to purchase credits from this page: !link.",
+      array('!link' => l(t('Purchase credits'), 'ms_credits/purchase_package'))),
+  );
+  $form['sell']['ms_credits_packages'] = array(
+    '#type' => 'textarea',
+    '#title' => t('Credits Packages'),
+    '#default_value' => variable_get('ms_credits_packages', "100|9.95|10 days"),
+    '#description' => t("Add as many packages as you want to offer, one per line,
+      in the format '[credits]|[price]|[expiration]'. Example: '100|9.95|10 days'.
+      For no expiration, enter a 0. Example: '100|9.95|0'"),
+  );
+
+  return $form;
+}
+
+
+/**
+ * Implements hook_user_load().
+ *
+ * We use this to load the credits balance into the user object.
+ */
+function ms_credits_user_load($users) {
+  foreach ($users as $uid => $account) {
+    // Load the Balance to the $account object.
+    $account->ms_credits_balance = ms_credits_get_user_balance($account->uid);
+    $users[$uid] = $account;
+  }
+}
+
+/**
+ * Implements hook_entity_property_info_alter().
+ */
+function ms_credits_entity_property_info_alter(&$info) {
+  $account = &$info['user']['properties'];
+  $account['ms_credits_balance'] = array(
+    'label' => t('MS Credits Balance'),
+    'description' => t('The number of credits the user currently has.'),
+    'computed' => TRUE,
+    'entity views field' => TRUE,
+  );
+}
+
+/**
+ * Show the credits balance on the user edit form
+ */
+function ms_credits_form_user_profile_form_alter(&$form, &$form_state) {
+  if ($form['#user_category'] == 'account') {
+    $account = $form['#user'];
+
+    $account = user_load($account->uid);
+
+    if (user_access('administer users')) {
+      $form['ms_credits']['ms_credits_balance'] = array(
+        '#type' => 'textfield',
+        '#title' => t('Credits Balance'),
+        '#default_value' => $account->ms_credits_balance,
+        '#description' => t('The current Credits Balance for the user.'),
+        '#weight' => 11,
+        '#required' => FALSE,
+      );
+      $form['ms_credits']['ms_credits_expiration'] = array(
+        '#type' => 'textfield',
+        '#title' => t('Credits Expiration'),
+        '#description' => t('If you are adding credits by changing the balance,
+          you can set the expiration date of the credits you add here. Enter any date string.'),
+        '#weight' => 11,
+        '#required' => FALSE,
+      );
+    }
+  }
+}
+
+/**
+ * Implements hook_user_presave().
+ */
+function ms_credits_user_presave(&$edit, $account, $category) {
+  if ($category == 'account' AND user_access('administer users')) {
+    //Save the New Balance
+    if (isset($edit['ms_credits_balance']) AND ($edit['ms_credits_balance'] != $account->ms_credits_balance)) {
+      $credits = $edit['ms_credits_balance'] - $account->ms_credits_balance;
+      global $user;
+      drupal_set_message('Updated Balance for the User');
+      $expiration = !empty($edit['ms_credits_expiration']) ? strtotime($edit['ms_credits_expiration']) : 0;
+      ms_credits_transaction($account->uid, $credits, t("Balance change by @name", array('@name' => $user->name)), 0, time(), $expiration);
+    }
+    //Delete form fields in $edit
+    $edit['ms_credits_balance'] = NULL;
+  }
+}
+
+// ======================================
+// General Functions:
+// ======================================
+
+/**
+ * Helper function to convert the amount to points
+ */
+function ms_credits_amount_to_credits($amount) {
+  $rate = variable_get('ms_credits_credit_value', 100);
+
+  // Round up for points
+  $points = ceil(($amount * $rate));
+
+  // Don't let it be negative
+  return ($points > 0) ? $points : 0;
+}
+
+/**
+ * Helper function to convert the credits to amount
+ */
+function ms_credits_credits_to_amount($credits) {
+  $rate = variable_get('ms_credits_credit_value', 100);
+  $amount = 0;
+  // Round up for points
+  if ($rate > 0) {
+    $amount = ($credits / $rate);
+  }
+
+  // Don't let it be negative
+  return ($amount > 0) ? $amount : 0;
+}
+
+/**
+ * Returns the user's current credit balance
+ *
+ * @param $uid
+ *   The user's uid
+ *
+ * @return int
+ *   The number of credits the user currently has
+ */
+function ms_credits_get_user_balance($uid) {
+  // We only want to get entries that are not expired
+  $result = db_query("SELECT uid, SUM(credits) AS total_credits FROM {ms_credit_transactions}
+    WHERE uid = :uid AND (expiration = :zero OR expiration > :now) GROUP BY uid",
+    array(':uid' => $uid, ':zero' => 0, ':now' => REQUEST_TIME));
+  foreach ($result as $row) {
+    return $row->total_credits;
+  }
+
+  return 0;
+}
+
+/**
+ * Performs a credit transaction
+ *
+ * This can be used to both add or subtract credits from a user's balance.
+ *
+ * @param $uid
+ *   The user's uid.
+ * @param $credits
+ *   The number of credits to add or subtract. To subtract, simply enter a negative amount.
+ * @param string $note
+ *   (Optional) A note to attach to this transaction. This will show in the history.
+ * @param int $oid
+ *   (Optional) An order id to associate with this transaction. This will show in the history.
+ * @param int $created
+ *   (Optional) The timestamp to use for this transaction. Defaults to now.
+ * @param int $expiration
+ *   (Optional) The timestamp to use for the expiration. Defaults to 0.
+ *
+ * @return mixed
+ *   An array with information about the transaction.
+ */
+function ms_credits_transaction($uid, $credits, $note = '', $oid = 0, $created = 0, $expiration = 0) {
+  $balance = ms_credits_get_user_balance($uid);
+
+  $return = array(
+    'status' => FALSE,
+  );
+
+  if ($balance + $credits < 0) {
+    $return['reason'] = t('Not enough credits');
+    return $return;
+  }
+  $id = db_insert('ms_credit_transactions')
+    ->fields(array(
+      'uid' => $uid,
+      'credits' => $credits,
+      'note' => $note,
+      'oid' => $oid,
+      'created' => ($created) ? $created : REQUEST_TIME,
+      'expiration' => ($expiration) ? $expiration : 0,
+    ))
+    ->execute();
+  if (!$id) {
+    $return['reason'] = t('Problem saving the transaction');
+    return $return;
+  }
+
+  // Display a message
+  if ($credits > 0) {
+    drupal_set_message(t('!num !creditsname have been added to your balance.',
+      array('!num' => abs($credits), '!creditsname' => variable_get('ms_credits_name', 'Credits'))));
+  }
+  else {
+    drupal_set_message(t('!num !creditsname have been deducted from your balance.',
+      array('!num' => abs($credits), '!creditsname' => variable_get('ms_credits_name', 'Credits'))));
+  }
+
+  $return['status'] = TRUE;
+
+  return $return;
+}
+
+// ======================================
+// Gateway Functions:
+// ======================================
+
+/**
+ * Implements hook_ms_core_payment_gateway().
+ */
+function ms_credits_ms_core_payment_gateway() {
+  global $user;
+  $gateways['ms_credits'] = array(
+    'name' => 'MS Credits',
+    'display_name' => variable_get('ms_credits_name', 'Credits'),
+    'description' => t('Pay with !creditsname.', array('!creditsname' => variable_get('ms_credits_name', 'Credits'))),
+    'module' => 'ms_credits',
+    'checkout_form' => 'ms_credits_checkout_page_form',
+    'cancel_url' => 'ms_credits_get_cancel_url',
+    'active' => $user->uid ? TRUE : FALSE,
+    'settings' => ms_credits_admin(),
+    'active_callback' => 'ms_credits_gateway_active_test',
+  );
+
+  return $gateways;
+}
+
+/**
+ * Active test callback.
+ */
+function ms_credits_gateway_active_test($cart) {
+  foreach ($cart->products as $product) {
+    if ($product->module == 'ms_credits') {
+      return FALSE;
+    }
+  }
+  return ms_core_variable_get('ms_credits_show_gateway', TRUE, $cart) && user_access('spend ms credits');
+}
+
+/**
+ * Get the Cancellation URL for a recurring order
+ */
+function ms_credits_get_cancel_url($order) {
+  return 'ms_credits/cancel/' . $order->oid;
+}
+
+/**
+ * Confirm a cancellation
+ */
+function ms_credits_cancel_page_confirm($form, &$form_state, $oid) {
+  $order = ms_core_order_load($oid);
+  $form['#ms_core_oid'] = $order->oid;
+  $redirect = ($_GET['destination']) ? $_GET['destination'] : '';
+  return confirm_form($form, t('Are you sure you want to cancel your order?'), $redirect, t('This action cannot be undone.'), t('Confirm'));
+}
+
+/**
+ * Comfirm the cancel page
+ */
+function ms_credits_cancel_page_confirm_submit($form, &$form_state) {
+  $order = ms_core_order_load($form['#ms_core_oid']);
+
+  // Get the subscription_id from the order
+  $subscription_id = ms_core_get_order_rec_id($order->oid);
+
+  // Enter the rec_cancel payment
+  $payment = ms_core_new_payment($order->oid, 'ms_credits', 'rec_cancel');
+  // Generate a Unique Transaction ID
+  $payment->transaction = drupal_get_token(serialize($order) . REQUEST_TIME);
+  $payment->currency = $order->currency;
+  $payment->recurring_id = $subscription_id;
+  $payment->billing_address = $order->billing_address;
+  $payment->shipping_address = $order->shipping_address;
+
+  ms_core_enter_payment($payment);
+
+  $form_state['redirect'] = '';
+}
+
+/**
+ * Displays the credits tab in the user account pages
+ *
+ * This is sort of a dashboard where the user can see their balance, top up, and
+ * see their past history in credits.
+ *
+ * @param $account
+ *   The account to display the credits dashboard for
+ */
+function ms_credits_user_page($account) {
+  $build = array();
+
+  // Show the balance
+  $build['content']['ms_credits_balance'] = array(
+    '#title' => t('!creditsname Balance', array('!creditsname' => variable_get('ms_credits_name', 'Credits'))),
+    '#type' => 'item',
+    '#markup' => ms_credits_get_user_balance($account->uid),
+  );
+
+  // Show the top up options
+  $build['content']['ms_credits_top_up'] = drupal_get_form('ms_credits_purchase_package_form', TRUE);
+
+  // Show the past history
+  $build['content']['ms_credits_history'] = array(
+    '#title' => t('!creditsname History', array('!creditsname' => variable_get('ms_credits_name', 'Credits'))),
+    '#type' => 'item',
+    '#markup' => ms_credits_history_table($account),
+  );
+
+  // Add the pager
+  $build['pager'] = array(
+    '#theme' => 'pager',
+    '#weight' => 5,
+  );
+
+  return $build;
+}
+
+/**
+ * Implements hook_ms_core_currency_sign_alter().
+ */
+function ms_credits_ms_core_currency_sign_alter(&$sign, $variables) {
+  switch ($variables['currency_code']) {
+    case 'CRD':
+      $sign = variable_get('ms_credits_name', 'Credits');
+      break;
+  }
+}
+
+/**
+ * Implements hook_ms_core_currency_format_alter().
+ */
+function ms_credits_ms_core_currency_format_alter(&$format, $variables) {
+  switch ($variables['currency_code']) {
+    case 'CRD':
+      switch ($variables['context']) {
+        case 'payment_amount':
+        case 'order_total':
+          $format = "[number] [sign]";
+          break;
+        default:
+          $credits = ms_credits_amount_to_credits($variables['amount']);
+          $format = $credits . " [sign]";
+          break;
+      }
+      break;
+  }
+}
+
+/**
+ * Build the credits history table for a user account.
+ *
+ * @param $account
+ *   The account to get the credits history for.
+ *
+ * @return string
+ *   The themed history table.
+ */
+function ms_credits_history_table($account) {
+  $headers = array(
+    array('data' => t('Date'), 'field' => 'created', 'sort' => 'desc'),
+    array('data' => t('Expires'), 'field' => 'expiration', 'sort' => 'desc'),
+    array('data' => t('Credits'), 'field' => 'credits'),
+    array('data' => t('Description'), 'field' => 'note'),
+    array('data' => t('Actions')),
+  );
+
+  $query = db_select('ms_credit_transactions', 't');
+  $query->fields('t');
+  $query->condition('t.uid', $account->uid, '=');
+
+  $query = $query->extend('TableSort')->orderByHeader($headers);
+  $query = $query->extend('PagerDefault')->limit(20);
+
+  $result = $query->execute();
+
+  $rows = array();
+  foreach ($result as $item) {
+    $actions = array();
+    if ($item->oid AND $order = ms_core_order_load($item->oid)) {
+      $actions[] = l(t('View Order'), 'user/' . $account->uid . '/order-history/view/' . $order->order_key);
+    }
+    $rows[] = array(
+      'created' => format_date($item->created),
+      'expiration' => ($item->expiration) ? format_date($item->expiration) : t('N/A'),
+      'credits' => $item->credits,
+      'note' => $item->note,
+      'actions' => implode(' | ', $actions),
+    );
+  }
+
+  // Output the table
+  return theme('table', array('header' => $headers, 'rows' => $rows, 'empty' => t('No history.')));
+}
+
+// ======================================
+// Purchase Functions:
+// ======================================
+
+/**
+ * Checkout an order automatically
+ */
+function ms_credits_one_click_checkout($order) {
+  // Otherwise let's charge the order
+  switch ($order->order_type) {
+    case 'recurring':
+      $response = ms_credits_charge_recurring($order, $order->recurring_schedule);
+
+      if ($response['approved'] == TRUE) {
+        // Insert the Payment to the database
+        $payment = ms_core_new_payment($order->oid, 'ms_credits', 'rec_signup');
+
+        $payment->transaction = $response['data']['transaction'];
+        $payment->recurring_id = $response['data']['recurring_id'];
+        $payment->amount = $response['data']['amount'];
+        $payment->currency = $response['data']['currency'];
+        $payment->data = $response['data'];
+
+        // Add the Payment to the Order
+        ms_core_enter_payment($payment);
+
+        ms_core_show_order_messages($order);
+      }
+      else { // The Charge was not approved, show an error
+        drupal_set_message(t('Error: @message', array('@message' => $response['message'])), 'error');
+      }
+      break;
+
+    case 'cart':
+      $response = ms_credits_charge_single($order);
+      if ($response['approved']) {
+        // Insert the Payment to the database
+        $payment = ms_core_new_payment($order->oid, 'ms_userpoints', 'cart');
+
+        $payment->transaction = $response['data']['transaction'];
+        $payment->recurring_id = $response['data']['recurring_id'];
+        $payment->amount = $response['data']['amount'];
+        $payment->currency = $response['data']['currency'];
+        $payment->data = $response['data'];
+
+        // Add the Payment to the Order
+        ms_core_enter_payment($payment);
+
+        ms_core_show_order_messages($order);
+      }
+      else { // The Charge was not approved, show an error
+        drupal_set_message(t('Error: @message', array('@message' => $response['message'])), 'error');
+      }
+      break;
+  }
+}
+
+/**
+ * Confirm a credits checkout
+ */
+function ms_credits_checkout_page_form($form, &$form_state, $order) {
+  $order->currency = 'CRD';
+  ms_core_order_save($order);
+  $form['#ms_core_oid'] = $order->oid;
+  $account = user_load($order->uid);
+  $credits_amount = ms_credits_amount_to_credits($order->amount);
+  $balance = ms_credits_get_user_balance($account->uid);
+  if (($balance + $credits_amount) < 0) {
+    $form['low_credits'] = array(
+      '#type' => 'item',
+      '#markup' => t('Your balance is too low for this purchase. You need at least @num. Please !purchase_link.',
+          array(
+            '@num' => $credits_amount,
+            '!purchase_link' => l(t('purchase more !creditsname',
+            array('!creditsname' => variable_get('ms_credits_name', 'Credits'))), 'ms_credits/purchase_package'),
+        ))
+    );
+  }
+  else {
+    $form['submit'] = array(
+      '#type' => 'submit',
+      '#value' => t('Complete Order'),
+    );
+  }
+
+  return $form;
+}
+
+/**
+ * Charge an order with credits
+ */
+function ms_credits_checkout_page_form_submit($form, &$form_state) {
+  $order = ms_core_order_load($form['#ms_core_oid']);
+
+  // Otherwise let's charge the order
+  switch ($order->order_type) {
+    case 'recurring':
+      $response = ms_credits_charge_recurring($order, $order->recurring_schedule);
+
+      if ($response['approved'] == TRUE) {
+        // Insert the Payment to the database
+        $payment = ms_core_new_payment($order->oid, 'ms_credits', 'rec_signup');
+
+        $payment->transaction = $response['data']['transaction'];
+        $payment->recurring_id = $response['data']['recurring_id'];
+        $payment->amount = $response['data']['amount'];
+        $payment->currency = $response['data']['currency'];
+        $payment->data = $response['data'];
+
+        // Add the Payment to the Order
+        ms_core_enter_payment($payment);
+
+        ms_core_show_order_messages($order);
+        $form_state['redirect'] = 'ms/thankyou';
+      }
+      else { // The Charge was not approved, show an error
+        drupal_set_message(t('Error: @message', array('@message' => $response['message'])), 'error');
+      }
+      break;
+
+    case 'cart':
+      $response = ms_credits_charge_single($order);
+      if ($response['approved']) {
+        // Insert the Payment to the database
+        $payment = ms_core_new_payment($order->oid, 'ms_userpoints', 'cart');
+
+        $payment->transaction = $response['data']['transaction'];
+        $payment->recurring_id = $response['data']['recurring_id'];
+        $payment->amount = $response['data']['amount'];
+        $payment->currency = $response['data']['currency'];
+        $payment->data = $response['data'];
+
+        // Add the Payment to the Order
+        ms_core_enter_payment($payment);
+
+        ms_core_show_order_messages($order);
+        $form_state['redirect'] = 'ms/thankyou';
+      }
+      else { // The Charge was not approved, show an error
+        drupal_set_message(t('Error: @message', array('@message' => $response['message'])), 'error');
+      }
+      break;
+  }
+}
+
+/**
+ * Process a single charge
+ */
+function ms_credits_charge_single($order) {
+  $return = array();
+
+  $account = user_load($order->uid);
+
+  // Deduct the correct amount from the user's credits, and return
+  $credits_amount = ms_credits_amount_to_credits($order->amount);
+  $credits_txn = ms_credits_transaction($account->uid, -$credits_amount, t('Purchase'), $order->oid);
+
+  if ($credits_txn['status']) {
+    $return['approved'] = TRUE;
+    // Get a unique transaction id using drupal_get_token
+    $return['data']['transaction'] = ms_core_generate_transaction_id();
+    $return['data']['recurring_id'] = '';
+    $return['data']['amount'] = ms_credits_credits_to_amount($credits_amount);
+    $return['data']['currency'] = 'CRD';
+  }
+  else {
+    // Fail the charge with the reason text in the decline message.
+    $return['approved'] = FALSE;
+    $return['message'] = t('There was a problem deducting !creditsname: @error',
+      array('!creditsname' => variable_get('ms_credits_name', 'Credits'), '@error' => $credits_txn['reason']));
+  }
+
+  return $return;
+}
+
+/**
+ * Process a recurring charge
+ */
+function ms_credits_charge_recurring($order, $recurring_schedule) {
+  $return = array();
+
+  $account = user_load($order->uid);
+
+  // Deduct the correct amount from the user's credits, and return
+  $credits_amount = ms_credits_amount_to_credits($order->amount);
+  $credits_txn = ms_credits_transaction($account->uid, -$credits_amount, t('Recurring Charge.'), $order->oid);
+
+  if ($credits_txn['status']) {
+    $return['approved'] = TRUE;
+    // Get a unique transaction id and recurring_id using drupal_get_token
+    $return['data']['transaction'] = ms_core_generate_transaction_id();
+    $return['data']['recurring_id'] = ms_core_generate_recurring_id();
+    $return['data']['amount'] = ms_credits_credits_to_amount($credits_amount);
+    $return['data']['currency'] = 'CRD';
+  }
+  else {
+    // Fail the charge with the reason text in the decline message.
+    $return['approved'] = FALSE;
+    $return['message'] = t('There was a problem deducting !creditsname: @error',
+      array('!creditsname' => variable_get('ms_credits_name', 'Credits'), '@error' => $credits_txn['reason']));
+  }
+
+  return $return;
+}
+
+/**
+ * Get a list of packages for forms
+ */
+function ms_credits_get_packages_list() {
+  $packages = ms_credits_get_packages();
+  $list = array();
+
+  foreach ($packages as $package) {
+    $list[$package['id']] = t('@credits !creditsname for @amount',
+      array('@credits' => $package['credits'], '!creditsname' => variable_get('ms_credits_name', 'Credits'),
+        '@amount' => ms_core_format_money($package['amount'])));
+    if ($package['expiration']) {
+      $list[$package['id']] .= t(' (Expiration: @expiration)',
+      array('@expiration' => format_date(strtotime($package['expiration']), 'short')));
+    }
+  }
+
+  return $list;
+}
+
+/**
+ * Returns an array of packages keyed by credits
+ */
+function ms_credits_get_packages() {
+  $packages = array();
+
+  if ($p_string = variable_get('ms_credits_packages', "")) {
+    $lines = preg_split('/[\n\r]+/', trim($p_string));
+
+    $count = 0;
+    foreach ($lines as $line) {
+      list($credits, $amount, $expiration) = explode('|', $line);
+      $id = $count . '_' . $credits;
+      $packages[$id] = array(
+        'id' => $id,
+        'credits' => $credits,
+        'amount' => $amount,
+        'expiration' => $expiration
+      );
+      $count += 1;
+    }
+  }
+
+  return $packages;
+}
+
+/**
+ * Get a single package by id
+ */
+function ms_credits_get_package($id) {
+  $packages = ms_credits_get_packages();
+  return (isset($packages[$id])) ? $packages[$id] : FALSE;
+}
+
+/**
+ * Purchase credits form
+ */
+function ms_credits_purchase_package_form($form, &$form_state, $collapsed = FALSE) {
+  $packages = ms_credits_get_packages_list();
+
+  $form = array();
+  if (!empty($packages)) {
+    $form['ms_credits'] = array(
+      '#type' => 'fieldset',
+      '#title' => t('Purchase more !creditsname', array('!creditsname' => variable_get('ms_credits_name', 'Credits'))),
+      '#collapsible' => TRUE,
+      '#collapsed' => $collapsed,
+    );
+    $form['ms_credits']['package'] = array(
+      '#type' => 'radios',
+      '#title' => t('Choose your package'),
+      '#options' => $packages,
+      '#required' => TRUE,
+    );
+    $form['ms_credits']['submit'] = array(
+      '#type' => 'submit',
+      '#value' => t('Submit'),
+    );
+  }
+  else {
+    $form['help'] = array(
+      '#type' => 'item',
+      '#markup' => t('No credit packages are available.'),
+    );
+  }
+
+  return $form;
+}
+
+/**
+ * Submit function for purchase credits form
+ */
+function ms_credits_purchase_package_form_submit($form, &$form_state) {
+  if ($package = ms_credits_get_package($form_state['values']['package'])) {
+    $product = ms_core_new_product(t('@credits !creditsname',
+      array('@credits' => $package['credits'], '!creditsname' => variable_get('ms_credits_name', 'Credits'))),
+      'ms_credits', 1, $package['amount'], 'cart');
+
+    // Store the custom data
+    $product->data['ms_credits_package_credits'] = $package['credits'];
+
+    // Empty the cart first
+    ms_core_empty_cart();
+
+    ms_core_add_cart_product($product, TRUE);
+
+    ms_core_checkout();
+  }
+  else {
+    drupal_set_message(t('Error: Invalid Package ID'));
+  }
+}
+
+/**
+ * Implements  hook_ms_order_payment
+ */
+function ms_credits_ms_order_payment($type, $product, $order, $payment) {
+  if ($product->module == 'ms_credits') {
+    $account = user_load($order->uid);
+
+    //Get credits
+    $credits = $product->data['ms_credits_package_credits'];
+    $created = REQUEST_TIME;
+    $expiration = 0;
+    if (isset($product->data['ms_credits_package_expiration']) AND $expiration_string = $product->data['ms_credits_package_expiration']) {
+      $expiration = strtotime("+" . $expiration_string);
+    }
+
+    // Handle Refunds
+    if ($type == 'refund' OR $type == 'reversal') {
+      // Remove the credits from the user's account
+      ms_credits_transaction($account->uid, -$credits, t('Removed because of Refund.'), $order->oid);
+
+      ms_core_log_error('ms_credits', 'Removed @credits !creditsname from @user because of refund.',
+        array('@credits' => $credits, '@user' => $account->name, '!creditsname' => variable_get('ms_credits_name', 'Credits')));
+    }
+    else {
+      // Add the credits to the user's account
+      ms_credits_transaction($account->uid, $credits, t('Package Purchased.'), $order->oid, $created, $expiration);
+
+      drupal_set_message(t('@credits !creditsname have been added to your account.',
+        array('@credits' => $credits, '!creditsname' => variable_get('ms_credits_name', 'Credits'))));
+    }
+  }
+}
+
+/**
+ * Implements hook_ms_core_add_to_cart_form_alter().
+ *
+ * Here we replace the regular add to cart button with the special credits one if applicable
+ */
+function ms_credits_form_ms_core_add_to_cart_form_alter(&$form, &$form_state) {
+  // First, check if the user is logged in and the credits override is on
+  if (variable_get('ms_credits_override_add_to_cart_button', TRUE)) {
+    global $user;
+    $account = user_load($user->uid);
+    if ($account->uid) {
+      $product = $form_state['build_info']['args'][0];
+      $credits_amount = ms_credits_amount_to_credits($product->amount);
+      $balance = ms_credits_get_user_balance($account->uid);
+
+      // Change the button
+      if ($balance >= $credits_amount) {
+        $form['submit']['#value'] = t('Purchase for @credits !creditsname (Balance: @balance)',
+          array('@balance' => $balance, '@credits' => $credits_amount,
+            '!creditsname' => variable_get('ms_credits_name', 'Credits')));
+        $form['submit']['#attributes']['onclick'] = 'return confirm("'.
+          t('Are you sure you want to use @credits !creditsname to purchase this?',
+            array('@credits' => $credits_amount, '!creditsname' => variable_get('ms_credits_name', 'Credits'))) . '");';
+      }
+      else {
+        $form['submit']['#value'] = t('@credits !creditsname - Top Up',
+          array('@balance' => $balance, '@credits' => $credits_amount,
+            '!creditsname' => variable_get('ms_credits_name', 'Credits')));
+      }
+
+      // Change the submit function to our own
+      $form['#submit'] = array('ms_credits_add_to_cart_form_submit');
+    }
+  }
+}
+
+/**
+ * Submit handler for the add to cart form
+ *
+ * Creates the order, adds the product to it, process the credits payment and completes order
+ */
+function ms_credits_add_to_cart_form_submit($form, &$form_state) {
+  $product = $form_state['values']['product'];
+  global $user;
+  $account = user_load($user->uid);
+
+  // Do some checking to make sure the user has enough credits
+  $balance = ms_credits_get_user_balance($account->uid);
+  $credits_amount = ms_credits_amount_to_credits($product->amount);
+
+  // If the user doesn't have enough credits, show a top up message and redirect to the topup page
+  if ($balance < $credits_amount) {
+    drupal_set_message(t('Your balance is too low for this purchase. You need at least @num. Please purchase more !creditsname.',
+      array('@num' => $credits_amount, '!creditsname' => variable_get('ms_credits_name', 'Credits'))));
+    drupal_goto('ms_credits/purchase_package');
+  }
+
+  // Empty the cart first
+  ms_core_empty_cart();
+
+  // Add the product to the cart
+  // This is showing the message, but shouldn't
+  ms_core_add_cart_product($product, TRUE, FALSE);
+
+  // Convert to an order
+  $order = ms_core_cart_to_order();
+
+  // Remove the order adjustments
+  ms_core_remove_order_adjustments($order);
+
+  // Reload the order
+  $order = ms_core_order_load($order->oid);
+
+  // Process the payment
+  ms_credits_one_click_checkout($order);
+}

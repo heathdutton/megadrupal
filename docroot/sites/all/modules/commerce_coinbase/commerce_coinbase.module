@@ -1,0 +1,305 @@
+<?php
+
+/**
+ * @file
+ * Provides a Coinbase payment method for Drupal Commerce.
+ */
+
+/**
+ * Implements hook_libraries_info().
+ */
+function commerce_coinbase_libraries_info() {
+  $libraries['coinbase-php'] = array(
+    'name' => 'Coinbase PHP client library',
+    'vendor url' => 'https://coinbase.com',
+    'download url' => 'https://github.com/coinbase/coinbase-php',
+    'path' => 'lib',
+    'files' => array(
+      'php' => array('Coinbase.php'),
+    ),
+    'version arguments' => array(
+      'file' => 'composer.json',
+      'pattern' => '/([0-9\.]+)/',
+      'lines' => 20,
+    ),
+  );
+  return $libraries;
+}
+
+/**
+ * Implements hook_commerce_payment_method_info().
+ */
+function commerce_coinbase_commerce_payment_method_info() {
+  $payment_methods['coinbase'] = array(
+    'base' => 'commerce_coinbase',
+    'title' => t('Coinbase'),
+    'display_title' => t('Bitcoin'),
+    'short_title' => t('Bitcoin'),
+    'description' => t('Coinbase Bitcoin API'),
+    'terminal' => FALSE,
+    'offsite' => TRUE,
+    'offsite_autoredirect' => FALSE,
+    'file' => 'includes/commerce_coinbase.commerce_callbacks.inc',
+  );
+
+  return $payment_methods;
+}
+
+/**
+ * Implements hook_menu().
+ */
+function commerce_coinbase_menu() {
+  // Define an always accessible path to receive IPNs.
+  $items['coinbase/callback/%commerce_order/%commerce_payment_transaction/%'] = array(
+    'title' => 'Coinbase Callback',
+    'page callback' => 'commerce_coinbase_process_callback',
+    'page arguments' => array(2, 3),
+    'access callback' => 'commerce_coinbase_callback_access',
+    'access arguments' => array(3, 4),
+    'type' => MENU_CALLBACK,
+    'file' => 'includes/commerce_coinbase.coinbase_callback.inc',
+  );
+  // This is where user goes after clicking "Go Back" on payment redirect form.
+  $items['checkout/%commerce_order/commerce_coinbase/cancel_payment'] = array(
+    'title' => 'Cancel checkout payment',
+    'page callback' => 'commerce_coinbase_cancel_payment',
+    'page arguments' => array(1),
+    'access callback' => 'commerce_checkout_access',
+    'access arguments' => array(1),
+    'type' => MENU_CALLBACK,
+  );
+  return $items;
+}
+
+/**
+ * Menu access callback for Coinbase callbacks.
+ *
+ * @param object $transaction
+ *   Commerce payment transaction.
+ * @param string $secret
+ *   Random hash assumed to be associated with a transaction.
+ *
+ * @return bool
+ *   TRUE if callback secret is valid, FALSE otherwise.
+ */
+function commerce_coinbase_callback_access($transaction, $secret) {
+  return $transaction->data['secret'] == $secret;
+}
+
+/**
+ * Returns the default settings for the Coinbase payment method.
+ *
+ * @return array
+ *   Returns the default settings to populate the configuration form.
+ */
+function commerce_coinbase_default_settings() {
+  return array(
+    // An API key is required eventually for proper function.
+    'api_key' => '',
+    'api_secret' => '',
+    // Show text, icon, or both on payment choice page.
+    'checkout_display' => 'both',
+    'type' => 'buy_now',
+    'style' => 'large',
+    'text' => t('Pay With Bitcoin'),
+    // Options: hosted = hosted checkout; iframe = embedded on payment page.
+    'redirect_mode' => 'iframe',
+  );
+}
+
+/**
+ * Implements hook_cron().
+ *
+ * This is the only method by which transactions ever move to a success status
+ * because Coinbase will leave a transaction in a pending status for around
+ * ~6 confirmations on the blockchain before moving it to a complete state.
+ */
+function commerce_coinbase_cron() {
+  $result = db_select('commerce_payment_transaction', 'cpt')
+    ->fields('cpt', array('transaction_id', 'remote_id'))
+    ->condition('cpt.payment_method', 'coinbase')
+    ->condition('cpt.status', 'pending')
+    ->condition('cpt.remote_id', '', '<>')
+    ->condition('cpt.remote_status', 'pending')
+    ->addTag('commerce_coinbase_cron_pending')
+    ->execute();
+  if ($result) {
+    while ($row = $result->fetchAssoc()) {
+      $transaction = commerce_payment_transaction_load($row['transaction_id']);
+      commerce_coinbase_update_transaction($transaction, $row['remote_id']);
+    }
+  }
+}
+
+function commerce_coinbase_update_transaction($transaction, $remote_id) {
+  libraries_load('coinbase-php');
+
+  $payment_method = commerce_payment_method_instance_load($transaction->instance_id);
+  $key = $payment_method['settings']['api_key'];
+  $secret = $payment_method['settings']['api_secret'];
+  $coinbase_auth = new Coinbase_ApiKeyAuthentication($key, $secret);
+  $coinbase = new Coinbase($coinbase_auth);
+  $coinbase_transaction = $coinbase->getTransaction($remote_id);
+  if (is_object($coinbase_transaction)) {
+    switch ($coinbase_transaction->status) {
+      case 'complete':
+        $transaction->message = t('Transaction complete.');
+        $transaction->status = COMMERCE_PAYMENT_STATUS_SUCCESS;
+        break;
+      case 'pending':
+        break;
+      default:
+        watchdog('commerce_coinbase', 'Unknown status from Coinbase for transaction @id: @status.', array('@id' => $transaction->transaction_id, '@status' => $coinbase_transaction->status));
+        continue;
+    }
+  }
+  $transaction->remote_status = $coinbase_transaction->status;
+  $transaction->payload = $coinbase_transaction;
+  commerce_payment_transaction_save($transaction);
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function commerce_coinbase_form_commerce_checkout_form_alter(&$form, &$form_state) {
+  // If this checkout form contains the payment method radios.
+  if (!empty($form['commerce_payment']['payment_method']['#options'])) {
+    // Loop over its options array looking for a Bitcoin option.
+    foreach ($form['commerce_payment']['payment_method']['#options'] as $key => &$value) {
+      list($method_id, $rule_name) = explode('|', $key);
+
+      switch ($method_id) {
+        case 'coinbase':
+          // Prepare the replacement radio button text with icons.
+          $variables = array(
+            'path' => drupal_get_path('module', 'commerce_coinbase') . '/images/bitcoin.png',
+            'title' => t('Bitcoin accepted by Coinbase'),
+            'alt' => t('Bitcoin logo'),
+            'attributes' => array(
+              'class' => array('commerce-coinbase-icon'),
+            ),
+          );
+          $icons['bitcoin'] = theme('image', $variables);
+
+          $payment_method = commerce_payment_method_instance_load($key);
+
+          if (isset($payment_method['settings']['checkout_display'])) {
+            $value = '';
+            if (in_array($payment_method['settings']['checkout_display'], array('both', 'text'))) {
+              $value .= t('Bitcoin');
+            }
+            if (in_array($payment_method['settings']['checkout_display'], array('both', 'icon'))) {
+              $value .= '<span class="commerce-coinbase-icons">' . implode(' ', $icons) . '</span>';
+            }
+          }
+
+          // Add the CSS to place the icon after the radio button text.
+          $form['commerce_payment']['payment_method']['#attached']['css'][] = drupal_get_path('module', 'commerce_coinbase') . '/theme/commerce_coinbase.theme.css';
+
+          break;
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_commerce_checkout_pane_info_alter().
+ */
+function commerce_coinbase_commerce_checkout_pane_info_alter(&$checkout_panes) {
+  /*
+  When users try to click the "Complete checkout" button on the iframe payment
+  page, but the paid callback hasn't been received yet, there's a
+  drupal_set_message warning accompanied by "Off-site payment redirect".
+  This alter un-sets that redirect title so that it just shows the warning.
+  */
+  $checkout_panes['commerce_payment_redirect']['title'] = '';
+}
+
+/**
+ * Implements hook_commerce_checkout_page_info_alter().
+ */
+function commerce_coinbase_commerce_checkout_page_info_alter(&$checkout_pages) {
+  $checkout_pages['payment']['help'] = t('Use your Bitcoin client to send payment to the address on the invoice. Once the payment is acknowledged on the blockchain, you may proceed to complete checkout.');
+}
+
+/**
+ * Page callback for "Go Back" button on payment page.
+ *
+ * @param object $order
+ *   Commerce order object.
+ */
+function commerce_coinbase_cancel_payment($order) {
+  $order = commerce_order_status_update($order, 'checkout_review');
+  drupal_goto(commerce_checkout_order_uri($order));
+}
+
+/**
+ * Creates a payment transaction for the specified charge amount.
+ *
+ * @param array $payment_method
+ *   The payment method instance object used to charge this payment.
+ * @param object $order
+ *   The order object the payment applies to.
+ * @param array $charge
+ *   An array indicating the amount and currency code to charge.
+ */
+function commerce_coinbase_transaction($payment_method, $order, $charge) {
+  $transaction = commerce_payment_transaction_new('coinbase', $order->order_id);
+  $transaction->instance_id = $payment_method['instance_id'];
+  $transaction->remote_id = '';
+  $transaction->amount = $charge['amount'];
+  $transaction->currency_code = $charge['currency_code'];
+  $transaction->status = COMMERCE_PAYMENT_STATUS_PENDING;
+  $transaction->message = 'Initialized transaction';
+  $transaction->message_variables = array();
+  $transaction->data['secret'] = sha1(mt_rand() . uniqid());
+
+  commerce_payment_transaction_save($transaction);
+}
+
+/**
+ * Unauthenticated request for all the currencies supported by Coinbase.
+ *
+ * [["Afghan Afghani (AFN)","AFN"], ... ,["Zimbabwean Dollar (ZWL)","ZWL"]]
+ *
+ * @return array
+ *   List of currencies, with keys as names, and values as currency codes.
+ */
+function commerce_coinbase_currencies() {
+  $currencies_json = file_get_contents('https://coinbase.com/api/v1/currencies');
+  if ($currencies_json === FALSE) {
+    // Coinbase is having some connectivity issues.
+    return FALSE;
+  }
+
+  $currencies = json_decode($currencies_json, TRUE);
+  // Make it look more like the JSON format by stripping layers from the array.
+  foreach ($currencies as $element) {
+    $currency_weightloss[$element[0]] = $element[1];
+  }
+  return $currency_weightloss;
+}
+
+/**
+ * Unauthenticated request for the spot rate of a single currency.
+ *
+ * @param string $currency
+ *   (optional) Currency code to denominate the spot rate request.
+ *
+ * @return array
+ *   Two element array, keyed as amount and currency with corresponding values.
+ */
+function commerce_coinbase_spot_rate($currency = 'USD') {
+  if (empty($currency)) {
+    $spot_rate_json = file_get_contents('https://coinbase.com/api/v1/prices/spot_rate');
+  }
+  else {
+    $spot_rate_json = file_get_contents('https://coinbase.com/api/v1/prices/spot_rate?currency=' . $currency);
+  }
+  if ($spot_rate_json === FALSE) {
+    // Coinbase is having some connectivity issues.
+    return FALSE;
+  }
+
+  return json_decode($spot_rate_json, TRUE);
+}

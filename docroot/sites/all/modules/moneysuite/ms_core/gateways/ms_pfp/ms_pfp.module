@@ -1,0 +1,1374 @@
+<?php
+
+/**
+ * @file
+ * A module used for PayPal's PayFlow Pro gateway for MS Core.
+ *
+ * Original author: Leighton Whiting - Released under GENERAL PUBLIC LICENSE
+ * Current maintenance by multiple MoneySuite users.
+ * Re: new initiative: https://www.drupal.org/node/2315653 
+ */
+
+// Include our other files
+module_load_include('inc', 'ms_pfp', 'ms_pfp.utils');
+module_load_include('php', 'ms_pfp', 'PayflowProRecurring.class');
+
+// =========================================================
+// Cron
+// =========================================================
+/**
+ * Implements hook_cron().
+ */
+function ms_pfp_cron() {
+  // Sync every profile once per day.
+  // If the profile is canceled via manager.paypal.com it needs to be updated here.
+  // Only check it once every day
+  if (variable_get('ms_php_last_sync', 0) < (REQUEST_TIME - 86400)) {
+    variable_set('ms_php_last_sync', REQUEST_TIME);
+    ms_pfp_sync_profiles();
+  }
+}
+
+/**
+ * Checks if a user should be able to access the modify page
+ */
+function ms_pfp_modify_test($oid, $id) {
+  global $user;
+  $order = ms_core_order_load($oid);
+  if ($user->uid == $order->uid) {
+    return TRUE;
+  }
+  return FALSE;
+}
+
+/**
+ * Checks if a user should be able to access the cancel page
+ */
+function ms_pfp_cancel_test($oid) {
+  global $user;
+  $order = ms_core_order_load($oid);
+  if ($user->uid == $order->uid OR user_access('administer moneysuite orders')) {
+    return TRUE;
+  }
+  return FALSE;
+}
+
+/**
+ * Checks if a user should be able to access the checkout page
+ */
+function ms_pfp_checkout_access_test() {
+  return TRUE;
+}
+
+/**
+ * Make sure PayPal always has access to send IPNs.
+ */
+function ms_pfp_ipn_access() {
+  return TRUE;
+}
+
+/**
+ * Implements hook_menu().
+ */
+function ms_pfp_menu() {
+  $items['ms_pfp/ipn'] = array(
+    'page callback' => 'ms_pfp_ipn',
+    'access callback' => 'ms_pfp_ipn_access',
+    'type' => MENU_CALLBACK,
+  );
+  $items['ms_pfp/cancel/%'] = array(
+    'title' => 'Cancel Payments',
+    'page callback' => 'ms_pfp_cancel_page',
+    'page arguments' => array(2),
+    'access callback' => 'ms_pfp_cancel_test',
+    'access arguments' => array(2),
+    'type' => MENU_CALLBACK,
+  );
+  $items['ms_pfp/billing/%'] = array(
+    'title' => 'Update Billing Information',
+    'page callback' => 'ms_pfp_billing_page',
+    'page arguments' => array(2),
+    'access callback' => 'ms_pfp_cancel_test',
+    'access arguments' => array(2),
+    'type' => MENU_CALLBACK,
+  );
+  $items['ms_pfp/modify/%/%'] = array(
+    'title' => 'Modify Payments',
+    'page callback' => 'ms_pfp_modify_page',
+    'page arguments' => array(2, 3),
+    'access callback' => 'ms_pfp_modify_test',
+    'access arguments' => array(2, 3),
+    'type' => MENU_CALLBACK,
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_theme().
+ */
+function ms_pfp_theme($existing, $type, $theme, $path) {
+  return array(
+    'payflowpro_tender' => array(
+      'variables' => array('tender' => NULL, 'update_link' => NULL),
+    ),
+    'payflow_address' => array(
+      'variables' => array('title' => 'Address', 'address' => NULL),
+    ),
+  );
+}
+
+/**
+ * Admin Settings Form
+ */
+function ms_pfp_admin() {
+  $form['payflowpro_settings'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('PayFlow Pro settings'),
+  );
+  $form['payflowpro_settings']['ms_pfp_mode'] = array(
+    '#type' => 'radios',
+    '#title' => t('Transaction Mode'),
+    '#description' => t('Transactions are run through the test server by default. Adjust to live transactions when you are ready to start processing real payments.'),
+    '#default_value' => variable_get('ms_pfp_mode', 'test'),
+    '#required' => TRUE,
+    '#options' => array(
+      'test' => t('Test transactions'),
+      'live' => t('Live transactions'),
+    ),
+  );
+  $form['payflowpro_settings']['ms_pfp_payment_action'] = array(
+    '#type' => 'select',
+    '#title' => t('Payment action'),
+    '#required' => TRUE,
+    '#description' => t('Complete Sale will authorize and capture the funds at the time the payment is processed.<br>Authorization will only reserve funds on the card to be captured later through your PayFlow account.'),
+    '#options' => array(
+      'Sale' => t('Complete Sale'),
+      'Authorization' => t('Authorization'),
+    ),
+    '#default_value' => variable_get('ms_pfp_payment_action', 'Sale'),
+  );
+  $form['payflowpro_settings']['api'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('API Credentials'),
+    '#description' => t('PayFlow Pro account information (test this at manager.paypal.com)'),
+    '#collapsible' => TRUE,
+    '#collapsed' => FALSE,
+  );
+  $form['payflowpro_settings']['api']['ms_pfp_partner'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Partner'),
+    '#required' => TRUE,
+    '#default_value' => variable_get('ms_pfp_partner', 'PayPal'),
+    '#description' => t('The ID provided to you by the authorized PayPal Reseller who registered you for the Payflow Pro service.  If you purchased your account directly from PayPal, use PayPal.  Otherwise, it is typically Verisign.  This is case sensitive.'),
+  );
+  // PayFlow XMLPay Guide refers to this as vendor instead of merchant
+  $form['payflowpro_settings']['api']['ms_pfp_vendor'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Vendor'),
+    '#required' => TRUE,
+    '#default_value' => variable_get('ms_pfp_vendor', ''),
+    '#description' => t('The vendor name for the PayFlow service.'),
+  );
+  $form['payflowpro_settings']['api']['ms_pfp_user'] = array(
+    '#type' => 'textfield',
+    '#title' => t('User'),
+    '#required' => TRUE,
+    '#default_value' => variable_get('ms_pfp_user', ''),
+    '#description' => t('The user name for the PayFlow service (this is often the same as the Vendor name).'),
+  );
+  $form['payflowpro_settings']['api']['ms_pfp_password'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Password'),
+    '#required' => TRUE,
+    '#default_value' => variable_get('ms_pfp_password', ''),
+    '#description' => t('PayFlow password.'),
+  );
+
+
+  return $form;
+}
+
+// ======================================
+// MoneySuite Hooks
+// ======================================
+
+/**
+ * Implements hook_ms_core_payment_gateway().
+ */
+function ms_pfp_ms_core_payment_gateway() {
+  $gateways['ms_pfp'] = array(
+    'name' => 'Payflow Pro',
+    'display_name' => t('Credit Card'),
+    'description' => t('Pay with a credit card.'),
+    'module' => 'ms_pfp',
+    'cards' => array('visa', 'mc', 'discover', 'amex'),
+    'checkout_form' => 'ms_pfp_checkout_form',
+    'cancel_url' => 'ms_pfp_get_cancel_url',
+    //'modify_url' => 'ms_pfp_get_modify_url',
+    'billing_url' => 'ms_pfp_get_billing_url',
+    'settings' => ms_pfp_admin(),
+  );
+
+  return $gateways;
+}
+
+// =========================================================
+// Billing Info, Modification, and Cancellation Callbacks
+// =========================================================
+
+/**
+ * Get the Change Billing URL
+ */
+function ms_pfp_get_billing_url($order) {
+  return 'ms_pfp/billing/' . $order->oid;
+}
+
+/**
+ * Page Callback for the Billing Info page
+ */
+function ms_pfp_billing_page($oid) {
+  if ($order = ms_core_order_load($oid)) {
+    return drupal_get_form('ms_pfp_billing_page_form', $order);
+  }
+
+  return t('There was an error.');
+}
+
+/**
+ * Form to change the billing info
+ */
+function ms_pfp_billing_page_form($form, &$form_state, $order) {
+  $form['oid'] = array(
+    '#type' => 'value',
+    '#value' => $order->oid,
+  );
+
+  $payment_profile = ms_core_payment_profile_load_by_oid($order->oid);
+
+  $form['ms_pfp_card'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Credit Card Information'),
+    '#collapsible' => FALSE,
+    '#collapsed' => FALSE,
+    '#description' => t('Please enter the new billing information you would like to use.'),
+  );
+
+  // Credit Card Info
+  $form['ms_pfp_card']['cc_first_name'] = array(
+    '#type' => 'textfield',
+    '#title' => t('First Name'),
+    '#size' => 80,
+    '#maxlength' => 120,
+    '#required' => TRUE,
+    '#desription' => t('The First Name as it appears on the card.'),
+    '#default_value' => $payment_profile->first_name,
+  );
+  $form['ms_pfp_card']['cc_last_name'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Last Name'),
+    '#size' => 80,
+    '#maxlength' => 120,
+    '#required' => TRUE,
+    '#desription' => t('The Last Name as it appears on the card.'),
+    '#default_value' => $payment_profile->last_name,
+  );
+
+  $cards = array(
+    'visa' => 'Visa',
+    'mc' => 'MasterCard',
+    'amex' => 'American Express',
+    'discover' => 'Discover',
+    'diners' => 'Diners',
+    'jcb' => 'JCB',
+  );
+
+  $form['ms_pfp_card']['cc_type'] = array(
+    '#type' => 'select',
+    '#title' => t('Card Type'),
+    '#options' => $cards,
+    '#description' => t("Select the Card Type."),
+    '#default_value' => $payment_profile->cc_type,
+    '#required' => TRUE,
+  );
+  $form['ms_pfp_card']['cc_number'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Credit Card Number'),
+    '#size' => 40,
+    '#maxlength' => 20,
+    '#description' => t("The Credit Card Number. This is encrypted for your safety. You must enter the full card number if you are making any changes."),
+    '#required' => TRUE,
+    '#default_value' => $payment_profile->cc_num,
+  );
+  $form['ms_pfp_card']['cc_exp_month'] = array(
+    '#type' => 'select',
+    '#title' => t('Month'),
+    '#options' => ms_core_get_months(),
+    '#description' => t("The month this credit card expires."),
+    '#default_value' => str_pad($payment_profile->exp_month, 2, 0, STR_PAD_LEFT),
+    '#required' => TRUE,
+  );
+  $form['ms_pfp_card']['cc_exp_year'] = array(
+    '#type' => 'select',
+    '#title' => t('Year'),
+    '#options' => ms_core_get_years(),
+    '#description' => t("The year this credit card expires."),
+    '#default_value' => $payment_profile->exp_year,
+    '#required' => TRUE,
+  );
+  $form['ms_pfp_card']['cc_cvv'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Credit Card Verification Code'),
+    '#size' => 5,
+    '#maxlength' => 5,
+    '#description' => t("Enter the Credit Card Verification Code."),
+    '#required' => FALSE,
+  );
+
+  $form['ms_pfp_billing'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Billing Info'),
+    '#collapsible' => FALSE,
+    '#collapsed' => FALSE,
+  );
+
+  // Billing Info
+  $form['ms_pfp_billing']['billing_address1'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Address Line 1'),
+    '#size' => 80,
+    '#required' => TRUE,
+    '#default_value' => $payment_profile->address,
+  );
+  $form['ms_pfp_billing']['billing_city'] = array(
+    '#type' => 'textfield',
+    '#title' => t('City'),
+    '#size' => 40,
+    '#required' => TRUE,
+    '#default_value' => $payment_profile->city,
+  );
+  $form['ms_pfp_billing']['billing_state'] = array(
+    '#type' => 'textfield',
+    '#title' => t('State'),
+    '#size' => 40,
+    '#description' => t('Enter the 2 Letter Code for the State'),
+    '#required' => TRUE,
+    '#default_value' => $payment_profile->state,
+  );
+  $form['ms_pfp_billing']['billing_zip'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Zip Code'),
+    '#size' => 20,
+    '#required' => TRUE,
+    '#default_value' => $payment_profile->zip,
+  );
+  $form['ms_pfp_billing']['billing_country'] = array(
+    '#type' => 'select',
+    '#title' => t('Country'),
+    '#options' => ms_core_get_countries('iso'),
+    '#required' => TRUE,
+    '#default_value' => $payment_profile->country,
+  );
+  $form['ms_pfp_billing']['billing_phone'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Phone Number'),
+    '#size' => 40,
+    '#required' => FALSE,
+    '#default_value' => $payment_profile->phone,
+  );
+  $form['ms_pfp_billing']['billing_email'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Email'),
+    '#size' => 40,
+    '#required' => TRUE,
+    '#default_value' => $payment_profile->email,
+  );
+
+  $form['#validate'][] = 'ms_core_cc_form_validate';
+  $form['#validate'][] = 'ms_pfp_billing_page_form_validate';
+
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Save'),
+  );
+
+  return $form;
+}
+
+/**
+ * Validate the Info and Update the Profile
+ */
+function ms_pfp_billing_page_form_validate($form, &$form_state) {
+  $v = $form_state['values'];
+
+  $order = ms_core_order_load($v['oid']);
+
+  // Get the subscription_id from the order
+  $pid = ms_core_get_order_rec_id($order->oid);
+
+  // Load up the profile
+  $profile = new PayflowProRecurring($pid, _ms_pfp_get_auth());
+  $profile->refresh();
+
+  // Set up the items to modify (currently only CC info supported).
+  $profile->clearUpdate(); // Make sure nothing else gets changed.
+  $tender['Type'] = 'C';
+  $tender['CardNum'] = $v['cc_number'];
+  $tender['NameOnCard'] = $v['cc_first_name'] . ' ' . $v['cc_last_name'];
+  $tender['ExpDate'] = $v['cc_exp_year'] . sprintf('%02d', $v['cc_exp_month']);
+  $tender['CVNum'] = $v['cc_cvv'];
+  $profile->setTender($tender);
+
+  // Attempt to update remote data
+  if (!$profile->update()) {
+    // Failed
+    form_set_error('cc_number', t('Error: @message', array('@message' => $profile->getReturnMsg())));
+  } else {
+    // Success
+    drupal_set_message(t('Successfully changed your billing information.'));
+
+    $payment_profile = array(
+      'oid' => $order->oid,
+      'uid' => $order->uid,
+      'module' => 'ms_pfp',
+      'status' => 1,
+      'first_name' => $v['cc_first_name'],
+      'last_name' => $v['cc_last_name'],
+      'address' => $v['billing_address1'],
+      'city' => $v['billing_city'],
+      'state' => $v['billing_state'],
+      'zip' => $v['billing_zip'],
+      'country' => $v['billing_country'],
+      'phone' => $v['billing_phone'],
+      'email' => $v['billing_email'],
+      'fax' => '',
+      'cc_type' => $v['cc_type'],
+      'cc_num' => $v['cc_number'],
+      'exp_month' => $v['cc_exp_month'],
+      'exp_year' => $v['cc_exp_year'],
+    );
+    ms_core_payment_profile_save($payment_profile);
+
+    ms_core_add_history_item($order, 0, t('Payflow: CC into for recurring profile @pid updated.',
+      array('@pid' => $pid)));
+  }
+}
+
+/**
+ * Get the Cancellation URL for a recurring order
+ */
+function ms_pfp_get_cancel_url($order) {
+  return 'ms_pfp/cancel/' . $order->oid;
+}
+
+/**
+ * Initiate a cancellation
+ */
+function ms_pfp_cancel_page($oid) {
+  return drupal_get_form('ms_pfp_cancel_page_confirm', $oid);
+}
+
+/**
+ * Initiate a cancellation
+ */
+function ms_pfp_cancel_page_confirm($form, &$form_state, $oid) {
+  $order = ms_core_order_load($oid);
+  $form['#ms_core_oid'] = $order->oid;
+  return confirm_form($form, t('Are you sure you want to cancel your order?'), '', t('This action cannot be undone.'), t('Confirm'));
+}
+
+/**
+ * Form submission handler for ms_pfp_cancel_page_confirm().
+ */
+function ms_pfp_cancel_page_confirm_submit($form, &$form_state) {
+  $order = ms_core_order_load($form['#ms_core_oid']);
+
+  // Get the subscription_id from the order
+  $subscription_id = ms_core_get_order_rec_id($order->oid);
+
+  // Load up the profile
+  $profile = new PayflowProRecurring($subscription_id, _ms_pfp_get_auth());
+  $profile->refresh();
+
+  // Attempt to cancel the profile
+  if (!$profile->cancel()) {
+    // Failed to cancel
+    $message = $profile->getReturnMsg();
+    drupal_set_message(t('Unable to cancel your subscription at this time.  Error: @error_msg',
+      array('@error_msg' => $message)), 'error');
+
+    ms_core_add_history_item($order, 0, t('Payflow: Recurring profile @pid cancel error: @error_msg.',
+      array('@pid' => $subscription_id, '@error_msg' => $message)));
+    ms_core_log_error('ms_pfp', 'Payflow: Recurring profile @pid cancel error: @error_msg.',
+      array('@pid' => $subscription_id, '@error_msg' => $message));
+  } else {
+    // Success, Enter the rec_cancel payment
+    $payment = ms_core_new_payment($order->oid, 'ms_pfp', 'rec_cancel');
+
+    $payment->transaction = ms_core_new_transaction($profile);
+    $payment->currency = $order->currency;
+    $payment->recurring_id = $subscription_id;
+    $payment->billing_address = $order->billing_address;
+    $payment->shipping_address = $order->shipping_address;
+
+    ms_core_enter_payment($payment);
+
+    drupal_set_message(t('Your subscription has been canceled.'));
+
+    ms_core_add_history_item($order, 0, t('Payflow: Recurring profile @pid canceled.',
+      array('@pid' => $subscription_id)));
+  }
+}
+
+/**
+ * Get the Modification URL for a recurring order
+ */
+function ms_pfp_get_modify_url($order, $id) {
+  return 'ms_pfp/modify/' . $order->oid . '/' . $id;
+}
+
+/**
+ * Initiate a modification
+ */
+function ms_pfp_modify_page($oid, $id) {
+  // Enter a rec_cancel payment
+  $order = ms_core_order_load($oid);
+  $new_product = ms_core_load_module_product(ms_core_get_order_module($order), $id);
+
+  $data['new_product'] = $new_product;
+
+  $order = ms_core_add_data($order, $data);
+
+  // Get the subscription_id from the order
+  $profile_id = ms_core_get_order_rec_id($order->oid);
+  // @testme
+  $updates = array(
+    'TRXTYPE' => 'R',
+    'ACTION' => 'M',
+    'AMT' => round($new_product->recurring_schedule['main_amount'], 2),
+    'DESC' => ms_core_get_order_title($order, 127),
+    'PAYPERIOD' => ms_pfp_switch_unit($new_product->recurring_schedule['main_unit']),
+    'TERM' => $new_product->recurring_schedule['total_occurrences'],
+    'START' => date(DATE_ATOM),
+    'ORIGPROFILEID' => $profile_id,
+  );
+
+  $result = ms_pfp_recurring_update($order, $profile_id, $updates);
+
+  if ($result['success']) {
+    drupal_set_message(t('Your billing cycle has been modified. Thank you.'));
+
+    // Enter the rec_modify payment
+    $payment = ms_core_new_payment($order->oid, 'ms_pfp_dp', 'rec_modify');
+    $payment->transaction = $result['txn_id'];
+    $payment->recurring_id = $profile_id;
+    $payment->currency = $order->currency;
+    $payment->data = array('new_product' => $new_product);
+    $payment->billing_address = $order->billing_address;
+    $payment->shipping_address = $order->shipping_address;
+
+    ms_core_enter_payment($payment);
+
+    drupal_goto();
+  } else {
+    drupal_set_message(t('There was a problem modifying your billing cycle. The error has been logged. Please contact a site admin for further help.'));
+    // Log the error
+    ms_core_log_error('ms_pfp', 'There was a problem changing the recurring payments: @error',
+      array('@error' => $result['code'] . ' : ' . $result['message']));
+
+    drupal_goto();
+  }
+}
+
+function ms_pfp_recurring_update($order, $profile_id, $updates) {
+  $profile = new PayflowProRecurring($profile_id, _ms_pfp_get_auth());
+  $profile->refresh();
+
+  foreach ($updates as $key => $val) {
+    $profile->setUpdate($key, $val);
+  }
+
+  if ($profile->update()) {
+    $result = array(
+      'success' => TRUE,
+      'comment' => t('Updated Profile'),
+      'txn_id' => ms_core_generate_transaction_id(),
+      'message' => $profile->getReturnMsg(),
+      'code' => $profile->getReturnCode(),
+    );
+  } else {
+    $result = array(
+      'success' => FALSE,
+      'message' => $profile->getReturnMsg(),
+      'code' => $profile->getReturnCode(),
+    );
+  }
+
+  ms_core_add_history_item($order, 0, $profile->getReturnMsg(), TRUE);
+
+  return $result;
+}
+
+/********************************************************************
+ * Checkout Form
+ *******************************************************************/
+
+/**
+ * Builds the Checkout Form.
+ */
+function ms_pfp_checkout_form($form, $form_state, $order) {
+  $form = array();
+
+  $form['ms_order_contents'] = array(
+    '#type' => 'markup',
+    '#markup' => ms_core_get_order_details_table($order),
+  );
+
+  $cards = array(
+    'visa' => 'Visa',
+    'mc' => 'MasterCard',
+    'amex' => 'American Express',
+    'discover' => 'Discover',
+    'diners' => 'Diners',
+    'jcb' => 'JCB',
+  );
+
+  $allowed_cards = ms_core_get_cards($cards, variable_get('ms_pfp_allowed_cards', array('visa', 'mc', 'discover', 'amex', 'echeck', 'paypal')));
+
+  ms_core_get_cc_form($form, $order, $allowed_cards);
+
+  ms_core_get_billing_form($form, $order);
+
+  $form['ms_oid'] = array(
+    '#type' => 'value',
+    '#value' => $order->oid,
+  );
+
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Pay Now'),
+  );
+
+  $form['#validate'][] = 'ms_core_cc_form_validate';
+  $form['#validate'][] = 'ms_pfp_checkout_form_validate';
+
+  return $form;
+}
+
+/**
+ * Validate the Checkout Form, and Try to Charge the Card
+ */
+function ms_pfp_checkout_form_validate($form, &$form_state) {
+  $v = $form_state['values'];
+
+  if (form_get_errors()) {
+    return;
+  }
+
+  $order = ms_core_order_load($v['ms_oid']);
+
+  switch ($order->order_type) {
+    case 'recurring':
+      // Create a new recurring payment profile with paypal
+      $response = ms_pfp_setup_recurring_payment($order, $v, $order->recurring_schedule);
+
+      if (!empty($response['data']['response']['ExtData'])) {
+        foreach ($response['data']['response']['ExtData'] as $i => $obj) {
+          $response['data']['response']['ExtData'][$i] = (string)$obj;
+        }
+      }
+
+      if ($response['success']) {
+        // Add the payment to the order
+        $form_state['values']['ms_oid'] = $order->oid;
+        $form_state['values']['ms_order_charged'] = TRUE;
+
+        // Insert the rec_signup Payment to the database
+        $payment = ms_core_new_payment($order->oid, 'ms_pfp', 'rec_signup');
+        $payment->transaction = $response['txn_id'];
+        $payment->currency = $order->currency;
+        $payment->data = $response['data'];
+        $payment->amount = 0;
+        $payment->recurring_id = $response['data']['subscr_id'];
+
+        // Update the address
+        $payment->billing_address = array(
+          'street' => check_plain($v['billing_address1']),
+          'city' => check_plain($v['billing_city']),
+          'state' => check_plain($v['billing_state']),
+          'zip' => check_plain($v['billing_zip']),
+          'country' => check_plain($v['billing_country']),
+          'phone' => check_plain($v['billing_phone']),
+        );
+
+        // Update the contact details
+        $payment->first_name = check_plain($v['cc_first_name']);
+        $payment->last_name = check_plain($v['cc_last_name']);
+
+        // Add the Payment to the Order
+        $payment->amount = $response['amount'];
+        ms_core_enter_payment($payment);
+
+        // Reload the order to get the uid
+        $order = ms_core_order_load($order->oid);
+
+        $payment_profile = array(
+          'oid' => $order->oid,
+          'uid' => $order->uid,
+          'module' => 'ms_pfp',
+          'status' => 1,
+          'first_name' => $v['cc_first_name'],
+          'last_name' => $v['cc_last_name'],
+          'address' => $v['billing_address1'],
+          'city' => $v['billing_city'],
+          'state' => $v['billing_state'],
+          'zip' => $v['billing_zip'],
+          'country' => $v['billing_country'],
+          'phone' => $v['billing_phone'],
+          'email' => $v['billing_email'],
+          'fax' => '',
+          'cc_type' => $v['cc_type'],
+          'cc_num' => $v['cc_number'],
+          'exp_month' => $v['cc_exp_month'],
+          'exp_year' => $v['cc_exp_year'],
+        );
+        ms_core_payment_profile_save($payment_profile);
+
+        // Redirect
+        $form_state['redirect'] = 'ms/thankyou';
+      } else {
+        // Log the error
+        ms_core_log_error('ms_pfp', 'Error Setting up Recurring Payments: @message',
+          array('@message' => $response['message']));
+        form_set_error('cc_number', $response['message']);
+      }
+      break;
+
+    case 'cart':
+      // Just charge the card with direct payment
+      $response = ms_pfp_charge($order, $order->amount, $v);
+
+      if ($response['success'] == TRUE) {
+        // Insert the Payment to the database
+        $payment = ms_core_new_payment($order->oid, 'ms_pfp', 'cart');
+        $payment->transaction = $response['PNRef'];
+        $payment->amount = $response['amount'];
+        $payment->currency = $order->currency;
+        $payment->data = $response['data'];
+
+        // Update the address
+        $payment->billing_address = array(
+          'street' => trim($v['billing_address1']) . '\n' . trim($v['billing_address2']),
+          'city' => trim($v['billing_city']),
+          'state' => trim($v['billing_state']),
+          'zip' => trim($v['billing_zip']),
+          'country' => trim($v['billing_country']),
+          'phone' => trim($v['billing_phone']),
+        );
+
+        // Update the contact details
+        $payment->first_name = trim($v['cc_first_name']);
+        $payment->last_name = trim($v['cc_last_name']);
+
+        // Add the Payment to the Order
+        ms_core_enter_payment($payment);
+
+        // Save the values
+        $form_state['values']['ms_oid'] = $order->oid;
+        $form_state['values']['ms_order_charged'] = TRUE;
+
+        // Remove Me
+        // Reload the order to get the uid
+        $order = ms_core_order_load($order->oid);
+
+        $payment_profile = array(
+          'oid' => $order->oid,
+          'uid' => $order->uid,
+          'module' => 'ms_pfp',
+          'status' => 1,
+          'first_name' => $v['cc_first_name'],
+          'last_name' => $v['cc_last_name'],
+          'address' => $v['billing_address1'],
+          'city' => $v['billing_city'],
+          'state' => $v['billing_state'],
+          'zip' => $v['billing_zip'],
+          'country' => $v['billing_country'],
+          'phone' => $v['billing_phone'],
+          'email' => $v['billing_email'],
+          'fax' => '',
+          'cc_type' => $v['cc_type'],
+          'cc_num' => $v['cc_number'],
+          'exp_month' => $v['cc_exp_month'],
+          'exp_year' => $v['cc_exp_year'],
+        );
+        ms_core_payment_profile_save($payment_profile);
+      } else { // The Credit Card was not approved, set an error on the form
+        form_set_error('cc_number', t('Error: !error', array('!error' => $response['message'])));
+        ms_core_log_error('ms_pfp', 'Error Processing Direct Payment Form: !error Details: !details',
+          array('!error' => $response['message'], '!details' => ms_core_print_r($response)), WATCHDOG_WARNING);
+      }
+      break;
+  }
+}
+
+/**
+ * The card has been charged, mark the order as completed
+ */
+function ms_pfp_checkout_form_submit($form, &$form_state) {
+  $v = $form_state['values'];
+
+  // If the Order was charged, complete it
+  if (isset($v['ms_order_charged']) AND $v['ms_order_charged']) {
+    drupal_goto('ms/thankyou');
+  } else {
+    // There was an error...
+  }
+}
+
+// =========================================================
+// Charge Functions
+// =========================================================
+
+/**
+ * Charges a one-time payment through PFP
+ */
+function ms_pfp_charge($order, $amount, $data) {
+  // Check that all required functions exist
+  if (!_ms_pfp_check_requirements()) {
+    return array('success' => FALSE);
+  }
+
+  $request = _ms_pfp_cc_sale_xml($order, $amount, $data);
+  $response = _ms_pfp_submit_xml($request);
+
+  if (!$response) {
+    $result = array(
+      'success' => FALSE,
+      'message' => t('Received blank response from the PayFlow Pro gateway.'),
+      'data' => array('pfp_response' => $response),
+    );
+    return $result;
+  }
+
+  $txn_result_code = $response['Result'];
+  $txn_message = $response['Message'];
+
+  if ((int)$txn_result_code != 0) {
+    $data = array();
+    $data['pnref'] = check_plain((string)$response['PNRef']);
+    $data['authcode'] = check_plain((string)$response['AuthCode']);
+    $data['result'] = check_plain((string)$response['Result']);
+    $data['pfp_response'] = $response;
+
+    $result = array(
+      'success' => FALSE,
+      'message' => t('Credit card payment declined: @text', array('@text' => $txn_message)),
+      'data' => $data,
+    );
+  } else {
+    $x_approval_code = $response['AuthCode'];
+    $pnref = $response['PNRef'];
+    $data = array();
+    $data['pnref'] = check_plain((string)$response['PNRef']);
+    $data['authcode'] = check_plain((string)$response['AuthCode']);
+    $data['result'] = check_plain((string)$response['Result']);
+    $data['pfp_response'] = $response;
+    $result = array(
+      'success' => TRUE,
+      'amount' => $amount,
+      'PNRef' => $data['pnref'],
+      'message' => t('Credit card payment processed successfully with approval code @code and pnref @pnref.', array('@code' => $x_approval_code, '@pnref' => $pnref)),
+      'data' => $data,
+    );
+  }
+
+  return $result;
+}
+
+/**
+ * Set up a recurring payment
+ */
+function ms_pfp_setup_recurring_payment($order, $data, $recurring_schedule) {
+  // Make sure the user isn't using Days
+  if ($recurring_schedule['main_unit'] == 'D') {
+    return array(
+      'success' => FALSE,
+      'message' => t('You cannot use Days as the unit when using Payflow Pro. Please change the plan settings to Weekly or Monthly.'),
+      'data' => array(),
+    );
+  }
+
+  $profile = new PayflowProRecurring();
+  $profile->setAuth(_ms_pfp_get_auth());
+
+  // Call the create new function to set the object up to create a new profile.
+  $profile->createNew();
+  $profile->setName($order->order_key);
+
+  $profile->setBillTo(array(
+    'FirstName' => $data['cc_first_name'],
+    'LastName' => $data['cc_last_name'],
+    'Phone' => $data['billing_phone'],
+    'EMail' => $order->email_address,
+    'CustCode' => $order->uid,
+    'Street' => $data['billing_address1'],
+    'Street2' => $data['billing_address2'],
+    'City' => $data['billing_city'],
+    'State' => $data['billing_state'],
+    'Zip' => $data['billing_zip'],
+    'Country' => $data['billing_country'],
+  ));
+  if (isset($data['shipping_address1'])) {
+    $profile->setShipTo(array(
+      'FirstName' => $data['cc_first_name'],
+      'LastName' => $data['cc_last_name'],
+      'Phone' => $data['shipping_phone'],
+      'EMail' => $order->email_address,
+      'CustCode' => $order->uid,
+      'Street' => $data['shipping_address1'],
+      'Street2' => $data['shipping_address2'],
+      'City' => $data['shipping_city'],
+      'State' => $data['shipping_state'],
+      'Zip' => $data['shipping_zip'],
+      'Country' => $data['shipping_country'],
+    ));
+  }
+
+  $profile->setEmail($order->email_address);
+
+  // Tender
+  $tender['Type'] = 'C';
+  $tender['CardNum'] = $data['cc_number'];
+  $tender['NameOnCard'] = $data['cc_first_name'] . ' ' . $data['cc_last_name'];
+  $tender['ExpDate'] = $data['cc_exp_year'] . sprintf('%02d', $data['cc_exp_month']);
+  $tender['CVNum'] = $data['cc_cvv'];
+  $profile->setTender($tender);
+
+  // Terms
+  $profile->setAmt($recurring_schedule['main_amount']);
+  $amount = 0;
+
+  // Add Trial Period Settings
+  if ($order->recurring_schedule['has_trial']) {
+    // If there is a trial period, and if it isn't free, we set the optional amount to the trial amount
+    if ($recurring_schedule['trial_amount'] > 0) {
+      $amount = $recurring_schedule['trial_amount'];
+      $profile->setOptionalTransAmt($recurring_schedule['trial_amount']);
+    }
+
+    // Set the start_date to after the trial period ends
+    $start_date = strtotime("+1 " . ms_pfp_switch_unit_english($recurring_schedule['trial_unit']));
+  } else {
+    // Charge the initial amount first
+    $amount = $recurring_schedule['main_amount'];
+    $profile->setOptionalTransAmt($recurring_schedule['main_amount']);
+
+    // Set the start_date to after the first period ends
+    $start_date = strtotime("+1 " . ms_pfp_switch_unit_english($recurring_schedule['main_unit']));
+  }
+
+  $profile->setStartDate(format_date($start_date, 'custom', 'mdY'));
+  $profile->setTerm($recurring_schedule['total_occurrences']);
+  $profile->setPayPeriod(ms_pfp_switch_unit($recurring_schedule['main_unit']));
+
+  // Set the IPN url
+  $profile->setNotifyUrl(url('ms_pfp/ipn/' . $order->order_key, array('absolute' => TRUE)));
+
+  // Now we try to save the profile and see what the result is
+  $result = $profile->save();
+  $result = $result['RecurringProfileResult'];
+  //ms_core_debug($result);
+
+  // Place the profile result into our database
+  if ($result['Message'] == 'Approved') {
+    $message = t('Recurring payment processed successfully with profile ID @pfp_profile_id.', array(
+      '@pfp_profile_id' => $result['ProfileID'],
+    ));
+
+    $result = array(
+      'success' => TRUE,
+      'comment' => t('PayPal transaction ID: @transactionid', array('@transactionid' => $result['RPRef'])),
+      'message' => $message,
+      'amount' => $amount,
+      'txn_id' => $result['RPRef'],
+      'data' => array(
+        'txn_id' => $result['RPRef'],
+        'subscr_id' => $result['ProfileID'],
+        'response' => $result,
+      ),
+    );
+  } else {
+    $message = t('Recurring payment declined with error code @return_code (@message).', array(
+      '@return_code' => $result['Result'],
+      '@message' => $result['Message'],
+    ));
+
+    $result = array(
+      'success' => FALSE,
+      'message' => $message,
+      'data' => array(
+        'response' => $result,
+      ),
+    );
+  }
+
+  ms_core_add_history_item($order, 0, $message, TRUE);
+
+  return $result;
+}
+
+// Returns the auth information for PFP
+function _ms_pfp_get_auth() {
+  $auth = array();
+  $auth['vendor'] = variable_get('ms_pfp_vendor', '');
+  $auth['partner'] = variable_get('ms_pfp_partner', '');
+  $auth['user'] = variable_get('ms_pfp_user', '');
+  $auth['password'] = variable_get('ms_pfp_password', '');
+  return $auth;
+}
+
+/**
+ * Gets the correct name for the unit.
+ */
+function ms_pfp_switch_unit($unit) {
+  switch ($unit) {
+    case 'M':
+      return 'Monthly';
+    case 'S':
+      return 'Semi-monthly';
+    case 'W':
+      return 'Weekly';
+    case 'Y':
+      return 'Yearly';
+    default:
+      return $unit;
+  }
+}
+
+/**
+ * Gets the correct name for the unit
+ */
+function ms_pfp_switch_unit_english($unit) {
+  switch ($unit) {
+    case 'D':
+      return 'Days';
+    case 'M':
+      return 'Months';
+    case 'S':
+      return 'Semi-Months';
+    case 'W':
+      return 'Weeks';
+    case 'Y':
+      return 'Years';
+    default:
+      return $unit;
+  }
+}
+
+// =========================================================
+// XML Helper Functions
+// =========================================================
+
+// Submit request to PayFlow
+function _ms_pfp_submit_xml($xml, $mode = NULL) {
+  $xml = trim($xml);
+
+  // Info
+
+  $servers['test'] = 'https://pilot-payflowpro.paypal.com:443';
+  $servers['live'] = 'https://payflowpro.paypal.com:443';
+
+  if ($mode == null) {
+    $url = $servers[variable_get('ms_pfp_mode', 'test')];
+  } else {
+    $url = $servers[$mode];
+  }
+
+  $request_id = md5($xml . REQUEST_TIME);
+  $user_agent = 'Mozilla/4.0 (compatible; MSIE 5.01; Windows NT 5.0)';
+
+  $headers[] = "Content-Type: text/xml"; // either text/namevalue or text/xml
+  $headers[] = "X-VPS-Timeout: 30";
+  $headers[] = "X-VPS-VIT-OS-Name: Linux"; // Name of your Operating System (OS)
+  $headers[] = "X-VPS-VIT-OS-Version: RHEL 4"; // OS Version
+  $headers[] = "X-VPS-VIT-Client-Type: PHP/cURL"; // Language you are using
+  $headers[] = "X-VPS-VIT-Client-Version: 1.0"; // For your info
+  $headers[] = "X-VPS-VIT-Client-Architecture: x86"; // For your info
+  $headers[] = "X-VPS-VIT-Integration-Product: MS Core"; // For your info, would populate with application name
+  $headers[] = "X-VPS-VIT-Integration-Version: 2.0"; // Application version
+  $headers[] = "X-VPS-Request-ID: " . $request_id;
+
+  $ch = curl_init();
+
+  curl_setopt($ch, CURLOPT_URL, $url);
+  curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+  curl_setopt($ch, CURLOPT_USERAGENT, $user_agent);
+  curl_setopt($ch, CURLOPT_HEADER, FALSE);
+  curl_setopt($ch, CURLOPT_POST, TRUE);
+  curl_setopt($ch, CURLOPT_POSTFIELDS, $xml);
+  curl_setopt($ch, CURLOPT_RETURNTRANSFER, TRUE);
+
+  curl_setopt($ch, CURLOPT_FORBID_REUSE, TRUE);
+  curl_setopt($ch, CURLOPT_TIMEOUT, 10);
+  curl_setopt($ch, CURLOPT_FOLLOWLOCATION, FALSE);
+  curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, FALSE);
+
+  $curl_response = curl_exec($ch);
+
+  if (!$curl_response) {
+    ms_core_log_error('ms_pfp', 'Connecting to PayFlow server failed: %error', array('%error' => curl_error($ch)));
+  }
+
+  curl_close($ch);
+
+  if ($curl_response == '') {
+    $response = FALSE;
+  } else {
+    $xml_response = @simplexml_load_string($curl_response);
+    if ($xml_response === FALSE) {
+      // Response wasn't valid XML, some errors come back as strings.
+      ms_core_log_error('ms_pfp', 'PayFlow server returned a non-XML error: %error', array('%error' => $curl_response));
+      $response = FALSE;
+    } elseif (isset($xml_response->ResponseData->RecurringProfileResults)) {
+      $response = $xml_response->ResponseData->RecurringProfileResults;
+    } else {
+      $response = $xml_response->ResponseData->TransactionResults->TransactionResult;
+    }
+  }
+
+  return _ms_pfp_xml2array($response);
+}
+
+// Generates the common portion of the XML transaction request
+// Changed payflowpro_merchant to vendor
+function _ms_pfp_wrap_xml($transaction) {
+  $xml = '<?xml version="1.0" encoding="UTF-8"?' . '>
+<XMLPayRequest Timeout="30" version = "2.0" xmlns="http://www.paypal.com/XMLPay">
+  <RequestData>
+    <Vendor>' . check_plain(variable_get('ms_pfp_vendor', '')) . '</Vendor>
+    <Partner>' . check_plain(variable_get('ms_pfp_partner', '')) . '</Partner>
+    <Transactions>
+      <Transaction>
+' . $transaction . '
+      </Transaction>
+    </Transactions>
+  </RequestData>
+  <RequestAuth>
+    <UserPass>
+      <User>' . check_plain(variable_get('ms_pfp_user', '')) . '</User>
+      <Password>' . check_plain(variable_get('ms_pfp_password', '')) . '</Password>
+    </UserPass>
+  </RequestAuth>
+</XMLPayRequest>';
+
+  return $xml;
+}
+
+// Generate XML for Invoice section of request
+function _ms_pfp_invoice_xml($order, $amount, $data) {
+  $xml = '            <Invoice>
+              <InvNum>' . intval($order->oid) . '</InvNum>
+              <Comment>' . check_plain(ms_core_get_order_title($order, 100)) . '</Comment>
+              <BillTo>
+                <Name>' . trim(check_plain($data['cc_first_name'] . ' ' . $data['cc_last_name'])) . '</Name>
+                <Phone>' . check_plain($data['billing_phone']) . '</Phone>
+                <EMail>' . check_plain($order->email_address) . '</EMail>
+                <CustCode>' . $order->uid . '</CustCode>
+                <Address>
+                  <Street>' . trim(check_plain($data['billing_address1'])) . '</Street>
+                  <City>' . check_plain($data['billing_city']) . '</City>
+                  <State>' . check_plain($data['billing_state']) . '</State>
+                  <Zip>' . check_plain($data['billing_zip']) . '</Zip>
+                  <Country>' . check_plain($data['billing_country']) . '</Country>
+                </Address>
+              </BillTo>';
+
+  if (isset($data['shipping_address1'])) {
+    $xml .= '
+              <ShipTo>
+                <Name>' . trim(check_plain($data['cc_first_name'] . ' ' . $data['cc_last_name'])) . '</Name>
+                <Phone>' . check_plain($data['shipping_phone']) . '</Phone>
+                <EMail>' . check_plain($order->email_address) . '</EMail>
+                <Address>
+                  <Street>' . trim(check_plain($data['shipping_address1'])) . '</Street>
+                  <City>' . check_plain($data['shipping_city']) . '</City>
+                  <State>' . check_plain($data['shipping_state']) . '</State>
+                  <Zip>' . check_plain($data['shipping_zip']) . '</Zip>
+                  <Country>' . check_plain($data['shipping_country']) . '</Country>
+                </Address>
+              </ShipTo>
+              ';
+  }
+  $xml .= '
+              <TotalAmt>' . round($amount, 2) . '</TotalAmt>
+            </Invoice>';
+
+  return $xml;
+}
+
+// Generate XML for credit card sale
+function _ms_pfp_cc_sale_xml($order, $amount, $data) {
+  // Get payment action (Sale or Authorization)
+  $payment_action = variable_get('ms_pfp_payment_action', '');
+
+  $xml = '         <' . $payment_action . '>
+          <PayData>
+' . _ms_pfp_invoice_xml($order, $amount, $data) . '
+            <Tender>
+' . _ms_pfp_cc_info_xml($order, $data) . '
+            </Tender>
+          </PayData>
+        </' . $payment_action . '>';
+
+  return _ms_pfp_wrap_xml($xml);
+}
+
+// Generate a credit card XML
+function _ms_pfp_cc_info_xml($order, $data) {
+  $cc_exp_year = $data['cc_exp_year'];
+  $cc_exp_month = sprintf('%02d', $data['cc_exp_month']);
+
+  $cc_exp = $cc_exp_year . $cc_exp_month;
+
+  $xml = '
+              <Card>
+                <CardNum>' . check_plain($data['cc_number']) . '</CardNum>
+                <ExpDate>' . check_plain($cc_exp) . '</ExpDate>
+                <ExtData Name="FIRSTNAME" Value="' . check_plain($data['cc_first_name']) . '"></ExtData>
+                <ExtData Name="LASTNAME" Value="' . check_plain($data['cc_last_name']) . '"></ExtData>
+                <CVNum>' . check_plain($data['cc_cvv']) . '</CVNum>
+              </Card>
+        ';
+  return $xml;
+}
+
+// =========================================================
+// Helper Functions
+// =========================================================
+
+// check for required modules
+function _ms_pfp_check_requirements() {
+  $success = TRUE;
+
+  if (!function_exists('curl_init')) {
+    drupal_set_message(t('The PayFlow Pro service requires cURL. Please talk to your system administrator to get this configured.'));
+    $success = FALSE;
+  }
+
+  if (!function_exists('simplexml_load_string')) {
+    drupal_set_message(t('The PayFlow Pro service requires simpleXML. Please talk to your system administrator to get this configured.'));
+    $success = FALSE;
+  }
+
+  return $success;
+}
+
+/**
+ * Helper function to translate the xml object to an array
+ */
+function _ms_pfp_xml2array($xml_object, $out = array()) {
+  foreach ((array)$xml_object as $index => $node) {
+    $out[$index] = (is_object($node)) ? _ms_pfp_xml2array($node) : $node;
+  }
+
+  return $out;
+}
+
+/**
+ * Parses the return string into an array
+ */
+function ms_pfp_parse_payflow_string($str) {
+  $workstr = $str;
+  $out = array();
+
+  while (strlen($workstr) > 0) {
+    $loc = strpos($workstr, '=');
+    if ($loc === FALSE) {
+      // Truncate the rest of the string, it's not valid
+      $workstr = "";
+      continue;
+    }
+
+    $substr = substr($workstr, 0, $loc);
+    $workstr = substr($workstr, $loc + 1); // "+1" because we need to get rid of the "="
+
+    if (preg_match('^(\w+)\[(\d+)]$', $substr, $matches)) {
+      // This one has a length tag with it.  Read the number of characters
+      // specified by $matches[2].
+      $count = intval($matches[2]);
+
+      $out[$matches[1]] = substr($workstr, 0, $count);
+      $workstr = substr($workstr, $count + 1); // "+1" because we need to get rid of the "&"
+    } else {
+      // Read up to the next "&"
+      $count = strpos($workstr, '&');
+      if ($count === FALSE) { // No more "&"'s, read up to the end of the string
+        $out[$substr] = $workstr;
+        $workstr = "";
+      } else {
+        $out[$substr] = substr($workstr, 0, $count);
+        $workstr = substr($workstr, $count + 1); // "+1" because we need to get rid of the "&"
+      }
+    }
+  }
+
+  return $out;
+}
+
+/**
+ * Sync the profiles with the manager
+ */
+function ms_pfp_sync_profiles() {
+  $result = db_query("SELECT * FROM {ms_recurring_schedules} WHERE gateway = :gateway", array(':gateway' => 'ms_pfp'));
+  foreach ($result as $row) {
+    $order = ms_core_order_load($row->oid);
+    $pid = ms_core_get_order_rec_id($order->oid);
+    $profile = new PayflowProRecurring($pid, _ms_pfp_get_auth());
+    $profile->refresh();
+
+    $last_recorded_payment = ms_core_get_last_payment($order);
+    $last_payment = $profile->getLastPayment();
+
+    if ($profile->getStatus() == 'ACTIVE') {
+      // If a payment occurred, the pnref needs to be updated in the database.
+      // If we have recorded this payment already, just ignore it
+      if ($last_recorded_payment->transaction == $last_payment['PNREF']) {
+        continue;
+      }
+
+      // If a payment was made and it was successful, need to do some order processing.
+      if ($profile->getLastPaymentStatus() === 0) {
+        // Insert the Payment to the order
+        $payment = ms_core_new_payment($order->oid, $order->gateway, 'rec_payment');
+        $payment->transaction = $last_payment['PNREF'];
+        $payment->amount = $last_payment['Amount'];
+        $payment->currency = $order->currency;
+        $payment->recurring_id = $pid;
+        $payment->data = $last_payment;
+
+        // Update the address
+        $payment->billing_address = $order->billing_address;
+        $payment->shipping_address = $order->shipping_address;
+
+        ms_core_enter_payment($payment);
+      } else {
+        // We need to insert a failed payment
+        $payment = ms_core_new_payment($order->oid, $order->gateway, 'failed', 0, $order->currency);
+        $payment->transaction = $last_payment['PNREF'];
+        $payment->recurring_id = $pid;
+        $payment->data = $last_payment;
+        ms_core_enter_payment($payment);
+      }
+    } else {
+      // We need to cancel the order
+      $payment = ms_core_new_payment($order->oid, $order->gateway, 'rec_cancel', 0, $order->currency);
+      $payment->transaction = $last_payment['PNREF'];
+      $payment->recurring_id = $pid;
+      $payment->data = $last_payment;
+      ms_core_enter_payment($payment);
+    }
+
+    // There could potentially be a whole lot of rows to process, so clean up memory.
+    unset($order, $shell_order, $data, $profile, $row);
+  }
+}

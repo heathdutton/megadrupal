@@ -1,0 +1,250 @@
+<?php
+/**
+ * @file
+ * Adds the Brazilian Boleto payment method to Drupal Commerce.
+ */
+
+// Break it down into file blocks for better maintanance.
+include_once 'commerce_boleto.admin.config.form.inc';
+
+/**
+ * Implements hook_menu().
+ */
+function commerce_boleto_menu() {
+  $items = array();
+  // Print out the boleto.
+  $items['checkout/%commerce_order/payment/boleto/print'] = array(
+    'page callback' => 'commerce_boleto_print',
+    'page arguments' => array(1),
+    'access arguments' => array('access content'),
+    'type' => MENU_CALLBACK,
+    'file' => 'includes/commerce_boleto.print.inc',
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_commerce_payment_method_info().
+ */
+function commerce_boleto_commerce_payment_method_info() {
+  $payment_methods = array();
+
+  $payment_methods['boleto'] = array(
+    'base' => 'commerce_boleto',
+    'title' => t('Boleto'),
+    'short_title' => t('Boleto'),
+    'display_title' => t('Boleto'),
+    'description' => t('Boleto Payment Method.'),
+  );
+
+  return $payment_methods;
+}
+
+/**
+ * Payment method callback: checkout form.
+ */
+function commerce_boleto_submit_form($payment_method, $pane_values, $checkout_pane, $order) {
+  $bank_logos = array('none' => t('N/A'));
+  foreach ($payment_method['settings'] as $bank_plugin) {
+    if (is_array($bank_plugin) && isset($bank_plugin['enabled']) && $bank_plugin['enabled']) {
+      $bank_code = $bank_plugin['bank_code'];
+      $img_path = base_path() . libraries_get_path('boleto-lib') . '/bancos/' . $bank_code;
+
+      $bank_logos[$bank_code] = "<img src='$img_path/logo.jpg' alt='" . $bank_plugin['bank_name'] . "'/>";
+    }
+  }
+
+  $form = array();
+
+  $defaut_value = 'none';
+  if (count($bank_logos) == 2) {
+    // If there is only one option then it will be selected.
+    $defaut_value = $bank_code;
+  }
+
+  $form['carteiras'] = array(
+    '#type' => 'radios',
+    '#title' => t('Choose a bank'),
+    '#options' => $bank_logos,
+    '#default_value' => $defaut_value,
+    '#required' => TRUE,
+  );
+
+  return $form;
+}
+
+/**
+ * Payment method callback: checkout form validation.
+ */
+function commerce_boleto_submit_form_validate($payment_method, $pane_form, $pane_values, $order, $form_parents = array()) {
+  if ($pane_form['carteiras']['#value'] == 'none') {
+    form_set_error('carteiras', t('Please select a bank issuer for the Boleto payment method.'));
+    return FALSE;
+  }
+}
+
+/**
+ * Payment method callback: checkout form submission.
+ */
+function commerce_boleto_submit_form_submit($payment_method, $pane_form, $pane_values, $order, $charge) {
+  $bank_code = $pane_values['carteiras'];
+
+  $amount = $order->commerce_order_total['und'][0]['amount'] / 100;
+  $amount = number_format($amount, 2, '.', '');
+  
+  $arguments = array(
+    'bank_code' => $bank_code,
+    'nosso_numero' => $order->order_id,
+    'valor_boleto' => $amount,
+    'numero_documento' => $order->order_number,
+
+    // These fields can be changed through hook_boleto_alter().
+    'endereco1' => '',
+    'endereco2' => '',
+    'sacado' => '',
+  );
+
+  foreach ($payment_method['settings'] as $key => $value) {
+    $arguments[$key] = $value;
+  }
+
+  foreach ($payment_method['settings']["bank_$bank_code"]['settings'] as $key => $value) {
+    $arguments[$key] = $value;
+  }
+
+  $boleto = CommerceBoletoLib::load_boleto($arguments);
+  $boleto->settingsPropertySetter(array('file_location' => base_path() . libraries_get_path('boleto-lib')));
+
+  // Register any issue.
+  commerce_boleto_logWatchDog($boleto);
+
+  if (is_object($boleto)) {
+    // Prepare a transaction object.
+    $transaction = commerce_payment_transaction_new('boleto', $order->order_id);
+    $transaction->instance_id = $payment_method['instance_id'];
+    $transaction->amount = $charge['amount'];
+    $transaction->remote_id = $bank_code;
+    $transaction->status = COMMERCE_PAYMENT_STATUS_PENDING;
+
+    $boleto->output(FALSE);
+    $output = $boleto->outputPropertyGetter();
+
+    $transaction->message = t('Payment Code:') . '<br />' . $output['linha_digitavel'] . '<br />' .
+      t('Due on: @date', array('@date' => $output['data_vencimento']));
+
+    // Save the transaction.
+    commerce_payment_transaction_save($transaction);
+
+    $output['bank_code'] = $bank_code;
+    $order->data['commerce_boleto'] = serialize($output);
+  }
+  else {
+    drupal_set_message(t('We are terribly sorry but something went wrong.'), 'error');
+    return FALSE;
+  }
+}
+
+/**
+ * Log any warning issued by the Boleto Library PHP.
+ *
+ * @param object $boleto
+ *   The Boleto Library PHP object.
+ */
+function commerce_boleto_logWatchDog($boleto) {
+  if (!empty($boleto->warnings)) {
+    // Record it in the watch dog log.
+    foreach ($boleto->warnings as $error => $error_message) {
+      if (is_array($error_message)) {
+        foreach ($error_message as $error_delta_message) {
+          watchdog('boleto_library_php', '@error: @error_delta_message', array('@error' => $error, '@error_delta_message' => $error_delta_message), WATCHDOG_DEBUG);
+        }
+      }
+      else {
+        watchdog('boleto_library_php', '@error: @error_message', array('@error' => $error, '@error_message' => $error_message), WATCHDOG_DEBUG);
+      }
+    }
+
+    // Clear up the warning property.
+    $boleto->warnings = array();
+  }
+}
+
+/**
+ * Implements hook_entity_view().
+ *
+ * Add the boleto header on the Order View at the user page.
+ */
+function commerce_boleto_entity_view($entity, $type, $view_mode, $langcode) {
+  if ($type == 'commerce_order') {
+    if ($entity->status == 'pending' && $entity->data['payment_method'] == 'boleto|commerce_payment_boleto') {
+      $entity->content['commerce_boleto_header'] = array(
+        '#markup' => '<div class="commerce-boleto-header">' . commerce_boleto_make_header($entity) . '</div>',
+        '#weight' => -11,
+      );
+    }
+  }
+}
+
+/**
+ * Implements hook_commerce_checkout_pane_info_alter().
+ */
+function commerce_boleto_commerce_checkout_pane_info_alter(&$checkout_panes) {
+  $checkout_panes['checkout_completion_message'] += array(
+    'callbacks' => array('checkout_form' => 'commerce_boleto_completion_message_pane_checkout_form'),
+  );
+  // TODO: Remove boleto option when currency is not BRL.
+}
+
+
+/**
+ * Checkout pane callback: Wraps the completion message with a custom div.
+ */
+function commerce_boleto_completion_message_pane_checkout_form($form, &$form_state, $checkout_pane, $order) {
+  // Build the original message pane.
+  $pane_form = commerce_checkout_completion_message_pane_checkout_form($form, $form_state, $checkout_pane, $order);
+
+  if ($order->data['payment_method'] == 'boleto|commerce_payment_boleto') {
+    // Add and extra div.
+    $pane_form['commerce_boleto_header'] = array(
+      '#markup' => '<div class="commerce-boleto-header">' . commerce_boleto_make_header($order) . '</div>',
+      '#weight' => -10,
+    );
+  }
+  return $pane_form;
+}
+
+/**
+ * Helper function for building the Boleto Header.
+ *
+ * @param Object $order
+ *   The Order Object.
+ *
+ * @return String
+ *   The html header.
+ */
+function commerce_boleto_make_header($order) {
+  $output = unserialize($order->data['commerce_boleto']);
+  $print_path = base_path() . 'checkout/' . $order->order_id . '/payment/boleto/print';
+
+  $header = '<p><h2>' . t('Boleto Code payment via Internet Banking:') . '</h2><h3> <b>' . $output['linha_digitavel'] . '</b></h3></p>' .
+            '<p>' . t('Due on: @date', array('@date' => $output['data_vencimento'])) . '</p>';
+
+  $settings = array(
+    'print_path' => $print_path,
+  );
+  drupal_add_js(array('commerce_boleto' => $settings), 'setting');
+  drupal_add_js(drupal_get_path('module', 'commerce_boleto') . '/print_boleto.js', 'file');
+
+  $form = array();
+  $form['print_boleto'] = array(
+    '#type' => 'button',
+    '#value' => t('Print Out Boleto'),
+    '#attributes' => array('onclick' => 'print_boleto()'),
+  );
+
+  $header .= render($form);
+
+  return $header;
+}
+

@@ -1,0 +1,472 @@
+<?php
+/**
+ * @file
+ * Internal nodes
+ *
+ * Creates a permission per content type which when disabled denies node view
+ * to the specified role.
+ * Adds an option to content type edit forms for administrators to select the
+ * result of a direct node view.
+ * Node view options are Allow, Access Denied, Not Found, and Redirect.
+ * Redirect URL/path can use tokens, an anchors or get variables.
+ * "Denied action setting per-node" in content type settings. Node default is
+ * to use content type default.
+ * hook_url_outbound_alter() implementation to rewrite URLs of denied nodes
+ * to the redirect URL.
+ * Simpletests for content type settings, node settings, and
+ * hook_url_outbound_alter().
+ */
+
+/**
+ * 200 - File found
+ */
+define('INTERNAL_NODES_FOUND', 200);
+
+/**
+ * 403 - Access denied
+ */
+define('INTERNAL_NODES_ACCESS_DENIED', 403);
+
+/**
+ * 404 - File not found
+ */
+define('INTERNAL_NODES_NOT_FOUND', 404);
+
+/**
+ * 301 - Redirect
+ */
+define('INTERNAL_NODES_REDIRECT', 301);
+
+/**
+ * Lists the available view denied actions.
+ */
+function internal_nodes_get_actions() {
+  return array(
+    INTERNAL_NODES_FOUND => t('Allow'),
+    INTERNAL_NODES_ACCESS_DENIED => t('Access denied - 403'),
+    INTERNAL_NODES_NOT_FOUND => t('Not Found - 404'),
+    INTERNAL_NODES_REDIRECT => t('Redirect - 301')
+  );
+}
+
+/**
+ * Implements hook_permission().
+ */
+function internal_nodes_permission() {
+  // Add the admin perm.
+  $perms = array(
+    'administer internal nodes' => array(
+      'title' => t('Administer Internal nodes'),
+      'description' => t('Perform administration tasks for Internal nodes.'),
+    ),
+    'blocked node status' => array(
+      'title' => t('Blocked node status'),
+      'description' => t('View status messages for blocked nodes.'),
+    ),
+  );
+  // Add perms for each content type
+  $types = node_type_get_types();
+  $names = node_type_get_names();
+  foreach ($names as $key => $name) {
+    $type = $types[$key];
+    $url = 'admin/structure/types/manage/' . str_replace('_', '-', $key);
+    $options['fragment'] = 'edit-internal-nodes';
+    $perms['access ' . $key . ' node view'] = array(
+      'title' => t('Access !name node view', array('!name' => l($name, $url, $options))),
+      //'description' => t('Access node view for ' . $name . ' nodes.'),
+    );
+  }
+  return $perms;
+}
+
+/**
+ * Implements hook_menu().
+ */
+function internal_nodes_menu() {
+  $items = array();
+  $items['admin/config/search/internal-nodes'] = array(
+    'title' => 'Internal nodes',
+    'description' => 'Configure global settings for Internal nodes.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('internal_nodes_admin_form'),
+    'access arguments' => array('administer internal nodes'),
+    'file' => 'internal_nodes.admin.inc',
+  );
+  return $items;
+}
+
+/**
+ * Implements hook_menu_get_item_alter().
+ */
+function internal_nodes_menu_get_item_alter(&$router_item, $path, $original_map) {
+  // If loading a node.
+  if ($router_item['path'] == 'node/%') {
+    $nid = arg(1);
+    // If node exists.
+    if ($node = node_load($nid)) {
+      // If action is 404.
+      if ($node->internal_nodes['action'] == INTERNAL_NODES_NOT_FOUND) {
+        // If user doesn't have access.
+        if (!user_access('access ' . $node->type . ' node view')) {
+          // Change the load function - this makes Drupal really think the node doesn't exist.
+          $router_item['load_functions'] = serialize(array(1 => 'internal_nodes_force_404'));
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Callback returns FALSE to simulate not being able to load the argument to node/%.
+ */
+function internal_nodes_force_404($node, $cid = NULL) {
+  if (module_exists('rules')) {
+    rules_invoke_event('internal_nodes_denied', $node);
+  }
+  return FALSE;
+}
+
+/**
+ * Implements hook_node_access().
+ *
+ * Could/should this functionality be implemented in internal_nodes_force_404()?
+ */
+function internal_nodes_node_access($node, $op, $account) {
+  if ($op == 'view') {
+    // Check if user doesn't have access and we are viewing the node view alone.
+    if (!user_access('access ' . $node->type . ' node view', $account) &&
+        arg(0) == 'node' && arg(1) == $node->nid) {
+      // If user has permission to edit node AND arg(2) == 'edit', allow access
+      // Note: node_access() use would cause an infinite loop.
+      if ((user_access('edit own ' . $node->type . ' content', $account) ||
+          user_access('edit any ' . $node->type . ' content', $account)) &&
+          arg(2) == 'edit') {
+        return NODE_ACCESS_IGNORE;
+      }
+      // If user has permission to delete node AND arg(2) == 'delete', allow access
+      if ((user_access('delete own ' . $node->type . ' content', $account) ||
+          user_access('delete any ' . $node->type . ' content', $account)) &&
+          arg(2) == 'delete') {
+        return NODE_ACCESS_IGNORE;
+      }
+
+      // Check the action
+      switch ($node->internal_nodes['action']) {
+        case INTERNAL_NODES_ACCESS_DENIED:
+          if (module_exists('rules')) {
+            rules_invoke_event('internal_nodes_denied', $node);
+          }
+          // Access denied
+          return NODE_ACCESS_DENY;
+        case INTERNAL_NODES_REDIRECT:
+          if (module_exists('rules')) {
+            rules_invoke_event('internal_nodes_denied', $node);
+          }
+          // Redirect
+          $redirect = internal_nodes_create_redirect($node->internal_nodes['url'], $node);
+
+          drupal_goto($redirect['path'], $redirect['options'], 301);
+          break;
+        default:
+          break;
+      }
+    }
+  }
+  return NODE_ACCESS_IGNORE;
+}
+
+/**
+ * Implements hook_url_outbound_alter().
+ *
+ * Disabled by default in the configuration: admin/config/search/internal-nodes
+ * This function is called many times per page, so I've tried to make it as
+ * efficient as possible. Multiple if statements are ordered to reduce overall cpu
+ * cycles for most use cases.
+ */
+function internal_nodes_url_outbound_alter(&$path, &$options, $original_path) {
+  //If function is enabled.
+  if (variable_get('internal_nodes_outbound_alter', 0)) {
+    //If path is for a node.
+    if (preg_match('|^node/([0-9]+)$|', $path, $matches)) {
+      global $user;
+      // No node_load here! Note: Specifically don't want db_rewrite_sql() here.
+      $result = db_query('SELECT type FROM {node} n WHERE nid = :nid', array(':nid' => $matches[1]))->fetchAssoc();
+      // If enabled for content type, and user doesn't have access.
+      if (variable_get('internal_nodes_outbound_alter_' . $result['type'], 0)
+          && !user_access('access ' . $result['type'] . ' node view', $user)) {
+        // I'd rather not run node_load at all, but tokens can't work without it.
+        $node = node_load($matches[1]);
+        if ($node->internal_nodes['action'] == INTERNAL_NODES_REDIRECT) {
+          $redirect = internal_nodes_create_redirect($node->internal_nodes['url'], $node);
+          $path = $redirect['path'];
+          $options = array_merge($options, $redirect['options']);
+          $options['alias'] = TRUE; // Lies! Otherwise the path will get "fixed" to the URL alias.
+        }
+        // If not 301, do nothing.
+        return;
+      }
+    }
+  }
+}
+
+/**
+ * Converts a URL with tokens, into a format url() will accept.
+ */
+function internal_nodes_create_redirect($url, $node) {
+  $url = token_replace($url, array('node' => $node), array('sanitize' => FALSE));
+
+  // Build url() options using parse_url(); works well enough on relative URLs.
+  $options = array();
+  $url = parse_url($url);
+  if (isset($url['query'])) {
+    parse_str($url['query'], $options['query']);
+  }
+  if (isset($url['fragment'])) {
+    $options['fragment'] = $url['fragment'];
+  }
+
+  // TODO: Is there a more efficient method?
+  $path = isset($url['scheme']) ? $url['scheme'] . '://' : '';
+  $path .= isset($url['user']) ? $url['user'] : '';
+  $path .= isset($url['password']) ? ':' . $url['password'] . '@' : '';
+  $path .= isset($url['host']) ? $url['host'] : '';
+  $path .= isset($url['path']) ? $url['path'] : '';
+
+  return array(
+    'path' => $path,
+    'options' => $options,
+  );
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter() for the node type form.
+ */
+function internal_nodes_form_node_type_form_alter(&$form, &$form_state, $form_id) {
+  $options['action'] = variable_get('internal_nodes_action_' . $form['#node_type']->type, INTERNAL_NODES_FOUND);
+  $options['url'] = variable_get('internal_nodes_url_' . $form['#node_type']->type, '');
+  internal_nodes_add_action($form, $form_state, $form_id, $options);
+
+  // Now $form['internal_nodes'] exists, add the per-node option
+  $form['internal_nodes']['internal_nodes_nodes'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Enable per-node settings'),
+    '#description' => t('Add <em>View action</em> and <em>301 - Redirect destination</em> settings to each node of this content type. Nodes default to the content type\'s <em>View action</em> setting.'),
+    '#default_value' => variable_get('internal_nodes_nodes_' . $form['#node_type']->type, 0),
+  );
+  // If outbound is enabled.
+  if (variable_get('internal_nodes_outbound_alter', 0)) {
+    // If enabled, and redirect is selected.
+    $form['internal_nodes']['internal_nodes_outbound_alter'] = array(
+      '#type' => 'checkbox',
+      '#title' => t('Rewrite redirected nodes URLs to the redirect URL'),
+      '#description' => t('Drupal generated URLs to redirected nodes of this content type will be rewritten to the redirect URL. <em>Warning: hook_url_outbound_alter() is called many times per page; only enable if the functionality required.</em>'),
+      '#default_value' => variable_get('internal_nodes_outbound_alter_' . $form['#node_type']->type, 0),
+    );
+  }
+}
+
+/**
+ * Adds the action and redirect fields.
+ *
+ * Used by node type edit and node edit forms.
+ */
+function internal_nodes_add_action(&$form, &$form_state, $form_id, $options) {
+  $form['internal_nodes'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Internal Nodes settings'),
+    '#access' => user_access('administer internal nodes'),
+    '#weight' => 50,
+    '#collapsible' => TRUE,
+    '#collapsed' => TRUE,
+    '#group' => 'additional_settings',
+    '#attached' => array(
+      'js' => array(
+        'internal-nodes' => drupal_get_path('module', 'internal_nodes') . '/internal_nodes.js',
+      ),
+    ),
+  );
+
+  $form['internal_nodes']['internal_nodes_action'] = array(
+    '#type' => 'radios',
+    '#title' => t('View action'),
+    '#description' => t('The action to take when node is view is attempted. <em>Allow</em> is default functionality.'),
+    '#default_value' => $options['action'],
+    '#options' => internal_nodes_get_actions(),
+  );
+  $form['internal_nodes']['internal_nodes_url'] = array(
+    '#type' => 'textfield',
+    '#title' => t('301 - Redirect destination'),
+    '#description' => t('The destination path or url when node view is specifically 301 denied. [token] notation, and GET (?), and anchor (#) are allowed.'),
+    '#default_value' => $options['url'],
+  );
+  // Display the list of available placeholders if token module is installed.
+  if (module_exists('token')) {
+    $form['internal_nodes']['token_help'] = array(
+      '#theme' => 'token_tree',
+      '#token_types' => array('node'),
+    );
+  }
+}
+
+/**
+ * Implements hook_node_type_delete().
+ */
+function internal_nodes_node_type_delete($info) {
+  // Delete type specific settings.
+  variable_del('internal_nodes_action_' . $info->type);
+  variable_del('internal_nodes_url_' . $info->type);
+  variable_del('internal_nodes_nodes_' . $info->type);
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter() for the node form.
+ */
+function internal_nodes_form_node_form_alter(&$form, &$form_state, $form_id) {
+  // If per-node settings enabled.
+  if (variable_get('internal_nodes_nodes_' . $form['type']['#value'], 0)) {
+    $options['action'] = $form['#node']->internal_nodes['action'];
+    $options['url'] = $form['#node']->internal_nodes['url'];
+    internal_nodes_add_action($form, $form_state, $form_id, $options);
+
+    $actions = internal_nodes_get_actions();
+    $type_action = variable_get('internal_nodes_action_' . $form['type']['#value'], INTERNAL_NODES_FOUND);
+    // Less code to change/add the node specific default setting now.
+    $form['internal_nodes']['internal_nodes_action']['#options'] = array(
+      0 => t('Content type default: !default', array('!default' => $actions[$type_action]))
+      ) + $actions;
+  }
+}
+
+/**
+ * Implements hook_node_submit().
+ */
+function internal_nodes_node_submit($node, $form, &$form_state) {
+  if (variable_get('internal_nodes_nodes_' . $node->type, 0)) {
+    // Move the new data into the node object.
+    $fv = $form_state['values'];
+    $node->internal_nodes['action'] = $fv['internal_nodes_action'];
+    $node->internal_nodes['url'] = isset($fv['internal_nodes_url']) ? $fv['internal_nodes_url'] : '';
+  }
+}
+
+/**
+ * Implements hook_node_prepare().
+ */
+function internal_nodes_node_prepare($node) {
+  if (variable_get('internal_nodes_nodes_' . $node->type, 0)) {
+    if (empty($node->internal_nodes) || $node->internal_nodes['source'] == 'content_type') {
+      // Set default values.
+      // Only happens when editing a node, or if node settings came from content type.
+      $node->internal_nodes = array(
+        'action' => 0,
+        'url' => variable_get('internal_nodes_url_' . $node->type, ''),
+      );
+    }
+  }
+}
+
+/**
+ * Implements hook_node_load().
+ */
+function internal_nodes_node_load($nodes, $types) {
+
+  // Get the per-node settings if a relevant bundle is set to allow per-node
+  $result = array();
+  foreach ($nodes as $node) {
+    if (variable_get('internal_nodes_nodes_' . $node->type, 0)) {
+      $result = db_query('SELECT * FROM {internal_nodes} WHERE nid IN(:nids)', array(':nids' => array_keys($nodes)))->fetchAllAssoc('nid');
+      break;
+    }
+  }
+
+  foreach ($nodes as &$node) {
+    // If action exists in the result
+    if (isset($result[$node->nid]->action) && $result[$node->nid]->action != 0) {
+      $node->internal_nodes['source'] = 'node';
+      $node->internal_nodes['action'] = $result[$node->nid]->action;
+      $node->internal_nodes['url'] = $result[$node->nid]->url;
+    }
+    else {
+      // Action not in results, use content type settings
+      $node->internal_nodes['source'] = 'content_type';
+      $node->internal_nodes['action'] = variable_get('internal_nodes_action_' . $node->type, INTERNAL_NODES_FOUND);
+      $node->internal_nodes['url'] = variable_get('internal_nodes_url_' . $node->type, '');
+    }
+  }
+}
+
+
+/**
+ * Implements hook_node_insert().
+ */
+function internal_nodes_node_insert($node) {
+  if (variable_get('internal_nodes_nodes_' . $node->type, 0)) {
+    db_insert('internal_nodes')
+      ->fields(array(
+        'nid' => $node->nid,
+        'action' => $node->internal_nodes['action'],
+        'url' => $node->internal_nodes['url'],
+      ))
+      ->execute();
+  }
+}
+
+/**
+ * Implements hook_node_update().
+ */
+function internal_nodes_node_update($node) {
+  if (variable_get('internal_nodes_nodes_' . $node->type, 0)) {
+    // If data exists
+    if (db_select('internal_nodes', 'd')->fields('d')->condition('nid', $node->nid, '=')->execute()->fetchAssoc()) {
+      db_update('internal_nodes')
+        ->fields(array('action' => $node->internal_nodes['action'], 'url' => $node->internal_nodes['url']))
+        ->condition('nid', $node->nid)
+        ->execute();
+    }
+    else {
+      // Cleaner than doing it again.
+      internal_nodes_node_insert($node);
+    }
+  }
+}
+
+/**
+ * Implements hook_node_delete().
+ */
+function internal_nodes_node_delete($node) {
+  db_delete('internal_nodes')
+    ->condition('nid', $node->nid)
+    ->execute();
+}
+
+/**
+ * Process variables for node.tpl.php
+ */
+function internal_nodes_preprocess_node(&$variables) {
+  $node = $variables['node'];
+  if (isset($node->internal_nodes)) {
+    $action = $node->internal_nodes['action'];
+    // If node would be denied, assuming user has access.
+    if ($action != INTERNAL_NODES_FOUND) {
+      // Apply class showing node would be denied
+      $variables['classes_array'][] = 'internal-node';
+    }
+  }
+}
+
+/**
+ * Implements hook_node_view().
+ */
+function internal_nodes_node_view($node, $view_mode, $langcode) {
+  if (user_access('blocked node status')) {
+    $action = $node->internal_nodes['action'];
+    // If node view would be blocked, show status message
+
+    if (($action != INTERNAL_NODES_FOUND)
+      && arg(0) == 'node' && arg(1) == $node->nid && arg(2) == FALSE) {
+        $actions = internal_nodes_get_actions();
+        // $actions is already sanitized.
+        drupal_set_message(t('!action - Node view blocked.', array('!action' => $actions[$action])), 'status', FALSE);
+    }
+  }
+}

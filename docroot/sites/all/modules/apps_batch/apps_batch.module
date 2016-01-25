@@ -1,0 +1,284 @@
+<?php
+
+/**
+ * Implements hook_menu_alter().
+ */
+function apps_batch_menu_alter(&$items) {
+  //Override default app enable callback
+  $items['admin/apps/development/app/%/enable']['page callback'] = 'apps_batch_enable_wrapper';
+}
+
+/**
+ * Wrapper for app enable
+ */
+function apps_batch_enable_wrapper($server_name, $app_name) {
+  $app = features_get_features($app_name);
+  //handle features app enabling
+  if ($server_name == 'development' && !empty($app)) {
+    apps_batch_enable_app($server_name, $app_name);
+  } else {
+    apps_app_enable($server_name, $app_name);
+  }
+}
+
+/**
+ * Enable app batch
+ */
+function apps_batch_enable_app($server_name, $app_name) {
+  $dependencies = _apps_batch_get_dependencies(array($app_name));
+  $components = _apps_batch_get_components($dependencies);
+  $callbacks = _apps_batch_get_post_cbs($server_name, $dependencies);
+
+  $batch = array(
+    'finished' => '_enable_app_batch_finished',
+    'title' => t('Processing'),
+    // We use a single multi-pass operation, so the default
+    // 'Remaining x of y operations' message will be confusing here.
+    'progress_message' => '',
+    'error_message' => t('The enable process has encountered an error.'),
+    'file' => drupal_get_path('module', 'apps_batch') . '/apps_batch.page.inc',
+  );
+  $batch['operations'][] = array('_enable_dependencies_batch_operation', array($dependencies));
+  if (!empty($components)) {
+    $batch['operations'][] = array('_enable_components_batch_operation', array($components));
+  }
+  $batch['operations'][] = array('_execute_callbacks_batch_operation', array($callbacks));
+
+  batch_set($batch);
+  batch_process('admin/apps/development/app/' . $app_name);
+}
+
+/**
+ * Get app dependencies
+ */
+function _apps_batch_get_dependencies($modules) {
+  //curent modules data
+  $module_data = system_rebuild_module_data();
+
+  $module_list = array_flip(array_values($modules));
+
+  while (list($module) = each($module_list)) {
+    if (!isset($module_data[$module])) {
+      // This module is not found in the filesystem, abort.
+      return false;
+    }
+    if ($module_data[$module]->status) {
+      // Skip already enabled modules.
+      unset($module_list[$module]);
+      continue;
+    }
+    $module_list[$module] = $module_data[$module]->sort;
+
+    // Add dependencies to the list, with a placeholder weight.
+    // The new modules will be processed as the while loop continues.
+    foreach (array_keys($module_data[$module]->requires) as $dependency) {
+      if (!isset($module_list[$dependency])) {
+        $module_list[$dependency] = 0;
+      }
+    }
+  }
+  arsort($module_list);
+  return array_keys($module_list);
+}
+
+/**
+ * Get app components
+ */
+function _apps_batch_get_components($modules) {
+  $components = array();
+  foreach ($modules as $module) {
+    $feature = features_load_feature($module);
+    if ($feature) {
+      $components[$module] = array_keys($feature->info['features']);
+    }
+  }
+  return $components;
+}
+
+/**
+ * Get app post callbacks
+ */
+function _apps_batch_get_post_cbs($server_name, $modules) {
+  module_load_include('inc', 'apps', 'apps.manifest');
+  $apps = apps_apps($server_name);
+  return array_intersect_key($apps, array_flip($modules));
+}
+
+/**
+ * Enable a module excluding features
+ */
+function _apps_batch_enable_module($module) {
+  include_once DRUPAL_ROOT . '/includes/install.inc';
+  $modules_installed = array();
+  $modules_enabled = array();
+  // Only process modules that are not already enabled.
+  $existing = db_query("SELECT status FROM {system} WHERE type = :type AND name = :name", array(
+    ':type' => 'module',
+    ':name' => $module))
+      ->fetchObject();
+  if ($existing->status == 0) {
+    // Load the module's code.
+    drupal_load('module', $module);
+    module_load_install($module);
+
+    // Update the database and module list to reflect the new module. This
+    // needs to be done first so that the module's hook implementations,
+    // hook_schema() in particular, can be called while it is being
+    // installed.
+    db_update('system')
+        ->fields(array('status' => 1))
+        ->condition('type', 'module')
+        ->condition('name', $module)
+        ->execute();
+    // Refresh the module list to include it.
+    system_list_reset();
+    module_list(TRUE);
+    module_implements('', FALSE, TRUE);
+    _system_update_bootstrap_status();
+    // Update the registry to include it.
+    registry_update();
+    // Refresh the schema to include it.
+    drupal_get_schema(NULL, TRUE);
+    // Update the theme registry to include it.
+    drupal_theme_rebuild();
+    // Clear entity cache.
+    entity_info_cache_clear();
+
+    // Now install the module if necessary.
+    if (drupal_get_installed_schema_version($module, TRUE) == SCHEMA_UNINSTALLED) {
+      drupal_install_schema($module);
+
+      // Set the schema version to the number of the last update provided
+      // by the module.
+      $versions = drupal_get_schema_versions($module);
+      $version = $versions ? max($versions) : SCHEMA_INSTALLED;
+
+      // If the module has no current updates, but has some that were
+      // previously removed, set the version to the value of
+      // hook_update_last_removed().
+      if ($last_removed = module_invoke($module, 'update_last_removed')) {
+        $version = max($version, $last_removed);
+      }
+      drupal_set_installed_schema_version($module, $version);
+      // Allow the module to perform install tasks.
+      module_invoke($module, 'install');
+      // Record the fact that it was installed.
+      $modules_installed[] = $module;
+      watchdog('system', '%module module installed.', array('%module' => $module), WATCHDOG_INFO);
+    }
+
+    // Enable the module.
+    module_invoke($module, 'enable');
+
+    // Record the fact that it was enabled.
+    $modules_enabled[] = $module;
+    watchdog('system', '%module module enabled.', array('%module' => $module), WATCHDOG_INFO);
+  }
+
+  // If any modules were newly installed, invoke hook_modules_installed().
+  if (!empty($modules_installed)) {
+    module_invoke_all('modules_installed', $modules_installed);
+  }
+
+  // If any modules were newly enabled, invoke hook_modules_enabled().
+  if (!empty($modules_enabled)) {
+    _module_invoke_all('modules_enabled', array('features'), $modules_enabled);
+  }
+}
+
+/**
+ * This is a wrapper of module_invoke_all()
+ * @see module_invoke_all()
+ */
+function _module_invoke_all($hook, $exclude = array()) {
+  $args = func_get_args();
+  // Remove $hook from the arguments.
+  unset($args[0]);
+  unset($args[1]);
+  $return = array();
+  foreach (module_implements($hook) as $module) {
+    if (!in_array($module, $exclude)) {
+      $function = $module . '_' . $hook;
+      if (function_exists($function)) {
+        $result = call_user_func_array($function, $args);
+        if (isset($result) && is_array($result)) {
+          $return = array_merge_recursive($return, $result);
+        }
+        elseif (isset($result)) {
+          $return[] = $result;
+        }
+      }
+    }
+  }
+  return $return;
+}
+
+/**
+ * Revert a features component
+ */
+function _apps_batch_restore_feature_component($module_name, $component, $restore_hook = 'features_revert') {
+  module_load_include('inc', 'features', 'features.export');
+  features_include();
+  $pre_hook = 'pre_' . $restore_hook;
+  module_invoke($module_name, $pre_hook, $component);
+  if (features_hook($component, $restore_hook)) {
+    // Set a semaphore to prevent other instances of the same script from running concurrently.
+    //watchdog('features', '@actioning @module_name / @component.', array('@action' => $log_action, '@component' => $component, '@module_name' => $module_name));
+    features_semaphore('set', $component);
+    features_invoke($component, $restore_hook, $module_name);
+
+    // If the script completes, remove the semaphore and set the code signature.
+    features_semaphore('del', $component);
+    features_set_signature($module_name, $component);
+    //watchdog('features', '@action completed for @module_name / @component.', array('@action' => $log_action, '@component' => $component, '@module_name' => $module_name));
+  }
+  // Invoke post hook
+  $post_hook = 'post_' . $restore_hook;
+  module_invoke($module_name, $post_hook, $component);
+}
+
+/**
+ * For installing apps from the command line.
+ */
+function apps_batch_modules_enabled($modules) {
+  if (drupal_is_cli()) {
+    $vars = variable_get('apps_batch_callbacks', array());
+    $apps = _apps_batch_get_post_cbs('development', $modules);
+    foreach ($apps as $app) {
+      if (isset($app['post install callback'])) {
+        $vars[] = $app['post install callback'];
+      }
+    }
+    variable_set('apps_batch_callbacks', $vars);
+  }
+}
+
+/**
+ * Implement hook_flush_caches().
+ */
+function apps_batch_flush_caches() {
+  // Get callbacks from apps_batch_callbacks @see apps_batch_modules_enabled
+  if ($callbacks = variable_get('apps_batch_callbacks', FALSE)) {
+    foreach ($callbacks as $callback) {
+      if (function_exists($callback)) {
+        // Call app post callback.
+        call_user_func($callback);
+        watchdog('apps_batch', t('Post callback @func', array('@func' => $callback)), array(), WATCHDOG_NOTICE);
+      }
+    }
+    variable_set('apps_batch_callbacks', array());
+  }
+}
+
+/**
+ * Implement hook_module_implements_alter().
+ *
+ * run @apps_batch_flush_caches after run @features_flush_caches.
+ */
+function apps_batch_module_implements_alter(&$implementations, $hook) {
+  if ($hook == 'flush_caches') {
+    $group = $implementations['apps_batch'];
+    unset($implementations['apps_batch']);
+    $implementations['apps_batch'] = $group;
+  }
+}

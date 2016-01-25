@@ -1,0 +1,634 @@
+<?php
+
+/**
+ * @file
+ * Implements GECAD ePayment payment services for use in Drupal Commerce.
+ */
+
+/**
+ * Implements hook_menu().
+ */
+function commerce_epayment_menu() {
+  $items = array();
+
+  // Define an always accessible path to receive IPNs.
+  $items['commerce_epayment/ipn'] = array(
+    'page callback' => 'commerce_epayment_process_ipn',
+    'page arguments' => array(),
+    'access callback' => TRUE,
+    'type' => MENU_CALLBACK,
+  );
+
+  return $items;
+}
+
+// -----------------------------------------------------------------------------
+// ePayment IPN implementations.
+
+/**
+ * Returns the IPN URL.
+ */
+function commerce_epayment_ipn_url() {
+  $parts = array(
+    'commerce_epayment',
+    'ipn',
+  );
+
+  return url(implode('/', $parts), array('absolute' => TRUE));
+}
+
+/**
+ * Processes an incoming IPN.
+ *
+ * @param $payment_method
+ *   The payment method instance array that originally made the payment.
+ * @param $debug_ipn
+ *   Optionally specify an IPN array for debug purposes; if left empty, the IPN
+ *     be pulled from the $_POST. If an IPN is passed in, validation of the IPN
+ *     at ePayment will be bypassed.
+ *
+ * @return
+ *   TRUE or FALSE indicating whether the IPN was successfully processed or not.
+ */
+function commerce_epayment_process_ipn($payment_method = NULL, $debug_ipn = array()) {
+  module_load_include('inc', 'commerce_epayment', 'commerce_epayment.hash');
+
+  // Load the default ePayment payment method.
+  $payment_method = commerce_payment_method_instance_load('epayment|commerce_payment_epayment');
+
+  // Retrieve the IPN from $_POST if the caller did not supply an IPN array.
+  if (empty($debug_ipn)) {
+    $ipn = $_POST;
+
+    // Check for mandatory IPN keys.
+    $mandatory_keys = array('REFNO', 'REFNOEXT', 'ORDERSTATUS', 'IPN_TOTALGENERAL', 'CURRENCY', 'IPN_PID', 'IPN_PNAME', 'IPN_DATE');
+    $not_found = array();
+    foreach ($mandatory_keys as $key) {
+      if (!isset($ipn[$key])) {
+        $not_found[] = $key;
+      }
+    }
+    if (count($not_found)) {
+      $args = array('!url' => 'https://secure.payu.ro/cpanel/ipn_settings.php', '@keys' => implode(', ', $not_found));
+      watchdog('commerce_epayment', 'Your IPN settings on PayU Control Panel are misconfigured. Go to <a href="!url">IPN settings</a> and, under "Data", enable also next IPN keys: @keys.', $args, WATCHDOG_ERROR);
+      return FALSE;
+    }
+
+    // Map fields from the ePayments response to our IPN implementation.
+    $ipn['txn_id'] = $ipn['REFNO'];
+    $ipn['txn_type'] = isset($ipn['PAYMETHOD']) ? $ipn['PAYMETHOD'] : '';
+    $ipn['merchant_id'] = $payment_method['settings']['merchant_id'];
+    $ipn['payer_email'] = isset($ipn['CUSTOMEREMAIL']) ? $ipn['CUSTOMEREMAIL'] : '';
+    $ipn['mc_gross'] = $ipn['IPN_TOTALGENERAL'];
+    $ipn['mc_currency'] = $ipn['CURRENCY'];
+    $ipn['mc_fee'] = isset($ipn['IPN_COMMISSION']) ? $ipn['IPN_COMMISSION'] : 0.0;
+    $ipn['payment_status'] = $ipn['ORDERSTATUS'];
+    $ipn['payment_type'] = isset($ipn['PAYMETHOD']) ? $ipn['PAYMETHOD'] : '';
+    $ipn['test_ipn'] = ($ipn['ORDERSTATUS'] == 'TEST');
+  }
+  else {
+    $ipn = $debug_ipn;
+  }
+
+  // If the payment method specifies full IPN logging, do it now.
+  if (!empty($payment_method['settings']['ipn_logging']) &&
+    $payment_method['settings']['ipn_logging'] == 'full_ipn') {
+    watchdog('commerce_epayment', 'Attempting to process IPN @txn_id. !ipn_log', array('@txn_id' => $ipn['txn_id'], '!ipn_log' => '<pre>' . check_plain(print_r($ipn, TRUE)) . '</pre>'), WATCHDOG_NOTICE);
+  }
+
+  // Exit if the IPN has already been processed.
+  if (!empty($ipn['txn_id']) && $prior_ipn = commerce_epayment_ipn_load($ipn['txn_id'])) {
+    if ($prior_ipn['payment_status'] == $ipn['payment_status']) {
+      watchdog('commerce_epayment', 'Attempted to process an IPN that has already been processed with transaction ID @txn_id.', array('@txn_id' => $ipn['txn_id']), WATCHDOG_NOTICE);
+      return FALSE;
+    }
+  }
+
+  // Load the order based on the IPN's invoice number.
+  list($ipn['order_id'], $timestamp) = explode('-', $ipn['REFNOEXT']);
+
+  if ($ipn['order_id']) {
+    $order = commerce_order_load($ipn['order_id']);
+  }
+  else{
+    $order = FALSE;
+  }
+
+  // Give the payment method module an opportunity to process the IPN.
+  if (commerce_epayment_ipn_process($order, $payment_method, $ipn) !== FALSE) {
+    commerce_epayment_ipn_save($ipn);
+  }
+
+  // Invoke the hook here so implementations have access to the order and
+  // payment method if available and a saved IPN array that includes the payment
+  // transaction ID.
+  module_invoke_all('commerce_epayment_ipn_process', $order, $payment_method, $ipn);
+
+  // Send our response so ePayment can validate the IPN.
+  commerce_epayment_ipn_output($order, $payment_method, $ipn);
+}
+
+/**
+ * Process an IPN once it's been validated.
+ */
+function commerce_epayment_ipn_process(&$order, $payment_method, &$ipn) {
+  // Exit when we don't get a payment status we recognize.
+  if (!in_array($ipn['ORDERSTATUS'], array('PAYMENT_AUTHORIZED', 'PAYMENT_RECEIVED', 'TEST', 'CASH', 'COMPLETE', 'REVERSED', 'REFUND', '-'))) {
+    return FALSE;
+  }
+
+  // If this is a prior authorization capture IPN for which we've already
+  // created a transaction.
+  if (!empty($ipn['transaction_id']) && $prior_ipn = commerce_epayment_ipn_load($ipn['txn_id'])) {
+    // Load the prior IPN's transaction and update that with the capture values.
+    $transaction = commerce_payment_transaction_load($prior_ipn['transaction_id']);
+  }
+  else {
+    // Create a new payment transaction for the order.
+    $transaction = commerce_payment_transaction_new('epayment', $order->order_id);
+    $transaction->uid = $order->uid;
+    $transaction->instance_id = $payment_method['instance_id'];
+  }
+
+  $transaction->instance_id = $payment_method['instance_id'];
+  $transaction->remote_id = $ipn['REFNO'];
+  $transaction->amount = commerce_currency_decimal_to_amount($ipn['IPN_TOTALGENERAL'], $ipn['CURRENCY']);
+  $transaction->currency_code = $ipn['CURRENCY'];
+  $transaction->payload[REQUEST_TIME] = $ipn;
+
+  // Set the transaction's statuses based on the IPN's payment_status.
+  $transaction->remote_status = $ipn['ORDERSTATUS'];
+
+  // Set the status for this transaction.
+  commerce_epayment_feedback_status($ipn, $transaction);
+
+  // Save the transaction information.
+  commerce_payment_transaction_save($transaction);
+  $ipn['transaction_id'] = $transaction->transaction_id;
+
+  // Update order status based on the transaction status.
+  if ($transaction->status == COMMERCE_PAYMENT_STATUS_SUCCESS) {
+    $order = commerce_order_status_update($order, 'completed');
+    commerce_checkout_complete($order);
+  }
+
+  watchdog('commerce_epayment', 'IPN processed for Order @order_number with ID @txn_id.', array('@txn_id' => $ipn['txn_id'], '@order_number' => $order->order_number), WATCHDOG_INFO);
+}
+
+/**
+ * Prepare and send our response so ePayment can validate the IPN.
+ */
+function commerce_epayment_ipn_output($order, $payment_method, $ipn) {
+  $result = '';  // String for compute HASH for received data.
+  $return	= ''; // String to compute HASH for return result.
+  $signature = $_POST['HASH'];	// HASH received.
+  $date_return = date("YmdGis", REQUEST_TIME);
+
+  // We're using $_POST values instead of the $ipn argument because ePayment
+  // requires very specific fields for this validation.
+  ob_start();
+  while (list($key, $val) = each($_POST)) {
+    $$key = $val;
+
+    // Get values.
+    if ($key != "HASH") {
+      if (is_array($val)) {
+        $result .= _commerce_epayment_expand_array($val);
+      }
+      else {
+        $size	= strlen(stripslashes($val));
+        $result	.= $size . stripslashes($val);
+      }
+    }
+  }
+
+  ob_end_flush();
+
+  $return = strlen($_POST["IPN_PID"][0]) . $_POST["IPN_PID"][0] . strlen($_POST["IPN_PNAME"][0]) . $_POST["IPN_PNAME"][0];
+  $return .= strlen($_POST["IPN_DATE"]) . $_POST["IPN_DATE"] . strlen($date_return) . $date_return;
+
+  $hash = commerce_epayment_hmac($payment_method['settings']['key'], $result); /* HASH for data received */
+
+  if ($hash == $signature) {
+    echo "Verified OK!";
+    
+    // ePayment response.
+    $result_hash =  commerce_epayment_hmac($payment_method['settings']['key'], $return);
+    echo "<EPAYMENT>" . $date_return . "|" . $result_hash . "</EPAYMENT>";
+  }
+  else {
+    echo t('Nothing to see here, move along.');
+  }
+
+  // Exit here so the page response content is kept to a minimum.
+  drupal_exit();
+}
+
+/**
+ * Loads a stored IPN by ID.
+ *
+ * @param $id
+ *   The ID of the IPN to load.
+ * @param $type
+ *   The type of ID you've specified, either the serial numeric ipn_id or the
+ *     actual ePayment txn_id. Defaults to txn_id.
+ *
+ * @return
+ *   The original IPN with some meta data related to local processing.
+ */
+function commerce_epayment_ipn_load($id, $type = 'txn_id') {
+  return db_select('commerce_epayment_ipn', 'cei')
+    ->fields('cei')
+    ->condition('cei.' . $type, $id)
+    ->execute()
+    ->fetchAssoc();
+}
+
+/**
+ * Saves an IPN with some meta data related to local processing.
+ *
+ * @param $ipn
+ *   An IPN array with additional parameters for the order_id and Commerce
+ *     Payment transaction_id associated with the IPN.
+ *
+ * @return
+ *   The operation performed by drupal_write_record() on save; since the IPN is
+ *     received by reference, it will also contain the serial numeric ipn_id
+ *     used locally.
+ */
+function commerce_epayment_ipn_save(&$ipn) {
+  if (!empty($ipn['ipn_id']) && commerce_epayment_ipn_load($ipn['txn_id'])) {
+    $ipn['changed'] = REQUEST_TIME;
+
+    return drupal_write_record('commerce_epayment_ipn', $ipn, 'ipn_id');
+  }
+  else {
+    $ipn['created'] = REQUEST_TIME;
+    $ipn['changed'] = REQUEST_TIME;
+
+    return drupal_write_record('commerce_epayment_ipn', $ipn);
+  }
+
+  return $ipn;
+}
+
+/**
+ * Deletes a stored IPN by ID.
+ *
+ * @param $id
+ *   The ID of the IPN to delete.
+ * @param $type
+ *   The type of ID you've specified, either the serial numeric ipn_id or the
+ *     actual ePayment txn_id. Defaults to txn_id.
+ */
+function commerce_epayment_ipn_delete($id, $type = 'txn_id') {
+  db_delete('commerce_epayment_ipn')
+    ->condition($type, $id)
+    ->execute();
+}
+
+/**
+ * Returns a unique order number based on the Order ID and timestamp.
+ */
+function commerce_epayment_ipn_order($order) {
+  return $order->order_id . '-' . REQUEST_TIME;
+}
+
+// -----------------------------------------------------------------------------
+// ePayment payment method implementations.
+
+/**
+ * Implements hook_commerce_payment_method_info().
+ *
+ * This hook will define the ePayment payment method.
+ */
+function commerce_epayment_commerce_payment_method_info() {
+  $payment_methods = array();
+
+  $payment_methods['epayment'] = array(
+    'base' => 'commerce_epayment',
+    'title' => t('PayU'),
+    'short_title' => t('PayU'),
+    'display_title' => t('PayU'),
+    'description' => t('Integrates PayU (former ePayment) payment system'),
+    'terminal' => FALSE,
+    'offsite' => TRUE,
+    'offsite_autoredirect' => TRUE,
+  );
+
+  return $payment_methods;
+}
+
+/**
+ * Payment method callback: settings form.
+ *
+ * Returns form elements for the payment methods settings form included
+ * as part of the payment methods enabling action in Rules
+ */
+function commerce_epayment_settings_form($settings = NULL) {
+  $form = array();
+
+  $settings = (array) $settings + array(
+    'account' => 'test',
+    'live_update_url' => 'https://secure.payu.ro/order/lu.php',
+    'merchant_id' => '',
+    'key' => '',
+    'currency' => variable_get('commerce_default_currency', 'RON'),
+    'language' => 'RO',
+    'ipn_logging' => 'notification',
+  );
+
+  $form['ipn_url'] = array(
+    '#type' => 'item',
+    '#title' => t('Instant Payment Notification (IPN) URL'),
+    '#markup' => commerce_epayment_ipn_url(),
+  );
+
+  $form['account'] = array(
+    '#type' => 'radios',
+    '#title' => t('ePayment account'),
+    '#options' => array(
+      'test' => t('Test account - for testing purposes only'),
+      'prod' => t('Production account - use for processing real transactions'),
+    ),
+    '#default_value' => $settings['account'],
+  );
+
+  $form['live_update_url'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Live Update URL'),
+    '#required' => TRUE,
+    '#default_value' => $settings['live_update_url'],
+  );
+
+  $form['merchant_id'] = array(
+    '#type' => 'textfield',
+    '#title' => t('ePayment Merchant ID'),
+    '#required' => TRUE,
+    '#description' => t('Your ePayment Merchant ID.'),
+    '#default_value' => $settings['merchant_id'],
+  );
+
+  $form['key'] = array(
+    '#type' => 'textfield',
+    '#title' => t('ePayment Key'),
+    '#description' => t('The key provided by ePayment.'),
+    '#default_value' => $settings['key'],
+    '#size' => 30,
+  );
+
+  $form['currency'] = array(
+    '#type' => 'select',
+    '#title' => t('Currency code'),
+    '#description' => t('Transactions can only be processed in one of the listed currencies.'),
+    '#options' => commerce_epayment_currencies(),
+    '#default_value' => $settings['currency'],
+  );
+
+  $form['language'] = array(
+    '#type' => 'select',
+    '#title' => t('Language code'),
+    '#options' => commerce_epayment_languages(),
+    '#default_value' => $settings['language'],
+  );
+
+  $form['ipn_logging'] = array(
+    '#type' => 'radios',
+    '#title' => t('IPN logging'),
+    '#options' => array(
+      'notification' => t('Log notifications during IPN validation and processing.'),
+      'full_ipn' => t('Log notifications with the full IPN during validation and processing (used for debugging).'),
+    ),
+    '#default_value' => $settings['ipn_logging'],
+  );
+
+  $form['#submit'][] = 'commerce_epayment_settings_form_submit';
+
+  return $form;
+}
+
+/**
+ * Payment method callback: redirect form
+ *
+ * returns form elements that should be submitted to the redirected
+ * payment service
+ */
+function commerce_epayment_redirect_form($form, &$form_state, $order, $payment_method) {
+  // Return an error if the enabling action's settings haven't been configured.
+  if (empty($payment_method['settings']['merchant_id'])) {
+    drupal_set_message(t('ePayment is not configured for use. No ePayment merchant ID has been specified.'), 'error');
+    return array();
+  }
+  if (empty($payment_method['settings']['key'])) {
+    drupal_set_message(t('ePayment is not configured for use. No ePayment key has been specified.'), 'error');
+    return array();
+  }
+
+  // Set feedback URLs.
+  $settings = array(
+    // Return to the payment redirect page for processing successful payments.
+    'return' => url('checkout/' . $order->order_id . '/payment/return/' . $order->data['payment_redirect_key'], array('absolute' => TRUE)),
+
+    // Specify the current payment method instance ID in the notify_url.
+    'payment_method' => $payment_method['instance_id'],
+  );
+
+  return commerce_epayment_build_redirect_form($form, $form_state, $order, $payment_method['settings'] + $settings);
+}
+
+/**
+ * Helper function for the redirect_form callback.
+ * Builds an ePayment payment form from an order object.
+ */
+function commerce_epayment_build_redirect_form($form, &$form_state, $order, $settings) {
+  global $user;
+
+  $wrapper = entity_metadata_wrapper('commerce_order', $order);
+
+  module_load_include('inc', 'commerce_epayment', 'commerce_epayment.hash');
+
+  // Get order info.
+  $currency_code = $wrapper->commerce_order_total->currency_code->value();
+  $amount = $wrapper->commerce_order_total->amount->value();
+
+  // Get order line items.
+  foreach ($wrapper->commerce_line_items as $delta => $line_item_wrapper) {
+    if (in_array($line_item_wrapper->type->value(), commerce_product_line_item_types())) {
+      $line_item_unit_price = $line_item_wrapper->commerce_unit_price->value();
+      $line_item_total_price = commerce_line_items_total(array($line_item_wrapper), commerce_product_line_item_types());
+
+      // Calculate the VAT rate for this line item.
+      $vat_rate = 0;
+      $tax_rates = commerce_tax_components($line_item_unit_price['data']['components']);
+      foreach ($tax_rates as $key => $tax_rate) {
+        if ($tax_rate['price']['data']['tax_rate']['type'] == 'vat') {
+          $vat_rate += ($tax_rate['price']['data']['tax_rate']['rate'] * 100);
+        }
+      }
+
+      $data_pname[] = trim($line_item_wrapper->commerce_product->title->value());
+      $data_pcode[] = trim($line_item_wrapper->commerce_product->sku->value());
+      $data_pinfo[] = trim($line_item_wrapper->commerce_product->sku->value());
+      $data_price[] = round(commerce_currency_amount_to_decimal($line_item_total_price['amount'], $line_item_total_price['currency_code']), 2);
+      $data_qty[] = round($line_item_wrapper->quantity->value());
+      $data_vat[] = $vat_rate;
+    }
+  }
+
+  // Build the data array that will be translated into hidden form values.
+  $data = array(
+    // General parameters.
+    'MERCHANT' => $settings['merchant_id'],
+    // Use the timestamp to generate a unique order reference.
+    'ORDER_REF' => commerce_epayment_ipn_order($order),
+    'ORDER_DATE' => date('Y-m-d H:i:s', REQUEST_TIME),
+    'ORDER_PNAME' => $data_pname,
+    'ORDER_PCODE' => $data_pcode,
+    'ORDER_PINFO' => $data_pinfo,
+    'ORDER_PRICE' => $data_price,
+    'ORDER_QTY' => $data_qty,
+    'ORDER_VAT' => $data_vat,
+    'ORDER_SHIPPING' => '0',
+    'PRICES_CURRENCY' => $currency_code,
+  );
+
+  // Generate hash security string.
+  $order_hash = commerce_epayment_generate_hash($data, $settings);
+
+  $data += array(
+    // Add the calculated hash string.
+    'ORDER_HASH' => $order_hash,
+    // URL to return on order completion.
+    'BACK_REF' => $settings['return'],
+    // Locale parameters.
+    'LANGUAGE' => $settings['language'],
+    'CURRENCY' => $settings['currency'],
+  );
+
+  // Allow other modules to alter the data that will be sent to ePayment.
+  drupal_alter('commerce_epayment_data', $data, $order, $settings);
+
+  // Redirect to ePayment Live Update URL.
+  $form['#action'] = $settings['live_update_url'];
+
+  // Add hidden parameters to the form.
+  foreach ($data as $name => $value) {
+    if (is_array($value)) {
+      // Let FAPI know that this is a HTML Form Array.
+      $form[$name] = array('#tree' => TRUE);
+      foreach ($value as $key => $arr_value) {
+        $arr_value = trim($arr_value);
+        // Add the value as a hidden form element.
+        $form[$name][] = array('#type' => 'hidden', '#value' => $arr_value);
+      }
+    }
+    else {
+      $value = trim($value);
+      // Add the value as a hidden form element.
+      $form[$name] = array('#type' => 'hidden', '#value' => $value);
+    }
+  }
+
+  // Add the test parameter.
+  $form['TESTORDER'] = array('#type' => 'hidden', '#value' => ($settings['account'] == 'test' ? 'TRUE' : 'FALSE'));
+
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Proceed with payment'),
+  );
+
+  return $form;
+}
+
+/**
+ * Payment method callback: redirect form submission.
+ */
+function commerce_epayment_redirect_form_submit($order, $payment_method) {
+  // There is no Rule action to update the status per payment method so we are
+  // updating the order status here.
+  commerce_order_status_update($order, 'processing');
+}
+
+/**
+ * Get a payment status and message based on the ePayment status.
+ * 
+ * @param $ipn
+ *   Received ePayment status ID.
+ */
+function commerce_epayment_feedback_status($ipn, &$transaction) {
+  switch ($ipn['ORDERSTATUS']) {
+    case 'PAYMENT_AUTHORIZED':
+      $transaction->status = COMMERCE_PAYMENT_STATUS_SUCCESS;
+      $transaction->message = t("The credit cart payment has been authorized.");
+      break;
+
+    case 'PAYMENT_RECEIVED':
+      $transaction->status = COMMERCE_PAYMENT_STATUS_SUCCESS;
+      $transaction->message = t('The payment order has been cashed.');
+      break;
+
+    case 'TEST':
+      $transaction->status = COMMERCE_PAYMENT_STATUS_SUCCESS;
+      $transaction->message = t('Test payment.');
+      break;
+
+    case 'CASH':
+      $transaction->status = COMMERCE_PAYMENT_STATUS_SUCCESS;
+      $transaction->message = t('Payment on delivery.');
+      break;
+
+    case 'COMPLETE':
+      $transaction->status = COMMERCE_PAYMENT_STATUS_SUCCESS;
+      $transaction->message = t('The payment has completed.');
+      break;
+    
+    case 'REVERSED':
+      $transaction->status = COMMERCE_PAYMENT_STATUS_FAILURE;
+      $transaction->message = t('The payment has been canceled.');
+      break;
+
+    case 'REFUND':
+      $transaction->status = COMMERCE_PAYMENT_STATUS_SUCCESS;
+      $transaction->message = t('Refund for transaction @txn_id', array('@txn_id' => $ipn['parent_txn_id']));
+      break;
+
+    case '-':
+      $transaction->status = COMMERCE_PAYMENT_STATUS_PENDING;
+      $transaction->message = t('Pending.');
+      break;
+  }
+}
+
+/**
+ * Returns an array of all possible language codes.
+ */
+function commerce_epayment_languages() {
+  return drupal_map_assoc(array('RO', 'EN', 'DE', 'FR', 'IT', 'ES'));
+}
+
+/**
+ * Returns an array of all possible currency codes.
+ */
+function commerce_epayment_currencies() {
+  // Build a currency options list from all enabled currencies.
+  $options = array();
+
+  // List of currencies accepted by ePayment.
+  $epayment_allowed_currencies = drupal_map_assoc(array('RON', 'EUR', 'USD'));
+  // List of currencies enabled in Commerce.
+  $commerce_currencies = commerce_currencies(TRUE);
+
+  foreach ($epayment_allowed_currencies as $currency_code => $value) {
+    // If this currency is also enabled in Commerce, add it to the list.
+    if (isset($commerce_currencies[$currency_code])) {
+      $currency = $commerce_currencies[$currency_code];
+      $options[$currency_code] = t('@code - !name', array('@code' => $currency['code'], '@symbol' => $currency['symbol'], '!name' => $currency['name']));
+
+      if (!empty($currency['symbol'])) {
+        $options[$currency_code] .= ' - ' . check_plain($currency['symbol']);
+      }
+    }
+  }
+
+  return $options;
+}

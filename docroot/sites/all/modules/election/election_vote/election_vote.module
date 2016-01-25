@@ -1,0 +1,551 @@
+<?php
+/**
+ * @file
+ * Election Vote: primary module file.
+ */
+
+/**
+ * Implements hook_menu().
+ */
+function election_vote_menu() {
+  $items = array();
+
+  $items['election-post/%election_post/vote'] = array(
+    'title' => 'Vote',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('election_vote_form', 1),
+    'file' => 'election_vote.forms.inc',
+    'access callback' => 'election_vote_access',
+    'access arguments' => array('vote', 1),
+    'type' => MENU_CALLBACK,
+  );
+
+  $items['election-post/%election_post/vote/undo'] = array(
+    'title' => 'Undo',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('election_vote_undo_form', 1),
+    'file' => 'election_vote.forms.inc',
+    'access callback' => 'election_vote_access',
+    'access arguments' => array('undo', 1),
+    'type' => MENU_CALLBACK,
+  );
+
+  $items['election-post/%election_post/explain'] = array(
+    'title' => 'Explanation',
+    'page callback' => 'election_vote_page_explain',
+    'page arguments' => array(1),
+    'access callback' => 'election_vote_explanation_access',
+    'access arguments' => array(1),
+    'type' => MENU_CALLBACK,
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_permission().
+ */
+function election_vote_permission() {
+  return array(
+    'vote in elections' => array(
+      'title' => t('Vote in elections'),
+      'description' => t('Users must have this permission in order to vote.'),
+    ),
+    'undo own vote' => array(
+      'title' => t('Undo own vote'),
+      'description' => t('This allows users to undo their own vote.'),
+    ),
+    'view voting access explanation' => array(
+      'title' => t('View voting access explanation'),
+      'description' => t('This allows users to see why they can or cannot vote.'),
+    ),
+  );
+}
+
+/**
+ * Implements hook_views_api().
+ */
+function election_vote_views_api() {
+  return array(
+    'api' => 3,
+  );
+}
+
+/**
+ * Implements hook_theme().
+ */
+function election_vote_theme() {
+  return array(
+    'election_vote_confirm' => array(
+      'variables' => array(
+        'form_state' => NULL,
+      ),
+      'file' => 'election_vote.theme.inc',
+    ),
+    'election_vote_eligibility' => array(
+      'variables' => array(
+        'post' => NULL,
+        'account' => NULL,
+      ),
+      'file' => 'election_vote.theme.inc',
+    ),
+    'election_vote_button' => array(
+      'variables' => array(
+        'post' => NULL,
+      ),
+      'file' => 'election_vote.theme.inc',
+    ),
+    'election_vote_access_explain' => array(
+      'variables' => array(
+        'limitations' => array(),
+        'post' => NULL,
+        'account' => NULL,
+      ),
+      'file' => 'election_vote.theme.inc',
+    ),
+  );
+}
+
+/**
+ * Access callback for voting.
+ *
+ * @param string $op
+ *   The operation requested (e.g. 'vote').
+ * @param object $post
+ *   The election post object.
+ * @param object $account
+ *   The user account for which to check.
+ */
+function election_vote_access($op, stdClass $post, $account = NULL) {
+
+  // The default account is the current user.
+  if ($account === NULL) {
+    $account = $GLOBALS['user'];;
+  }
+
+  // If access has already been checked in this page request, return from cache.
+  $grants = &drupal_static('election_vote_grants', array());
+  if (isset($grants[$post->post_id][$account->uid][$op])) {
+    return $grants[$post->post_id][$account->uid][$op];
+  }
+
+  // Check whether the user can view the post.
+  if (!election_post_access('view', $post, $account)) {
+    $grants[$post->post_id][$account->uid][$op] = FALSE;
+    return FALSE;
+  }
+
+  // Check whether the election is open.
+  $election = $post->election;
+  if (!election_voting_open($election)) {
+    $grants[$post->post_id][$account->uid][$op] = FALSE;
+    return FALSE;
+  }
+
+  // Check whether the post is individually set to 'closed'.
+  if ($post->vstatus_inheritance == ELECTION_POST_STATUS_CLOSED) {
+    $grants[$post->post_id][$account->uid][$op] = FALSE;
+    return FALSE;
+  }
+
+  // Check role access.
+  $accounts_roles_with_access = array_intersect(array_keys($account->roles), (array) $post->rids);
+  if (!count($accounts_roles_with_access)) {
+    $grants[$post->post_id][$account->uid][$op] = FALSE;
+    return FALSE;
+  }
+
+  if ($op == 'undo') {
+    // Check undo access.
+    if (!user_access('undo own vote', $account)) {
+      $grants[$post->post_id][$account->uid][$op] = FALSE;
+      return FALSE;
+    }
+    // The user must have previously voted in order to undo a vote.
+    if (!election_vote_check_account_previously_voted($post, $account)) {
+      $grants[$post->post_id][$account->uid][$op] = FALSE;
+      return FALSE;
+    }
+  }
+
+  // Invoke hook_election_vote_before_grant().
+  $hook_results = module_invoke_all('election_vote_before_grant', $post, $account);
+  foreach ($hook_results as $result) {
+    if ($result === FALSE) {
+      $grants[$post->post_id][$account->uid]['vote'] = FALSE;
+      $grants[$post->post_id][$account->uid]['undo'] = FALSE;
+      return FALSE;
+    }
+  }
+
+  // Invoke the Rules event 'Before granting access to vote'.
+  rules_invoke_event('election_vote_before_grant', $post, $account);
+
+  // Check the grants cache again; the Rules action 'Deny voting access' acts
+  // on the same cache.
+  if (isset($grants[$post->post_id][$account->uid][$op]) && $grants[$post->post_id][$account->uid][$op] === FALSE) {
+    return FALSE;
+  }
+
+  $grants[$post->post_id][$account->uid][$op] = TRUE;
+
+  return TRUE;
+}
+
+/**
+ * Access callback for a user to view an explanation of their own voting access.
+ *
+ * @param object $post
+ *   The election post object.
+ * @param object $account
+ *   The user account object (optional, defaults to the current user).
+ */
+function election_vote_explanation_access($post, $account = NULL) {
+  if (!isset($account)) {
+    $account = $GLOBALS['user'];
+  }
+  if (!election_post_access('view', $post, $account)) {
+    return FALSE;
+  }
+  return user_access('view voting access explanation', $account);
+}
+
+/**
+ * Explain to a user the voting limitations of a post.
+ *
+ * @param object $post
+ *   The election post object.
+ * @param object $account
+ *   The user account object (optional).
+ *
+ * @return array
+ *   An array of information for each limitation on voting, keyed by the
+ *   machine name. Each array element is itself an array, containing:
+ *   - 'explanation': The user explanation for this voting access limitation
+ *                    (a string, in HTML).
+ *   - 'result': Whether or not the user passes this voting access limitation (a
+ *             Boolean).
+ */
+function election_vote_access_explain($post, $account = NULL) {
+  $cache = &drupal_static(__FUNCTION__, array());
+
+  if (!isset($account)) {
+    $account = $GLOBALS['user'];
+  }
+
+  if (isset($cache[$post->post_id][$account->uid])) {
+    return $cache[$post->post_id][$account->uid];
+  }
+
+  $limitations = array();
+
+  $election = $post->election;
+  $post_name = election_get_post_name($election->type);
+
+  // Examine the global voting permission.
+  $limitations['permission'] = array(
+    'explanation' => t('You must have permission to vote in any elections.'),
+    'result' => user_access('vote in elections'),
+  );
+
+  // Examine the election voting status.
+  $election_open = election_voting_open($election);
+  $limitations['vstatus'] = array(
+    'explanation' => t('Voting must be open for this election.'),
+    'result' => $election_open,
+  );
+
+  // Examine the post's voting status.
+  $limitations['vstatus_post'] = array(
+    'explanation' => t('Voting must be open for this @post.', array(
+      '@post' => $post_name,
+    )),
+    'result' => $election_open && $post->vstatus_inheritance != ELECTION_POST_STATUS_CLOSED,
+  );
+
+  // Examine role access.
+  $rids = array_filter((array) $post->rids);
+  if (!empty($rids)) {
+    $roles = db_select('role', 'r')
+      ->fields('r', array('rid', 'name'))
+      ->condition('rid', $rids, 'IN')
+      ->execute()
+      ->fetchAllKeyed();
+    if (!empty($roles)) {
+      $limitations['roles'] = array(
+        'explanation' => t('You must have one of the following roles: %roles.',
+        array(
+          '%roles' => implode(', ', $roles),
+        )),
+        'result' => count(array_intersect(array_keys($account->roles), $post->rids)) > 0,
+      );
+    }
+  }
+  else {
+    $limitations['role'] = array(
+      'explanation' => t('At least one user role must be assigned to this @post.', array('@post' => $post_name)),
+      'result' => FALSE,
+    );
+  }
+
+  // Examine implementations of hook_election_vote_before_grant().
+  $hook = 'election_vote_before_grant';
+  $modules = module_implements($hook);
+  if (!empty($modules)) {
+    foreach ($modules as $module) {
+      $limitations['module_' . $module] = array(
+        'explanation' => t('Module %module', array('%module' => $module)),
+        'result' => module_invoke($module, $hook, $post, $account) !== FALSE,
+      );
+    }
+  }
+
+  // See if there are any explanations provided by the Rules action 'Deny voting
+  // access'.
+  if (!election_vote_access('vote', $post, $account)) {
+    $grants = drupal_static('election_vote_grants', array());
+    if (isset($grants['explanations'][$post->post_id][$account->uid])) {
+      foreach ($grants['explanations'][$post->post_id][$account->uid] as $key => $explanation) {
+        $limitations['rule_' . $key] = $explanation;
+      }
+    }
+  }
+
+  drupal_alter('election_vote_access_explain', $limitations, $post, $account);
+
+  $cache[$post->post_id][$account->uid] = $limitations;
+  return $limitations;
+}
+
+/**
+ * Implements hook_hook_info().
+ */
+function election_vote_hook_info() {
+  return array(
+    'election_vote_before_grant' => array(
+      'group' => 'election',
+    ),
+    'election_vote_access_explain_alter' => array(
+      'group' => 'election',
+    ),
+  );
+}
+
+/**
+ * Implements hook_entity_delete().
+ */
+function election_vote_entity_delete($entity, $type) {
+  switch ($type) {
+    // Delete associated votes when a post is deleted.
+    case 'election_post':
+      db_delete('election_vote')
+        ->condition('post_id', $entity->post_id)
+        ->execute();
+      db_delete('election_ballot')
+        ->condition('post_id', $entity->post_id)
+        ->execute();
+      break;
+
+  }
+}
+
+/**
+ * Find out whether the $account has previously voted regarding this $post.
+ *
+ * @param object $post
+ *   The election post object.
+ * @param object $account
+ *   Optional user account object (leave blank for the logged-in user).
+ *
+ * @return bool
+ *   TRUE if previously voted, FALSE otherwise.
+ */
+function election_vote_check_account_previously_voted($post, $account = NULL) {
+
+  global $user;
+  if (empty($account)) {
+    $account = $user;
+  }
+
+  // Determine whether or not we're checking on behalf of the current user.
+  $account_is_user = ($account->uid == $user->uid);
+
+  // Build the SQL query, first checking against the UID.
+  $query = db_select('election_ballot')
+    ->fields('election_ballot', array('ballot_id'))
+    ->condition('value', 1, '>=')
+    ->condition('uid', $account->uid)
+    ->condition('post_id', $post->post_id);
+
+  // For anonymous users, check the session ID, or a combination of IP address
+  // and user agent. Of course this is not a reliable identifier of a user.
+  if ($account_is_user && $account->uid == 0) {
+    $query->condition(db_or()
+      ->condition('sid_hash', _election_vote_session_hash())
+      ->condition(db_and()
+        ->condition('ip', ip_address())
+        ->condition('agent', $_SERVER['HTTP_USER_AGENT'])
+      )
+    );
+  }
+
+  $result = $query->execute()->fetchCol();
+
+  return !empty($result);
+
+}
+
+/**
+ * Get a hash of the session ID, in order to track anonymous users anonymously.
+ */
+function _election_vote_session_hash() {
+  $sid = session_id();
+  return md5($sid . $GLOBALS['drupal_hash_salt']);
+}
+
+/**
+ * Implements hook_html_head_alter().
+ */
+function election_vote_html_head_alter(&$head_elements) {
+  // Prevent search engines from indexing voting forms.
+  if (preg_match('/election\-post\/[0-9]+\/vote/', current_path())) {
+    foreach ($head_elements as $key => $element) {
+      if (isset($element['#atributes']['name']) && $element['#attributes']['name'] == 'robots' && $element['#attributes']['content'] != 'noindex,nofollow') {
+        unset($head_elements[$key]);
+        break;
+
+      }
+    }
+    $head_elements['robots'] = array(
+      '#type' => 'html_tag',
+      '#tag' => 'meta',
+      '#attributes' => array('name' => 'robots', 'content' => 'noindex,nofollow'),
+    );
+  }
+}
+
+/**
+ * Implements hook_ENTITY_view_alter().
+ */
+function election_vote_election_post_view_alter(&$build, $type) {
+  static $js_added;
+  $post = $build['#post'];
+  // Display the vote button and eligibility information on election posts.
+  $build['vote_button'] = array(
+    '#theme' => 'election_vote_button',
+    '#post' => $post,
+  );
+  $build['eligibility'] = array(
+    '#theme' => 'election_info_item',
+    '#html' => TRUE,
+    '#value' => theme('election_vote_eligibility', array('post' => $post)),
+  );
+  // Add the JavaScript for filtering the display of posts by vote access (the
+  // user can toggle between 'votable', 'unvotable', and 'all').
+  if (!$js_added && !empty($post->election->settings['post_display_filter'])) {
+    $build['#attached']['js'][] = drupal_get_path('module', 'election_vote') . '/filter-display-by-access.min.js';
+    $js_added = TRUE;
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function election_vote_form_election_form_alter(&$form, &$form_state) {
+  if (!isset($form['presentation'])) {
+    $form['presentation'] = array(
+      '#type' => 'fieldset',
+      '#title' => t('Presentation'),
+      '#collapsible' => TRUE,
+    );
+  }
+  $election = $form_state['election'];
+  $posts_name = election_get_post_name($election->type, TRUE);
+  $form['presentation']['settings_post_display_filter'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Filter the list of @posts by vote access', array('@posts' => $posts_name)),
+    '#description' => t('If enabled, the user will be able to choose between seeing Votable, Unvotable, or All @posts.', array(
+      '@posts' => $posts_name,
+    )),
+    '#default_value' => isset($election->settings['post_display_filter']) ? $election->settings['post_display_filter'] : 1,
+  );
+}
+
+/**
+ * Implements template_preprocess_election_post().
+ */
+function election_vote_preprocess_election_post(&$variables) {
+  $post = $variables['elements']['#post'];
+  if (election_vote_access('vote', $post)) {
+    $variables['classes_array'][] = 'election-post-votable';
+  }
+}
+
+/**
+ * Implements hook_field_extra_fields_alter().
+ */
+function election_vote_field_extra_fields_alter(&$info) {
+  foreach (election_types() as $type) {
+    $bundle_name = $type['post machine name'];
+    // Add properties to the 'Manage Display' form for election posts.
+    $info['election_post'][$bundle_name]['display'] += array(
+      'vote_button' => array(
+        'label' => t('Vote button'),
+        'weight' => -5,
+      ),
+      'eligibility' => array(
+        'label' => t('Eligibility'),
+        'weight' => 3,
+      ),
+    );
+  }
+}
+
+
+/**
+ * Implements hook_ip_anon_alter().
+ *
+ * Integrates with the IP Anonymize module (drupal.org/project/ip_anon).
+ */
+function election_vote_ip_anon_alter(&$tables) {
+  $tables['election_ballot'] = array(
+    'hostname' => 'ip',
+    'timestamp' => 'timestamp',
+  );
+}
+
+/**
+ * Menu callback. A page explaining a user's voting access.
+ */
+function election_vote_page_explain($post) {
+
+  global $user;
+
+  drupal_set_title(t('Your voting access for %post', array('%post' => $post->title)), PASS_THROUGH);
+  election_set_breadcrumb($post->election);
+
+  return array(
+    '#theme' => 'election_vote_access_explain',
+    '#limitations' => election_vote_access_explain($post, $user),
+    '#post' => $post,
+    '#account' => $user,
+  );
+}
+
+/**
+ * Get the value of a ballot, before it is saved.
+ *
+ * @param object $election
+ *   The election entity.
+ * @param object $post
+ *   The post that will be voted for.
+ * @param object $account
+ *   The user who is voting.
+ *
+ * @return int
+ */
+function election_vote_get_ballot_value($election, $post, $account) {
+  $value = 1;
+  drupal_alter('election_vote_ballot_value', $value, $election, $post, $account);
+  return $value;
+}
