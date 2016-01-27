@@ -14,7 +14,7 @@
     define('CACHE_DAYS', variable_get('shrinktheweb_cache_days', '')); // how many days should the local copy be valid?
                              // Enter 0 (zero) to never update screenshots once cached
                              // Enter -1 to disable caching and always use embedded method instead
-    define('VER', '2.0.6_drupal7'); // allows us to identify known bugs and version control; DONT touch!
+    define('VER', '2.0.7_drupal7'); // allows us to identify known bugs and version control; DONT touch!
     define('QUOTA_IMAGE', 'quota.jpg');
     define('BANDWIDTH_IMAGE', 'bandwidth.jpg');
     define('NO_RESPONSE_IMAGE', 'no_response.jpg');
@@ -336,24 +336,24 @@
             if (DEBUG) {
                 $sHash = shrinktheweb_generateHash($aArgs);
                 $aFields = array(
-                    'domain' => $aArgs['stwurl'],
-                    'timestamp' => time(),
-                    'capturedon' => $aResponse['stw_last_captured'],
-                    'quality' => isset($aArgs['stwqual']) ? $aArgs['stwqual'] : 90,
-                    'full' => isset($aArgs['stwfull']) ? $aArgs['stwfull'] : 0,
-                    'xmax' => isset($aArgs['stwxmax']) ? $aArgs['stwxmax'] : 200,
-                    'ymax' => isset($aArgs['stwymax']) ? $aArgs['stwymax'] : 150,
-                    'nrx' => isset($aArgs['stwnrx']) ? $aArgs['stwnrx'] : 1024,
-                    'nry' => isset($aArgs['stwnry']) ? $aArgs['stwnry'] : 768,
-                    'invalid' => $aResponse['invalid'] != '' ? $aResponse['invalid'] : 0,
-                    'stwerrcode' => $aResponse['stw_response_code'],
-                    'error' => $aResponse['error'] != '' ? $aResponse['error'] : 0,
-                    'errcode' => $aResponse['stw_response_status'],
-                    'hash' => $sHash,
-                    'referrer' => '0',
+                    'stw_domain' => $aArgs['stwurl'],
+                    'stw_timestamp' => time(),
+                    'stw_capturedon' => $aResponse['stw_last_captured'],
+                    'stw_quality' => isset($aArgs['stwqual']) ? $aArgs['stwqual'] : 90,
+                    'stw_full' => isset($aArgs['stwfull']) ? $aArgs['stwfull'] : 0,
+                    'stw_xmax' => isset($aArgs['stwxmax']) ? $aArgs['stwxmax'] : 200,
+                    'stw_ymax' => isset($aArgs['stwymax']) ? $aArgs['stwymax'] : 150,
+                    'stw_nrx' => isset($aArgs['stwnrx']) ? $aArgs['stwnrx'] : 1024,
+                    'stw_nry' => isset($aArgs['stwnry']) ? $aArgs['stwnry'] : 768,
+                    'stw_invalid' => $aResponse['invalid'] != '' ? $aResponse['invalid'] : 0,
+                    'stw_stwerrcode' => $aResponse['stw_response_code'],
+                    'stw_error' => $aResponse['error'] != '' ? $aResponse['error'] : 0,
+                    'stw_errcode' => $aResponse['stw_response_status'],
+                    'stw_hash' => $sHash,
+                    'stw_referrer' => '0',
                 );
                 db_merge('shrinktheweb_log')
-                    ->key(array('hash' => $sHash))
+                    ->key(array('stw_hash' => $sHash))
                     ->fields($aFields)
                     ->updateFields($aFields)
                     ->execute();
@@ -611,14 +611,8 @@
 
             curl_setopt($rConnect, CURLOPT_URL, $sFileUrl . $sParams);
             curl_setopt($rConnect, CURLOPT_RETURNTRANSFER, 1);
-            curl_setopt($rConnect, CURLOPT_FOLLOWLOCATION, 1);
+            curl_setopt($rConnect, CURLOPT_FOLLOWLOCATION, 0);
             curl_setopt($rConnect, CURLOPT_HEADER, 0); // must be 0 or else headers will break SimpleXML parsing
-
-            $sAllCookies = '';
-            foreach($_COOKIE as $sKey=>$sValue){
-                $sAllCookies .= $sKey."=".$sValue.";";
-            }
-            curl_setopt($rConnect, CURLOPT_COOKIE, $sAllCookies);
 
             $sResult = curl_exec($rConnect);
             curl_close($rConnect);

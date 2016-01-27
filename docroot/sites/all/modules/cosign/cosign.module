@@ -1,0 +1,489 @@
+<?php
+
+/**
+ * @file
+ * The Cosign Module
+ *
+ * This module manages automatic user login and logout.
+ */
+
+/**
+ * Implements hook_menu().
+ */
+function cosign_menu() {
+
+  $items['admin/config/system/cosign'] = array(
+    'title' => 'Cosign',
+    'description' => 'Control the Cosign module behavior',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('cosign_admin'),
+    'access arguments' => array('administer cosign'),
+    'type' => MENU_NORMAL_ITEM,
+  );
+
+  return $items;
+
+}
+
+/**
+ * Implements hook_boot().
+ *
+ * Adds a minimal check to see if local cosign has stored a remote user in the
+ * $_SERVER variable, and if so, turn off caching for the page request. The idea
+ * here is to use hook_boot to speculate about the forthcoming authentication
+ * inspection in hook_menu_get_item_alter and prevent page caching from
+ * happening before it gets to that point (page caching occurs in hook_exit,
+ * which happens before hook_menu_get_item_alter).
+ */
+function cosign_boot() {
+
+  $cosign_name = cosign_retrieve_remote_user();
+
+  if (!empty($cosign_name)) {
+
+    // Disable caching for this page request.
+    drupal_page_is_cacheable(FALSE);
+    // Then resume the bootstrap phase.
+    drupal_bootstrap(DRUPAL_BOOTSTRAP_FULL);
+
+  }
+
+}
+
+/**
+ * Implements hook_permission().
+ */
+function cosign_permission() {
+
+  $permissions = array();
+
+  $permissions['administer cosign'] = array(
+    'title' => t('Administer cosign'),
+    'description' => t('Allows a user to configure cosign settings.'),
+  );
+
+  return $permissions;
+
+}
+
+/**
+ * Implements hook_menu_get_item_alter().
+ *
+ * We can't use hook_init here in Drupal 7 because some changes were made to
+ * the order that hooks run. Essentially, there a bunch of things that run in
+ * between hook_boot and hook_init in D7. One of these is menu_get_item, which
+ * runs the menu access callback functions on the request and returns
+ * $router_item['access'] before hook_init even runs. This means that if a user
+ * links directly to an https page with any drupal permissions protection, the
+ * user will hit an access denied page immediately after authenticating through
+ * cosign. Refreshing that page or navigating to a new one does not produce a
+ * second access denied because by that point $user is defined from hook_init on
+ * the previous page request.
+ *
+ * @see http://drupal.org/node/928160
+ * @see http://drupal.org/node/553944
+ */
+function cosign_menu_get_item_alter(&$router_item, $path, $original_map) {
+  // When retrieving the router item for the current path...
+  if ($path == $_GET['q']) {
+    // Call a function that handles user login.
+    cosign_route();
+  }
+}
+
+/**
+ * Helper function, does heavy lifting of cosign login and logout.
+ */
+function cosign_route() {
+  global $user;
+  if ($_GET['q'] == 'user/logout') {
+    cosign_logout();
+    return TRUE;
+  }
+
+  if (drupal_get_path_alias($_GET['q']) == 'invalidlogin') {
+    return TRUE;
+  }
+
+  $cosign_name = cosign_retrieve_remote_user();
+
+  // If friend accounts are not allowed, log them out
+  if (variable_get('cosign_allow_friend_accounts', 0) == 0 && stristr($cosign_name, '@')) {
+    watchdog('cosign', 'User attempted login using a university friend account and the friend account configuration setting is turned off: @remote_user', array('@remote_user' => $cosign_name), WATCHDOG_NOTICE);
+
+    drupal_set_message(variable_get('cosign_friend_account_message', t('We were not able to log you in because this site does not accept university friend accounts.')), 'status');
+
+    drupal_goto(variable_get('cosign_invalid_login', 'access-denied'));
+  }
+
+  // Perform some cleanup so plaintext passwords aren't available
+  unset($_SERVER['PHP_AUTH_USER'], $_SERVER['PHP_AUTH_PW']);
+
+  if (!empty($cosign_name)) {
+
+    if ($user->uid) {
+
+      $remote = user_load_by_name($cosign_name);
+
+      if (!empty($remote->uid) && $user->uid == $remote->uid) {
+
+        // Already logged in hook invocation.
+        module_invoke_all('cosign_remote_local_match', $remote);
+
+        // Do nothing: user already logged in Drupal with session data matching.
+        return TRUE;
+
+      }
+      else {
+
+        $logout = TRUE;
+
+        if (!empty($remote->uid)) {
+
+          // Remote user and session mis-match hook invocation.
+          $results = module_invoke_all('cosign_remote_local_mismatch', $user, $remote);
+
+          $logout = $results[count($results) - 1];
+
+        }
+
+        if ($logout) {
+
+          // Log user out and proceed.
+          cosign_drupal_logout();
+
+        }
+        else {
+
+          // Another module using the cosign api is hijacking the ordinary
+          // behavior here. Instead of logging out the drupal user and
+          // proceeding to log in the drupal user corresponding to the remote
+          // user, we do nothing and leave the behavior up to the module using
+          // hook_cosign_remote_local_mismatch().
+          return TRUE;
+
+        }
+
+      }
+
+    }
+
+    // Retrieve user credentials
+      $result = db_select('users', 'u')
+                  ->fields('u', array('uid', 'name'))
+                  ->condition('name', $cosign_name, '=')
+                  ->execute();
+      $user_info = $result->fetchObject();
+
+      if (empty($user_info)) {
+        if (variable_get('cosign_autocreate', 0) == 1) {
+
+          $default_email_domain = 'umich.edu';
+          $new_user->name = $cosign_name;
+
+          if (stristr($new_user->name, '@')) {
+            // friend account
+            $new_user->mail = $cosign_name;
+          }
+          else {
+            $new_user->mail = $cosign_name . '@' . variable_get('cosignautocreate_email_domain', $default_email_domain);
+          }
+
+          user_external_login_register($new_user->name, 'cosignautocreate');
+
+          $edit = array(
+            'mail' => $new_user->mail,
+          );
+
+          user_save($user, $edit);
+
+          drupal_session_regenerate();
+
+          // New Drupal user created hook invocation.
+          module_invoke_all('cosign_user_created', $new_user);
+
+        }
+        else {
+
+          // No Drupal user exists and none can be created automatically because
+          // that setting is off hook invocation.
+          module_invoke_all('cosign_user_not_created', $cosign_name);
+
+          watchdog('cosign', 'User attempted login but does not have a Drupal account and the auto-create user configuration setting is turned off: @remote_user', array('@remote_user' => $cosign_name), WATCHDOG_NOTICE);
+
+          drupal_set_message(variable_get('cosign_invalid_login_message', t('We were not able to log you in because you do not have an account on this site yet.')), 'status');
+
+          drupal_goto(variable_get('cosign_invalid_login', 'access-denied'));
+        }
+      }
+      else {
+        // Log the user in.
+        $remote = user_load_by_name($cosign_name);
+
+        $form_state['uid'] = $remote->uid;
+
+        user_login_submit(array(), $form_state);
+      }
+  }
+  else {
+
+    // Remote user is empty hook invocation.
+    module_invoke_all('cosign_no_remote_user');
+
+    // remote_user is empty, if user is still logged in, log user out
+    if ($user->uid && variable_get('cosign_autologout', 1)) {
+      cosign_drupal_logout();
+    }
+  }
+  return TRUE;
+}
+
+/**
+ * Attempts to retrieve the remote user from the $_SERVER variable.
+ *
+ * If the user is logged in to cosign webserver auth, the remote user variable
+ * will contain the name of the user logged in.
+ *
+ * @return
+ *   String username or empty string.
+ */
+function cosign_retrieve_remote_user() {
+
+  $cosign_name = '';
+
+  // Make sure we get the remote user whichever way it is available.
+  if (isset($_SERVER['REDIRECT_REMOTE_USER'])) {
+    $cosign_name = $_SERVER['REDIRECT_REMOTE_USER'];
+  }
+  elseif (isset($_SERVER['REMOTE_USER'])) {
+    $cosign_name = $_SERVER['REMOTE_USER'];
+  }
+
+  return $cosign_name;
+
+}
+
+/**
+ * Form constructor for the cosign administrative configuration form.
+ *
+ * @ingroup forms
+ */
+function cosign_admin() {
+
+  $default_logout_path = 'https://' . $_SERVER['SERVER_NAME'] . '/cgi-bin/logout';
+  $form['cosign_logout_path'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Logout Path'),
+    '#default_value' => variable_get('cosign_logout_path', $default_logout_path),
+    '#size' => 80,
+    '#maxlength' => 200,
+    '#description' => t("The address (including http(s)) of the machine and script path for logging out. Cosign has two options for logout. The default of the Cosign module is to use the local server logout script. This script immediately kills the local service cookie and redirects the user to central Cosign weblogin to logout. Alternatively, you can instead change the logout address to the central Cosign weblogin logout script (for the University of Michigan, it is: https://weblogin.umich.edu/cgi-bin/logout). By redirecting the user directly to the central Cosign weblogin logout script, the user's service cookie will not be immediately destroyed. Instead, it will remain active for a period of up to 1 minute during which time the user's HTTP requests will remain authenticated by the local service cookie."),
+  );
+
+  $logout_to =  'http://' . $_SERVER['SERVER_NAME'] . base_path();
+  $form['cosign_logout_to'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Logout to'),
+    '#default_value' => variable_get('cosign_logout_to', $logout_to),
+    '#size' => 80,
+    '#maxlength' => 200,
+    '#description' => t("The address to redirect users to after they have logged out."),
+  );
+
+  $default_email_domain = 'umich.edu';
+
+  $YesNo = array(
+    1 => 'Yes',
+    0 => 'No',
+  );
+
+  $form['cosign_autologout'] = array(
+    '#type' => 'select',
+    '#title' => t('Logout users from Drupal when their Cosign session expires?'),
+    '#description' => t('If not selected, when users logout of Cosign, they will not also be automatically logged out of Drupal. This can lead to quite a bit of confusion depending on how you have Cosign configured on the server and how your site is setup. For instance, a user could logout of Cosign through a different Cosign protected application, return to the site, and access protected pages after thinking they\'ve already logged out. This can be a security issue if users think they\'re logged out of Drupal but are not.'),
+    '#options' => $YesNo,
+    '#default_value' => variable_get('cosign_autologout', 1),
+  );
+
+  $form['cosign_autocreate'] = array(
+    '#type' => 'select',
+    '#title' => 'Auto-create Users?',
+    '#options' => $YesNo,
+    '#default_value' => variable_get('cosign_autocreate', 0),
+  );
+
+  $form['cosign_invalid_login'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Redirect for users without a Drupal account'),
+    '#default_value' => variable_get('cosign_invalid_login', 'access-denied'),
+    '#size' => 80,
+    '#maxlength' => 200,
+    '#description' => t("The address or path where users should land if they authenticate through Cosign, but do not have a corresponding Drupal account, and thus are not logged in to Drupal. This is only relevant if you have 'Auto-create Users' set to 'No' or 'Allow friend accounts' set to 'No'. If you set this to an internal path that doesn't exist, you must create the page you set it to."),
+  );
+
+  $form['cosign_invalid_login_message'] = array(
+    '#type' => 'textarea',
+    '#title' => t('Message displayed to users after they authenticate to Cosign but don\'t have a Drupal account'),
+    '#default_value' => variable_get('cosign_invalid_login_message', t('We were not able to log you in because you do not have an account on this site yet.')),
+    '#description' => t("This message is only relevant if you have 'Auto-create Users' set to 'No'. When a user logs in who doesn't have an account, this message will tell them what happened."),
+  );
+
+  // This setting is not used anywhere anymore. May be useful for some feature
+  // that was removed and may be built back in in the future.
+  /*$form['cosign_autocreate_email_domain'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Email domain'),
+    '#default_value' => variable_get('cosign_autocreate_email_domain', $default_email_domain),
+    '#size' => 80,
+    '#maxlength' => 200,
+    '#description' => t("The default email domain to use"),
+  );*/
+
+  $form['cosign_allow_friend_accounts'] = array(
+    '#type' => 'select',
+    '#title' => 'Allow friend accounts?',
+    '#options' => $YesNo,
+    '#default_value' => variable_get('cosign_allow_friend_accounts', 0),
+  );
+  $form['cosign_friend_account_message'] = array(
+    '#type' => 'textarea',
+    '#title' => t('Message displayed to users after they authenticate to Cosign with a friend account'),
+    '#default_value' => variable_get('cosign_friend_account_message', t('We were not able to log you in because this site does not accept university friend accounts.')),
+    '#description' => t("This message is only relevant if you have 'Allow friend accounts' set to 'No'. When a friend account user logs in, this message will tell them that they don't have access."),
+  );
+
+  return system_settings_form($form);
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function cosign_form_alter(&$form, &$form_state, $form_id) {
+
+  if ($form_id == "user_login_block") {
+    $form['#action'] = 'user/login';
+    $form['name']['#access'] = FALSE;
+    $form['pass']['#access'] = FALSE;
+    $form['submit']['#access'] = FALSE;
+    $form['links']['#value'] = '<a href="https://' . $_SERVER['HTTP_HOST'] . request_uri() . '">Login</a>';
+  }
+
+  if ($form_id == "user_login") {
+    drupal_goto('https://' . $_SERVER['SERVER_NAME'] . base_path());
+  }
+
+  if ($form_id == "user_profile_form") {
+    if (isset($form['account']['name'])) {
+      $form['account']['name']['#type'] = 'hidden';
+    }
+    $form['account']['pass']['#access'] = FALSE;
+  }
+}
+
+/**
+ * Implements hook_help().
+ */
+function cosign_help($path, $arg) {
+  switch ($path) {
+    case 'admin/modules#description':
+      return t("Allows users to authenticate via Cosign.");
+
+    case "admin/help#cosign":
+      return '<p>' . t("Allows users to authenticate via Cosign") . '</p>';
+  }
+}
+
+/**
+ * Helper function, handles drupal and cosign logout.
+ *
+ * @see user_logout()
+ */
+function cosign_logout() {
+  // The following method for logging the user out of Drupal comes from
+  // user_logout in core.
+  global $user;
+
+  watchdog('user', 'Session closed for %name.', array('%name' => $user->name));
+
+  module_invoke_all('user_logout', $user);
+
+  // Destroy the current session, and reset $user to the anonymous user.
+  session_destroy();
+
+  $default_logout_path = 'https://' . $_SERVER['SERVER_NAME'] . '/cgi-bin/logout';
+  $default_logout_to =   'http://' . $_SERVER['SERVER_NAME'] . base_path();
+
+  $logout_path = variable_get('cosign_logout_path', $default_logout_path);
+  $logout_to = variable_get('cosign_logout_to', $default_logout_to);
+
+  drupal_goto($logout_path . '?' . $logout_to);
+
+  return TRUE;
+}
+
+/**
+ * Helper function, logs user out of drupal with no redirect.
+ *
+ * Alternative to user_logout(), cosign_drupal_logout() doesn't redirect.
+ *
+ * @see user_logout()
+ */
+function cosign_drupal_logout() {
+  // The following method for logging the user out of Drupal comes from
+  // user_logout in core.
+  global $user;
+
+  watchdog('user', 'Session closed for %name.', array('%name' => $user->name));
+
+  module_invoke_all('user_logout', $user);
+
+  // Destroy the current session, and reset $user to the anonymous user.
+  session_destroy();
+}
+
+// Not sure what the purpose is of creating a block anymore.
+/**
+ * Implements hook_block_info().
+ */
+/*function cosign_block_info() {
+  global $user;
+  $blocks['cosign'] = array(
+      'info' => t('Cosign status and logout'),
+  );
+  return $blocks;
+}*/
+
+/**
+ * Implements hook_disable().
+ */
+function cosign_disable() {
+  $module = 'cosign';
+
+  db_update('system')
+      ->fields(array(
+            'status' => 0,
+      ))
+      ->condition('type', 'module')
+      ->condition('name', $module)
+      ->execute();
+  drupal_set_message(t('Cosign module has been disabled'));
+}
+
+/**
+ * Implements hook_enable().
+ */
+function cosign_enable() {
+  $errmsg = '';
+  $realm = '';
+
+  if (isset($_SERVER['REMOTE_REALM'])) {
+    $realm = '@' . $_SERVER['REMOTE_REALM'];
+  }
+
+  // This is a fresh install, don't bother copying users
+  if (basename($_SERVER['SCRIPT_NAME']) == "install.php") {
+    drupal_set_message(t('Cosign module has been enabled'));
+  }
+  return TRUE;
+}
+

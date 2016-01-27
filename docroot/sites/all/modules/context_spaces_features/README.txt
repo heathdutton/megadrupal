@@ -1,2 +1,0 @@
-***** USAGE *****
-Create a context. Select a condition and you'll be able to select from Features which are spaces aware.  This is far more efficient then adding blocks based on stray view / og activation and leads to less queries running on pages in distributions that run off of spaces / context / features.

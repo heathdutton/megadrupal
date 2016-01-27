@@ -30,7 +30,7 @@ STANDARD INSTALLATION:
 
 2. Download and install the jquery Map Hilight from: http://drupal.org/project/jq_maphilight
 
-3. Download the jquery Map Hilight plugin from http://plugins.jquery.com/project/maphilight
+3. Download the jquery Map Hilight plugin from https://github.com/kemayo/maphilight
 
 4. Extract the jquery.maphilight.min.js file into the sites/all/libraries/jquery.maphilight directory.
 
@@ -42,11 +42,9 @@ indicating the path where it has been found in the "jQuery Maphilight Plugin Sta
 
 DRUSH INSTALLATION:
 
-1. drush dl libraries jq_maphilight
+1. drush en -y libraries jq_maphilight
 
-2. drush en libraries jq_maphilight
-
-3. drush maphilight-plugin
+2. drush maphilight-plugin
 
 
 -------------------------

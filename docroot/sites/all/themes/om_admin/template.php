@@ -1,7 +1,0 @@
-<?php
-
-/**
- * @file
- *
- * Theme functions
- */

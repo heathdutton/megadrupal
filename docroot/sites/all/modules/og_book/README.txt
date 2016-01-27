@@ -1,0 +1,1 @@
+Each group gets its own book into which members can post. Structured content for groups.

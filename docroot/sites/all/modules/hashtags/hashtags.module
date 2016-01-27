@@ -1,0 +1,1164 @@
+<?php
+
+/**
+ * Constants
+ */
+define('HASHTAGS_FILTER_NAME', 'filter_hashtags');
+
+/**
+* Implements hook_help().
+*/
+function hashtags_help($path, $arg) {
+  switch ($path) {
+    case "admin/help#hashtags":
+      return '<p>'.  t("Configure default behaviour of hashtags, including in which vocabulary it\'ll be stored, outputing, showing field.") .'</p>';
+      break;
+  }
+}
+
+/**
+* Implements hook_init().
+*/
+function hashtags_init() {
+  drupal_add_css(drupal_get_path('module', 'hashtags') . '/hashtags.css');  
+}
+
+/**
+ * Implements hook_permission().
+ */
+function hashtags_permission() {
+  return array (
+    'administer hashtags' => array(
+      'title' => t('Administer hashtags'),
+      'restrict access' => TRUE,
+    ),
+  );
+}
+
+/**
+* Implements hook_menu().
+*/
+function hashtags_menu() {
+  $items['admin/config/content/hashtags'] = array(
+    'title' => 'Hashtags',
+    'description' => 'Configure default behavior of hashtags, including in which vocabulary it\'ll be stored, outputing, showing field.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('hashtags_configuration_form'),
+    'access arguments' => array('administer hashtags'),
+    'weight' => -10,
+  );
+
+  return $items;
+}
+
+/**
+ * Implementation of hook_form_field_ui_field_edit_form_alter().
+ */
+function hashtags_form_field_ui_field_edit_form_alter(&$form, &$form_state) {  
+  $field_name = variable_get('hashtags_terms_field', 'field_hashtags');
+  // Extract the instance info from the form.
+  $instance = $form['#instance'];
+  $entity_type = $instance['entity_type'];
+  $bundle = $instance['bundle'];  
+  // for comments we check bundle of node that attached 
+  // to this comments
+  if ($entity_type == 'comment') {
+    $entity_type = 'node';
+    // remove comment_node_ substring at the beginning
+    $bundle = substr($bundle, 13);    
+  }
+
+  // field module = 'text' + field_hashtags exists
+  if ($form['#field']['module'] != 'text' ||     
+    !_hashtags_is_field_exists(
+    $field_name, 
+    $entity_type, 
+    $bundle)) {
+    return;  
+  }   
+  
+  $hashtag_value = isset($instance['hashtag_settings']['hashtag_field']) ?
+    $instance['hashtag_settings']['hashtag_field'] : FALSE;
+  $form['instance']['hashtag_settings'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Hashtag settings'),
+    '#description' => t('Track hashtags for this field'),
+    '#weight' => 5,
+    '#collapsible' => FALSE,
+  );
+  $form['instance']['hashtag_settings']['hashtag_field'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Enable this field for tracking hashtags'),
+    '#default_value' => $hashtag_value,
+  );
+}
+
+/**
+ * Implementation of hook_entity_presave().
+ */
+function hashtags_entity_presave($entity, $entity_type) {      
+  if ($entity_type == 'comment') {    
+    return;
+  }
+  // hashtags generation proccess can be prevented if define 
+  // hashtags_ignore property
+  if (isset($entity->hashtags_ignore) && $entity->hashtags_ignore) {
+    return;
+  }  
+
+  $field_name = variable_get('hashtags_terms_field', 'field_hashtags');
+  $vid = variable_get('hashtags_vocabulary', 3);      
+  $wrapper = entity_metadata_wrapper($entity_type, $entity);    
+  $bundle = $wrapper->getBundle();
+  // Check if field_hashtags field exists
+  // for current entity
+  if (!_hashtags_is_field_exists(
+    $field_name, 
+    $entity_type,
+    $bundle)) {  
+    return;
+  }    
+
+  $entity_id = $wrapper->getIdentifier();
+  // for new entity - setup entity_id = 0 and save zero 
+  // value to hashtags_index table; and then update all 
+  // rows with entity_id = 0  inside hook_entity_insert() 
+  // with generated entity_id because we don't have access 
+  // to entity_id from hook_entity_presave()
+  $entity_id = empty($entity_id) ? 0 : $entity_id;
+  // go through every textfield/textarea that marked 
+  // to use hashtags and put everything to $text string for
+  // further taking tags from it  
+  $text = _hashtags_get_tracked_text($wrapper, $entity_type, $bundle);  
+  // this array is going to contain 'title' => 'tid' 
+  // format of terms that should be attached to entity
+  // (some of previous and some of new ones)
+  $current_terms = array();  
+  // get all tags titles 
+  $current_terms_titles = hashtags_parse_tags($text, FALSE);
+  // get 'title' => 'tid' values of previous tags 
+  // (only works for existing entities)
+  $prev_terms           = _hashtags_index_get_entity_tags($entity_id, $entity_type); //_hashtags_get_prev_terms($wrapper);
+  // take the titles of previous tags
+  $prev_terms_titles    = array_keys($prev_terms);
+  // list of terms that should be checked and 
+  // added to database (except previous terms)  
+  $terms_to_add         = array_diff($current_terms_titles, $prev_terms_titles);  
+  // go through the title list of terms that should be
+  // added to database or taken if they are existed;
+  // save data into $current_terms array
+  foreach ($terms_to_add as $name) {
+    // create/get existing term by name & vid
+    $tid = _hashtags_add_term($name, $vid);    
+    // add row to index
+    _hashtags_index_add($entity_id, $entity_type, $tid);    
+  }
+
+  if ($entity_id) {
+    // list of terms that should be checked and 
+    // deleted from database
+    $terms_to_delete      = array_diff($prev_terms_titles, $current_terms_titles);        
+    // go through the title list of previous terms and check if 
+    // they should be deleted from database (if term has only 
+    // one attachment to hashtags_field)
+    foreach ($terms_to_delete as $name) {
+      $tid = $prev_terms[$name];
+      // remove row from index
+      $left_hashtags = _hashtags_index_remove($entity_id, $entity_type, $tid);
+      // when term is last in vocabulary - remove it
+      if (!$left_hashtags && _hashtags_is_last_term($tid, $field_name)) {      
+        taxonomy_term_delete($tid);
+      }    
+    }      
+  }
+  // refresh Hashtags field with data from
+  // hashtags_index table
+  _hashtags_index_sync_tags($wrapper, $entity_type);    
+}
+
+/**
+ * Implementation of hook_entity_insert().
+ */
+function hashtags_entity_insert($entity, $entity_type) {      
+  if ($entity_type == 'comment') {    
+    return;
+  }
+  // hashtags generation proccess can be prevented if define 
+  // hashtags_ignore property
+  if (isset($entity->hashtags_ignore) && $entity->hashtags_ignore) {
+    return;
+  }  
+
+  $field_name = variable_get('hashtags_terms_field', 'field_hashtags');
+  $vid = variable_get('hashtags_vocabulary', 3);  
+  $wrapper = entity_metadata_wrapper($entity_type, $entity);
+  $bundle = $wrapper->getBundle();      
+  
+  // Check if field_hashtags field exists
+  // for current entity
+  if (!_hashtags_is_field_exists(
+    $field_name, 
+    $entity_type,
+    $bundle)) {  
+    return;
+  }   
+
+  $entity_id = $wrapper->getIdentifier();
+
+  // update all rows that have entity_id = 0 
+  // with entity_id that we have in this hook
+  // because we don't have access to entity_id 
+  // from hook_entity_presave()
+  db_update('hashtags_index')
+    ->fields(array(       
+      'entity_id' => $entity_id,
+    ))
+    ->condition('entity_id', 0)    
+    ->execute();  
+}
+
+/**
+ * Implements hook_comment_presave().
+ */
+function hashtags_comment_presave($comment) {
+  $field_name = variable_get('hashtags_terms_field', 'field_hashtags');
+  $vid = variable_get('hashtags_vocabulary', 3);      
+  
+  $entity_type = 'node';
+  $entity = entity_load_single($entity_type, $comment->nid);
+
+  $entity_wrapper = entity_metadata_wrapper($entity_type, $entity);    
+  $bundle = $entity_wrapper->getBundle();
+
+  // Check if field_hashtags field exists
+  // for current entity
+  if (!_hashtags_is_field_exists(
+    $field_name, 
+    $entity_type,
+    $bundle)) {  
+    return;
+  } 
+
+  $comment_wrapper = entity_metadata_wrapper('comment', $comment); 
+  // go through every textfield/textarea that marked 
+  // to use hashtags and put everything to $text string for
+  // further taking tags from it 
+  $text = _hashtags_get_tracked_text($comment_wrapper, 'comment', $comment->node_type);
+
+  $entity_id = $entity_wrapper->getIdentifier();
+  // for new comment - setup cid = 0 and save zero 
+  // value inside hashtags_index table; and update all 
+  // rows with cid = 0  inside hook_comment_insert() 
+  // with generated cid because we don't have access 
+  // to cid from hook_comment_presave()
+  $comment_id = empty($comment->cid) ? 0 : $comment->cid;
+
+  // go through every textfield/textarea that marked 
+  // to use hashtags and put everything to $text string for
+  // further taking tags from it    
+  
+  // this array is going to contain 'title' => 'tid' 
+  // format of terms that should be attached to entity
+  // (some of previous and some of new ones)
+  $current_terms = array();  
+
+  // get all tags titles 
+  $current_terms_titles = hashtags_parse_tags($text, FALSE);
+  // get 'title' => 'tid' values of previous tags 
+  // (only works for existing entities)
+  $prev_terms           = _hashtags_index_get_comment_tags($comment_id, $entity_type);
+  // take the titles of previous tags
+  $prev_terms_titles    = array_keys($prev_terms);
+  // list of terms that should be checked and 
+  // added to database (except previous terms)    
+  $terms_to_add         = array_diff($current_terms_titles, $prev_terms_titles);    
+  // go through the title list of terms that should be
+  // added to database or taken if they are existed;
+  // save data into $current_terms array
+  foreach ($terms_to_add as $name) {
+    // create/get existing term by name & vid
+    $tid = _hashtags_add_term($name, $vid);    
+    // add row to index
+    _hashtags_index_add($entity_id, $entity_type, $tid, $comment_id);    
+  }
+
+  if ($comment_id != 0) {
+    // list of terms that should be checked and 
+    // deleted from database
+    $terms_to_delete      = array_diff($prev_terms_titles, $current_terms_titles);  
+      
+    // go through the title list of previous terms and check if 
+    // they should be deleted from database (if term has only 
+    // one attachment to hashtags_field)
+    foreach ($terms_to_delete as $name) {
+      $tid = $prev_terms[$name];      
+      // remove row from index
+      $left_hashtags = _hashtags_index_remove($entity_id, $entity_type, $tid, $comment_id);      
+      // when term is last in vocabulary - remove it
+      if (!$left_hashtags && _hashtags_is_last_term($tid, $field_name)) {      
+        taxonomy_term_delete($tid);
+      }    
+    }    
+  }  
+  // refresh Hashtags field with data from
+  // hashtags_index table
+  _hashtags_index_sync_tags($entity_wrapper, $entity_type, TRUE);
+}
+
+/**
+ * Implements hook_comment_insert().
+ */
+function hashtags_comment_insert($comment) {
+  $field_name = variable_get('hashtags_terms_field', 'field_hashtags');
+  $vid = variable_get('hashtags_vocabulary', 3);      
+  
+  $entity_type = 'node';
+  $entity = entity_load_single($entity_type, $comment->nid);
+
+  $wrapper = entity_metadata_wrapper($entity_type, $entity);    
+  $bundle = $wrapper->getBundle();
+
+  // Check if field_hashtags field exists
+  // for current entity
+  if (!_hashtags_is_field_exists(
+    $field_name, 
+    $entity_type,
+    $bundle)) {  
+    return;
+  }
+
+  // update all rows that have comment_id = 0 
+  // with comment_id that we have in this hook 
+  // because we don't have access to cid 
+  // from hook_comment_presave()
+  db_update('hashtags_index')
+    ->fields(array(       
+      'comment_id' => $comment->cid,
+    ))
+    ->condition('comment_id', 0)    
+    ->execute();
+}
+
+/**
+ * Implements hook_filter_info().
+ */
+function hashtags_filter_info() {
+  $filters = array();  
+  $filters[HASHTAGS_FILTER_NAME] = array(
+    'title'             => t('Convert Hashtags into links'),
+    'description'       => t('Turn #words into links which lead to taxonomy terms'),             
+    'process callback'  => '_hashtags_filter_process',
+    'cache'             => TRUE,
+  );
+  
+  return $filters;
+}
+
+/**
+ * Gather content of all 'text' fields that marked 
+ * as 'Hashtag tracked'
+ * @param  EntityMetadataWrapper &$wrapper    
+ * @param  string $entity_type 
+ * @param  string $bundle      
+ * @return string              
+ */
+function _hashtags_get_tracked_text(&$wrapper, 
+  $entity_type, 
+  $bundle) {
+  $text = '';
+  // get all fields by entity type & bundle
+  $fields = field_info_instances($entity_type, $bundle);   
+  foreach ($fields as $field_name => $field) {
+    // check field is marked as 'Hashtag tracked' and
+    // go through all marked fields to gather a content
+    // (only 'text' fields can be marked like this)
+    if (isset($field['hashtag_settings']) && 
+      $field['hashtag_settings']['hashtag_field']) {
+      $text .= ' ';
+      // value of fields with Input formats have should be 
+      // taken in different way through MetadataWrapper
+      if ($field['settings']['text_processing']) {                
+        $text .= $wrapper->{$field_name}->value->value();                                      
+      } else {
+        $text .= $wrapper->{$field_name}->value();
+      }                 
+    }
+  }
+
+  return $text;
+}
+
+/**
+ * Return formatted list of previous terms
+ * (taken from Term referrence field)
+ * @param  EntityMetadataWrapper &$wrapper 
+ * @param  string $field_name 
+ * @return array('title' => 'tid')
+ */
+function _hashtags_get_prev_terms(&$wrapper, 
+  $field_name = 'field_hashtags') {
+  $prev_terms = array();
+  $terms = $wrapper->{$field_name}->value();
+  foreach ($terms as $term) {    
+    if (isset($term->tid)) {
+      $prev_terms[$term->name] = $term->tid;
+    }
+  }
+
+  return $prev_terms;
+}
+
+/**
+ * Check if term is attached only to one entity
+ * (through Term referrence field type)
+ * @param  integer $tid 
+ * @param  string $field_name 
+ * @return boolean      
+ */
+function _hashtags_is_last_term($tid, $field_name = 'field_hashtags') {
+  $query = new EntityFieldQuery();
+  $query->fieldCondition($field_name, 'tid', $tid, '=');
+  $entity_types = $query->execute();
+  $count = 0;
+  foreach ($entity_types as $entity_type) {
+    $count += sizeof($entity_type);
+  }
+
+  return $count == 1;
+}
+
+/**
+ * Check if term exists with passed term name and 
+ * if not - add new term to database 
+ * 
+ * @param  string $name term name
+ * @param  int $vid  vid
+ * @return int       tid
+ */
+function _hashtags_add_term($name, $vid) {
+  $term = taxonomy_term_load_multiple(
+    array(), 
+    array('name' => trim($name), 'vid' => $vid)
+  );
+  // move up array to one level
+  $term = array_shift($term);
+
+  if (empty($term)) {
+    $term = new stdClass();
+    $term->name = $name;
+    $term->vid = $vid;
+    taxonomy_term_save($term);  
+  } 
+
+  return isset($term->tid) ? $term->tid : '';  
+}
+
+/**
+ * Check if field_hashtags field exists for 
+ * passed entity
+ * @param  object $entity      
+ * @param  string $entity_type 
+ * @return boolean              
+ */
+function _hashtags_is_field_exists($field_name, $entity_type, $bundle = '') {
+  // some entities doesn't have type property
+  if (empty($bundle)) {    
+    $field_names = field_info_instances($entity_type);    
+  } else {
+    $field_names = field_info_instances($entity_type, $bundle);      
+  }  
+  
+  // entity doesn't have field_hashtags 
+  // field attached
+  return isset($field_names[$field_name]);
+}
+
+/**
+ * Add hashtag index to database
+ * @param  int $entity_id  id of entity (node/user/custom entity)
+ * @param  int $tid        id of hashtag
+ * @param  string $type        entity type of entity_id entity
+ * @param  int $comment_id id of comment; should be setup if 
+ * hashtag should be related to comment; NULL if added hashtag 
+ * relates to entity. Same hashtag can be related to entity & comment.
+ * in this case it should be added 2 rows. One with comment_id = NULL, second 
+ * with id of comment
+ * For example:
+ * 1) array(entity_id = 2, tid = 5, comment_id = NULL)
+ * 2) array(entity_id = 2, tid = 5, comment_id = 6)
+ * @return TRUE, @TODO: try {} catch {}
+ */
+function _hashtags_index_add($entity_id, $type, $tid, $comment_id = NULL) {
+  db_insert('hashtags_index')
+  ->fields(array(
+    'entity_id' => $entity_id,
+    'type' => $type,
+    'tid' => $tid,
+    'comment_id' => $comment_id,
+  ))
+  ->execute();
+
+  return TRUE;
+}
+
+/**
+ * Remove hashtag index from database 
+ * @param  int $entity_id  @see _hashtags_index_add()  
+ * @param  string $type    @see _hashtags_index_add() 
+ * @param  int $tid        @see _hashtags_index_add() 
+ * @param  int $comment_id @see _hashtags_index_add() 
+ * @return TRUE, @TODO: try {} catch {}
+ */
+function _hashtags_index_remove($entity_id, $type, $tid, $comment_id = NULL) {
+  db_delete('hashtags_index')
+  ->condition('entity_id', $entity_id)
+  ->condition('type', $type)
+  ->condition('tid', $tid)
+  ->condition('comment_id', $comment_id)
+  ->execute();
+  // return the number hashtags that still is 
+  // attached to entity
+  return _hashtags_index_get_tags_count($entity_id, $type, $tid);
+}
+
+/**
+ * Return a array(name => tid) list of entity hashtags 
+ * (without comments related)
+ * @param  int $entity_id
+ * @param  string $type
+ * @return array (name => tid)
+ */
+function _hashtags_index_get_entity_tags($entity_id, $type) {
+  $result = db_query('SELECT hi.tid, td.name 
+    FROM {hashtags_index} hi 
+    INNER JOIN {taxonomy_term_data} td ON hi.tid = td.tid
+    WHERE hi.entity_id = :entity_id 
+    AND hi.type = :type    
+    AND hi.comment_id IS NULL',
+    array(':entity_id' => $entity_id,
+          ':type' => $type)
+  );
+  $tags = array();
+  foreach ($result as $data) {
+    $tags[$data->name] = $data->tid;
+  }
+
+  return $tags;
+}
+
+/**
+ * Return a array(name => tid) list of all hashtags that 
+ * related to current entity (own hashtags & all comments hashtags)
+ * @param  int $entity_id
+ * @param  string $type
+ * @return array (name => tid)
+ */
+function _hashtags_index_get_all_tags($entity_id, $type) {
+  $result = db_query('SELECT hi.tid, td.name 
+    FROM {hashtags_index} hi 
+    INNER JOIN {taxonomy_term_data} td ON hi.tid = td.tid
+    WHERE hi.entity_id = :entity_id 
+    AND hi.type = :type 
+    GROUP BY hi.tid',
+    array(':entity_id' => $entity_id,
+          ':type' => $type)
+  );
+  $tags = array();
+  foreach ($result as $data) {
+    $tags[$data->name] = $data->tid;
+  }
+
+  return $tags;
+}
+
+/**
+ * Return a array(name => tid) list of hashtags that
+ * belongs to passed comment
+ * @param  int $comment_id
+ * @param  string $type
+ * @return array (name => tid)
+ */
+function _hashtags_index_get_comment_tags($comment_id, $type) {
+  $result = db_query('SELECT hi.tid, td.name 
+    FROM {hashtags_index} hi 
+    INNER JOIN {taxonomy_term_data} td ON hi.tid = td.tid
+    WHERE hi.comment_id = :comment_id AND hi.type = :type',
+    array(':comment_id' => $comment_id, ':type' => $type)
+  );
+  $tags = array();
+  foreach ($result as $data) {
+    $tags[$data->name] = $data->tid;
+  }
+
+  return $tags;
+}
+
+/**
+ * Check if index exists
+ * @param  int $entity_id  
+ * @param  string $type
+ * @param  int $tid        
+ * @param  int $comment_id 
+ * @return boolean             
+ */
+function _hashtags_index_is_exists($entity_id, $type, $tid, $comment_id = NULL) {  
+  $count = db_query('SELECT COUNT(*) 
+    FROM {hashtags_index} 
+    WHERE entity_id = :entity_id 
+    AND type = :type
+    AND tid = :tid 
+    AND comment_id = :comment_id',
+    array(
+      ':entity_id' => $entity_id, 
+      ':type' => $type,
+      ':tid' => $tid, 
+      ':comment_id' => $comment_id)
+    )
+  ->fetchField();
+
+  return $count ? TRUE : FALSE;
+}
+
+/**
+ * Return number of same tags that attached to
+ * current entity (only one can be attached for
+ * entity, and by one for each comment)
+ * @param  int $entity_id id of entity
+ * @param  string $type
+ * @param  int $tid       id of hashtag
+ * @return int            number of tags
+ */
+function _hashtags_index_get_tags_count($entity_id, $type, $tid) {
+  $count = db_query('SELECT COUNT(*) 
+    FROM {hashtags_index} 
+    WHERE entity_id = :entity_id 
+    AND type = :type
+    AND tid = :tid',
+    array(
+      ':entity_id' => $entity_id, 
+      ':type' => $type,
+      ':tid' => $tid)
+    )
+  ->fetchField();
+
+  return $count;
+}
+
+/**
+ * Syncronize tags from 'hashtags_index' to field_hashtags.
+ * Must be called inside hook_entity_presave()
+ * @param  EntityMetadataWrapper &$wrapper Wrapper of current entity (node)
+ * @param  array  $tags     list of tags that should be syncronizied 
+ * with field_hashtags
+ * @return boolean           
+ */
+function _hashtags_index_sync_tags(&$wrapper, 
+  $entity_type,
+  $save = FALSE,
+  $field_name = "field_hashtags", 
+  $tags = array()) {
+  if (!sizeof($tags)) {
+    $entity_id = $wrapper->getIdentifier();
+    $tags = _hashtags_index_get_all_tags($entity_id, $entity_type);
+  }
+  // attach all current term tids to hashtags field
+  $wrapper
+    ->{$field_name}
+    ->set(array_values($tags));
+
+  // need to be saved (used called from hook_comment_insert
+  // to update a node). Don't need to be used when it's called
+  // from hook_entity_presave()
+  if ($save) {
+    $wrapper->save();
+  }
+
+  return TRUE;
+}
+
+
+/*
+ * Replace hashtags with term links 
+ */
+function _hashtags_filter_process($text, $filter, $format, $langcode, $cache, $cache_id) {
+  $hashtags_array = hashtags_parse_tags($text, FALSE);            
+  // No hashtag found in text
+  if (!sizeof($hashtags_array)) { return $text; }        
+  $hashtags_tids = hashtags_get_terms_by_names($hashtags_array);        
+  // No hashtag tids found
+  if (!sizeof($hashtags_tids)) { return $text; }   
+  
+  // create a class to pass parameters and have replace logic  
+  $replace_parameter = new HashtagsLinksConverter;
+  $replace_parameter->hashtags_tids = $hashtags_tids; 
+  
+  // 1) 2+ character after #
+  // 2) Don't start with or use only numbers (0-9) (#123abc, #123 etc)
+  // 3) Letters - digits work correct (#abc123, #conference2013)
+  // 4) No Special Characters “!, $, %, ^, &, *, +, .” 
+  // 5) No Spaces
+  // 6) May use an underscore. Hyphens and dashes will not work.
+  // 7) <p>#hashtag</p> - is valid
+  // 8) <a href="#hashtag">Link</p> - is not valid
+  // Bug when hashtag resides at the begining of the string
+  $pattern = "/([\s>]*?)(#)([[:alpha:]][[:alnum:]_]*[^<\s[:punct:]])/iu";                      
+  $text = preg_replace_callback($pattern, array(&$replace_parameter, 'replace'), $text);
+  
+  return $text;
+}
+
+/*
+ * Create and return commas separated string from hashtag words (#some_word)
+ */
+function hashtags_parse_tags($text, $is_string_return = TRUE, $capture_position = FALSE) {
+  // capture_position == PREG_OFFSET_CAPTURE; 
+  // save position to avoid replacing hashtags 
+  // inside links (<a hre="#ball">)    
+  $flag = $capture_position ? PREG_OFFSET_CAPTURE : PREG_PATTERN_ORDER;
+
+  $tags_list = array();  
+  // 1) 2+ character after #
+  // 2) Don't start with or use only numbers (0-9) (#123abc, #123 etc)
+  // 3) Letters - digits work correct (#abc123, #conference2013)
+  // 4) No Special Characters “!, $, %, ^, &, *, +, .” 
+  // 5) No Spaces
+  // 6) May use an underscore. Hyphens and dashes will not work.
+  // 7) <p>#hashtag</p> - is valid
+  // 8) <a href="#hashtag">Link</p> - is not valid
+  $pattern = "/[\s>]+?#([[:alpha:]][[:alnum:]_]*[^<\s[:punct:]])/iu";
+  // add <htest> to process first #hastag - string beginning
+  preg_match_all($pattern, '<htest>'.$text.'<htest>', $tags_list, $flag);  
+  // no hashtags has been found
+  if (isset($tags_list[0]) && !sizeof($tags_list[0])) {        
+    if ($is_string_return) {
+      return '';  
+    }
+    return array();
+  }
+  // save position    
+  if ($capture_position) {
+    foreach ($tags_list[1] as $key => $data) {
+      // array[position] = hashtag
+      $result[$data[1]] = strtolower($data[0]);      
+    }
+  } else {
+    // turn tags into lowercase  
+    foreach ($tags_list[1] as $key => $tag) {
+      $tags_list[1][$key] = strtolower($tag);
+    }  
+    if ($is_string_return) {
+      $result = implode(',', $tags_list[1]);  
+    } else {
+      $result = $tags_list[1];
+    }
+  }
+  
+  return array_unique($result);
+}
+
+/*
+ * Returns an array of hashtags by names
+ * Array['term_name'] = term_id;
+ */
+function hashtags_get_terms_by_names($names) {
+  $terms = array();  
+  $vid = variable_get('hashtags_vocabulary', '');  
+  $sql = "SELECT ttd.name, ttd.tid FROM {taxonomy_term_data} ttd   
+  WHERE lower(ttd.name) IN (:names) AND ttd.vid = :vid";  
+  $result = db_query($sql, array(':names' => $names, ':vid' => $vid));
+  foreach ($result as $term) {
+    $terms[$term->name] = $term->tid;
+  }  
+  
+  return $terms;
+}
+
+/**
+ * Check whether a content type can be used in a hashtag. 
+ */
+function _hashtags_node_check_node_type($node) {
+  // Fetch information about the Hashtags field.
+  $field_name = variable_get('hashtags_terms_field', '');
+  $field = field_info_instance('node', $field_name, $node->type);  
+  return is_array($field);
+}
+
+/**
+* Hashtags configuration form
+*/
+function hashtags_configuration_form($form, &$form_state) {          
+  $field_name = variable_get('hashtags_terms_field', '');
+  $types = node_type_get_names();    
+  $types_keys = array_keys($types);
+  $default_values = array();
+  $vocabulary = taxonomy_vocabulary_load(variable_get('hashtags_vocabulary', 0));
+  foreach ($types_keys as $type) {    
+    if (field_info_instance('node', $field_name, $type)) {
+      $default_values[$type] = $type;
+    } else {
+      $default_values[$type] = 0;
+    }
+  }  
+  $values = array();
+  $form['hashtags_content_types'] = array(
+    '#type' => 'checkboxes',
+    '#title' => t('Content types'),
+    '#options' => $types,
+    '#default_value' => $default_values, 
+    '#description' => t('Check for what content types you want Hashtags functionality to have')
+  );
+  $form['advanced'] = array(
+    '#title' => t('Advanced'),
+    '#type' => 'fieldset',
+    '#collapsible' => TRUE,
+    '#collapsed' => TRUE,    
+  );
+  $form['advanced']['clean_orphaned_terms'] = array(
+    '#type' => 'submit',
+    '#value' => t('Clean orphaned hashtags'),
+    '#submit' => array('hashtags_clean_orphaned_terms_submit'),
+  );
+  $form['advanced']['clean_hash_symbol'] = array(
+    '#type' => 'submit',
+    '#value' => t('Clean hash symbol'),
+    '#submit' => array('hashtags_clean_hash_symbol_submit'),
+  );
+  $form['advanced']['import_to_index'] = array(
+    '#type' => 'submit',
+    '#value' => t('Import hashtags to index'),
+    '#submit' => array('hashtags_import_to_index_submit'),
+  );
+
+  $form['#submit'][] = 'hashtags_fields_content_types_submit';
+
+  return system_settings_form($form);
+}
+
+/**
+ * Submit handler for 'Import hashtags to index' button 
+ */
+function hashtags_import_to_index_submit($form, &$form_state) {
+  if ($form_state['clicked_button']['#parents'][0] == 'import_to_index') {
+    hashtags_index_import();
+  }
+}
+
+/**
+ * Submit handler for 'Clean hash symbol' button 
+ */
+function hashtags_clean_hash_symbol_submit($form, &$form_state) {
+  if ($form_state['clicked_button']['#parents'][0] == 'clean_hash_symbol') {
+   $vid = variable_get('hashtags_vocabulary', '');
+    $count = hashtags_clean_hash_symbol();
+    
+    drupal_set_message(t(':count hashtags has been updated', 
+      array(':count' => $count))
+    );
+  }
+}
+
+/**
+ * Submit handler for 'Clean orphaned hashtags' button 
+ */
+function hashtags_clean_orphaned_terms_submit($form, &$form_state) {
+  if ($form_state['clicked_button']['#parents'][0] == 'clean_orphaned_terms') {                
+    $count = hashtags_clean_orphaned_terms();
+    drupal_set_message(t(':count orphaned hastags have been cleaned'),
+    array(':count' => $count));
+  }
+}
+
+/**
+ * Import hashtags data from node body fields to
+ * 'hashtags_index' table
+ * @return int    number of rows added
+ */
+function hashtags_index_import() {
+  db_delete('hashtags_index')  
+  ->execute();
+
+  $query = new EntityFieldQuery();
+  $query->entityCondition('entity_type', 'node')
+        ->fieldCondition('field_hashtags');
+  $entity_types = $query->execute();
+  
+  $batch = array(
+    'title' => t('Import data to Hashtags index table from nodes that related to hashtags'),
+    'operations' => array(),
+    'finished' => '_hashtags_index_batch_finished',
+  );
+
+  $count = 0;
+  foreach ($entity_types['node'] as $nid => $item) {
+    $batch['operations'][] = array('_hashtags_index_batch_process', array($nid));
+    $count++;    
+  }
+  batch_set($batch);
+}
+
+/**
+ * Hashtags index import, batch process callback
+ * @param  int $nid      
+ * @param  array &$context  
+ */
+function _hashtags_index_batch_process($nid, &$context) {
+  $node = node_load($nid);
+  node_save($node);
+}
+
+/**
+ * Hashtags index import, batch finished callback
+ * @param  boolean $success    
+ * @param  array $results    
+ * @param  array $operations  
+ */
+function _hashtags_index_batch_finished($success, $results, $operations) {
+  if ($success) {    
+    drupal_set_message('Hashtags data have been imported to Hashtags index');
+  }
+  else {
+    $error_operation = reset($operations);
+    $message = t('An error occurred while processing %error_operation with arguments: @arguments', array(
+      '%error_operation' => $error_operation[0],
+      '@arguments' => print_r($error_operation[1], TRUE)
+    ));
+    drupal_set_message($message, 'error');
+  } 
+}
+
+/**
+ * Activate hashtag field to use Hashtags for all bundles 
+ * of passed entity type
+ * @param  string $entity_type    (node, comment, user, etc)
+ * @param  string $field_activate by default - body
+ * @return boolean                 
+ */
+function hashtags_fields_activate($entity_type = 'node', $field_activate = 'body') {
+  $field_name = variable_get('hashtags_terms_field', 'field_hashtags');
+  // get all bundles => fields array by Entity type 
+  $fields = field_info_instances($entity_type);
+  // go through all bundles and check 2 options: 
+  // * Field Hashtags exists
+  // * Field to be activated exists
+  foreach ($fields as $bundle => $fields) {
+    if (isset($fields[$field_name]) && isset($fields[$field_activate])) {
+      // activate Hashtag tracking for node body field
+      $fields[$field_activate]['hashtag_settings']['hashtag_field'] = 1;
+      field_update_instance($fields[$field_activate]);
+      // activate Hashtag tracking for comment body field of 
+      // current node 
+      $comment_instance = field_info_instance('comment', 
+        'comment_body', 
+        'comment_node_'.$bundle);
+      $comment_instance['hashtag_settings']['hashtag_field'] = 1;
+      field_update_instance($comment_instance);
+    }
+  }
+}
+
+/**
+ * Clean hash (#) symbol in Hashtags vocabulary
+ * @param  int $vid vocabulary id
+ * @return int      Number of affected values
+ */
+function hashtags_clean_hash_symbol($vid = NULL) {
+  if (is_null($vid)) {
+    $vid = variable_get('hashtags_vocabulary', '');
+  }
+  $result = db_query("UPDATE {taxonomy_term_data} 
+      SET name = SUBSTR(name, 2) 
+      WHERE vid = :vid AND 
+      name LIKE '#%'", 
+      array(':vid' => $vid));
+
+  return $result->rowCount();
+}
+
+/**
+ * Clean orphaned hashtags in Hashtags vocabulary
+ * @param  int $vid vocabulary id
+ * @return int      Number of affected values
+ */
+function hashtags_clean_orphaned_terms($vid = NULL) {  
+  if (is_null($vid)) {
+    $vid = variable_get('hashtags_vocabulary', '');
+  }
+  $sql = "SELECT td.tid, (SELECT COUNT(*) 
+    FROM {field_data_field_hashtags} fh 
+    WHERE fh.field_hashtags_tid = td.tid) AS attached_count 
+    FROM {taxonomy_term_data} td 
+    WHERE vid = :vid 
+    HAVING attached_count = 0";  
+  $result = db_query($sql, array(':vid' => $vid));
+  
+  foreach ($result as $term) {    
+    taxonomy_term_delete($term->tid);
+  } 
+
+  return $result->rowCount();  
+}
+
+/*
+ * Validate hashtags vocabulary & field exisitng
+ */
+function hashtags_configuration_form_validate($form, &$form_state) {  
+  if ($form_state['clicked_button']['#parents'][0] == 'submit') {
+    $vocabulary = taxonomy_vocabulary_load(variable_get('hashtags_vocabulary', 0));
+    if (!$vocabulary) {
+      form_set_error('', t('Hashtags vocabulary has n\'t been created or has been deleted manually.. try to reinstall module.'));
+      return;
+    }
+    $field_name = variable_get('hashtags_terms_field', '');    
+    if (!field_info_field($field_name)) {
+      form_set_error('', t('Hashtags field has n\'t been created or has been deleted manually.. try to reinstall module.'));
+      return;
+    } 
+  }
+}
+
+/*
+ * Deal with attaching/detaching Hashtag fields to / out of content types
+ */
+function hashtags_fields_content_types_submit($form, &$form_state) {
+  if ($form_state['clicked_button']['#parents'][0] == 'submit') {        
+    $field_name = variable_get('hashtags_terms_field', '');    
+    foreach ($form_state['values']['hashtags_content_types'] as $content_type => $checked) {      
+      $instance = field_info_instance('node', $field_name, $content_type);
+      if ($content_type === $checked) {        
+        if (!is_array($instance)) {          
+          $instance = array(
+            'field_name' => $field_name, 
+            'entity_type' => 'node',
+            'label' => 'Hashtags',
+            'bundle' => $content_type,
+            'widget' => array(
+              'type' => 'taxonomy_autocomplete',
+              'weight' => -4,
+            ),
+            'display' => array(
+              'default' => array(
+                'type' => 'taxonomy_term_reference_link',
+                'weight' => 10,
+              ),
+              'teaser' => array(
+                'type' => 'taxonomy_term_reference_link',
+                'weight' => 10,
+              ),
+            ),
+          );
+          field_create_instance($instance);          
+        } 
+      } else {
+        if (is_array($instance)) {          
+          field_delete_instance($instance, FALSE);          
+        } 
+      }
+    }  
+    // activate hashtags for Body field for selected content types
+    hashtags_fields_activate(); 
+    drupal_set_message(t('Content types and Hashtags fields chain have been saved.'));
+  }  
+}
+
+/*
+ * Add Hashtags filter to system input formats: Filter HTML and Full HTML;
+ */
+function hashtags_add_filter() {
+  $added_status = array();
+  $format_id = 'filtered_html';   
+  $is_hashtag_filter_exists = db_query('SELECT COUNT(*) FROM {filter} WHERE format = :format AND module = :module AND name = :name', array(':format' => $format_id, ':module' => 'hashtags', ':name' => HASHTAGS_FILTER_NAME))->fetchField();
+  if (!$is_hashtag_filter_exists) {
+    $max_filter_weight = db_query('SELECT MAX(weight) FROM {filter} WHERE format = :format', array(':format' => $format_id))->fetchField();
+    db_insert('filter')
+      ->fields(array(
+        'format',
+        'name',
+        'weight',
+        'status',
+        'module',
+        'settings',
+      ))
+      ->values(array(
+        'format' => $format_id,
+        'name' => 'filter_hashtags',
+        'weight' => $max_filter_weight + 1,
+        'status' => 1,
+        'module' => 'hashtags',
+        'settings' => serialize(array()),
+      ))->execute();    
+    $added_status[] = $format_id;
+    drupal_set_message(t('Hashtags filter has been added to "Filter HTML" input format'));
+    watchdog('Input format', t('Hashtags filter has been added to "Filter HTML" input format'));
+  }
+  $format_id = 'full_html';
+  $is_hashtag_filter_exists = db_query('SELECT COUNT(*) FROM {filter} WHERE format = :format AND module = :module AND name = :name', array(':format' => $format_id, ':module' => 'hashtags', ':name' => HASHTAGS_FILTER_NAME))->fetchField();
+  if (!$is_hashtag_filter_exists) {
+    $max_filter_weight = db_query('SELECT MAX(weight) FROM {filter} WHERE format = :format', array(':format' => $format_id))->fetchField();
+    db_insert('filter')
+      ->fields(array(
+        'format',
+        'name',
+        'weight',
+        'status',
+        'module',
+        'settings',
+      ))
+      ->values(array(
+        'format' => $format_id,
+        'name' => 'filter_hashtags',
+        'weight' => $max_filter_weight + 1,
+        'status' => 1,
+        'module' => 'hashtags',
+        'settings' => serialize(array()),
+      ))->execute();     
+    $added_status[] = $format_id;
+    drupal_set_message(t('Hashtags filter has been added to "Full HTML" input format'));
+    watchdog('Input format', t('Hashtags filter has been added to "Full HTML" input format'));
+  }      
+  // clear filter caches
+  filter_formats_reset();
+  if (sizeof($added_status)) {
+    return TRUE;
+  }
+  return FALSE;
+}
+
+/*
+ * Remove Hashtags filter out of all input formats
+ */
+function hashtags_remove_filter() {
+  $module = 'hashtags';
+  db_query("DELETE FROM {filter} WHERE module = :module", array(':module' => $module));
+  // clear filter caches
+  filter_formats_reset();
+  drupal_set_message(t('Hashtags filter has been removed from all input format'));
+  watchdog('Input format', t('Hashtags filter has been removed from all input format'));
+}
+
+/* 
+ * Help class to pass paramters to callback function within preg_replace_callback 
+ */
+class HashtagsLinksConverter {
+  function replace($matches) {     
+    if (isset($this->hashtags_tids)) {
+      $hashtags_tids = $this->hashtags_tids; 
+    }        
+    $first_delimeter = isset($matches[1]) ? $matches[1] : '';    
+    $hashtag_name = isset($matches[3]) ? $matches[3] : '';              
+    $hashtag_tid = isset($hashtags_tids[strtolower($hashtag_name)]) ? $hashtags_tids[strtolower($hashtag_name)] : '';            
+    $hashtag_name = '#'.$hashtag_name;
+    // hashtag is not exists - show without link
+    if (empty($hashtag_tid)) {
+      return $first_delimeter . $hashtag_name;      
+    } 
+    // Fatal error: [] operator not supported for strings in /includes/common.inc on line 2442
+    // Issue comes up when we try to bind attribute to link which has path parameter of the current page............
+    if ($_GET['q'] == 'taxonomy/term/'.$hashtag_tid) {
+      $hashtag_link = l($hashtag_name, 'taxonomy/term/'.$hashtag_tid);
+    } else {
+      $hashtag_link = l($hashtag_name, 'taxonomy/term/'.$hashtag_tid, array('attributes' => array('class' => 'hashtag')));
+    }
+
+    return $first_delimeter . $hashtag_link;      
+  }
+}

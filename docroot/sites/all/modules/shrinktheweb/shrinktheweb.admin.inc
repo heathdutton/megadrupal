@@ -7,21 +7,21 @@ function shrinktheweb_admin_log($form, $form_state) {
 
     // format the tableselect header
     $header = array(
-      'domain' => array('data' => t('Domain'), 'field' => 'sl.domain'),
-      'hash' => array('data' => t('Hash'), 'field' => 'sl.hash'),
-      'timestamp' => array('data' => t('Timestamp'), 'field' => 'sl.timestamp'),
-      'capturedon' => array('data' => t('Captured on'), 'field' => 'sl.capturedon'),
-      'quality' => array('data' => t('Quality'), 'field' => 'sl.quality'),
-      'full' => array('data' => t('Full'), 'field' => 'sl.full'),
-      'xmax' => array('data' => t('Xmax'), 'field' => 'sl.xmax'),
-      'ymax' => array('data' => t('Ymax'), 'field' => 'sl.ymax'),
-      'nrx' => array('data' => t('nrX'), 'field' => 'sl.nrx'),
-      'nry' => array('data' => t('nrY'), 'field' => 'sl.nry'),
-      'invalid' => array('data' => t('Invalid'), 'field' => 'sl.invalid'),
-      'stwerrcode' => array('data' => t('STW error code'), 'field' => 'sl.stwerrcode'),
-      'error' => array('data' => t('Error'), 'field' => 'sl.error'),
-      'errcode' => array('data' => t('Error'), 'field' => 'sl.errcode'),
-      'referrer' => array('data' => t('Referrer'), 'field' => 'sl.referrer'),
+      'domain' => array('data' => t('Domain'), 'field' => 'sl.stw_domain'),
+      'hash' => array('data' => t('Hash'), 'field' => 'sl.stw_hash'),
+      'timestamp' => array('data' => t('Timestamp'), 'field' => 'sl.stw_timestamp'),
+      'capturedon' => array('data' => t('Captured on'), 'field' => 'sl.stw_capturedon'),
+      'quality' => array('data' => t('Quality'), 'field' => 'sl.stw_quality'),
+      'full' => array('data' => t('Full'), 'field' => 'sl.stw_full'),
+      'xmax' => array('data' => t('Xmax'), 'field' => 'sl.stw_xmax'),
+      'ymax' => array('data' => t('Ymax'), 'field' => 'sl.stw_ymax'),
+      'nrx' => array('data' => t('nrX'), 'field' => 'sl.stw_nrx'),
+      'nry' => array('data' => t('nrY'), 'field' => 'sl.stw_nry'),
+      'invalid' => array('data' => t('Invalid'), 'field' => 'sl.stw_invalid'),
+      'stwerrcode' => array('data' => t('STW error code'), 'field' => 'sl.stw_stwerrcode'),
+      'error' => array('data' => t('Error'), 'field' => 'sl.stw_error'),
+      'errcode' => array('data' => t('Error'), 'field' => 'sl.stw_errcode'),
+      'referrer' => array('data' => t('Referrer'), 'field' => 'sl.stw_referrer'),
     );
 
     // get the log records
@@ -35,22 +35,22 @@ function shrinktheweb_admin_log($form, $form_state) {
       ->execute();
 
     foreach ($result as $record) {
-      $log_records[$record->siteid] = array(
-        'domain' => $record->domain,
-        'hash' => $record->hash,
-        'timestamp' => $record->timestamp,
-        'capturedon' => $record->capturedon,
-        'quality' => $record->quality,
-        'full' => $record->full,
-        'xmax' => $record->xmax,
-        'ymax' => $record->ymax,
-        'nrx' => $record->nrx,
-        'nry' => $record->nry,
-        'invalid' => $record->invalid,
-        'stwerrcode' => $record->stwerrcode,
-        'error' => $record->error,
-        'errcode' => $record->errcode,
-        'referrer' => $record->referrer,
+      $log_records[$record->stw_siteid] = array(
+        'domain' => $record->stw_domain,
+        'hash' => $record->stw_hash,
+        'timestamp' => $record->stw_timestamp,
+        'capturedon' => $record->stw_capturedon,
+        'quality' => $record->stw_quality,
+        'full' => $record->stw_full,
+        'xmax' => $record->stw_xmax,
+        'ymax' => $record->stw_ymax,
+        'nrx' => $record->stw_nrx,
+        'nry' => $record->stw_nry,
+        'invalid' => $record->stw_invalid,
+        'stwerrcode' => $record->stw_stwerrcode,
+        'error' => $record->stw_error,
+        'errcode' => $record->stw_errcode,
+        'referrer' => $record->stw_referrer,
       );
     }
 
@@ -106,7 +106,7 @@ function shrinktheweb_admin_log_submit($form, &$form_state) {
   else {
     if (!empty($form_state['storage']['log_records'])) {
       $num_deleted = db_delete('shrinktheweb_log')
-        ->condition('siteid', $form_state['storage']['log_records'], 'IN')
+        ->condition('stw_siteid', $form_state['storage']['log_records'], 'IN')
         ->execute();
       drupal_set_message(t('Deletion successful.'));
     }
