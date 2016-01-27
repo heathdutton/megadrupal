@@ -1,0 +1,1 @@
+<?php print t('Unfortunately you do not have permissions to edit this pane.'); ?>

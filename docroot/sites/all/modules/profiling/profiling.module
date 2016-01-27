@@ -1,0 +1,272 @@
+<?php
+
+/**
+ * @file
+ * Profiling framework module.
+ * 
+ * This module is, and will remain this small. We do not need any other core
+ * functions, nothing in here is about display, or tricky Drupal hacks stuff.
+ */
+
+/**
+ * Default timer collection for orphan timers.
+ */
+define('PROFILING_DEFAULT_COLLECTION', 'default');
+
+/**
+ * Timer collection specific for core hooks measure.
+ */
+define('PROFILING_DEFAULT_HOOK', 'hook');
+
+/**
+ * Page timer name.
+ */
+define('PROFILING_TIMER_PAGE', 'page');
+
+// We don't have any autoloader and don't want to rely on any other module, this
+// won't hurt performances anyway. Further, using D7 the actual core autoloader
+// may hurt performances, so we may not use it to ensure the minimal performance
+// impact.
+$profiling_path = dirname(__FILE__);
+require_once $profiling_path . '/lib/Backend.php';
+require_once $profiling_path . '/lib/Backend/Interface.php';
+require_once $profiling_path . '/lib/Backend/Default.php';
+
+/**
+ * Build hooks implementation using eval'd code. This is ugly but it allows us
+ * to spawn hooks implementation dynamically even before the Drupal framework
+ * know we implement them, at hook_boot() time.
+ * 
+ * Eval'd code will skip OPCode optimizations, so we have to be careful about
+ * what we are eval'ing here.
+ */
+function profiling_build_hooks($hooks) {
+  if (!empty($hooks)) {
+    $code = '';
+
+    foreach ($hooks as $hook => $options) {
+      if (empty($hook)) {
+        // Do not allow crash.
+        continue;
+      }
+
+      $modules = module_implements($hook);
+
+      // Go for it only if at least some modules implements this hook. Also do
+      // another failsafe mecanism for already implemented hooks. This can avoid
+      // some WSOD during runtime by already existing function creation attempt.
+      if (/* empty($modules) || */ function_exists('profiling_' . $hook) || function_exists('profiling_late_' . $hook)) {
+        continue;
+      }
+
+      $code .= "function profiling_$hook() {\n";
+      $code .= "  \$GLOBALS['profiling_hook_delta'][] = profiling_start('hook_$hook', PROFILING_DEFAULT_HOOK);\n";
+      if ($options['array']) {
+        $code .= "  return array();\n";
+      }
+      $code .= "}\n";
+      $code .= "function profiling_late_$hook() {\n";
+      $code .= "  profiling_stop('hook_$hook', array_pop(\$GLOBALS['profiling_hook_delta']));\n";
+      if ($options['array']) {
+        $code .= "  return array();\n";
+      }
+      $code .= "}\n";
+    }
+
+    // Where the magic happens. Let's do only one bulk eval() to ensure minimal
+    // performance impact.
+    if (!empty($code)) {
+      eval($code);
+    }
+
+    // Refresh static cache for later.
+    module_implements(NULL, FALSE, TRUE);
+  }
+}
+
+/**
+ * Implementation of hook_boot().
+ */
+function profiling_boot() {
+  // Init some internals for our own timers.
+  $GLOBALS['profiling_hook_delta'] = array();
+
+  if ($GLOBALS['profiling_enabled']) {
+    // Init the hooks.
+    profiling_build_hooks(variable_get('profiling_hooks', NULL));
+
+    // Init the backend.
+    $backend = Profiling_Backend::getInstance();
+    $backend->init();
+  
+    // Start page timer.
+    $backend->startTimer(PROFILING_TIMER_PAGE, PROFILING_DEFAULT_COLLECTION);
+  }
+}
+
+/**
+ * Implementation of hook_node_view().
+ * 
+ * Early execution timer start.
+ * The nodeapi hook is an edge case, we canno't spawn it dynamically because of
+ * the 'op' parameter that we'd prefer to be splitted.
+ * 
+ * @see profiling_late_node_view()
+ */
+//function profiling_node_view(&$node, $op, $a3 = NULL, $a4 = NULL) {
+//  $GLOBALS['profiling_hook_delta'][] = profiling_start('hook_node_view', PROFILING_DEFAULT_HOOK);
+//}
+
+/**
+ * Implementation of hook_node_view().
+ * 
+ * Late execution timer stop.
+ * 
+ * @see profiling_node_view()
+ */
+//function profiling_late_node_view(&$node, $op, $a3 = NULL, $a4 = NULL) {
+//  profiling_stop('hook_node_view', array_pop($GLOBALS['profiling_hook_delta']));
+//}
+
+/**
+ * Implementation of hook_profiling_backend().
+ */
+function profiling_profiling_backend() {
+  $items = array();
+  $items['Profiling_Backend_Default'] = t("Default backend");
+  return $items;
+}
+
+/**
+ * Implementation of hook_profiling_timer_help().
+ */
+function profiling_profiling_timer_help() {
+  $items = array();
+  foreach (array_unique(variable_get('profiling_hooks', array())) as $hook => $options) {
+    $items['hook_' . $hook] = array(
+      'title' => "hook_" . $hook . "()",
+      'description' => t("Dynamically spawned <em>@hook</em> profiling, currently being implemented by <em>@modules</em> modules.", array(
+        '@hook' => 'hook_' . $hook . '()',
+        // Modules currently implementing these hook do not include ourself
+        // since we don't spawn the eval'd code at runtime when we are in
+        // administrative screens.
+        '@modules' => implode(', ', module_implements($hook)),
+      ))
+    );
+  }
+  return $items;
+}
+
+/**
+ * Implementation of hook_profiling_collection_help().
+ */
+function profiling_profiling_collection_help() {
+  $items = array();
+  $items[PROFILING_DEFAULT_COLLECTION] = array(
+    'title' => t("Default"),
+    'description' => t("Profiling module default timers."),
+  );
+  $items[PROFILING_DEFAULT_HOOK] = array(
+    'title' => t("Hooks"),
+    'description' => t("Hook timers measure profile some critical hooks resources consumption."),
+  );
+  return $items;
+}
+
+/**
+ * Implementation of hook_exit().
+ */
+function profiling_exit() {
+  global $user, $theme_key;
+
+  if (!$GLOBALS['profiling_enabled']) {
+    return;
+  }
+
+  // Create a unique token for the current page. This will allow us to do
+  // per hit statistics.    
+  if (!function_exists('drupal_get_token')) {
+    require_once 'includes/common.inc';
+  }
+  $identifier = drupal_get_token(uniqid());
+
+  // Stop all timers.
+  $backend = Profiling_Backend::getInstance();
+  $backend->stopAllTimers();
+
+  // Save all timers.
+  foreach ($backend->getTimers() as $name => $timers) {
+    foreach ($timers as $delta => $timer) {
+
+      // Spawn new database object.
+      $object = (object) $timer;
+      $object->duration = $object->time_stop - $object->time_start;
+      $object->memory = $object->memory_stop - $object->memory_start;
+      $object->identifier = $identifier;
+
+      if ($object->name == 'page') {
+        // watchdog('profiling', '<pre>' . print_r($object, TRUE) . '</pre>', NULL);
+        // Save request with extra metadata fields for later statistics.
+        $object->uid = $user->uid; 
+        $object->path = $_GET['q'];
+        $object->created = $_SERVER['REQUEST_TIME'];
+        $object->theme = $theme_key;
+        drupal_write_record('profiling_request', $object);
+      }
+      else {
+        // Save raw timer as measured.
+        // FIXME: We should optimize this and build a bulk insert instead.
+        // Some backend should be able to send their data to an external
+        // server or save it into files, so we should let this save being
+        // optional.
+        drupal_write_record('profiling_timers', $object);
+      }
+    }
+  }
+}
+
+// Failsafe, some other module could mess with those.
+if (!function_exists('profiling_start') && !function_exists('profiling_stop')) {
+  $GLOBALS['profiling_enabled'] = FALSE;
+
+  // Check for configuration settings if profiling is enabled, and if we are not on
+  // a excluded URL.
+  // WARNING: by default profiling is disabled!
+  if (variable_get('profiling_enabled', FALSE)) {
+    if (!empty($_GET['q']) && ($patterns = variable_get('profiling_exclude_path', array('admin', 'admin/*')))) {
+      // Hacky here, but needed.
+      require_once './includes/path.inc';
+      if (drupal_match_path($_GET['q'], implode("\n", $patterns))) {
+        $GLOBALS['profiling_enabled'] = FALSE;
+      }
+      else {
+        $GLOBALS['profiling_enabled'] = TRUE;
+      }
+    }
+  }
+
+  // Create real functions only if we are not in a an excluded path and
+  // profiling is not suspended.
+  if ($GLOBALS['profiling_enabled']) {
+
+    /**
+     * @see Profiling_Backend_Interface::startTimer()
+     */
+    function profiling_start($name, $collection = PROFILING_DEFAULT_COLLECTION) {
+      return Profiling_Backend::getInstance()->startTimer($name, $collection);
+    }
+
+    /**
+     * @see Profiling_Backend_Interface::stopTimer()
+     */
+    function profiling_stop($name, $delta = NULL) {
+      return Profiling_Backend::getInstance()->stopTimer($name, $delta);
+    }
+  }
+  else {
+    // We are in an excluded path, or profiling is suspended
+    // disable profiling by creating foo void functions.
+    function profiling_start() { }
+    function profiling_stop() { }
+  }
+}

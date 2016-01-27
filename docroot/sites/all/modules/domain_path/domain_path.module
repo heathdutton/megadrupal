@@ -1,0 +1,546 @@
+<?php
+
+/**
+ * @file
+ *  Path alias handling for multiple domains.
+ */
+
+/**
+ * Implements hook_permission().
+ */
+function domain_path_permission() {
+  $permissions['edit domain paths'] = array(
+    'title' => t('Set domain-specific path aliases'),
+  );
+  return $permissions;
+}
+
+/**
+ * Fetch a specific domain path alias from the database.
+ *
+ * @param $conditions
+ *  A string representing the source, a number representing the dpid, or an
+ *  array of query conditions.
+ *
+ * @return
+ *  FALSE if no alias was found or an associative array containing the
+ *   following keys:
+ *    - source: The internal system path.
+ *    - alias: The URL alias.
+ *    - dpid: Unique path alias identifier.
+ *    - domain_id: The domain ID.
+ *    - entity_type: The entity type.
+ *    - entity_id: The entity ID.
+ *    - language: The language of the alias.
+ */
+function domain_path_path_load($conditions) {
+  global $_domain;
+
+  if (is_numeric($conditions)) {
+    $conditions = array('dpid' => $conditions);
+  }
+  elseif (is_string($conditions)) {
+    $conditions = array('source' => $conditions);
+  }
+  elseif (!is_array($conditions)) {
+    return FALSE;
+  }
+  if (empty($conditions['domain_id'])) {
+    $conditions['domain_id'] = $_domain['domain_id'];
+  }
+  $select = db_select('domain_path');
+  foreach ($conditions as $field => $value) {
+    $select->condition($field, $value);
+  }
+  return $select
+    ->fields('domain_path')
+    ->execute()
+    ->fetchAssoc();
+}
+
+/**
+ * Implements hook_domainpath().
+ *
+ * Wrapper around the new hook_domain_path() for 7.x.2.
+ */
+function domain_path_domainpath($domain_id, &$path, &$options, $original_path) {
+  domain_path_domain_path($domain_id, $path, $options, $original_path);
+}
+
+/**
+ * Implements hook_domainpath().
+ */
+function domain_path_domain_path($domain_id, &$path, &$options, $original_path) {
+  // Let's not muck with absolute paths.
+  if (!empty($options['absolute'])) {
+    return;
+  }
+
+  $path_language = isset($options['language']->language) ? $options['language']->language : NULL;
+  if ($alias = domain_path_lookup_path('alias', $original_path, $domain_id, $path_language)) {
+    $path = $alias;
+    $options['alias'] = TRUE;
+  }
+  elseif($alias = drupal_get_path_alias($original_path, $path_language)) {
+    $path = $alias;
+    $options['alias'] = TRUE;
+  }
+}
+
+/**
+ * Implements hook_url_inbound_alter().
+ */
+function domain_path_url_inbound_alter(&$path, $original_path, $path_language) {
+  if ($source = domain_path_lookup_path('source', $original_path, NULL, $path_language)) {
+    $path = $source;
+  }
+}
+
+/**
+ * Heavily modeled after drupal_lookup_path().
+ *
+ * Given an domain specific alias, return its Drupal system URL if one exists. Given a Drupal
+ * system URL return one of its domain specific aliases if such a one exists. Otherwise,
+ * return FALSE.
+ *
+ * @param $action
+ *   One of the following string values:
+ *   - wipe: delete the alias cache.
+ *   - alias: return an alias for a given Drupal system path (if one exists).
+ *   - source: return the Drupal system URL for a path alias (if one exists).
+ * @param $path
+ *   The path string to investigate for corresponding domain aliases or system URLs.
+ * @param $domain_id
+ *  The id of the domain to load the associated path for.
+ * @param $path_language
+ *   Optional language code to search the path with. Defaults to the page language.
+ *   If there's no path defined for that language it will search paths without
+ *   language.
+ *
+ * @return
+ *   Either a Drupal system path, an aliased path, or FALSE if no path was
+ *   found.
+ */
+function domain_path_lookup_path($action, $path = '', $domain_id = NULL, $path_language = NULL) {
+  global $language_url;
+  global $_domain;
+
+  // Use the advanced drupal_static() pattern, since this is called very often.
+  static $drupal_static_fast;
+  if (!isset($drupal_static_fast)) {
+    $drupal_static_fast['cache'] = &drupal_static(__FUNCTION__);
+  }
+  $cache = &$drupal_static_fast['cache'];
+
+  if ($action == 'wipe' || !isset($cache)) {
+    $cache = array(
+      'map' => array(),
+      'no_aliases' => array(),
+      'no_sources' => array(),
+      'domain_id' => $_domain['domain_id'],
+    );
+  }
+
+  // Check and load domain_id and cache if necessary.
+  if ($domain_id == NULL || $domain_id == $cache['domain_id']) {// Null or the same don't do anything.
+    $domain_id = $cache['domain_id'];
+  }
+  elseif($domain = domain_load($domain_id)) {// A differnt domain is wanted.
+    $cache['domain_id'] = $domain_id = $domain['domain_id'];
+  }
+  else {// Bad id? Oh well load current domain again just to make sure.
+    $cache['domain_id'] = $domain_id = $_domain['domain_id'];
+  }
+
+  // If no language is explicitly specified we default to the current URL
+  // language. If we used a language different from the one conveyed by the
+  // requested URL, we might end up being unable to check if there is a path
+  // alias matching the URL path.
+  $path_language = $path_language ? $path_language : $language_url->language;
+  // If the alias has already been loaded, return it.
+  if (isset($cache['map'][$domain_id][$path_language][$path])) {
+    return $cache['map'][$domain_id][$path_language][$path];
+  }
+
+  // Lookup Drupal system path.
+  if ($action == 'source') {
+    // Check $cache['no_sources'] for this $path in case we've already determined that there
+    // isn't a path that has this alias.
+    if (!isset($cache['no_sources'][$domain_id][$path_language][$path])) {
+      $args = array(
+        ':alias' => $path,
+        ':domain_id' => $domain_id,
+        ':language' => $path_language,
+        ':language_none' => LANGUAGE_NONE,
+      );
+
+      // Always get the language-specific alias before the language-neutral
+      // one. For example 'de' is less than 'und' so the order needs to be
+      // ASC, while 'xx-lolspeak' is more than 'und' so the order needs to
+      // be DESC. We also order by pid ASC so that fetchAllKeyed() returns
+      // the most recently created alias for each source. Subsequent queries
+      // using fetchField() must use pid DESC to have the same effect.
+      // For performance reasons, the query builder is not used here.
+      if ($path_language == LANGUAGE_NONE) {
+        unset($args[':language']);
+        $source = db_query("SELECT source FROM {domain_path} WHERE alias = :alias AND domain_id = :domain_id AND language = :language_none ORDER BY dpid DESC", $args)->fetchField();
+      }
+      elseif ($path_language > LANGUAGE_NONE) {
+        $source = db_query("SELECT source FROM {domain_path} WHERE alias = :alias AND domain_id = :domain_id AND language IN (:language, :language_none) ORDER BY language DESC, dpid DESC", $args)->fetchField();
+      }
+      else {
+        $source = db_query("SELECT source FROM {domain_path} WHERE alias = :alias AND domain_id = :domain_id AND language IN (:language, :language_none) ORDER BY language ASC, dpid DESC", $args)->fetchField();
+      }
+
+
+      if ($source) {// Source was found, store and return it.
+        $cache['map'][$domain_id][$path_language][$path] = $source;
+      }
+      else {// No source found store in no_sources for future lookups.
+        $cache['no_sources'][$domain_id][$path_language][$path] = TRUE;
+      }
+
+      return $source;
+    }
+  }
+  // Look up the domain specific alias.
+  elseif ($action == 'alias') {
+    // Check $cache['no_aliases'] for this $path in case we've already determined that there
+    // isn't an alias for this path.
+    if (!isset($cache['no_aliases'][$domain_id][$path_language][$path])) {
+      $args = array(
+        ':source' => $path,
+        ':domain_id' => $domain_id,
+        ':language' => $path_language,
+        ':language_none' => LANGUAGE_NONE,
+      );
+
+      // See the queries above.
+      if ($path_language == LANGUAGE_NONE) {
+        unset($args[':language']);
+        $alias = db_query("SELECT alias FROM {domain_path} WHERE source = :source AND domain_id = :domain_id AND language = :language_none ORDER BY dpid DESC", $args)->fetchField();
+      }
+      elseif ($path_language > LANGUAGE_NONE) {
+        $alias = db_query("SELECT alias FROM {domain_path} WHERE source = :source AND domain_id = :domain_id AND language IN (:language, :language_none) ORDER BY language DESC, dpid DESC", $args)->fetchField();
+      }
+      else {
+        $alias = db_query("SELECT alias FROM {domain_path} WHERE source = :source AND domain_id = :domain_id AND language IN (:language, :language_none) ORDER BY language ASC, dpid DESC", $args)->fetchField();
+      }
+      // Alias was found, store and return it.
+      if ($alias) {
+        $cache['map'][$domain_id][$path_language][$path] = $alias;
+      }
+      // No alias found store in no_aliases for future lookups.
+      else {
+        $cache['no_aliases'][$domain_id][$path_language][$path] = TRUE;
+      }
+
+      return $alias;
+    }
+  }
+
+  // Otherwise always FALSE.
+  return FALSE;
+}
+
+/**
+ * Implements hook_form_NODE_FORM_alter().
+ */
+function domain_path_form_node_form_alter(&$form, $form_state) {
+  // Custom setting for vertical tabs for domains.
+  // This is in domain 7.x.3 but not 7.x.2.
+
+  if (isset($form['domain'])) {
+    $form['domain']['#group'] = 'additional_settings';
+  }
+
+  $form['domain_path'] = array(
+    '#tree' => TRUE,
+    '#title' => t('Domain-specific paths'),
+    '#type' => 'fieldset',
+    '#group' => 'additional_settings',
+    '#access' => user_access('edit domain paths'),
+    '#attached' => array(
+      'js' => array(drupal_get_path('module', 'domain_path') . '/domain_path.js'),
+    ),
+  );
+
+  // If the user doesn't have access to the domain form element then we will
+  // create a domain id setting for the js so that it will know which path
+  // field to display.
+  if (!user_access('publish to any assigned domain') && !user_access('set domain access')) {
+    $domain_id = FALSE;
+
+    // Only set the default domain id as the js domain id when the user can
+    // publish from default domain but not when the user can publish from
+    // assigned domains.
+    if (user_access('publish from default domain') && !user_access('publish from assigned domain')) {
+      $default_domain = domain_default();
+      $domain_id = $default_domain['domain_id'];
+    }
+    // Set the js domain id to the current domain for everything else.
+    else {
+      global $_domain;
+      $domain_id = $_domain['domain_id'];
+    }
+
+    $form['domain_path']['#attached']['js'][] = array(
+      'data' => array('domainPath' => array('domainId' => $domain_id)),
+      'type' => 'setting',
+    );
+  }
+
+  $paths = array();
+  $domains = domain_domains();
+  $current = t('<none>');
+
+  $path = $nid = FALSE;
+  if (!empty($form['#node']->nid)) {
+    $current = drupal_get_path_alias('node/' . $form['#node']->nid);
+    $nid = $form['#node']->nid;
+  }
+
+  $form['domain_path']['current'] = array(
+    '#type' => 'item',
+    '#title' => t('Current alias'),
+    '#markup' => check_plain($current),
+    '#weight' => -5,
+  );
+  $show_delete = FALSE;
+  foreach ($domains as $domain_id => $domain) {
+    $path = FALSE;
+    if ($nid) {
+      $path = domain_path_lookup_path('alias', 'node/' . $nid, $domain_id);
+    }
+
+    $default = '';
+    if ($path) {
+      $show_delete = TRUE;
+    }
+    // TODO: Only exposed checked domains?
+    $form['domain_path'][$domain_id] = array(
+      '#type' => 'textfield',
+      '#title' => check_plain($domain['path']),
+      '#default_value' => $path ? $path : $default,
+      '#access' => user_access('edit domain paths'),
+    );
+  }
+  $form['domain_path']['domain_path_delete'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Delete domain-specific aliases'),
+    '#default_value' => FALSE,
+    '#access' => $show_delete,
+    '#weight' => -1,
+  );
+}
+
+/**
+ * Implements hook_node_validate().
+ */
+function domain_path_node_validate($node, $form, &$form_state) {
+  // No validatio on node delete, alias delete, or alias override.
+  $op = $form_state['values']['op'];
+  $delete = $form_state['values']['domain_path']['domain_path_delete'];
+  if (!empty($delete) || $op == t('Delete')) {
+    return;
+  }
+  $paths = $form_state['values']['domain_path'];
+  unset($paths['domain_path_delete']);
+  $alias = $form_state['values']['path']['alias'];
+  // Make sure we don't duplicate anything.
+  foreach ($paths as $domain_id => $path) {
+    $key = ($domain_id == -1) ? 0 : $domain_id;
+    if (!empty($path) && $path == $alias) {
+      form_set_error("domain_path][$key", t('Domain path %alias may not match the default path alias. You may leave the element blank.', array('%alias' => $path)));
+      $set_message = TRUE;
+    }
+    elseif (!empty($path)) {
+      $query = db_query("SELECT COUNT(dpid) FROM {domain_path}
+        WHERE domain_id = :domain_id
+        AND alias = :alias
+        AND language = :language
+        AND source != :source",
+        array(
+          ':domain_id' => $key,
+          ':alias' => $path,
+          ':language' => isset($node->language) ? $node->language : LANGUAGE_NONE,
+          ':source' => "node/$node->nid",
+        )
+      );
+      if ($query->fetchField() > 0) {
+        $domain = domain_lookup($domain_id);
+        form_set_error("domain_path][$key", t('Domain path %alias matches an existing domain path alias for %domain.', array('%alias' => $path, '%domain' => $domain['path'])));
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_node_insert().
+ */
+function domain_path_node_insert($node) {
+  if (empty($node->domain_path)) {
+    return;
+  }
+
+  // If not set to revert, then save changes.
+  if (empty($node->domain_path['domain_path_delete'])) {
+    $paths = array();
+    unset($node->domain_path['domain_path_delete']);
+    foreach ($node->domain_path as $domain_id => $alias) {
+      // Attempt to retreive the path.
+      $conditions = array(
+        'source' => "node/$node->nid",
+        'language' => $node->language,
+        'domain_id' => $domain_id,
+      );
+      $path = domain_path_path_load($conditions);
+      if (!$path) {
+        $path = array();
+      }
+
+      // Set the path alias.
+      $path['alias'] = $alias;
+
+      // Fill in missing pieces.
+      $path += array(
+        'dpid' => NULL,
+        'domain_id' => $domain_id,
+        'source' => "node/$node->nid",
+        'language' => isset($node->language) ? $node->language : LANGUAGE_NONE,
+        'entity_type' => 'node',
+        'entity_id' => $node->nid,
+      );
+
+      // Delete old alias if user erased it.
+      if (!empty($path['dpid']) && empty($path['alias'])) {
+        domain_path_path_delete($path['dpid']);
+      }
+      elseif (!empty($path['alias'])) {
+        $paths[$domain_id] = $path;
+      }
+    }
+    // Save the paths.
+    if (!empty($paths)) {
+      domain_path_save_paths($paths);
+    }
+  }
+  // Reverted delete all domain path aliases.
+  else {
+    domain_path_node_delete($node);
+  }
+}
+
+/**
+ * Save a domain path alias to the database.
+ *
+ * @param $path
+ *  An associative array containing the following keys:
+ *  - source: The internal system path.
+ *  - domain_id: The domain ID (required if dpid is not set).
+ *  - alias: The URL alias.
+ *  - dpid: (optional) Unique domain path alias identifier.
+ *  - language: (optional) The language of the alias.
+ * @param $reset
+ *  A boolean value to reset the domain_path_lookup_path static cache.
+ *  (Useful if you are saving multiple paths at once.)
+ */
+function domain_path_path_save(&$path, $reset = TRUE) {
+  $path += array('language' => LANGUAGE_NONE);
+
+  // Load the stored alias, if any.
+  if (!empty($path['dpid']) && !isset($path['original'])) {
+    $path['original'] = domain_path_path_load($path['dpid']);
+  }
+
+  if (empty($path['dpid'])) {
+    drupal_write_record('domain_path', $path);
+    module_invoke_all('domain_path_insert', $path);
+  }
+  else {
+    drupal_write_record('domain_path', $path, array('dpid'));
+    module_invoke_all('domain_path_update', $path);
+  }
+
+  // Clear internal properties.
+  unset($path['original']);
+
+  if ($reset) {
+    // Rebuild the node alias.
+    drupal_static_reset('domain_path_lookup_path');
+  }
+}
+
+/**
+ * A helper function to save multiple domain paths at once.
+ *
+ * @param $paths
+ *  An array of path aliases.
+ *
+ * @see domain_path_path_save()
+ */
+function domain_path_save_paths($paths) {
+  if (!empty($paths)) {
+    foreach ($paths as $path) {
+      domain_path_path_save($path, FALSE);
+    }
+  }
+  // Rebuild the node alias.
+  drupal_static_reset('domain_path_lookup_path');
+}
+
+/**
+ * Delete a domain path alias.
+ *
+ * @param $criteria
+ *  A number representing the dpid or an array of criteria.
+ *  (Must contain domain_id if dpid is not set.)
+ */
+function domain_path_path_delete($criteria) {
+  if (!is_array($criteria)) {
+    $criteria = array('dpid' => $criteria);
+  }
+  elseif (empty($criteria['domain_id'])) {
+    return;// Should we put in a watchdog error?
+  }
+
+  $path = domain_path_path_load($criteria);
+  $query = db_delete('domain_path');
+  foreach ($criteria as $field => $value) {
+    $query->condition($field, $value);
+  }
+  $query->execute();
+  module_invoke_all('domain_path_delete', $path);
+}
+
+/**
+ * Implements hook_node_update().
+ */
+function domain_path_node_update($node) {
+  domain_path_node_insert($node);
+}
+
+/**
+ * Implements hook_node_delete().
+ */
+function domain_path_node_delete($node) {
+  db_delete('domain_path')
+    ->condition('entity_type', 'node')
+    ->condition('entity_id', $node->nid)
+    ->execute();
+}
+
+/**
+ * Implements hook_field_extra_fields().
+ */
+function domain_path_field_extra_fields() {
+  $extra = array();
+  foreach (node_type_get_names() as $name => $value) {
+    $extra['node'][$name]['form']['domain_path'] = array(
+      'label' => t('Domain paths'),
+      'description' => t('Domain-specific path settings.'),
+      'weight' => 30,
+    );
+  }
+  return $extra;
+}

@@ -1,0 +1,491 @@
+<?php
+
+/**
+ * @file
+ * Module file for Web Taxonomy.
+ */
+
+/**
+ * Implements hook_ctools_plugin_type().
+ *
+ * Creates the hook_web_taxonomy_plugins() hook. We can then get registered
+ * plugins by calling ctools_get_plugins().
+ */
+function web_taxonomy_ctools_plugin_type() {
+  return array(
+    'info' => array(
+      'cache' => TRUE,
+      'use hooks' => TRUE,
+      'classes' => array('handler'),
+    ),
+  );
+}
+
+/**
+ * Implements hook_menu().
+ */
+function web_taxonomy_menu() {
+  $items['web_taxonomy/autocomplete'] = array(
+    'page callback' => 'web_taxonomy_autocomplete',
+    'page arguments' => array(2, 3),
+    'access arguments' => array('use web_taxonomy'),
+    'type' => MENU_CALLBACK,
+  );
+  $items['web_taxonomy/vocabulary/%/update'] = array(
+    'page callback' => 'web_taxonomy_update_vocabulary',
+    'page arguments' => array(2),
+    'access arguments' => array('administer web_taxonomy'),
+    'type' => MENU_CALLBACK,
+    'file' => 'web_taxonomy.admin.inc',
+  );
+  return $items;
+}
+
+/**
+ * Implements hook_permission().
+ */
+function web_taxonomy_permission() {
+  return array(
+    'administer web_taxonomy' => array(
+      'title' => t('Administer Web Taxonomy'), 
+      'description' => t('Perform administration tasks for Web Taxonomy.'),
+    ),
+    'use web_taxonomy' => array(
+      'title' => t('Use web taxonomy'),
+    ),
+  );
+}
+
+/**
+ * Implements hook_field_widget_info().
+ */
+function web_taxonomy_field_widget_info() {
+  return array(
+    'web_taxonomy_autocomplete' => array(
+      'label'       => t('Web Taxonomy autocomplete'),
+      'description' => t('Display the list of referenceable nodes as a textfield with autocomplete behaviour.'),
+      'field types' => array('taxonomy_term_reference'),
+      'settings'    => array(
+        'size' => 60,
+        'autocomplete_path' => 'web_taxonomy/autocomplete',
+      ),
+      'behaviors' => array(
+        'multiple values' => FIELD_BEHAVIOR_CUSTOM,
+      ),
+    ),
+  );
+}
+
+/**
+ * Implements hook_field_widget_form().
+ */
+function web_taxonomy_field_widget_form(&$form, &$form_state, $field, $instance, $langcode, $items, $delta, $element) {
+  switch ($instance['widget']['type']) {
+    case 'web_taxonomy_autocomplete':
+      $vocabulary_name = $field['settings']['allowed_values'][0]['vocabulary'];
+      $web_tax = db_query("SELECT wt.name FROM {web_taxonomy_vocabulary} wt LEFT JOIN {taxonomy_vocabulary} t ON wt.vid = t.vid WHERE t.machine_name = :machine_name", array('machine_name' => $vocabulary_name))->fetch();
+      if (empty($web_tax)) {
+        $admin_path = "admin/structure/taxonomy/$vocabulary_name/edit";
+        drupal_set_message(t("{$element['#field_name']} uses Web Taxonomy autocomplete, but there is no source set for this vocabulary. Set a source on the !admin.", array('!admin' => l(t('vocabulary page'), $admin_path))), 'warning');
+      }
+
+      $tags = array();
+      foreach ($items as $item) {
+        $tags[$item['tid']] = isset($item['taxonomy_term']) ? $item['taxonomy_term'] : taxonomy_term_load($item['tid']);
+      }
+
+      $element += array(
+        '#type' => 'textfield',
+        '#default_value' => taxonomy_implode_tags($tags),
+        '#autocomplete_path' => $instance['widget']['settings']['autocomplete_path'] . '/' . $web_tax->name,
+        '#size' => $instance['widget']['settings']['size'],
+        '#element_validate' => array('web_taxonomy_autocomplete_validate'),
+      );
+      break;
+  }
+
+  return $element;
+}
+
+/**
+ * Menu callback for autocomplete.
+ */
+function web_taxonomy_autocomplete($wt_name, $tags_typed = '') {
+  $matches = array();
+
+  // Find the class for this vocabulary and instantiate it.
+  $wt = web_taxonomy_get_class($wt_name);
+
+  $tags_typed = drupal_explode_tags($tags_typed);
+  $string = drupal_strtolower(array_pop($tags_typed));
+
+  $match_info = $wt->autocomplete($string);
+  // Temporarily save the info for the terms that match so the selected term's
+  // info can be accessed after form submission and can be used to save the
+  // term.
+  $wt->cacheMatchInfo($match_info);
+  foreach ($match_info as $info) {
+    $name = check_plain($info['name']);
+    $n = $name;
+    // Term names containing commas or quotes must be wrapped in quotes.
+    if (strpos($name, ',') !== FALSE || strpos($name, '"') !== FALSE) {
+      $n = '"' . str_replace('"', '""', $name) . '"';
+    }
+    $matches[$n] = $name;
+  }
+
+  if (count($tags_typed)) {
+    $prefix = drupal_implode_tags($tags_typed) . ', ';
+    foreach ($matches as $key => $match) {
+      $matches[$prefix . $key] = $match;
+      unset($matches[$key]);
+    }
+  }
+  
+  drupal_json_output($matches);
+}
+
+/**
+ * Implements hook_field_validate().
+ *
+ * Transform the web_tid into a local tid.
+ */
+function web_taxonomy_autocomplete_validate($element, &$form_state) {
+  global $user;
+  $value = array();
+  $cache = cache_get($user->uid, 'cache_web_taxonomy');
+  // When the widget is shown in the instance configuration form, the $cache
+  // won't be set.
+  $web_tids = isset($cache->data) ? $cache->data : array();
+
+  if ($tags = $element['#value']) {
+    // Collect candidate vocabularies.
+    $field = field_widget_field($element, $form_state);
+    $vocabularies = array();
+
+    $vocabulary_name = $field['settings']['allowed_values'][0]['vocabulary'];
+    $vocabulary = taxonomy_vocabulary_machine_name_load($vocabulary_name);
+
+    // If this vocabulary does not have a web_tid field, the terms cannot
+    // be saved.
+    $field_info = field_info_field('web_tid');
+    $admin_path = "admin/structure/taxonomy/{$vocabulary->machine_name}/fields";
+    $eligible_vocabs = !empty($field_info['bundles']) ? $field_info['bundles']['taxonomy_term'] : array();
+    if (!in_array($vocabulary->machine_name, $eligible_vocabs)) {
+      form_set_error($element['#field_name'], t("Terms in vocabulary !vocab do not have a web_tid field. Please add the existing web_tid field to the !terms.", array('!vocab' => $vocabulary->name, '!terms' => l(t('vocabulary\'s terms'), $admin_path))));
+    }
+
+    // Translate term names into actual terms.
+    $typed_terms = drupal_explode_tags($tags);
+    foreach ($typed_terms as $typed_term) {
+      $name = trim($typed_term);
+      // Create term defaults.
+      $term = array(
+        'vid' => $vocabulary->vid,
+        'name' => $name,
+        'vocabulary_machine_name' => $vocabulary->machine_name,
+      );
+      // See if the term exists in the chosen vocabulary and return the tid;
+      // otherwise, create a new 'autocreate' term for insert/update.
+      // @todo Change this to check by web_tid.
+      if ($possibilities = taxonomy_term_load_multiple(array(), array('name' => $name, 'vid' => $vocabulary->vid))) {
+        $term = array_pop($possibilities);
+      }
+      elseif (isset($web_tids[$name])) {
+        if ($tid = web_taxonomy_term_load($web_tids[$name]['web_tid'])) {
+          // @todo update for new name.
+        }
+        else {
+          // If there is a web_tid and no existing term, we will create the
+          // term.
+          $term['web_tid'][LANGUAGE_NONE][0]['value'] = $web_tids[$name]['web_tid'];
+          $term = (object) $term;
+          $wt_name = web_taxonomy_get_web_vocabulary_name($term->vid);
+          $wt = web_taxonomy_get_class($wt_name);
+          $wt->saveTerm($term);
+        }
+      }
+      // Otherwise, the term is created with the $term defaults and a notice is
+      // given about the non-existent web tid.
+      else {
+        // Magic string for taxonomy_field_validate().
+        $term['tid'] = 'autocreate';
+        $terms_path = "admin/structure/taxonomy/{$vocabulary->machine_name}";
+        drupal_set_message(t('There is no Web Term ID (such as a URL) to identify <em>@term</em>. You can add one manually from the !terms.', array('@term' => $name, '!terms' => l(t('terms list'), $terms_path))), 'warning');
+      }
+
+      $value[] = (array)$term;
+    }
+  }
+
+  form_set_value($element, $value, $form_state);
+}
+
+/**
+ * Implements hook_field_widget_error().
+ */
+function web_taxonomy_field_widget_error($element, $error, $form, &$form_state) {
+  form_error($element, $error['message']);
+}
+
+/**
+ * Implements hook_form_FORMID_alter().
+ *
+ * Adds Web Taxonomy options to vocabulary form.
+ *
+ * @see taxonomy_form_vocabulary()
+ */
+function web_taxonomy_form_taxonomy_form_vocabulary_alter(&$form, $form_state, $edit = array()) {
+  ctools_include('plugins');
+  $options = array();
+
+  if (isset($form_state['vocabulary']->vid)) {
+    $wt_name = web_taxonomy_get_web_vocabulary_name($form_state['vocabulary']->vid);
+    $default_value = $wt_name;
+  }
+  else {
+    $default_value = '';
+  }
+
+  foreach (ctools_get_plugins('web_taxonomy', 'info') as $machine_name => $web_voc) {
+    $options[$machine_name] = $web_voc['name'];
+  }
+
+  $form['web_taxonomy'] = array(
+    '#type' => 'radios',
+    '#title' => t('Web Taxonomy Sources'),
+    '#options' => $options,
+    '#default_value' => $default_value,
+  );
+
+  $form['#submit'][] = 'web_taxonomy_form_vocabulary_submit';
+}
+
+/**
+ * Form submission handler for fields added to taxonomy_form_vocabulary().
+ *
+ * @see web_taxonomy_form_taxonomy_form_vocabulary_alter()
+ */
+function web_taxonomy_form_vocabulary_submit($form, &$form_state) {
+  $vid = $form_state['vid'];
+  $machine_name = $form_state['values']['web_taxonomy'];
+
+  if (!empty($machine_name)) {
+    db_merge('web_taxonomy_vocabulary')
+      ->key(array('vid' => $vid))
+      ->fields(array(
+        'vid' => $vid,
+        'name' => $machine_name,
+    ))
+    ->execute();
+  }
+}
+
+/**
+ * Alter mapping targets.
+ *
+ * Web Taxonomy term reference fields can import terms based on web_tid.
+ *
+ * @todo Move to web_taxonomy.feeds.inc when #1139676 is resolved.
+ */
+function web_taxonomy_feeds_processor_targets_alter(&$targets, $entity_type, $bundle_name) {
+  foreach (field_info_instances($entity_type, $bundle_name) as $name => $instance) {
+    if ($instance['widget']['type'] == 'web_taxonomy_autocomplete') {
+      $targets[$name . '_web_tid'] = array(
+        'name' => check_plain($instance['label']) . ': ' . t('Web Term ID'),
+        'callback' => 'web_taxonomy_feeds_set_target',
+        'description' => t('The Web Term ID for terms in the @label field.', array('@label' => $instance['label'])),
+      );
+    }
+  }
+}
+
+/**
+ * Adds Web Term ID as a Feeds target.
+ *
+ * @todo Move to web_taxonomy.feeds.inc when #1139676 is resolved.
+ */
+function web_taxonomy_feeds_set_target($source, $entity, $target, $values, $mapping, $input_format = FALSE) {
+  // Get the target field name by removing '_web_tid'.
+  $target_name = str_replace('_web_tid', '', $target);
+
+  $field_info = field_info_field($target_name);
+
+  $i = 0;
+  foreach ($values as $value) {
+    $term = new stdClass();
+    if ($term = web_taxonomy_term_load($value)) {
+      $entity->{$target_name}['und'][$i]['tid'] = $term->tid;
+    }
+    else {
+      $vocabulary = taxonomy_vocabulary_machine_name_load($field_info['settings']['allowed_values'][0]['vocabulary']);
+      $wt_name = web_taxonomy_get_web_vocabulary_name($vocabulary->vid);
+      $wt = web_taxonomy_get_class($wt_name);
+
+      $item = array(
+        'tid' => 'autocreate',
+        'vid' => $vocabulary->vid,
+        'name' => $name,
+        'vocabulary_machine_name' => $vocabulary->machine_name,
+      );
+      $item['web_tid'][LANGUAGE_NONE][0]['value'] = $value;
+      $term = (object) $item;
+      unset($term->tid);
+      $wt->saveTerm($term);
+      $entity->{$target_name}['und'][$i]['tid'] = $term->tid;
+    }
+    $i++;
+  }
+}
+
+/**
+ * Helper function; gets a vocabulary's cooresponding Web Taxonomy vocabulary
+ * name.
+ */
+function web_taxonomy_get_web_vocabulary_name($vid) {
+  $result = db_query("SELECT name FROM {web_taxonomy_vocabulary} WHERE vid = :vid", array('vid' => $vid))->fetch();
+  return $result->name;
+}
+
+function web_taxonomy_get_class($wt_name) {
+  ctools_include('plugins');
+  $plugins = ctools_get_plugins('web_taxonomy', 'info');
+  $class = $plugins[$wt_name]['handler']['class'];
+  return new $class($wt_name);
+}
+
+/**
+ * Helper function; loads a term by the Web Term ID.
+ */
+function web_taxonomy_term_load($url) {
+  $query = db_select('field_data_web_tid', 'web_tid');
+  $query->fields('web_tid', array('entity_id'));
+  $query->condition('web_tid.web_tid_value', $url, '=');
+  $result = $query->execute()->fetchAll();
+  if (!empty($result)) {
+    return taxonomy_term_load($result[0]->entity_id);
+  }
+  else {
+    return FALSE;
+  }
+}
+
+/**
+ * A common class for Web Taxonomies.
+ *
+ * Required - Extend the class with an autocomplete implementation.
+ */
+abstract class WebTaxonomy {
+  // The name of the external taxonomy, as declared in hook_web_taxonomy.
+  protected $wt_name;
+
+  function __construct($wt_name) {
+    $this->wt_name = $wt_name;
+  }
+
+  /**
+   * Fetch this term from the external vocabulary.
+   * 
+   * @param $term
+   *   The loaded taxonomy term.
+   * 
+   * @return
+   *   An array containing the following term info:
+   *     - name: The name of the term.
+   *     - web_tid: The URL that acts as the universal identifier for this term.
+   *     - parent_web_tids: (optional) An array of universal identifiers for
+   *       parent terms. There can be multiple parents, but they must all be
+   *       from the same vocabulary.
+   */
+  abstract function fetchTerm($term);
+
+  /**
+   * Autocompletes term against external vocabulary based on user-input.
+   *
+   * @param $string
+   *   The letters that the user has already typed.
+   *
+   * @return
+   *   Implementations must return an array of matches. Each match should be
+   *   an array that is keyed by the term name and contains the term info
+   *   as described in fetchTerm().
+   */
+  abstract function autocomplete($string = '');
+
+  public function saveTerm($term) {
+    $ext_term = $this->fetchTerm($term);
+
+    if (!empty($ext_term['parent'])) {
+      if ($parent = web_taxonomy_term_load($ext_term['parent'])) {
+        
+      }
+      else {
+        $item = array(
+          'vid' => $term->vid,
+          'name' => $term->name,
+        );
+        $item['web_tid'][LANGUAGE_NONE][0]['value'] = $ext_term['parent'];
+        $parent = (object) $item;
+        $this->saveTerm($parent);
+      }
+    }
+    $term->name = isset($ext_term['name']) ? $ext_term['name'] : $term->name;
+    $term->web_tid[LANGUAGE_NONE][0]['value'] = isset($ext_term['web_tid']) ? $ext_term['web_tid'] : $term->web_tid[LANGUAGE_NONE][0]['value'];
+    if (isset($parent)) {
+      $term->parent = $parent->tid;
+    }
+    taxonomy_term_save($term);
+  }
+
+  public function updateVocabulary() {
+    $query = db_select('taxonomy_term_data', 'data');
+    $query->join('web_taxonomy_vocabulary', 'voc', 'data.vid=voc.vid');
+    $query->join('field_data_web_tid', 'web_tid', 'data.tid=web_tid.entity_id');
+    $query->condition('voc.name', $this->wt_name, '=');
+    $query->fields('data', array('tid'));
+    $tids = $query->execute()->fetchCol();
+    $this->terms = taxonomy_term_load_multiple($tids);
+
+    foreach ($this->terms as $term) {
+      $operations[] = array(
+        '_web_taxonomy_update_term_batch_process',
+        array(
+          $term,
+          $this,
+        ),
+      );
+    }
+    $batch = array(
+      'title' => t('Updating Web Taxonomy vocabulary'),
+      'init_message' => t('Preparing to update vocabulary'),
+      'operations' => $operations,
+      'finished' => '_web_taxonomy_update_vocabulary_batch_finished',
+      'file' => drupal_get_path('module', 'web_taxonomy') . '/web_taxonomy.admin.inc',
+    );
+    batch_set($batch);
+    batch_process('');
+  }
+
+  /**
+   * Caches information about the terms listed in the autocomplete dropdown.
+   * This is cached in the database because the dropdown uses AJAX and thus the
+   * match info array isn't accessible when we need it for form submission.
+   *
+   * @param $match_info
+   *   An array of term information as returned by self::autocomplete().
+   */
+  public function cacheMatchInfo($match_info) {
+    global $user;
+    $cache = cache_get($user->uid, 'cache_web_taxonomy');
+    $old_match_info = $cache->data;
+
+    if (!empty($old_match_info)){
+      $match_info = array_merge($old_match_info, $match_info);
+    }
+    cache_set($user->uid, $match_info, 'cache_web_taxonomy', CACHE_TEMPORARY);
+  }
+
+  public function getName() {
+    return $this->wt_name;
+  }
+}

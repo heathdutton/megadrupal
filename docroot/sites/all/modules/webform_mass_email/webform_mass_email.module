@@ -1,0 +1,202 @@
+<?php
+
+/**
+ * Store info if we have Mime Mail module.
+ */
+define('WEBFORM_MASS_EMAIL_MIMEMAIL', module_exists('mimemail'));
+
+/**
+ * Whether or not the logging is enabled.
+ */
+define('WEBFORM_MASS_EMAIL_LOG', variable_get('webform_mass_email_log', 0));
+
+/**
+ * Implements hook_permission().
+ */
+function webform_mass_email_permission() {
+  return array(
+    'administer webform_mass_email' => array(
+      'title' => t('Administer Webform Mass Email'),
+      'description' => t('Configure Webform Mass Email module settings.'),
+    ),
+    'send mass mail' => array(
+      'title' => t('Send mass mail'),
+      'description' => t('Allow user to send mass mail via the Webform Mass Email form.'),
+    ),
+  );
+}
+
+/**
+ * Implements hook_menu().
+ */
+function webform_mass_email_menu() {
+  $items = array();
+
+  // Admin page
+  $items['admin/config/content/webform-mass-email'] = array(
+    'title' => 'Webform Mass Email',
+    'description' => 'Configure Webform Mass Email settings.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('webform_mass_email_settings'),
+    'access arguments' => array('administer webform_mass_email'),
+    'file' => 'includes/webform_mass_email.admin.inc',
+    'type' => MENU_NORMAL_ITEM,
+  );
+
+  // Mass emailing page
+  $items['node/%node/webform-results/email'] = array(
+    'title' => 'Mass email',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('webform_mass_email_form', 1, '50'),
+    'access callback' => 'webform_mass_email_form_access',
+    'access arguments' => array(1),
+    'file' => 'includes/webform_mass_email.pages.inc',
+    'weight' => 20,
+    'type' => MENU_LOCAL_TASK,
+  );
+
+  return $items;
+}
+
+/**
+ * Access callback for the Webform Mass Email form.
+ *
+ * @param object $node
+ *   Currently viewed Webform node object. We'll use webform_results_access()
+ *   with our own permissions to check the access against this node.
+ */
+function webform_mass_email_form_access($node) {
+  if (webform_results_access($node, $account = NULL) && user_access('send mass mail')) {
+    return TRUE;
+  }
+  return FALSE;
+}
+
+/**
+ * Put the item into the Drupal's queue table.
+ *
+ * @param array $values
+ *   An array of the values (key => value) we want to get queued.
+ */
+function webform_mass_email_enqueue_request($values) {
+  // Create the queue.
+  $queue = DrupalQueue::get('webform_mass_email_setter');
+  $queue->createQueue();
+  // Queue the values.
+  $queue->createItem($values);
+}
+
+/**
+ * Implements hook_cron().
+ *
+ * Send the pending mails for the users.
+ */
+function webform_mass_email_cron() {
+  // Get the queue.
+  $queue_items = DrupalQueue::get('webform_mass_email_setter');
+
+  // How many items we're fetching per cron run.
+  $throttle = variable_get('webform_mass_email_throttle', 20);
+
+  // How many items we have already fetched.
+  $count = 0;
+
+  // Set the claim time (how long the failed-to-fetch queue items should be left
+  // untouched until the next fetching).
+  $expire = variable_get('webform_mass_email_queue_expire', 600);
+
+  while ($item = $queue_items->claimItem($expire)) {
+    if ($count <= $throttle) {
+      $count++;
+      // Prepare some variables.
+      $submission_id = (isset($item->data['sid']) ? $item->data['sid'] : NULL);
+      $subject = (isset($item->data['subject']) ? $item->data['subject'] : NULL);
+      $body = (isset($item->data['body']) ? $item->data['body'] : NULL);
+      $email = (isset($item->data['email']) ? $item->data['email'] : NULL);
+      $nid = (isset($item->data['nid']) ? $item->data['nid'] : NULL);
+      $node_title = (isset($item->data['node_title']) ? $item->data['node_title'] : NULL);
+
+      // Not enough values given, just notify Watchdog and delete faulty item so
+      // that it doesn't get re-queued
+      if (empty($subject) || empty($body) || empty($email)) {
+        if (WEBFORM_MASS_EMAIL_LOG == 1) {
+          watchdog('webform_mass_email', "Sending mail for user at webform submission %sid failed.", array('%sid', $submission_id), WATCHDOG_ERROR);
+        }
+        $queue_items->deleteItem($item);
+      }
+
+       // Build the message array for sending.
+      $message = array(
+        'email' => $email,
+        'subject' => $subject,
+        'body' => $body,
+      );
+
+      // Do the sending.
+      if (webform_mass_mail_email_deliver($message)) {
+        // Log if set on admin page.
+        if (WEBFORM_MASS_EMAIL_LOG == 1) {
+          // Build the tokens for watchdog().
+          $tokens = array(
+            '%node' => $node_title . ' (nid: ' . $nid . ')',
+            '%sid' => $sid,
+            '%sid' => $submission_id,
+            '%subject' => $subject,
+            '%email' => $email
+          );
+          watchdog('webform_mass_email', "Successfully sent email from node %node, Webform submission ID: %sid: Email subject: %subject. Sent to the address %email.", $tokens, WATCHDOG_INFO);
+        }
+
+        // Success, delete the item.
+        $queue_items->deleteItem($item);
+
+        // Throttle limit full. Reset $expire to zero so the other items don't have
+        // to wait at the next cron run since we're looping through claimItem($expire).
+        if ($count == $throttle) {
+          $expire = 0;
+        }
+      }
+      // Something went wrong (server error or something).
+      // Do nothing so the item will get re-queued.
+      else {}
+    }
+  }
+}
+
+/**
+ * Sends the given message.
+ *
+ * @param array $message
+ *   An array of message parameters to be sent (to, subject, body, headers).
+ * @return
+ *   Boolean indicating if the message was sent successfully.
+ */
+function webform_mass_mail_email_deliver($message) {
+  $key = 'direct';
+  // @todo Make this configurable?
+  $from = variable_get('site_mail', '');
+
+  // Construct the mail.
+  $mail = array(
+    'to' => $message['email'],
+    'subject' => $message['subject'],
+    'body' => $message['body'],
+    'headers' => array(
+      'From' => $from,
+      'Sender' => $from,
+      'Return-Path' => $from,
+    ),
+  );
+
+  // MimeMail existing.
+  if (WEBFORM_MASS_EMAIL_MIMEMAIL) {
+    $mail['subject'] = mime_header_encode($message['subject']);
+    mailsystem_set(array(
+      "webform_mass_email_$key" => 'MimeMailSystem'
+    ));
+  }
+
+  // Kick it.
+  $system = drupal_mail_system('webform_mass_email', $key);
+  return $system->mail($mail);
+}

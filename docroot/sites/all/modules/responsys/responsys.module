@@ -1,0 +1,552 @@
+<?php
+
+/**
+ * @file
+ * Make it possible to integrate with the Responsys webservice.
+ */
+
+/**
+ * Implements hook_permission().
+ */
+function responsys_permission() {
+  return array(
+    'administer responsys' => array(
+      'title' => t('administer responsys'),
+      'description' => t('Access the Responsys administration screens'),
+    ),
+  );
+}
+
+/**
+ * Check if the given email is subscribed to the given list.
+ *
+ * @param string $list_id
+ *   The identifier for a list.
+ * @param string $email
+ *   The email address to check for.
+ *
+ * @return bool
+ *   TRUE if they are subscribed.
+ */
+function responsys_is_subscribed($list_id, $email) {
+  // @TODO
+}
+
+/**
+ * Subscribe a user to a given list.
+ *
+ * @return bool
+ *   TRUE on success.
+ */
+function responsys_subscribe_user($list, $email, $merge_vars, $message = TRUE, $mcapi = NULL) {
+  // @TODO
+}
+
+/**
+ * Saves the current state of the user from Drupal to Responsys.
+ *
+ * @param string $email
+ *   The identifying email address in Responsys.
+ * @param array $merge_vars
+ *   An array defining the columns of the list.
+ *   Set 'EMAIL_ADDRESS_' to the new one if being
+ *   updated.
+ * @param string $folder
+ *   (optional) The name of the folder containing the list.
+ *   Defaults to the system default.
+ * @param string $list
+ *   (optional) The name of the list.
+ *   Defaults to the system default.
+ * @param bool $message
+ *   Show a message about this update
+ *
+ * @return bool
+ *   TRUE on success.
+ *
+ * @throws WSIFUnavailableException
+ *   If Responsys is unavailable.
+ */
+function responsys_update_user($email, $merge_vars, $folder = NULL, $list = NULL, $message = TRUE) {
+  $success = FALSE;
+  $folder = empty($folder) ? variable_get('responsys_user_folder', '') : $folder;
+  $list = empty($list) ? variable_get('responsys_user_list', '') : $list;
+
+  if (!valid_email_address($email)) {
+    watchdog('responsys', 'Bad email address used to identify a responsys record: %email', array('%email' => $email), WATCHDOG_ERROR);
+    return FALSE;
+  }
+
+  // Make a connection to Reponsys.
+  $api = wsif_get_api('responsys');
+
+  // Decide which field in merge_vars to use as the key
+  // when deciding which Responsys record to update.
+  $match_column = 'EMAIL_ADDRESS_';
+
+  // Deal with an email change. We need to get the old data and
+  // use the RIID_ column instead as the key.
+  if ($merge_vars['EMAIL_ADDRESS_'] !== $email) {
+    // See if a member object exists on Responsys for the original email.
+    $old_record = responsys_get_memberinfo($email);
+    if (!empty($old_record) && !empty($old_record['RIID_'])) {
+      $merge_vars['RIID_'] = $old_record['RIID_'];
+      $match_column = 'RIID_';
+    }
+  }
+
+  $success = $api->mergeListMembers($folder, $list, array($merge_vars), TRUE, RESPONSYS_REPLACE_ALL, $match_column);
+
+  if ($success && $message) {
+    drupal_set_message(t('You have updated your settings in %folder/%list.', array('%folder' => $folder, '%list' => $list)));
+  }
+
+  // @TODO clear user cache.
+  if ($success) {
+    watchdog('responsys', '@email was updated in list @folder/@list.',
+      array(
+        '@email' => $merge_vars['EMAIL_ADDRESS_'],
+        '@folder' => $folder,
+        '@list' => $list), WATCHDOG_NOTICE
+    );
+  }
+  else {
+    watchdog('responsys', 'A problem occurred subscribing @email to list @list. Message: @msg', array(
+      '@email' => $merge_vars['EMAIL_ADDRESS_'],
+      '@list' => $list->label,
+      '@msg' => $api->errorMessage,
+    ), WATCHDOG_WARNING);
+  }
+
+  return $success;
+}
+
+/**
+ * Update a user account in Drupal using data from Responsys.
+ *
+ * @param user $account
+ *   The user account to update.
+ *
+ * @throws WSIFUnavailableException
+ *   If Responsys is unavailable.
+ */
+function responsys_update_user_from_responsys($account, $folder = NULL, $list = NULL) {
+  $account = is_object($account) ? user_load($account->uid) : user_load($account);
+
+  // This process finishes with a user save. Since
+  // Drupal does not set the original settings, we
+  // need to set them now or else rules breaks.
+  $account->original = clone $account;
+
+  // Set just synced flag on account so that
+  // conditions that need this know about it.
+  $account->responsys_just_synced = TRUE;
+
+  // Create a wraper object.
+  $account_wrapper = entity_metadata_wrapper('user', $account);
+
+  // Get the Responsys Object for the current user.
+  $member = responsys_get_memberinfo($account->mail);
+
+  if (empty($member)) {
+    // No responsys data so nothing to do.
+    watchdog('responsys', 'Could not sync account details with Responsys', array(), WATCHDOG_INFO);
+    return;
+  }
+
+  // Obtain the field mappings.
+  $field_mappings = responsys_get_field_mappings($folder, $list);
+
+  foreach ($field_mappings as $drupal_field => $responsys_field) {
+
+    // Get the type of the field, we have to deal with different
+    // types in different ways.
+    $field = field_info_field($drupal_field);
+
+    // Deal with a taxonomy reference field.
+    if ($field['type'] == 'taxonomy_term_reference') {
+      $tids = array();
+      foreach ($responsys_field as $tid => $responsys_field_term) {
+        if ($member[$responsys_field_term] == 'Yes') {
+          $tids[] = $tid;
+        }
+      }
+
+      $account_wrapper->{$drupal_field} = $tids;
+    }
+
+    // Deal with all other fields as if they provide a straight value.
+    elseif (!empty($responsys_field) && !empty($member[$responsys_field]) && $drupal_field != 'uid') {
+      $value = $member[$responsys_field];
+      if ($value == 'I') {
+        // Opt-In should be 1.
+        $value = 1;
+      }
+      elseif ($value == 'O') {
+        // Opt-out should be 0.
+        $value = 0;
+      }
+
+      $account_wrapper->{$drupal_field} = $value;
+    }
+  }
+
+  // Save the updated user object.
+  user_save($account);
+  watchdog('responsys', 'Synced account details with Responsys', array(), WATCHDOG_INFO);
+}
+
+/**
+ * Remove a user from a list.
+ * @TODO - remove folder / list pair and replace with a list_id
+ *
+ * @param string $email
+ *   The email address on Responsys.
+ *
+ * @throws WSIFUnavailableException
+ *   When Responsys is unavailable
+ */
+function responsys_delete_user($email, $folder = NULL, $list = NULL) {
+  $folder = empty($folder) ? variable_get('responsys_user_folder', '') : $folder;
+  $list = empty($list) ? variable_get('responsys_user_list', '') : $list;
+  wsif_get_api('responsys')->deleteListMembers($folder, $list, array($email));
+}
+
+/**
+ * Get the Responsys formatted fields for this user.
+ *
+ * @param int|user $user
+ *   Either a uid or a fully loaded user object.
+ */
+function responsys_get_user_fields($user, $folder = NULL, $list = NULL) {
+  $folder = empty($folder) ? variable_get('responsys_user_folder', '') : $folder;
+  $list = empty($list) ? variable_get('responsys_user_list', '') : $list;
+
+  $field_mappings = responsys_get_field_mappings($folder, $list);
+  $merge_vars = array();
+
+  try {
+    $user = is_object($user) ? $user : user_load($uid);
+    $user_wrapper = entity_metadata_wrapper('user', $user);
+
+    foreach ($field_mappings as $field_name => $responsys_name) {
+
+      // Get the type of the field, we have to deal with different
+      // types in different ways.
+      $field = field_info_field($field_name);
+
+      // Deal with a taxonomy reference field.
+      if ($field['type'] == 'taxonomy_term_reference') {
+        foreach ($user_wrapper->$field_name->value() as $term) {
+          if (array_key_exists($term->tid, $responsys_name)) {
+            $merge_vars[$responsys_name[$term->tid]] = 'Yes';
+          }
+        }
+        foreach ($responsys_name as $tid => $responsys_name_2) {
+          if (!array_key_exists($responsys_name_2, $merge_vars)) {
+            $merge_vars[$responsys_name_2] = 'No';
+          }
+        }
+      }
+
+      // Deal with all other fields as if they provide a straight value.
+      elseif (!empty($responsys_name)) {
+        try {
+          $merge_vars[$responsys_name] = $user_wrapper->$field_name->value();
+
+          if ($merge_vars[$responsys_name] === TRUE) {
+            $merge_vars[$responsys_name] = 'I';
+          }
+          elseif ($merge_vars[$responsys_name] === FALSE) {
+            $merge_vars[$responsys_name] = 'O';
+          }
+        }
+        catch (Exception $e) {
+          // This field type is unsupported.
+          watchdog('responsys', 'Unsupported field type on responsys field sync %type, %message', array('
+            %type' => $field['type'],
+            '%message' => $e->getMessage(), WATCHDOG_ERROR));
+        }
+      }
+    }
+  }
+  catch (Exception $e) {
+    watchdog_exception('responsys', $e);
+  }
+
+  return $merge_vars;
+}
+
+/**
+ * Retrieve the field mappings for a particular list.
+ *
+ * @return array
+ *   Key is the user field name, value is the Responsys equivalent field.
+ */
+function responsys_get_field_mappings($folder = NULL, $list = NULL) {
+  $folder = empty($folder) ? variable_get('responsys_user_folder', '') : $folder;
+  $list = empty($list) ? variable_get('responsys_user_list', '') : $list;
+  $mappings = variable_get('responsys_field_mappings', array());
+  return isset($mappings[$folder][$list]) ? $mappings[$folder][$list] : FALSE;
+}
+
+/**
+ * Unsubscribe a user from the given list.
+ *
+ * @param object $list
+ *   Add description.
+ * @param string $email
+ *   Add description.
+ * @param bool $message
+ *   Add description.
+ * @param object $mcapi
+ *   Add description.
+ * @param bool $delete
+ *   Indicates whether an email should be deleted or just unsubscribed.
+ *
+ * @return bool
+ *   TRUE on success.
+ */
+function responsys_unsubscribe_user($list, $email, $message = TRUE, $mcapi = NULL, $delete = FALSE) {
+  // @TODO
+}
+
+/**
+ * Get all the folders for the account.
+ *
+ * @return array
+ *   An array of folder name strings.
+ *
+ * @throws WSIFUnavailableException
+ *   When Responsys is unavailable.
+ */
+function responsys_get_folders() {
+  return wsif_get_api('responsys')->listFolders();
+}
+
+/**
+ * Return all lists for a given key.
+ *
+ * @param array $list_ids
+ *   An array of list IDs to filter the results by.
+ * @param bool $reset
+ *   Force a cache reset.
+ *
+ * @return array
+ *   An array of list arrays.
+ */
+function responsys_get_lists($list_ids = array(), $reset = FALSE) {
+  // @TODO
+}
+
+/**
+ * Get the Responsys memberinfo for a given email address and list.
+ *
+ * @param string $email
+ *   The email identifier for the member.
+ *   (Optional) defaults to logged in user.
+ * @param string $folder
+ *   The folder to retrieve the member from. Defaults
+ *   to the site default.
+ * @param string $list
+ *   The list to retrieve the member from. Default
+ *   to the site default.
+ * @param bool $reset
+ *   Go to responsys and do not retrieve from cache.
+ *
+ * @return array|FALSE
+ *   Member memberinfo array or FALSE if no one found or
+ *   query error.
+ *
+ * @throws WSIFUnavailableException
+ *   In the event responsys is unavailable.
+ */
+function responsys_get_memberinfo($email = NULL, $folder = NULL, $list = NULL, $reset = FALSE) {
+  if (empty($email)) {
+    global $user;
+    $email = $user->mail;
+  }
+
+  $folder = empty($folder) ? variable_get('responsys_user_folder', '') : $folder;
+  $list = empty($list) ? variable_get('responsys_user_list', '') : $list;
+
+  // Get a list of the fields to retrieve data for.
+  $field_list = array('RIID_', 'EMAIL_ADDRESS_');
+  drupal_alter('responsys_fields', $field_list, $folder, $list);
+
+  $members = responsys_get_members(array($email), $folder, $list, $field_list);
+
+  // Return the first record.
+  return empty($members) ? FALSE : $members[0];
+}
+
+/**
+ * Fine grain request function to get a list of Responsys records.
+ *
+ * @param array $ids
+ *   A list of ids to retrieve records for. The
+ *   type is defined by the $query variable and
+ *   is usually a list of Email addresses.
+ * @param string $folder
+ *   (Optional) the name of the folder.
+ * @param string $list
+ *   (Optional) the list to search against,
+ *   default to system default.
+ * @param array $field_list
+ *   (Optional) A list of fields to return
+ *   on each record.
+ * @param string $query
+ *   (Optional) the type of $ids provided.
+ *   Examples re 'EMAIL_ADDRESS' (default)
+ *   and 'RIID' which is the Responsys ID.
+ *
+ * @return array
+ *   A list of records.
+ *
+ * @throws WSIFUnavailableException
+ *   If Reponsys is unavailable this Exception is thrown,
+ *   ensure it is caught and dealt with.
+ */
+function responsys_get_members(array $ids, $folder = NULL, $list = NULL, array $field_list = array('RIID_', 'EMAIL_ADDRESS_'), $query = 'EMAIL_ADDRESS') {
+  $folder = empty($folder) ? variable_get('responsys_user_folder', '') : $folder;
+  $list = empty($list) ? variable_get('responsys_user_list', '') : $list;
+  $api = wsif_get_api('responsys');
+  return $api->retrieveListMembers($folder, $list, $ids, $query, $field_list);
+}
+
+/**
+ * Implements hook_wsif_info().
+ */
+function responsys_wsif_info() {
+  return array(
+    'responsys' => array(
+      'name' => t('Responsys'),
+      'description' => t('ResponSYS email marketing tool integration'),
+      'machine_name' => 'responsys',
+      'extra' => '',
+    ),
+  );
+}
+
+/**
+ * Implements hook_wsif().
+ */
+function responsys_wsif($reset = FALSE) {
+  $username = variable_get('responsys_api_username', '');
+  $password = variable_get('responsys_api_password', '');
+  return new ResponsysWrapper($username, $password);
+}
+
+/**
+ * Rules action callback.
+ */
+function responsys_rules_sync_user($account, $original_account = NULL) {
+  // Get the original email.
+  $original_email = !empty($original_account) ? $original_account->mail : $account->mail;
+
+  try {
+    // Get an array of Responsys values for the user, for this list.
+    $merge_vars = responsys_get_user_fields($account);
+    $response = responsys_update_user($original_email, $merge_vars, NULL, NULL, FALSE);
+  }
+  catch (WSIFUnavailableException $u) {
+    // @TODO - Deal with Responsys being unavailable at this point.
+    watchdog_exception('responsys', $u);
+  }
+}
+
+/**
+ * Pull a users details from responsys and update their Drupal account.
+ */
+function responsys_rules_pull_user($account) {
+  try {
+    responsys_update_user_from_responsys($account);
+  }
+  catch (Exception $e) {
+    // Not to worry should this fail. Log the issue.
+    watchdog_exception('responsys', $e);
+  }
+}
+
+/**
+ * Rules action callback.
+ */
+function responsys_rules_delete_user($email) {
+  try {
+    $response = responsys_delete_user($email);
+  }
+  catch (WSIFUnavailableException $u) {
+    // @TODO - Deal with Responsys being unavailable at this point.
+  }
+}
+
+/**
+ * Implements hook_responsys_fields_alter().
+ */
+function responsys_responsys_fields_alter(&$field_list, $folder, $list) {
+  $fields = &drupal_static(__FUNCTION__, array());
+
+  if (empty($fields[$folder][$list])) {
+    $fields[$folder][$list] = array();
+    $mappings = responsys_get_field_mappings($folder, $list);
+    if (!empty($mappings)) {
+      foreach ($mappings as $responsys_field) {
+        if (is_array($responsys_field)) {
+          foreach ($responsys_field as $responsys_sub_field) {
+            if (!empty($responsys_sub_field)) {
+              $fields[$folder][$list][] = $responsys_sub_field;
+            }
+          }
+        }
+        elseif (!empty($responsys_field)) {
+          $fields[$folder][$list][] = $responsys_field;
+        }
+      }
+    }
+  }
+
+  foreach ($fields[$folder][$list] as $field) {
+    if (!in_array($field, $field_list)) {
+      $field_list[] = $field;
+    }
+  }
+}
+
+/**
+ * Trigger a custom event for a given Responsys User.
+ */
+function responsys_trigger_custom_event($email, $event_id, $folder = NULL, $list = NULL) {
+  $folder = empty($folder) ? variable_get('responsys_user_folder', '') : $folder;
+  $list = empty($list) ? variable_get('responsys_user_list', '') : $list;
+  $api = wsif_get_api('responsys');
+  return $api->triggerCustomEvent($folder, $list, $event_id, $email);
+}
+
+/**
+ * Trigger a campaign message for a list of users.
+ *
+ * @param array $emails
+ *   A list of emails to send the campaign message to.
+ * @param string $campaign_id
+ *   The campaign_id
+ * @param string $folder
+ *   (Optional) folder the campaign and list resides in.
+ */
+function responsys_trigger_campaign_message(array $emails, $campaign_id, $folder = NULL, $list = NULL) {
+  $folder = empty($folder) ? variable_get('responsys_user_folder', '') : $folder;
+  $list = empty($list) ? variable_get('responsys_user_list', '') : $list;
+  $api = wsif_get_api('responsys');
+  return $api->triggerCampaignMessage($folder, $list, $campaign_id, $emails);
+}
+
+/**
+ * Decide if the given user account has just synced with Responsys.
+ *
+ * @param user $account
+ *   The given user account object.
+ *
+ * @return bool
+ *   TRUE if just synced.
+ */
+function responsys_account_just_synced($account) {
+  return (is_object($account) && isset($account->responsys_just_synced) && $account->responsys_just_synced);
+}

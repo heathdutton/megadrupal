@@ -1,0 +1,477 @@
+<?php
+
+/**
+ * @file
+ * Ooyala module provides integration with the Ooyala video service.
+ *
+ * Ooyala integrates with CCK to provide a field, widget, and formatters to
+ * upload video directly to the Ooyala service and display it.
+ */
+
+/**
+ * Implements hook_menu().
+ */
+function ooyala_taxonomy_menu() {
+  $items['admin/config/media/ooyala/sync-taxonomy'] = array(
+    'title' => 'Ooyala Sync confirmation',
+    'description' => 'Confirmation page before beginning taxonomy syncing.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('ooyala_taxonomy_sync_confirm'),
+    'access arguments' => array('administer site configuration'),
+    'file' => 'ooyala_taxonomy.pages.inc',
+    'type' => MENU_VISIBLE_IN_BREADCRUMB,
+  );
+  return $items;
+}
+
+/**
+ * Implements hook_theme().
+ */
+function ooyala_taxonomy_theme() {
+  $items['ooyala_taxonomy_settings_table'] = array(
+    'render element' => 'element',
+  );
+  return $items;
+}
+
+/**
+ * Implements hook_ooyala_field_asset_patch_alter().
+ */
+function ooyala_taxonomy_ooyala_field_asset_patch_alter(&$params, $context) {
+  if ($context['entity_type'] != 'node') {
+    return;
+  }
+
+  // Right now we only work with nodes.
+  $node = $context['entity'];
+  $embed_code = $params['embed_code'];
+
+  // This special flag is set when we're pulling information from Ooyala
+  // on cron jobs. No point in sending information back to Ooyala that we
+  // just got from them.
+  if (empty($node->pulled_from_ooyala)) {
+    module_load_include('inc', 'ooyala', 'includes/ooyala.api');
+
+    // Send Ooyala the current labels and metadata.
+    if ($ooyala_taxonomy = variable_get('ooyala_taxonomy', array())) {
+      $ooyala_types = ooyala_type_names();
+      if (!array_key_exists($node->type, $ooyala_types)) {
+        return;
+      }
+
+      $labels = ooyala_taxonomy_node_labels($node);
+      $metadata = ooyala_taxonomy_node_metadata($node);
+
+      $existing_lids = array();
+      $existing_labels = ooyala_api_video_label_load($embed_code);
+      foreach ($existing_labels as $label) {
+        $existing_lids[] = $label->id;
+      }
+
+      // Remove labels that are no longer associated the asset.
+      ooyala_api_video_label_remove($embed_code, array_diff($existing_lids, $labels));
+
+      // And add the labels that have been added.
+      ooyala_api_video_label_add($embed_code, array_diff($labels, $existing_lids));
+
+      // Metadata simply overrides existing metadata.
+      if ($metadata) {
+        ooyala_api_custom_metadata_save($embed_code, $metadata);
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_taxonomy_term_insert().
+ */
+function ooyala_taxonomy_taxonomy_term_insert($term) {
+  $ooyala_vocabularies = variable_get('ooyala_taxonomy', array());
+  if (!empty($ooyala_vocabularies[$term->vid]['olid']) && empty($term->pulled_from_ooyala)) {
+    $vocabulary_olid = $ooyala_vocabularies[$term->vid]['olid'];
+    // Check if needing to add this term to Ooyala. If $term->olid is already
+    // set this term originated from Ooyala and doesn't need to be sent.
+    // See ooyala_taxonomy_term_sync().
+    if (!isset($term->olid)) {
+      module_load_include('inc', 'ooyala', 'includes/ooyala.api');
+      module_load_include('inc', 'ooyala_taxonomy', 'ooyala_taxonomy');
+      $label = ooyala_taxonomy_create_label($term, $term->vid, $vocabulary_olid);
+      if ($olid = ooyala_api_label_add($label)) {
+        $term->olid = $olid;
+      }
+    }
+    // Always add the entry in the ooyala_taxonomy table.
+    if (isset($term->olid)) {
+      ooyala_taxonomy_term_save($term);
+    }
+  }
+}
+
+/**
+ * Implements hook_taxonomy_term_update().
+ */
+function ooyala_taxonomy_term_update($term) {
+  module_load_include('inc', 'ooyala_taxonomy', 'ooyala_taxonomy');
+  $ooyala_vocabularies = variable_get('ooyala_taxonomy', array());
+  if ($ooyala_vocabularies[$term->vid]['olid'] && empty($term->pulled_from_ooyala)) {
+    $vocabulary_olid = $ooyala_vocabularies[$term->vid]['olid'];
+
+    // Load the Ooyala label ID and check for renamed terms.
+    $term = _ooyala_taxonomy_term_load($term->tid);
+    if (isset($term->olid)) {
+      module_load_include('inc', 'ooyala', 'includes/ooyala.api');
+      $old_label = ooyala_api_label_name($term->olid);
+      $label = ooyala_taxonomy_create_label($term, $term->vid, $vocabulary_olid);
+      if ($old_label != $label) {
+        ooyala_api_label_rename($term->olid, $term->name);
+        ooyala_taxonomy_term_save($term);
+      }
+    }
+  }
+}
+
+/**
+ * Save a taxonomy term's Ooyala information to the database.
+ *
+ * This function is called from ooyala_taxonomy_term_insert() and
+ * ooyala_taxonomy_term_update().
+ */
+function ooyala_taxonomy_term_save($term) {
+  static $time;
+  $time = isset($time) ? $time : REQUEST_TIME;
+
+  $update = !isset($term->updated) ? NULL : array('tid');
+  $term->updated = $time;
+  $term->olid = isset($term->olid) ? $term->olid : NULL;
+
+  if ($term->tid && $term->olid) {
+    db_merge('ooyala_taxonomy')
+      ->key(array('tid' => $term->tid))
+      ->fields(array('vid' => $term->vid, 'tid' => $term->tid, 'olid' => $term->olid, 'updated' => $term->updated))
+      ->execute();
+  }
+}
+
+/**
+ * Implements hook_taxonomy_term_delete().
+ */
+function ooyala_taxonomy_term_delete($term) {
+  $ooyala_vocabularies = variable_get('ooyala_taxonomy', array());
+  if (!empty($ooyala_vocabularies[$term->vid]['olid'])) {
+    // Delete any matching Ooyala label information. We have to use a direct
+    // query here instead of ooyala_taxonomy_term_load() because the term_data
+    // record has already been deleted.
+    $olid = db_select('ooyala_taxonomy', 'ot')
+      ->fields('ot', array('olid'))
+      ->condition('ot.tid', $term->tid)
+      ->execute()
+      ->fetchAssoc();
+    if (isset($olid['olid'])) {
+      module_load_include('inc', 'ooyala', 'includes/ooyala.api');
+      ooyala_api_label_delete($olid['olid']);
+      db_delete('ooyala_taxonomy')
+        ->condition('tid', $term->tid)
+        ->execute();
+    }
+  }
+}
+
+/**
+ * Implementation of hook_taxonomy_vocabulary_delete().
+ */
+function ooyala_taxonomy_vocabulary_delete($vocabulary) {
+  $ooyala_vocabularies = variable_get('ooyala_taxonomy', array());
+  if ($ooyala_vocabularies[$vocabulary->vid]) {
+    unset($ooyala_vocabularies[$vocabulary->vid]);
+    variable_set('ooyala_taxonomy', $ooyala_vocabularies);
+    db_delete('ooyala_taxonomy')
+      ->condition('vid', $vocabulary->vid)
+      ->execute();
+    drupal_set_message(t('The vocabulary %name is no longer synced with Ooyala. Labels within Ooyala backlot have not been affected.', array('%name' => $vocabulary->name)));
+  }
+}
+
+/**
+ * Implements hook_cron().
+ */
+function ooyala_taxonomy_cron() {
+  module_load_include('inc', 'ooyala_taxonomy');
+  ooyala_taxonomy_term_sync_pull_labels();
+}
+
+/**
+ * Implements hook_ooyala_create_node()
+ */
+function ooyala_taxonomy_ooyala_create_node(&$node, $video) {
+  if (variable_get('ooyala_taxonomy', array()) && isset($video['labels'])) {
+    module_load_include('inc', 'ooyala_taxonomy');
+    $fields_to_check = ooyala_taxonomy_get_taxonomy_fields();
+    foreach ($fields_to_check as $field_name => $field_vid) {
+      if (isset($node->{$field_name})) {
+        foreach ($video['labels'] as $label) {
+          $tid = _ooyala_taxonomy_term_load(NULL, $label->id);
+          // Use both TID and Target ID for term and entity references.
+          $node->{$field_name}[LANGUAGE_NONE][]['tid'] = $tid;
+          $node->{$field_name}[LANGUAGE_NONE][]['target_id'] = $tid;
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_ooyala_sync_pull_videos().
+ *
+ * Update a list of nodes with any changed label information from Ooyala.
+ */
+function ooyala_taxonomy_ooyala_sync_pull_videos(&$nodes, $videos, $node_map) {
+  module_load_include('inc', 'ooyala_taxonomy');
+
+  // Load vocabularies to get machine names if needed.
+  $vocabularies = taxonomy_get_vocabularies();
+
+  // Make a regular expression that we can use to filter out non-synced labels.
+  $ooyala_taxonomy = variable_get('ooyala_taxonomy', array());
+  $vocabulary_labels = array();
+  foreach ($ooyala_taxonomy as $vid => $sync_settings) {
+    if ($sync_settings['type'] == 'labels' && $sync_settings['olid']) {
+      $vocabulary_label = ooyala_api_label_name($sync_settings['olid']);
+      $vocabulary_labels[$vid] = preg_quote($vocabulary_label, '/');
+    }
+  }
+  $label_filter = '/^' . implode('|', $vocabulary_labels) . '\//';
+
+  foreach ($videos as $embed_code => $video) {
+    foreach ($node_map['embed_codes'][$embed_code] as $nid) {
+      $node = &$nodes[$nid];
+
+      // This variable accumulates all the terms that will be set on the node.
+      $term_list = array();
+
+      // Assemble a list of labels that sync with Drupal.
+      $ooyala_labels = array();
+      foreach ($video['labels'] as $label) {
+        if (preg_match($label_filter, $label->full_name)) {
+          $ooyala_labels[] = $label->id;
+        }
+      }
+
+      // Load each label and put it into a group by vocabulary.
+      foreach ($ooyala_labels as $olid) {
+        $term = _ooyala_taxonomy_term_load(NULL, $olid);
+        // Set a target ID for entity references.
+        if (isset($term->tid)) {
+          $term->target_id = $term->tid;
+        }
+        $term_list[$term->vid][] = (array) $term;
+      }
+
+      // Now that labels are updated, update metadata items.
+      foreach ($ooyala_taxonomy as $vid => $sync_settings) {
+        if ($sync_settings['type'] == 'metadata' || isset($video['metadata']->{$sync_settings['metadata_key']})) {
+          $video_metadata = $video['metadata']->{$sync_settings['metadata_key']};
+          $term_list[$vid] = array();
+
+          // Translate term names into actual terms.
+          // This code copied from taxonomy_autocomplete_validate().
+          $typed_terms = drupal_explode_tags($video_metadata);
+          foreach ($typed_terms as $typed_term) {
+            // See if the term exists in the chosen vocabulary and return the
+            // TID, otherwise create the term and use that value.
+            if ($possibilities = taxonomy_term_load_multiple(array(), array('name' => trim($typed_term), 'vid' => $vid))) {
+              $term = array_pop($possibilities);
+            }
+            else {
+              $term = (object) array(
+                'vid' => $vid,
+                'name' => $typed_term,
+                'vocabulary_machine_name' => $vocabularies[$vid]->machine_name,
+              );
+              taxonomy_term_save($term);
+            }
+            // Set a target ID for entity references.
+            if (isset($term->tid)) {
+              $term->target_id = $term->tid;
+            }
+            $term_list[$vid][] = (array) $term;
+          }
+        }
+      }
+
+      // Set the values for each vocabulary.
+      $field_list = ooyala_taxonomy_get_taxonomy_fields();
+      foreach ($field_list as $field_name => $field_vid) {
+        if (isset($node->{$field_name}) && isset($term_list[$field_vid])) {
+          $node->{$field_name}[LANGUAGE_NONE] = $term_list[$field_vid];
+          $node->pulled_from_ooyala = TRUE; // Mark this node as changed.
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function ooyala_taxonomy_form_ooyala_settings_form_alter(&$form, &$form_state) {
+  module_load_include('inc', 'ooyala_taxonomy', 'ooyala_taxonomy.pages');
+  _ooyala_taxonomy_settings_form($form, $form_state);
+}
+
+/**
+ * Fetch a list of all Ooyala labels that can be derived from a node's taxonomy.
+ *
+ * This function is used when saving a node and Taxonomy synchronization is
+ * enabled. The list of labels is then compared against the Ooyala Backlot video
+ * and labels are added/removed to correspond with the synced vocabularies.
+ *
+ * @param $node
+ *   A full node object.
+ * @param $ooyala_vocabularies
+ *   An array of sync settings, keyed by vocabulary ID. If not set, the settings
+ *   from the "ooyala_taxonomy" variable will be used.
+ */
+function ooyala_taxonomy_node_labels($node, $ooyala_vocabularies = NULL) {
+  module_load_include('inc', 'ooyala', 'includes/ooyala.api');
+  module_load_include('inc', 'ooyala_taxonomy');
+
+  $labels = array();
+  $ooyala_vocabularies = isset($ooyala_vocabularies) ? isset($ooyala_vocabularies) : variable_get('ooyala_taxonomy', array());
+
+  foreach ($ooyala_vocabularies as $vid => $sync_settings) {
+    if ($sync_settings['type'] !== 'labels') {
+      continue;
+    }
+
+    $terms = _ooyala_taxonomy_node_terms($node, $vid);
+    if ($terms === FALSE) {
+      continue;
+    }
+
+    $vocabulary_label = ooyala_api_label_name($sync_settings['olid']);
+    // Loop through all terms and build a list of labels.
+    foreach ($terms as $tid => $term) {
+      // Use the label ID if available, as it tends to be more accurate.
+      if (isset($term->olid)) {
+        $labels[] = $term->olid;
+      }
+      // Otherwise return a label as a path, assume it will be inserted.
+      else {
+        $parents = taxonomy_get_parents($tid);
+        $term_label = $vocabulary_label;
+        foreach ($parents as $parent_term) {
+          $term_label .= '/' . $parent_term->name;
+        }
+        $term_label .= '/' . $term->name;
+        $labels[] = $term_label;
+      }
+    }
+  }
+
+  return $labels;
+}
+
+/**
+ * Fetch an array of Ooyala metadata that can be derived from a node's taxonomy.
+ *
+ * @param $node
+ *   A full node object.
+ * @param $ooyala_vocabularies
+ *   An array of sync settings, keyed by vocabulary ID. If not set, the settings
+ *   from the "ooyala_taxonomy" variable will be used.
+ */
+function ooyala_taxonomy_node_metadata($node, $ooyala_vocabularies = NULL) {
+  module_load_include('inc', 'ooyala', 'includes/ooyala.api');
+  module_load_include('inc', 'ooyala_taxonomy');
+
+  $metadata = array();
+  $ooyala_vocabularies = isset($ooyala_vocabularies) ? isset($ooyala_vocabularies) : variable_get('ooyala_taxonomy', array());
+
+  foreach ($ooyala_vocabularies as $vid => $sync_settings) {
+    if ($sync_settings['type'] != 'metadata') {
+      continue;
+    }
+    $terms = _ooyala_taxonomy_node_terms($node, $vid);
+    if ($terms === FALSE) {
+      continue;
+    }
+    $term_list = array();
+    foreach ($terms as $term) {
+      $term_list[] = $term->name;
+    }
+    $metadata[$sync_settings['metadata_key']] = implode(', ', $term_list);
+  }
+  return $metadata;
+}
+
+/**
+ * Return the taxonomy field(s)
+ *
+ * @return
+ * The name of the field(s) we should put terms in
+ */
+function ooyala_taxonomy_get_taxonomy_fields() {
+  $field_list = &drupal_static(__FUNCTION__);
+  if (isset($field_list)) {
+    return $field_list;
+  }
+
+  $fields = field_info_fields();
+  $vocabularies = taxonomy_get_vocabularies();
+  $field_names = array_keys($fields);
+
+  $field_list = array();
+  foreach ($field_names as $name) {
+    if ($fields[$name]['type'] == 'taxonomy_term_reference') {
+      // Taxonomy settings are by machine name, but we want the return value
+      // by VID, so we have to match the associated vocabulary.
+      $machine_name = $fields[$name]['settings']['allowed_values'][0]['vocabulary'];
+      foreach ($vocabularies as $vid => $vocabulary) {
+        if ($vocabulary->machine_name == $machine_name) {
+          $field_name = $fields[$name]['field_name'];
+          $field_list[$field_name] = $vid;
+        }
+      }
+    }
+    elseif ($fields[$name]['type'] == 'entityreference' && $fields[$name]['settings']['target_type'] == 'taxonomy_term') {
+      // The fields array is keyed slightly differently for entity references
+      // than for taxonomy term reference fields.
+      $target_bundles = $fields[$name]['settings']['handler_settings']['target_bundles'];
+      foreach ($vocabularies as $vid => $vocabulary) {
+        foreach ($target_bundles as $key => $machine_name) {
+          if ($vocabulary->machine_name == $machine_name) {
+            $field_name = $fields[$name]['field_name'];
+            $field_list[$field_name] = $vid;
+          }
+        }
+      }
+    }
+  }
+
+  return $field_list;
+}
+
+/**
+ * For a given node, return the taxonomy term ids for the node
+ *
+ * @param $node
+ * The node in question.
+ * @return
+ * An array of tids
+ */
+function ooyala_taxonomy_tids_for_nid($node) {
+  $fields = field_info_fields();
+  $field_names = array_keys($fields);
+  
+  foreach ($field_names as $name) {
+    if (isset($node->{$name}) && $fields[$name]['type'] == 'taxonomy_term_reference') {
+      if (isset($node->{$name}[LANGUAGE_NONE]) && is_array($node->{$name}[LANGUAGE_NONE])) {
+        foreach ($node->{$name}[LANGUAGE_NONE] as $tid) {
+          $tids[$tid['tid']] = $tid['tid'];
+        }
+      }
+    }
+  }
+  
+  return $tids;
+}

@@ -1,0 +1,1159 @@
+<?php
+// $Id$
+/**
+ * @file
+ * Enables the oauth capabilities.
+ */
+
+/**
+ * Saves an application type to the database.
+ *
+ * @param $info
+ *   The application type to save, as an object.
+ *
+ * @return
+ *   Status flag indicating outcome of the operation.
+ */
+function oauth_type_save($info) {
+  $existing_type = !empty($info->old_type) ? $info->old_type : $info->type;
+  $is_existing = (bool) db_query_range('SELECT 1 FROM {oauth_type} WHERE type = :type', 0, 1, array(':type' => $existing_type))->fetchField();
+  $type = oauth_type_set_defaults($info);
+
+  $fields = array(
+    'type' => (string) $type->type,
+    'name' => (string) $type->name,
+    'version' => (string) $type->version,
+    'base' => (string) $type->base,
+    'description' => (string) $type->description,
+    'help' => (string) $type->help,
+    'custom' => (int) $type->custom,
+    'locked' => (int) $type->locked,
+    'disabled' => (int) $type->disabled,
+    'module' => $type->module,
+  );
+
+  if ($is_existing) {
+    db_update('oauth_type')
+      ->fields($fields)
+      ->condition('type', $existing_type)
+      ->execute();
+
+    if (!empty($type->old_type) && $type->old_type != $type->type) {
+      field_attach_rename_bundle('oauth', $type->old_type, $type->type);
+    }
+    module_invoke_all('oauth_type_update', $type);
+    $status = SAVED_UPDATED;
+  }
+  else {
+    $fields['orig_type'] = (string) $type->orig_type;
+    db_insert('oauth_type')
+      ->fields($fields)
+      ->execute();
+
+    field_attach_create_bundle('oauth', $type->type);
+    oauth_add_oauth_field($type);
+
+    module_invoke_all('oauth_type_insert', $type);
+    $status = SAVED_NEW;
+  }
+
+  // Clear the oauth type cache.
+  oauth_type_cache_reset();
+  menu_rebuild();
+
+  return $status;
+}
+
+/**
+ * Sets the default values for an oauth type.
+ *
+ * The defaults are appropriate for a type defined through hook_oauth_info(),
+ * since 'custom' is TRUE for types defined in the user interface, and FALSE
+ * for types defined by modules. (The 'custom' flag prevents types from being
+ * deleted through the user interface.) Also, the default for 'locked' is TRUE,
+ * which prevents users from changing the machine name of the type.
+ *
+ * @param $info
+ *   An object or array containing values to override the defaults. See
+ *   hook_oauth_info() for details on what the array elements mean.
+ *
+ * @return
+ *   An oauth type object, with missing values in $info set to their defaults.
+ */
+function oauth_type_set_defaults($info = array()) {
+  $info = (array) $info;
+  $new_type = $info + array(
+    'type' => '',
+    'name' => '',
+    'base' => '',
+    'description' => '',
+    'help' => '',
+    'custom' => 0,
+    'locked' => 1,
+    'disabled' => 0,
+    'is_new' => 1,
+  );
+  if (!isset($new_type['token table']['secret length'])) {
+    $new_type['token table']['secret length'] = $new_type['token table']['token length'];
+  }
+  if (!isset($new_type['token table']['name'])) {
+    $new_type['token table']['name'] = $info['type'] . '_token';
+  }
+
+  $new_type = (object) $new_type;
+
+  if (empty($new_type->module)) {
+    $new_type->module = $new_type->base == 'oauth_application' ? 'oauth' : '';
+  }
+  $new_type->orig_type = isset($info['type']) ? $info['type'] : '';
+
+  return $new_type;
+}
+
+/**
+ * Implements hook_modules_installed().
+ */
+function oauth_modules_installed($modules) {
+  $rebuild = FALSE;
+
+  foreach ($modules as $module) {
+    if (module_hook($module, 'oauth_info')) {
+      module_load_install('oauth');
+      oauth_create_token_table($module);
+      $rebuild = TRUE;
+    }
+  }
+
+  if ($rebuild) {
+    oauth_types_rebuild();
+  }
+}
+
+/**
+* Implements hook_modules_uninstalled().
+*/
+function oauth_modules_uninstalled($modules) {
+  $rebuild = FALSE;
+
+  foreach ($modules as $module) {
+    if (module_hook($module, 'oauth_info')) {
+      module_load_install('oauth');
+      oauth_drop_token_table($module);
+      $rebuild = TRUE;
+    }
+  }
+
+  if ($rebuild) {
+    oauth_types_rebuild();
+  }
+}
+
+/**
+ * Determine whether a oauth hook exists.
+ *
+ * @param $oauth
+ *   An oauth object or a string containing the application type.
+ * @param $hook
+ *   A string containing the name of the hook.
+ * @return
+ *   TRUE if the $hook exists in the application type of $oauth.
+ */
+function oauth_hook($oauth, $hook) {
+  $base = oauth_type_get_base($oauth);
+  return module_hook($base, $hook);
+}
+
+/**
+ * Invoke a oauth hook.
+ *
+ * @param $oauth
+ *   An oauth object.
+ * @param $hook
+ *   A string containing the name of the hook.
+ * @param $a2, $a3, $a4
+ *   Arguments to pass on to the hook, after the $oauth argument.
+ * @return
+ *   The returned value of the invoked hook.
+ */
+function oauth_invoke($oauth, $hook, $a2 = NULL, $a3 = NULL, $a4 = NULL) {
+  if (oauth_hook($oauth, $hook)) {
+    $base = oauth_type_get_base($oauth);
+    $consumer = oauth_consumer_load($oauth->oid);
+    $function = $base . '_' . $hook;
+    return ($function($consumer, $a2, $a3, $a4));
+  }
+}
+
+/**
+ * Builds and returns the list of available application types.
+ *
+ * The list of types is built by invoking hook_oauth_info() on all modules and
+ * comparing this information with the application types in the {oauth_type} table.
+ * These two information sources are not synchronized during module installation
+ * until oauth_types_rebuild() is called.
+ *
+ * @param $rebuild
+ *  TRUE to rebuild oauth types. Equivalent to calling oauth_types_rebuild().
+ * @return
+ *   Associative array with two components:
+ *   - names: Associative array of the names of oauth types, keyed by the type.
+ *   - types: Associative array of oauth type objects, keyed by the type.
+ *   Both of these arrays will include new types that have been defined by
+ *   hook_oauth_info() implementations but not yet saved in the {oauth_type}
+ *   table. These are indicated in the type object by $type->is_new being set
+ *   to the value 1. These arrays will also include obsolete types: types that
+ *   were previously defined by modules that have now been disabled, or for
+ *   whatever reason are no longer being defined in hook_oauth_info()
+ *   implementations, but are still in the database. These are indicated in the
+ *   type object by $type->disabled being set to TRUE.
+ */
+function _oauth_types_build($rebuild = FALSE) {
+  $cid = 'oauth_types:' . $GLOBALS['language']->language;
+
+  if (!$rebuild) {
+    $_oauth_types = &drupal_static(__FUNCTION__);
+    if (isset($_oauth_types)) {
+      return $_oauth_types;
+    }
+    if ($cache = cache_get($cid)) {
+      $_oauth_types = $cache->data;
+      return $_oauth_types;
+    }
+  }
+
+  $_oauth_types = (object) array('types' => array(), 'names' => array());
+
+  foreach(module_implements('oauth_info') as $module) {
+    $info_array = module_invoke($module, 'oauth_info');
+    foreach ($info_array as $type => $info) {
+      $info['type'] = $type;
+      $_oauth_types->types[$type] = oauth_type_set_defaults($info);
+      $_oauth_types->types[$type]->module = $module;
+      $_oauth_types->names[$type] = $info['name'];
+    }
+  }
+  $query = db_select('oauth_type', 'ot')
+    ->addTag('translatable')
+    ->fields('ot')
+    ->orderBy('ot.type', 'ASC');
+  if (!$rebuild) {
+    $query->condition('disabled', 0);
+  }
+  foreach($query->execute() as $type_object) {
+    $type_db = $type_object->type;
+    // Original disabled value.
+    $disabled = $type_object->disabled;
+    // Check for oauth types from disabled modules and mark their types for removal.
+    // Types defined by the oauth module in the database (rather than by a separate
+    // module using hook_oauth_info) have a base value of 'oauth_application'.
+    if ($type_object->base != 'oauth_application' && empty($_oauth_types->types[$type_db])) {
+      $type_object->disabled = TRUE;
+    }
+    if (isset($_oauth_types->types[$type_db])) {
+      $type_object->disabled = FALSE;
+    }
+    else {
+      $_oauth_types->types[$type_db] = $type_object;
+      $_oauth_types->names[$type_db] = $type_object->name;
+
+      if ($type_db != $type_object->orig_type) {
+        unset($_oauth_types->types[$type_object->orig_type]);
+        unset($_oauth_types->names[$type_object->orig_type]);
+      }
+    }
+    $_oauth_types->types[$type_db]->disabled = $type_object->disabled;
+    $_oauth_types->types[$type_db]->disabled_changed = $disabled != $type_object->disabled;
+  }
+
+  if ($rebuild) {
+    foreach ($_oauth_types->types as $type => $type_object) {
+      if (!empty($type_object->is_new) || !empty($type_object->disabled_changed)) {
+        oauth_type_save($type_object);
+      }
+    }
+  }
+
+  asort($_oauth_types->names);
+
+  cache_set($cid, $_oauth_types);
+
+  return $_oauth_types;
+}
+
+/**
+ * Clears the oauth type cache.
+ */
+function oauth_type_cache_reset() {
+  cache_clear_all('oauth_types:', 'cache', TRUE);
+  drupal_static_reset('_oauth_types_build');
+}
+
+/**
+ * Implements hook_field_info().
+ */
+function oauth_field_info() {
+  return array(
+    'oauth_consumer' => array(
+      'label' => t('OAuth 1.0'),
+      'description' => t('A website or application that uses OAuth to access the Service Provider on behalf of the User.'),
+      'settings' => array('max_length' => 255),
+      'default_widget' => 'oauth_consumer',
+      'default_formatter' => 'oauth_default',
+    ),
+    'oauth2_client' => array(
+      'label' => t('OAuth 2.0'),
+      'description' => t('A website or application that uses OAuth to access the Service Provider on behalf of the User.'),
+      'settings' => array('max_length' => 255),
+      'default_widget' => 'oauth2_client',
+      'default_formatter' => 'oauth_default',
+    ),
+  );
+}
+
+/**
+* Implements hook_field_widget_info().
+*/
+function oauth_field_widget_info() {
+  return array(
+    'oauth_consumer' => array(
+      'label' => t('Consumer form'),
+      'field types' => array('oauth_consumer'),
+      'settings' => array('size' => 60),
+    ),
+    'oauth2_client' => array(
+      'label' => t('Client form'),
+      'field types' => array('oauth2_client'),
+      'settings' => array('size' => 60),
+    )
+  );
+}
+
+/**
+ * Implements hook_field_formatter_info().
+ */
+function oauth_field_formatter_info() {
+  return array(
+    'oauth_default' => array(
+      'label' => t('Default'),
+      'field types' => array('oauth_consumer', 'oauth2_client'),
+    ),
+  );
+}
+
+/**
+ * Implements hook_field_formatter_view().
+ */
+function oauth_field_formatter_view($entity_type, $entity, $field, $instance, $langcode, $items, $display) {
+  $rows = array();
+
+  $auth_types = oauth_auth_types();
+  $signature_methods = oauth_signature_methods();
+
+  foreach ($items as $delta => $item) {
+    $rows[] = array(t('Consumer key'), $item['key']);
+    $rows[] = array(t('Consumer secret'), $item['secret']);
+    $rows[] = array(t('Authentication type'), $auth_types[$item['auth_type']]);
+    $rows[] = array(t('Signature method'), $signature_methods[$item['signature_method']]);
+  }
+
+  return array(
+    '#theme' => 'table',
+    '#rows' => $rows,
+    '#empty' => t('No settings available.'),
+  );
+}
+
+/**
+* Implements hook_field_widget_form().
+*/
+function oauth_field_widget_form(&$form, &$form_state, $field, $instance, $langcode, $items, $delta, $element) {
+  switch ($instance['widget']['type']) {
+    case 'oauth_consumer':
+      $element['key'] = array(
+        '#title' => t('Consumer key'),
+        '#type' => 'textfield',
+        '#default_value' => isset($items[$delta]['key']) ? $items[$delta]['key'] : NULL,
+        '#size' => $instance['widget']['settings']['size'],
+        '#maxlength' => $field['settings']['max_length'],
+        '#required' => TRUE,
+      );
+      $element['secret'] = array(
+        '#title' => t('Consumer secret'),
+        '#type' => 'textfield',
+        '#default_value' => isset($items[$delta]['secret']) ? $items[$delta]['secret'] : NULL,
+        '#size' => $instance['widget']['settings']['size'],
+        '#maxlength' => $field['settings']['max_length'],
+        '#required' => TRUE,
+      );
+
+      $element['signature_method'] = array(
+        '#title' => t('Signature method'),
+        '#type' => 'select',
+        '#default_value' => isset($items[$delta]['signature_method']) ? $items[$delta]['signature_method'] : OAUTH_SIG_METHOD_HMACSHA1,
+        '#options' => oauth_signature_methods(),
+      );
+      $element['auth_type'] = array(
+        '#title' => t('Authentiation type'),
+        '#type' => 'select',
+        '#default_value' => isset($items[$delta]['auth_type']) ? $items[$delta]['auth_type'] : OAUTH_AUTH_TYPE_AUTHORIZATION,
+        '#options' => oauth_auth_types(),
+      );
+
+      break;
+  }
+  return $element;
+}
+
+/**
+* Implements hook_field_is_empty().
+*/
+function oauth_field_is_empty($item, $field) {
+  if (!isset($item['key']) || $item['key'] === '') {
+    return !isset($item['secret']) || $item['secret'] === '';
+  }
+  return FALSE;
+}
+
+/**
+ * Returns an array of available signature methods.
+ *
+ * First key is the default.
+ */
+function oauth_signature_methods() {
+  return array(
+    OAUTH_SIG_METHOD_HMACSHA1 => t('HMAC-SHA1'),
+    OAUTH_SIG_METHOD_HMACSHA256 => t('HMAC-SHA256'),
+    OAUTH_SIG_METHOD_RSASHA1 => t('RSA-SHA1'),
+    OAUTH_SIG_METHOD_PLAINTEXT => t('Plain Text'),
+  );
+}
+
+function oauth_auth_types() {
+  return array(
+    OAUTH_AUTH_TYPE_URI => t('HTTP GET'),
+    OAUTH_AUTH_TYPE_FORM => t('HTTP POST'),
+    OAUTH_AUTH_TYPE_AUTHORIZATION => t('HTTP Authorization header'),
+    OAUTH_AUTH_TYPE_NONE => t('None'),
+  );
+}
+
+/**
+ * Add OAuth 1.0 or 2.0 field to an application type.
+ *
+ * @param $type
+ *   An application type object.
+ */
+function oauth_add_oauth_field($type) {
+  switch ($type->version) {
+    // TODO: hardcoded!
+    case '2.0':
+      $field_name = 'client';
+      $field_type = 'oauth2_client';
+      break;
+    case '1.0':
+    default:
+      $field_name = 'consumer';
+      $field_type = 'oauth_consumer';
+      break;
+  }
+
+  $field = field_info_field($field_name);
+  $instance = field_info_instance('oauth', $field_name, $type->type);
+  if (empty($field)) {
+    $field = array(
+      'locked' => TRUE,
+      'field_name' => $field_name,
+      'type' => $field_type,
+      'entity_types' => array('oauth'),
+      'translatable' => TRUE,
+    );
+    $field = field_create_field($field);
+  }
+  if (empty($instance)) {
+    $instance = array(
+      'required' => TRUE,
+      'field_name' => $field_name,
+      'entity_type' => 'oauth',
+      'bundle' => $type->type,
+      'label' => t('Settings'),
+      'widget' => array('type' => $field_type),
+    );
+    $instance = field_create_instance($instance);
+  }
+  return $instance;
+}
+
+/**
+ * Implements hook_hook_info().
+ */
+function oauth_hook_info() {
+  $hooks['oauth_info'] = array(
+    'group' => 'oauth',
+  );
+  $hooks['oauth_authenticate'] = array(
+    'group' => 'oauth',
+  );
+  $hooks['oauth_callback'] = array(
+    'group' => 'oauth',
+  );
+  $hooks['oauth_response'] = array(
+    'group' => 'oauth',
+  );
+
+  return $hooks;
+}
+
+/**
+ * Implements hook_entity_info().
+ */
+function oauth_entity_info() {
+  $entity = array(
+    'oauth' => array(
+      'label' => t('OAuth Application'),
+      'base table' => 'oauth',
+      'uri callback' => 'oauth_uri',
+      'fieldable' => TRUE,
+      'entity keys' => array(
+        'id' => 'oid',
+        'bundle' => 'type',
+        'label' => 'title'
+      ),
+      'bundle keys' => array('bundle' => 'type'),
+      'bundles' => array(),
+    )
+  );
+
+  // Bundles must provide a human readable name so we can create help and error
+  // messages, and the path to attach Field admin pages to.
+  foreach(oauth_type_get_names() as $type => $name) {
+    $entity['oauth']['bundles'][$type] = array(
+      'label' => $name,
+      'admin' => array(
+        'path' => 'admin/structure/oauth/manage/%oauth_type',
+        'real path' => 'admin/structure/oauth/manage/' . str_replace('_', '-', $type),
+        'bundle argument' => 4,
+        'access arguments' => array('administer oauth types'),
+      ),
+    );
+  }
+
+  return $entity;
+}
+
+function oauth_uri($oauth) {
+  return array('path' => 'oauth/' . $oauth->oid);
+}
+
+/**
+ * Implements hook_menu().
+ */
+function oauth_menu() {
+  $items['oauth/%/autocomplete'] = array(
+    'title' => 'OAuth autocomplete',
+    'page callback' => 'oauth_autocomplete',
+    'page arguments' => array(1),
+    'access callback' => 'user_access',
+    'access arguments' => array('access user profiles'),
+    'type' => MENU_CALLBACK,
+    'file' => 'oauth.pages.inc',
+  );
+
+  $items['user/%user/identities'] = array(
+    'title' => 'External identities',
+    'page callback' => 'oauth_user_identities',
+    'page arguments' => array(1),
+    'access callback' => 'user_edit_access',
+    'access arguments' => array(1),
+    'type' => MENU_LOCAL_TASK,
+    'file' => 'oauth.pages.inc',
+  );
+  $items['user/%user/%oauth/delete'] = array(
+    'title' => 'Delete external identity',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('oauth_user_delete_form', 1, 2),
+    'access callback' => 'user_edit_access',
+    'access arguments' => array(1),
+    'file' => 'oauth.pages.inc',
+  );
+  // Add specific applications.
+  foreach (oauth_type_get_types() as $type) {
+    $type_url_str = str_replace('_', '-', $type->type);
+    $items['admin/config/services/' . $type_url_str] = array(
+      'title' => $type->name,
+      'title callback' => 'check_plain',
+      'page callback' => 'oauth_admin_applications',
+      'page arguments' => array($type->type),
+      'access arguments' => array('administer oauth applications'),
+      'description' => $type->description,
+      'file' => 'oauth.admin.inc',
+    );
+    $items['admin/config/services/' . $type_url_str . '/list'] = array(
+      'title' => 'List',
+      'type' => MENU_DEFAULT_LOCAL_TASK,
+      'weight' => -10,
+    );
+    $items['admin/config/services/' . $type_url_str . '/add'] = array(
+      'title' => 'Add application',
+      'page callback' => 'oauth_add',
+      'page arguments' => array($type->type),
+      'access arguments' => array('administer oauth applications'),
+      'type' => MENU_LOCAL_ACTION,
+      'file' => 'oauth.pages.inc',
+    );
+  }
+  $items['oauth/%oauth'] = array(
+    'title callback' => 'oauth_page_title',
+    'title arguments' => array(1),
+    'page callback' => 'oauth_page_view',
+    'page arguments' => array(1),
+    'access arguments' => array('administer oauth applications'),
+    'file' => 'oauth.pages.inc',
+  );
+  $items['oauth/%oauth/view'] = array(
+    'title' => 'View',
+    'type' => MENU_DEFAULT_LOCAL_TASK,
+    'weight' => -10,
+  );
+  $items['oauth/%oauth/edit'] = array(
+    'title' => 'Edit',
+    'page callback' => 'oauth_page_edit',
+    'page arguments' => array(1),
+    'access arguments' => array('administer oauth applications'),
+    'type' => MENU_LOCAL_TASK,
+    'file' => 'oauth.pages.inc',
+  );
+  $items['oauth/%oauth/delete'] = array(
+    'title' => 'Delete',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('oauth_delete_confirm', 1),
+    'access arguments' => array('administer oauth applications'),
+    'type' => MENU_LOCAL_TASK,
+    'file' => 'oauth.pages.inc',
+  );
+
+  $items['oauth/%oauth/authenticate'] = array(
+    'page callback' => 'oauth_invoke',
+    'page arguments' => array(1, 'oauth_authenticate'),
+    'access callback' => 'oauth_hook',
+    'access arguments' => array(1, 'oauth_authenticate'),
+    'type' => MENU_CALLBACK,
+  );
+  $items['oauth/%oauth/callback'] = array(
+//     'load arguments' => array(3),
+    'page callback' => 'oauth_invoke',
+    'page arguments' => array(1, 'oauth_callback'),
+    'access callback' => 'oauth_access',
+    'access arguments' => array(1),
+    'type' => MENU_CALLBACK,
+    'file' => 'oauth.inc',
+  );
+
+  $items['admin/structure/oauth'] = array(
+    'title' => 'Applications types',
+    'description' => 'Add new applications type to your site, manage existing application.',
+    'page callback' => 'oauth_overview_types',
+    'access arguments' => array('administer oauth types'),
+    'file' => 'application_types.inc',
+  );
+  $items['admin/structure/oauth/list'] = array(
+    'title' => 'List',
+    'type' => MENU_DEFAULT_LOCAL_TASK,
+    'weight' => -10,
+  );
+  $items['admin/structure/oauth/add'] = array(
+    'title' => 'Add application type',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('oauth_type_form'),
+    'access arguments' => array('administer oauth types'),
+    'type' => MENU_LOCAL_ACTION,
+    'file' => 'application_types.inc',
+  );
+  $items['admin/structure/oauth/manage/%oauth_type'] = array(
+    'title' => 'Edit application type',
+    'title callback' => 'oauth_type_page_title',
+    'title arguments' => array(4),
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('oauth_type_form', 4),
+    'access arguments' => array('administer oauth types'),
+    'file' => 'application_types.inc',
+  );
+  $items['admin/structure/oauth/manage/%oauth_type/edit'] = array(
+    'title' => 'Edit',
+    'type' => MENU_DEFAULT_LOCAL_TASK
+  );
+  $items['admin/structure/oauth/manage/%oauth_type/delete'] = array(
+    'title' => 'Delete',
+    'page arguments' => array('oauth_type_delete_confirm', 4),
+    'access arguments' => array('administer oauth types'),
+    'file' => 'application_types.inc',
+  );
+
+  $items['admin/people/identities'] = array(
+    'title' => 'External identities',
+    'description' => 'Find and manage people interacting with your site.',
+    'access arguments' => array('administer user identities'),
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('oauth_admin_people'),
+    'file' => 'oauth.admin.inc',
+    'type' => MENU_LOCAL_TASK,
+  );
+
+  return $items;
+}
+
+/**
+ * Title callback.
+ */
+function oauth_page_title($oauth) {
+  return $oauth->title;
+}
+
+/**
+ * Load oauth entities from the database.
+ *
+ * @param $oids
+ *   An array of application IDs.
+ * @param $reset
+ *   Whether to reset the internal oauth_load cache.
+ *
+ * @return
+ *   An array of application objects indexed by id.
+ */
+function oauth_load_multiple($oids = array(), $reset = FALSE) {
+  return entity_load('oauth', $oids, array(), $reset);
+}
+
+/**
+ * Load an oauth application object from the database.
+ *
+ * @param $oid
+ *   The application ID.
+ * @param $reset
+ *   Whether to reset the internal oauth_load_multiple cache.
+ *
+ * @return
+ *   A fully-populated application object.
+ */
+function oauth_load($oid = NULL, $reset = FALSE) {
+  $oids = (isset($oid) ? array($oid) : array());
+  $oauth = oauth_load_multiple($oids, $reset);
+  return $oauth ? reset($oauth) : FALSE;
+}
+
+/**
+ * Load and build an oauth consumer object from the database.
+ *
+ * @param $oid
+ *   The application ID.
+ *
+ * @param $aid
+ *   The authmap ID.
+ *
+ * @return DrupalOAuthConsumer
+ *   An oauth consumer object.
+ */
+function oauth_consumer_load($oid, $aid = NULL) {
+  $consumers = &drupal_static(__FUNCTION__, array());
+  if (!isset($consumers[$oid])) {
+    $oauth = oauth_load($oid);
+    $factory = new ReflectionMethod($oauth->class, 'construct');
+    $consumers[$oid] = $factory->invoke(NULL, $oauth, $aid);
+  }
+  return $consumers[$oid];
+}
+
+
+/**
+ * Save changes to an oauth application or add a new application.
+ *
+ * @param $oauth
+ *   The $oauth object to be saved. If $oauth->id is
+ *   omitted (or $oauth->is_new is TRUE), a new application will be added.
+ */
+function oauth_save($oauth) {
+  $transaction = db_transaction();
+
+  try {
+    // Load the stored entity, if any.
+    if (!empty($oauth->oid) && !isset($oauth->original)) {
+      $oauth->original = entity_load_unchanged('oauth', $oauth->oid);
+    }
+
+    field_attach_presave('oauth', $oauth);
+
+    // Determine if we will be inserting a new application.
+    if (!isset($oauth->is_new)) {
+      $oauth->is_new = empty($oauth->oid);
+    }
+
+    // Let modules modify the node before it is saved to the database.
+    module_invoke_all('entity_presave', $oauth, 'oauth');
+
+    if ($oauth->is_new) {
+      drupal_write_record('oauth', $oauth);
+      $op = 'insert';
+    }
+    else {
+      drupal_write_record('oauth', $oauth, 'oid');
+      $op = 'update';
+    }
+
+    // Save fields.
+    $function = "field_attach_$op";
+    $function('oauth', $oauth);
+
+    module_invoke_all('entity_' . $op, $oauth, 'oauth');
+
+    // Clear internal properties.
+    unset($oauth->is_new);
+    unset($oauth->original);
+    // Clear the static loading cache.
+    entity_get_controller('oauth')->resetCache(array($oauth->oid));
+
+    // Ignore slave server temporarily to give time for the
+    // saved application to be propagated to the slave.
+    db_ignore_slave();
+  }
+  catch (Exception $e) {
+    $transaction->rollback();
+    watchdog_exception('oauth', $e);
+    throw $e;
+  }
+}
+
+function oauth_token_table_get_name($oauth) {
+  return _oauth_extract_type($oauth) . '_token';
+}
+
+/**
+ * Delete an application.
+ *
+ * @param $oid
+ *   An application ID.
+ */
+function oauth_delete($oid) {
+  oauth_delete_multiple(array($oid));
+}
+
+/**
+ * Delete multiple applications.
+ *
+ * @param $oids
+ *   An array of application IDs.
+ */
+function oauth_delete_multiple($oids) {
+  $transaction = db_transaction();
+  if (!empty($oids)) {
+    $applications = oauth_load_multiple($oids, array());
+
+    try {
+      foreach ($applications as $oauth) {
+        // Call the node-specific callback (if any):
+        module_invoke_all('entity_delete', $oauth, 'oauth');
+        field_attach_delete('oauth', $oauth);
+      }
+
+      // Delete after calling hooks so that they can query oauth tables as needed.
+      db_delete('oauth')
+        ->condition('oid', $oids, 'IN')
+        ->execute();
+
+      // Delete internal token table.
+      db_delete(oauth_token_table_get_name($oauth))
+        ->condition('oid', $oids, 'IN')
+        ->execute();
+
+      // Delete authmap.
+      db_delete('authmap')
+        ->condition('oid', $oids, 'IN')
+        ->execute();
+    }
+    catch (Exception $e) {
+      $transaction->rollback();
+      watchdog_exception('oauth', $e);
+      throw $e;
+    }
+  }
+}
+
+
+/**
+ * Returns a list of available oauth application names.
+ *
+ * This list can include types that are queued for addition or deletion.
+ * See _oauth_types_build() for details.
+ *
+ * @return
+ *   An array of oauth type names, keyed by the type.
+ */
+function oauth_type_get_names() {
+  return _oauth_types_build()->names;
+}
+
+/**
+* Returns the application type name of the passed application or application
+* type string.
+*
+* @param $oauth
+*   An oauth object or string that indicates the application type to return.
+*
+* @return
+*   The application type name or FALSE if the application type is not found.
+*/
+function oauth_type_get_name($oauth) {
+  $type = _oauth_extract_type($oauth);
+  $types = _oauth_types_build()->names;
+  return isset($types[$type]) ? $types[$type] : FALSE;
+}
+
+/**
+ * Updates the database cache of application types.
+ *
+ * All new module-defined oauth types are saved to the database via a call to
+ * oauth_type_save(), and obsolete ones are deleted via a call to
+ * oauth_type_delete(). See _oauth_types_build() for an explanation of the new
+ * and obsolete types.
+ */
+function oauth_types_rebuild() {
+  _oauth_types_build(TRUE);
+}
+
+/**
+ * Extract the type name.
+ *
+ * @param $oauth
+ *   Either a string or object, containing the application type information.
+ *
+ * @return
+ *   Application type of the passed-in data.
+ */
+function _oauth_extract_type($oauth) {
+  return is_object($oauth) ? $oauth->type : $oauth;
+}
+
+/**
+ * Returns a list of all the available application types.
+ *
+ * This list can include types that are queued for addition or deletion.
+ * See _oauth_types_build() for details.
+ *
+ * @return
+ *   An array of application types, as objects, keyed by the type.
+ *
+ * @see oauth_type_get_type()
+ */
+function oauth_type_get_types() {
+  return _oauth_types_build()->types;
+}
+
+/**
+ * Returns the application type of the passed application or application type string.
+ *
+ * @param $oauth
+ *   An application object or string that indicates the application type to return.
+ *
+ * @return
+ *   A single application type, as an object, or FALSE if the application type
+ *   is not found. The application type is an object containing fields from
+ *   hook_oauth_info() return values, as well as the field 'type' (the machine-readable type).
+ */
+function oauth_type_get_type($oauth) {
+  $type = _oauth_extract_type($oauth);
+  $types = _oauth_types_build()->types;
+  return isset($types[$type]) ? $types[$type] : FALSE;
+}
+
+/**
+ * Returns the application type base of the passed oauth or application type string.
+ *
+ * The base indicates which module implements this application type and is used to
+ * execute oauth-type-specific hooks. For types defined in the user interface
+ * and managed by oauth.module, the base is 'oauth_application'.
+ *
+ * @param $oauth
+ *   An oauth object or string that indicates the application type to return.
+ *
+ * @return
+ *   The application, type base or FALSE if the application type is not found.
+ *
+ * @see oauth_invoke()
+ */
+function oauth_type_get_base($oauth) {
+  $type = _oauth_extract_type($oauth);
+  $types = _oauth_types_build()->types;
+  return isset($types[$type]) && isset($types[$type]->base) ? $types[$type]->base : FALSE;
+}
+
+/**
+ * Implements hook_form().
+ */
+function oauth_application_form($oauth, $form_state) {
+  $form = array();
+  $type = oauth_type_get_type($oauth);
+
+  return $form;
+}
+
+/**
+* Implements hook_forms().
+* All applications forms share the same form handler.
+*/
+function oauth_forms() {
+  $forms = array();
+  if ($types = oauth_type_get_types()) {
+    foreach (array_keys($types) as $type) {
+      $forms[$type . '_oauth_form']['callback'] = 'oauth_form';
+    }
+  }
+  return $forms;
+}
+
+/**
+ * Menu argument loader: loads an application type by string.
+ *
+ * @param $name
+ *   The machine-readable name of an application type to load, where '_' is replaced
+ *   with '-'.
+ *
+ * @return
+ *   A application type object or FALSE if $name does not exist.
+ */
+function oauth_type_load($name) {
+  return oauth_type_get_type(strtr($name, array('-' => '_')));
+}
+
+/**
+ * Deletes an application type from the database.
+ *
+ * @param $type
+ *   The machine-readable name of the application type to be deleted.
+ */
+function oauth_type_delete($type) {
+  $info = oauth_type_get_type($type);
+  db_delete('oauth_type')
+    ->condition('type', $type)
+    ->execute();
+  field_attach_delete_bundle('oauth', $type);
+  module_invoke_all('oauth_type_delete', $info);
+
+  // Clear the application type cache.
+  oauth_type_cache_reset();
+}
+
+/**
+ * Argument loader for %oauth_version
+ */
+function oauth_version_load($version) {
+  switch ($version) {
+    case '1.0':
+    case '2.0':
+      return $version;
+    default:
+      return FALSE;
+  }
+}
+
+function oauth_version_title($version) {
+  switch ($version) {
+    case '1.0':
+      return t('OAuth 1.0a');
+    case '2.0':
+      return t('OAuth 2.0 IETF draft v9');
+    default:
+      return FALSE;
+  }
+}
+
+/**
+ * Factory method to get an OAuth implementation.
+ *
+ * @deprecated
+ * @param $type Application type.
+ *
+ * @return DrupalOAuthConsumer
+ *   Returns the instanciated class defined in hook_oauth_info().
+ */
+function oauth_get_consumer($type) {
+  static $oauth_consumer;
+
+  if (!isset($oauth_consumer) || !isset($oauth_consumer[$type->base])) {
+    $query = new EntityFieldQuery();
+    $entities = $query
+      ->entityCondition('entity_type', 'oauth')
+      ->entityCondition('bundle', $type->type)
+      ->execute();
+
+    if (count($entities) > 0) {
+      $applications = oauth_load_multiple(array_keys($entities['oauth']));
+
+      $oauth = each($applications);
+
+      // TODO: Use a more conventional Reflection when the PECL module can be extended.
+      // @see: http://pecl.php.net/bugs/bug.php?id=21406
+      $factory = new ReflectionMethod($type->class, 'construct');
+      $oauth_consumer[$type->base] = $factory->invoke(NULL, $oauth['value']);
+    }
+    else {
+      // TODO: explicit.
+      throw new Exception(t('No default application for this type was found.'));
+    }
+  }
+
+  return $oauth_consumer[$type->base];
+}
+
+/**
+ * Implements hook_user_delete().
+ */
+function oauth_user_delete($account) {
+  // Clean potential tokens.
+  foreach (oauth_type_get_types() as $type) {
+    db_delete(oauth_token_table_get_name($type))
+      ->condition('uid', $account->uid)
+      ->execute();
+  }
+}
+
+/**
+ * Implements hook_theme().
+ */
+function oauth_theme() {
+  return array(
+    'oauth' => array(
+      'render element' => 'elements',
+      'file' => 'oauth.pages.inc',
+      'template' => 'oauth',
+    ),
+    'oauth_admin_overview' => array(
+      'variables' => array('name' => NULL, 'type' => NULL),
+    ),
+  );
+}
+
+/**
+ * Implements hook_permission().
+ */
+function oauth_permission() {
+  $perms = array(
+    'administer oauth types' => array(
+      'title' => t('Administer applications types'),
+    ),
+    'administer oauth applications' => array(
+      'title' => t('Administer applications configuration')
+    ),
+    'administer oauth account' => array(
+      'title' => t('Administer oauth account'),
+    ),
+  );
+
+  return $perms;
+}
+
+/**
+ * Cross Site Request Forgery (CSRF) protection.
+ *
+ * @see http://en.wikipedia.org/wiki/Cross-site_request_forgery
+ */
+function oauth_access($oauth) {
+  return oauth_consumer_load($oauth->oid)->checkAccess();
+}

@@ -1,0 +1,218 @@
+<?php
+
+/**
+ * @file
+ * Provides support for indexing the destination of file fields with the Apache
+ * Solr module.
+ */
+
+/**
+ * Implements hook_menu().
+ */
+function apachesolr_filefield_menu() {
+  $items = array();
+
+  $items['admin/config/search/apachesolr/apachesolr_filefield'] = array(
+    'title' => 'File field indexing',
+    'description' => 'Configure how file fields should be indexed by Apache Solr.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('apachesolr_filefield_settings_form'),
+    'access arguments' => array('administer search'),
+    'type' => MENU_IS_LOCAL_TASK,
+  );
+
+  return $items;
+}
+
+/**
+ * Form builder for settings form.
+ */
+function apachesolr_filefield_settings_form($form, &$form_state) {
+  $fields = field_info_fields();
+  $options = array();
+  foreach ($fields as $field) {
+    if ($field['type'] === 'file') {
+      $options[$field['field_name']] = $field['field_name'];
+    }
+  }
+
+  $form['apachesolr_filefield_indexed_fields'] = array(
+    '#type' => 'checkboxes',
+    '#title' => 'Select fields that should have their files indexed',
+    '#options' => $options,
+    '#default_value' => variable_get('apachesolr_filefield_indexed_fields', array()),
+  );
+
+  $form['apachesolr_filefield_plain_types'] = array(
+    '#type' => 'textarea',
+    '#title' => t('Types indexed as plain text'),
+    '#default_value' => variable_get('apachesolr_filefield_plain_types', "text/plain\r\ntext/*html\r\ntext/xml\r\n"),
+    '#description' => t('These MIME types will be indexed as plain text, after stripping HTML tags and invisibile content (audio, video, applet, etc.). Enter one MIME type per line with optional wildcards, i.e. <em>text/*</em>. For a list of types see <a href="http://en.wikipedia.org/wiki/Mime_type">Wikipedia</a>.'),
+  );
+  $form['apachesolr_filefield_attachment_types'] = array(
+    '#type' => 'textarea',
+    '#title' => t('Types to be extracted via Apache Solr Attachments'),
+    '#default_value' => variable_get('apachesolr_filefield_attachment_types', "application/*\r\n"),
+    '#description' => t('These MIME types will be treated as documents and text extraction with Tika will be performed using the settings from Apache Solr Attachments. Enter one MIME type per line with optional wildcards, i.e. <em>text/*</em>. For a list of types see <a href="http://en.wikipedia.org/wiki/Mime_type">Wikipedia</a>.'),
+  );
+
+  return system_settings_form($form);
+}
+
+/**
+ * Implements hook_apachesolr_field_mappings().
+ */
+function apachesolr_filefield_apachesolr_field_mappings() {
+  $mappings = array(
+    'file' => array(
+      'indexing_callback' => 'apachesolr_filefield_fields_default_file_callback',
+      'index_type' => 'text',
+      'query types' => array('term'),
+      'query type' => 'term',
+    ),
+  );
+  return $mappings;
+}
+
+/**
+ * Callback that converts file fields into URL text.
+ */
+function apachesolr_filefield_fields_default_file_callback($entity, $field_name, $index_key, $field_info) {
+  $settings = variable_get('apachesolr_filefield_indexed_fields', array());
+
+  $fields = array();
+  foreach ($settings as $enabled_field_name) {
+    // Check to see if this field is enabled.
+    if ($enabled_field_name && $field_name === $enabled_field_name) {
+      if (!empty($entity->{$field_name})) {
+        $field = $entity->$field_name;
+        list($lang, $values) = each($field);
+        for ($i = 0; $i < count($values); $i++) {
+          $fields[] = array(
+            'key' => $index_key,
+            'value' => apachesolr_filefield_fetch_file_contents($values[$i]),
+          );
+        }
+      }
+    }
+  }
+
+  return $fields;
+}
+
+/**
+ * Return the cleaned version of the content of a URL.
+ */
+function apachesolr_filefield_fetch_file_contents($file) {
+  if (file_exists($file['uri'])) {
+    $filepath = drupal_realpath($file['uri']);
+    if (apachesolr_filefield_match_mime($file['filemime'], variable_get('apachesolr_filefield_plain_types', "text/plain\r\ntext/*html\r\ntext/xml\r\n"))) {
+      // These files don't need to be parsed with tika, just get their content directly.
+      $text = file_get_contents($filepath);
+      // Strip bad control characters.
+      $text = iconv("UTF-8", "UTF-8//IGNORE", $text);
+      $text = trim(apachesolr_clean_text($text));
+    }
+    elseif (apachesolr_filefield_match_mime($file['filemime'], variable_get('apachesolr_filefield_attachment_types', "application/*\r\n"))) {
+      module_load_include('inc', 'apachesolr_attachments', 'apachesolr_attachments.index');
+
+      // The next few lines are copied from the apachsolr_attachments.index.inc
+      if (variable_get('apachesolr_attachments_extract_using', 'tika') == 'tika') {
+        $text = apachesolr_attachments_extract_using_tika($filepath);
+      }
+      else {
+        // Extract using Solr.
+        try {
+          list($text, $metadata) = apachesolr_attachments_extract_using_solr($filepath);
+        }
+        catch (Exception $e) {
+          // Exceptions from Solr may be transient, or indicate a problem with a specific file.
+          watchdog('Apache Solr Attachments', "Exception occurred sending %filepath to Solr\n!message", array('%filepath' => $file->uri, '!message' => nl2br(check_plain($e->getMessage()))), WATCHDOG_ERROR);
+          return FALSE;
+        }
+      }
+
+      // Strip bad control characters.
+      $text = iconv("UTF-8", "UTF-8//IGNORE", $text);
+      $text = trim(apachesolr_clean_text($text));
+
+    }
+    // end section copied from apachesolr_attachments.index.inc
+
+    else {
+      $text = '';
+    }
+  }
+  return $text;
+}
+
+/**
+ * Implements hook_apachesolr_index_document_build_ENTITY_TYPE().
+ */
+function apachesolr_filefield_apachesolr_index_document_build_node(ApacheSolrDocument $document, $entity, $env_id) {
+  $settings = variable_get('apachesolr_filefield_indexed_fields', array());
+
+  // Get our list of enabled fields.
+  $enabled_fields = array();
+  foreach ($settings as $enabled_field_name) {
+    // Check to see if this field is enabled.
+    if ($enabled_field_name) {
+      $enabled_fields[] = $enabled_field_name;
+    }
+  }
+
+  // Loop over all entity fields and add field content to solr document if field is enabled.
+  foreach (apachesolr_entity_fields() as $field_name => $field) {
+    if (in_array($field[0]['name'], $enabled_fields)) {
+      $solr_field = $document->getField($field_name);
+      if (!empty($solr_field['value'])) {
+        foreach ($solr_field['value'] as $value) {
+          $document->setMultiValue('tm_apachesolr_filefield_content', $value);
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Implement hook_apachesolr_query_prepare().
+ */
+function apachesolr_filefield_apachesolr_query_prepare(DrupalSolrQueryInterface $query) {
+  // Ensure that our custom field is added to the query.
+  $query->addParam('qf', 'tm_apachesolr_filefield_content');
+  $query->addParam('hl.fl', 'tm_apachesolr_filefield_content');
+}
+
+/**
+ * Check if a mime type matches any pattern in a set of patterns.
+ *
+ * @param $type
+ *   The mime type to match.
+ * @param $patterns
+ *   String containing a set of patterns separated by \n, \r or \r\n.
+ *
+ * @return
+ *   Boolean value: TRUE if the mime type matches a pattern, FALSE otherwise.
+ */
+function apachesolr_filefield_match_mime($content_type_header, $patterns) {
+  $parts = explode(';', $content_type_header);
+  $type = $parts[0];
+
+  $regexps = &drupal_static(__FUNCTION__);
+
+  if (!isset($regexps[$patterns])) {
+    // Convert path settings to a regular expression.
+    // Therefore replace newlines with a logical or and /* with asterisks..
+    $to_replace = array(
+      '/(\r\n?|\n)/', // newlines
+      '/\\\\\*/',     // asterisks
+    );
+    $replacements = array(
+      '|',
+      '.*',
+    );
+    $patterns_quoted = preg_quote($patterns, '/');
+    $regexps[$patterns] = '/^(' . preg_replace($to_replace, $replacements, $patterns_quoted) . ')$/';
+  }
+  return (bool)preg_match($regexps[$patterns], $type);
+}

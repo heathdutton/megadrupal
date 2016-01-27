@@ -1,0 +1,281 @@
+<?php
+/**
+* This module implements file handlers on the local server side
+* See fp_ui module of the User Interface
+*/
+
+
+/**
+* Implements a function available via a URL (see fp_ui module and hook_menu)
+* initiates the FTP transfer process 
+*/
+function _ftp_put($nid) {
+// an array for transfer logging and errors 
+  $log = new StdClass();
+//  initiate an FTP transfer
+  _ftp_put_ftphandler($nid, $log);
+// save the log and erros to the DB if logging is enabled in settings
+  if (variable_get('fp_ui_log', 0)) {
+    _ftp_put_log($log);
+  }
+  return 'your FTP request has been proccessed';
+}
+
+/**
+* Implements the main workflow of collecting data, packaging it, zipping,
+* FTP-ing, and deleting()
+* @arg 
+*/
+function _ftp_put_ftphandler($nid, &$log) {
+// read the settings values
+  $delete = variable_get('fp_ui_del', 0);
+// construct an array of strings from specified entity fields
+// and uploaded files associated with this entity
+  $packaged_data_array = _ftp_put_package($nid, $log);
+// if there is data, loop over all files and call the zip and ftp functions
+  if (empty($packaged_data_array)) {
+    $log->error .= 'no packaged files | ';
+	return 'ftprequest finished';
+  }
+// call the zip function to zip the files into one bundle and leave them at a local directory
+  $entity_zip_result = _ftp_put_compress($packaged_data_array, $log);
+// check if compression succeeded and return if it did not
+  if ($entity_zip_result === FALSE || empty($entity_zip_result)) {
+    $log->error .= 'ZIP returned no files | ';
+	return;
+  }
+// call ftp transfer function
+  $ftp_result  = _ftp_put_transfer($entity_zip_result, $log);
+  if ($ftp_result === FALSE || empty($ftp_result)) {
+    $log->error .= 'ZIP failed | ';
+    return;
+  }
+// check if FTP operation was successful by comparing file names
+// in the local directory and the remote FTP directory
+  $ftp_confirmed = TRUE;
+  foreach ($entity_zip_result as $zip_file_name => $zip_dir) {
+    if (!in_array($zip_file_name, $ftp_result)) {
+	  $ftp_confirmed = FALSE;
+	}  
+  }
+// clean up the zip archives created by _ftp_put_compress()
+  if (!empty($entity_zip_result)) {
+    foreach ($entity_zip_result as $zip_name => $zip_path) {
+	  file_unmanaged_delete($zip_path);
+	}
+  }
+// clean up files and entities that have been FTP-ed
+// wipe the entities (nodes) ONLY if they are listed on the remote FTP server
+  if ($delete == 1 && $ftp_confirmed === TRUE) {
+    entity_delete('node', $nid);
+  }
+  return 'ftprequest finished';
+}
+
+/**
+* Creates an array from a node
+* @arg array of strings of entity types to process
+*/
+function _ftp_put_package($nid, &$log) {
+// return if input is empty
+  if (empty($nid)) {
+    $log->error .= 'no NID to package | ';
+    return;
+  }
+  $node = node_load($nid);
+// array for returning data
+  $data_array = array();
+// collect fields and attached files from the node
+  $entity_array = entity_load('node', array($nid));
+// check if node and entity have loaded, if not, return
+  if ($node === FALSE || empty($entity_array)) {
+    $log->error .= 'load' . $nid . ' | ';
+	return;
+  }
+// loop through entities and extract all fields' values and attached files
+  $field_values = '';
+  $content_file_array = array();
+  $field_list = field_info_instances('node', $node->type);
+// assemble all form input into one string in this loop
+// 1. loop over all fields and see if they are db fields with values
+  foreach ($field_list as $field => $huinja) {
+    $field_array = field_get_items('node', $entity_array[$nid], $field);
+// a plain text field check
+    if ( isset($field_array[0]['value']) ) {
+// asseble all field values into a variable
+	$field_values .= $field_array[0]['value'] . "\r\n";
+  }
+  }
+// 2. construct an MD5 hash off of the filled in form lines
+//    if it's empty construct random hash
+  if (!empty($field_values)) {
+    $field_hash = md5($field_values);
+  }
+  else {
+    $field_hash = md5(mt_rand());
+  }
+// 3. add hash to log
+  $log->hash .=  $field_hash . ' | ';
+// 4. add assembled form input text to the array to compress
+  $content_file_array[$field_hash . '_form.txt'] = $field_values;
+// 5. add the umbrella file name to the array
+  $content_file_array['content_hash'] = $field_hash;
+// 6. loop over all fields and see if they are attached files  
+  foreach ($field_list as $field => $huinja) {
+    $field_array = field_get_items('node', $entity_array[$nid], $field);
+// this is a check for files attached to a field, 
+// the structure of the field array is different from plain text
+    if ( isset($field_array[0]['uri']) ) {
+      $field_file = $field_array[0]['uri'];
+      $file_path = drupal_realpath($field_file);
+      $file_path = str_replace('\\', '/', $file_path);
+      $file_content = file_get_contents($file_path);
+      $content_file_array[$field_hash . '_' . $field_array[0]['filename']] = $file_content;
+    }			  
+  }
+  return $content_file_array;
+}
+
+/**
+* @arg array of files to compress, keyed on file name with value of file content
+* both strings.
+* Depending on the "Compress" setting, writes compressed or 
+* ucompressed files into the 'temp' directory, see Settings
+* return bool; array with file names and paths of FTP-ed files on success, FALSE on failure of at least one file
+*/
+function _ftp_put_compress($file_array, &$log) {
+  $return_array = array();	
+// proceed only if there is input and content hash is present
+  if (empty($file_array) || !isset($file_array['content_hash'])) {
+    $log->error .= 'empty or bad compress input | ';
+    return FALSE;
+  }
+  $temp_dir = variable_get('fp_ui_tempdir', 'sites/default/files');
+// handle content if no compression is required:
+//   1. determine if compression is required in settings
+  $compression = variable_get('fp_ui_compr', 0);
+  if ($compression === 0) {
+//   3. delete the umbrella file name from the array to avoid saving it
+    unset($file_array['content_hash']);
+//   4. save uncompressed files into a directory  
+    foreach ($file_array as $file_name => $file_content) {
+      $destination = $temp_dir . '/' . $file_name;
+      $save_result = file_unmanaged_save_data($file_content, $destination);
+	  if ($save_result === FALSE) {
+	    $log->error .= 'saving uncompressed file | ';
+        drupal_set_message('ftp_put module is unable to save an uncompressed file ' . $file_name, 'error');
+	    return FALSE;
+	}
+	$return_array[$file_name] = $destination;
+  }
+//   5. return an array with file names and paths where the files are stored
+  return $return_array;
+  }
+
+// handle content if compression is required   
+//  1. construct a directory path to put all uncompressed files in
+    $zipped_file_name = $file_array['content_hash'] . '.zip';
+    $bundle_dir = $temp_dir . '/' . $zipped_file_name;
+//  2. construct an array with file paths to return
+    $return_array[$zipped_file_name] = $bundle_dir;
+//  3. delete the umbrella file name from the array to avoid saving it
+  unset($file_array['content_hash']);
+//  4. construct a new Zip archive object
+  $zip = new ZipArchive;
+  $zip_status = $zip->open($bundle_dir, ZipArchive::CREATE);
+//  5. check for errors when creating zip archive and return with FALSE if it fails
+  if ($zip_status !== TRUE) {
+    $log->error .= 'ZIP open | ';
+    drupal_set_message('ftp_put module is unable to write to temp directory', 'error');
+	return FALSE;
+  }
+  foreach ($file_array as $file_name => $file_content) {
+        $result = $zip->addFromString($file_name,  $file_content);
+// 6. trip the flag if the result is FALSE and return with FALSE
+		if ($result === FALSE) {
+		  $log->error .= 'ZIP add | ';
+		  return FALSE;
+		}
+  }
+//  7. close the zip archive for the current file bundle
+  $zip->close();
+  return $return_array;
+}
+
+/**
+* Performs FTP transfer
+* @arg string file path or string containing file
+*/
+function _ftp_put_transfer($files_array, &$log) {
+// check if input is empty and return if it is
+  if (empty($files_array)) {
+    $log->error .= 'FTP empty input | ';
+	return FALSE;
+  }
+  $ftp_server = variable_get('fp_ui_server', '');
+  $ftp_login = variable_get('fp_ui_login', 'anonymous');
+  $ftp_pass = variable_get('fp_ui_password', 'anonymous');
+// record the IP of the FTP server into logs
+  $log->ftp_ip = $ftp_server;
+// attempt an SSL connection. It will generally fail on Windows.
+  if (variable_get('fp_ui_ssl', 0) === 1 && function_exists('ftp_ssl_connect')) {  
+    $connect_result = @ftp_ssl_connect($ftp_server);
+  }
+  else{
+    $connect_result = @ftp_connect($ftp_server);
+  }
+  if ($connect_result === FALSE) {
+    $log->error .= 'FTP login | ';
+    drupal_set_message('ftp_put module is unable to make an FTP connection to ' . $ftp_server, 'error');
+	return FALSE;
+  }
+// login to the FTP server
+  $login_result = ftp_login($connect_result, $ftp_login, $ftp_pass);
+  if ($login_result === FALSE) {
+    $log->error .= 'FTP login | ';
+    drupal_set_message('ftp_put module is unable to login to the FTP server at ' . $ftp_server, 'error');
+	return FALSE;
+	}
+// change directory if it is given in settings
+  $remote_dir = variable_get('fp_ui_dir', '');
+  if (!empty($remote_dir)) {
+    $cd_result = ftp_chdir($connect_result, $remote_dir);
+    if ($cd_result === FALSE) {
+	  $log->error .= 'FTP dir change | ';
+	  drupal_set_message('ftp_put module is unable to change directory on the FTP server to ' . $remote_dir, 'error');
+	  return FALSE;
+  }
+  }
+// loop over all files for upload
+  foreach ($files_array as $name => $path) {
+    $upload_result = ftp_put($connect_result, $name, $path, FTP_BINARY);
+    if ($upload_result === FALSE) {
+	  $log->error .= 'FTP file upload | ';
+      drupal_set_message('ftp_put module is unable to upload file to the FTP server at ' . $ftp_server, 'error');
+	  return FALSE;
+  }
+  }
+// get a listing of files in the remote directory
+  $dir_array = ftp_nlist($connect_result, '');
+    if ($dir_array === FALSE) {
+	  $log->error .= 'FTP dir listing | ';
+      drupal_set_message('ftp_put module is unable get a directory listing on the FTP server to ' . $remote_dir, 'error');
+      return FALSE;
+  }
+// bid adieu
+  ftp_close($connect_result);
+  return $dir_array;
+}
+
+/**
+* Keeps log of transfers and erros
+* @args log object
+*/
+function _ftp_put_log(&$log) {
+  global $user;
+  $log->uid = $user->uid;
+  date_default_timezone_set('America/New_York');
+  $log->timestamp = date('c');
+  drupal_write_record('ftp_put_stats', $log);
+}
+

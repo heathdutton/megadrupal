@@ -1,0 +1,2176 @@
+<?php
+/**
+ * @file
+ * The OAI Harvester module collects metadata records from OAI-PMH data providers
+ * through the OAI-PMH protocol v2.0.
+ *
+ * Introduction
+ *
+ * The OAI Harvester module collects metadata records from OAI-PMH data providers
+ * through the OAI-PMH protocol v2.0. More about the protocol see
+ * {@link http://www.openarchives.org/OAI/2.0/openarchivesprotocol.htm}.
+ * The harvester simply harvests: it does not stores the records, because there
+ * are a lots of possible way to store such records in Drupal. There are hooks
+ * which the OAI harvester invokes and with which it sends the data to the
+ * implementers of that hooks. The XC Drupal Toolkit contains at least two
+ * modules, which implement these hooks (XC schema module to handle XC schema
+ * records, and xc_oai_dc module, which handles Dublin Core records). These
+ * module can be used as example for writing your own module. The OAI Harvester
+ * itself module is independent from other XC modules.
+
+ * The two parts of OAI Harvester:
+ * - the database structure and user interface, which helps to harvest data
+ * - the hooks, which helps to store or index data coming from a repository
+ *
+ * The concepts of the OAI harvester
+ *
+ * <b>Repository</b>
+ *
+ * Repository is an OAI-PHM data provider. I supports one or more XML format
+ * (identified with metadata prefix), and may supports one or more sets.
+ *
+ * <b>Schedule</b>
+ *
+ * A process of harvesting of one reporitory. The protocol supports only one
+ * format and one set at one time, so if we would like to harvest multiple sets
+ * or formats, it should be split into multiple steps of harvesting.
+ *
+ * <b>A single step of harvesting</b>
+ *
+ * Get all records matching one set of initial parameters (one format, set,
+ * from and until parameter). It request first an initial URL consisting from
+ * the initial parameters, and if there are more records, than the number
+ * allowed in one OAI response, the repository sends a resumptionToken
+ * information, with which we can continue the harvesting.
+ *
+ * The resumptionToken is a kind of session identifier, so we don't need to
+ * resend the initial parameters again, only the actual resumptionToken. The
+ * end of the single process is, when there is no resumptionToken information
+ * in the response.
+ *
+ * So from requester's persective the process is the follow:
+ * - a) issuing an initial URL
+ * - b) find out whether is there a resumptionToken in the response
+ * - c) if there is, issue a resumptionToken URL and go to b)
+ * - d) if there is not, finish
+ *
+ * <b>An initial URL</b>
+ *
+ * An initial URL contains the base URL of the repository, one format, and may
+ * contain one set parameter. It may contain from and until parameters to select
+ * a given date range. We use it when we harvest the same repository with the
+ * same parameters the second time and so on, so then we harvest only the
+ * incrementation. If the repository supports deleted records, it provide
+ * information about the deletions as well.
+ *
+ * <b>A resumptionToken URL</b>
+ *
+ * The resumptionToken URL is the type of URL we request from the repository
+ * from the second request on. resumptionToken is a kind of session identifier,
+ * and using this we don't need to use the initial parameters. The
+ * resumptionToken identifies the next records in the sequence.
+ *
+ * <b>Processing a single request</b>
+ *
+ * A single OAI-PMH request issues an initial or a resumptionToken URL, and
+ * processing its response (sending records to hook implementors by
+ * hook_oaiharvester_process_record).
+ *
+ * <b>The complete workflow of harvesting</b>
+ * <pre>
+ * schedule initialized
+ *   1st harvesting step: format1 and set1
+ *     calling initial URL: [base url]?verb=ListRecords&metadataPrefix=<b>format1</b>&set=<b>set1</b>
+ *       receiving record1 -> invoking <b>hook_oaiharvester_process_record($record1, $schedule_id)</b>
+ *       receiving record2 -> invoking <b>hook_oaiharvester_process_record($record2, $schedule_id)</b>
+ *       ...
+ *       receiving recordN -> invoking <b>hook_oaiharvester_process_record($recordN, $schedule_id)</b>
+ *       invoking <b>hook_oaiharvester_request_processed()</b>
+ *       extracting <b>resumptionToken1</b>
+ *     calling resumptionToken URL: [base url]?verb=ListRecords&resumptionToken=<b>resumptionToken1</b>
+ *       receiving record1 -> invoking <b>hook_oaiharvester_process_record($record1, $schedule_id)</b>
+ *       receiving record2 -> invoking <b>hook_oaiharvester_process_record($record2, $schedule_id)</b>
+ *       ...
+ *       receiving recordN -> invoking <b>hook_oaiharvester_process_record($recordN)</b>
+ *       invoking <b>hook_oaiharvester_request_processed()</b>
+ *       there is no more resumption token
+ *   2nd harvesting step: format1 and <b>set2</b>
+ *     calling initial URL: [base url]?verb=ListRecords&metadataPrefix=format1&set=<b>set2</b>
+ *       ...
+ *     calling resumptionToken URL: [base url]?verb=ListRecords&resumptionToken=resumptionToken1
+ *       ...
+ *   3rd harvesting step: format2 without a set, (which means harvesting all records)
+ *      ...
+ *   invoking <b>hook_oaiharvester_harvest_finished()</b>
+ * </pre>
+ *
+ * @copyright (c) 2010-2011 eXtensible Catalog Organization
+ */
+
+/**
+ * Line break
+ * @var char
+ */
+define('LN', "\n");
+
+/**
+ * HTML line break
+ * @var string
+ */
+define('BR', '<br />' . LN);
+
+/**
+ * Number of seconds in a minute
+ * @var int
+ */
+define('OAIHARVESTER_MINUTE', 60);
+
+/**
+ * Number of seconds in an hour
+ * @var int
+ */
+define('OAIHARVESTER_HOUR', 60 * OAIHARVESTER_MINUTE);
+
+/**
+ * Number of seconds in a day
+ * @var int
+ */
+define('OAIHARVESTER_DAY', 24 * OAIHARVESTER_HOUR);
+
+/**
+ * Number of seconds in a week
+ * @var int
+ */
+define('OAIHARVESTER_WEEK', 7 * OAIHARVESTER_DAY);
+
+/**
+ * Date format, used by date formating function
+ */
+define('OAIHARVESTER_DATE_FORMAT', "%04d-%02d-%02d 00:00:00");
+
+/**
+ * The OAI-PMH's long granularity format (includes date and time)
+ * @var string
+ */
+define('OAIHARVESTER_LONG_GRANULARITY', "YYYY-MM-DDThh:mm:ssZ");
+
+/**
+ * The OAI-PMH's short granularity format (includes only date)
+ */
+define('OAIHARVESTER_SHORT_GRANULARITY', "YYYY-MM-DD");
+
+/**
+ * The schedule's active status. The schedule is runnable
+ *
+ * @var string
+ */
+define('OAIHARVESTER_STATUS_ACTIVE', 'active');
+
+/**
+ * The schedule's passive status. The schedule is not runnable
+ *
+ * @var string
+ */
+define('OAIHARVESTER_STATUS_PASSIVE', 'passive');
+
+/**
+ * Permission for harvesting records
+ * @var String
+ */
+define('HARVEST_RECORDS', 'harvest records');
+
+/**
+ * Permission for administering the harvester
+ * @var String
+ */
+define('ADMINISTER_HARVESTER', 'administer harvester');
+
+/**
+ * The server type OAI provider
+ * @var string
+ */
+define('OAIHARVESTER_PROVIDERTYPE_SERVER', 'server');
+
+/**
+ * The cache type OAI provider
+ * @var string
+ */
+define('OAIHARVESTER_PROVIDERTYPE_CACHE', 'cache');
+
+require_once('oaiharvester.forms.inc');
+require_once('oaiharvester.db.inc');
+require_once('oaiharvester.batch.inc');
+
+/**
+ * Implements hook_help().
+ * Display help and module information
+ * @param path which path of the site we're displaying help
+ * @param arg array that holds the current path as would be returned from arg()
+ *   function
+ * @return help text for the path
+ */
+function oaiharvester_help($path, $arg) {
+  $output = '';
+  switch ($path) {
+    case "admin/help#oaiharvester":
+      $output = '<p>' . t("Import records to Drupal from OAI servers") . '</p>';
+      break;
+  }
+  return $output;
+}
+
+/**
+ * Valid permissions for this module
+ * @return array An array of valid permissions for the module
+ */
+function oaiharvester_permission() {
+  return array(
+    HARVEST_RECORDS => array(
+      'title' => t(HARVEST_RECORDS),
+      'description' => t('Harvest records'),
+    ),
+    ADMINISTER_HARVESTER => array(
+      'title' => t(ADMINISTER_HARVESTER),
+      'description' => t('Administering harvester'),
+    ),
+  );
+}
+
+/**
+ * Implements hook_menu().
+ *
+ * @return array The menu array
+ */
+function oaiharvester_menu() {
+  module_load_include('inc', 'oaiharvester', 'includes/menu');
+  return _oaiharvester_menu();
+}
+
+/**
+ * The list of themes
+ * @return array The list of themes
+ */
+function oaiharvester_theme() {
+  return array(
+    'show_properties' => array(
+      'variables' => array('title' => NULL, 'data' => NULL),
+    ),
+    // theming statistical data
+    'oaiharvester_statistics' => array(
+      'variables' => array('oaiharvester_statistics' => NULL),
+    ),
+  );
+}
+
+/**
+ * Add an item to the harvesting queue
+ *
+ * @param $schedule (Object)
+ *   The schedule object
+ * @param $format_name (string)
+ *   The metadata format's name
+ * @param $set_spec (string)
+ *   The set spec name
+ * @param $last_ran (int)
+ *   The last run time
+ */
+function oaiharvester_add_item_to_queue($schedule, $format_name, $set_spec = NULL, $last_ran) {
+  $stored_items = _oaiharvester_queue_get_item_by_schedule(
+    $schedule->harvest_schedule_id,
+    $format_name,
+    $set_spec
+  );
+  $stored_item  = $stored_items->fetchObject();
+  if ($stored_item == FALSE) {
+    $queue_id = oaiharvester_create_queue($schedule, $format_name, $set_spec, $last_ran);
+    drupal_set_message(t('New item in the queue %id', array('%id' => $queue_id)));
+  }
+}
+
+/**
+ * Run operations before start harvesting
+ * @return unknown_type
+ */
+/*
+function before_harvest() {
+  $harvest->start_time = format_date(time(), 'custom', 'Y-m-d H:i:s');
+  drupal_write_record('oaiharvester_harvest_queue', $harvest, 'harvest_id');
+}
+*/
+
+/**
+ * Operations run after harvesting
+ * @return unknown_type
+ */
+/*
+function after_harvest() {
+  $harvest->end_time = format_date(time(), 'custom', 'Y-m-d H:i:s');
+  drupal_write_record('oaiharvester_harvest_queue', $harvest, 'harvest_id');
+
+  // TODO: 1) set the queue item passive
+  //       2) feedback to schedule and provider (?): this time will be the next harvest's from parameter
+  //       3) statistics: how many records were harvested?
+}
+*/
+
+/**
+ * Create a harvestable item in the harvest queue from a schedule
+ * @param $schedule (object)
+ *   The schedule object
+ * @param $format_name (String)
+ *   The format name
+ * @paramm $set_spec (String)
+ *   The OAI set name
+ * @param $last_ran (int)
+ *   Timestamp of last ran
+ * @return (int)
+ *   Whether or not the oaiharvester_harvest_queue record has been created
+ */
+function oaiharvester_create_queue($schedule, $format_name, $set_spec = NULL, $last_ran = NULL) {
+  $queue_item = (object) array(
+    'harvest_schedule_id' => $schedule->harvest_schedule_id,
+    'provider_url' => $schedule->oai_provider_url,
+    'metadata_prefix' => $format_name,
+    'set_name' => $set_spec,
+    'from_date' => $last_ran,
+    'inserted_at' => time(), // date("Y-m-d H:i:s");
+    'parsing_mode' => $schedule->parsing_mode,
+  );
+
+  $ret_val = drupal_write_record('oaiharvester_harvest_queue', $queue_item);
+  xc_log_info('oai queue', t('A new item in the queue: %bool, %id', array('%bool' => $ret_val, '%id' => $queue_item->harvest_id)));
+  return $ret_val;
+}
+
+/**
+ * Create a page for the repositories list
+ * @return string The list repositories page
+ */
+function oaiharvester_repository_list() {
+  $headers = array(t('Server name'), t('URL'), t('Schedules'));
+  $rows = array();
+
+  $sql = 'SELECT * from {oaiharvester_providers}';
+  $result = db_query($sql); // TODO: what were these: $name, $url? filters?);
+
+  foreach ($result as $data) {
+    $schedules = _oaiharvester_schedule_get_by_provider($data->provider_id);
+    $rows[] = array(
+      l($data->name, 'admin/xc/harvester/repository/' . $data->provider_id),
+      check_plain($data->oai_provider_url),
+      join(', ', $schedules),
+    );
+  }
+  if (empty($rows)) {
+    drupal_set_message(t('No instances of OAI-PMH repository are on this system. You must first !add an OAI-PMH provider.',
+        array('!add' => l(t('add'), 'admin/xc/harvester/repository/add'))),
+      'warning');
+    return '';
+  }
+
+  return theme('table', array('header' => $headers, 'rows' => $rows));
+}
+
+/**
+ * Add a new repository
+ * @return string The add repository page with a form
+ */
+function oaiharvester_repository_add() {
+  drupal_set_title(t('Add repository'));
+  return drupal_get_form('oaiharvester_repository_add_form');
+}
+
+// -- BEGINING of show repository funtions
+
+/**
+ * Show the properties of a repository
+ * @param $id
+ * @return unknown_type
+ */
+function oaiharvester_repository_view($provider_id) {
+  $repository = oaiharvester_repository_load($provider_id);
+
+  drupal_set_title($repository->name);
+  $schedules = _oaiharvester_schedule_get_by_provider($repository->provider_id);
+
+  switch ($repository->type) {
+    case OAIHARVESTER_PROVIDERTYPE_CACHE:
+      $repository_type = t('Files in the local filesystem');
+      break;
+    case OAIHARVESTER_PROVIDERTYPE_SERVER:
+    default:
+      $repository_type = t('Real OAI-PMH server');
+      break;
+  }
+
+  $headers = array(t('Property'), t('Value'));
+  $rows = array();
+
+  $rows[] = array(t('The name of the repository'), $repository->name);
+  $rows[] = array(
+    t('The original name of the repository given by the provider itself'),
+    $repository->server_name,
+  );
+  $rows[] = array(t('URL of the server'), $repository->oai_provider_url);
+  $rows[] = array(t('Repository type'), $repository_type);
+  $rows[] = array(
+    t('Textual description of the repository, the nature of content'),
+    $repository->description,
+  );
+  $rows[] = array(t('Email of server administrator'), $repository->admin_email);
+  $rows[] = array(t('Phone number of server administrator'), $repository->admin_phone);
+  $rows[] = array(
+    t('Is the service ready to harvest?'),
+    $repository->is_service_ready ? t('Yes') : t('No'),
+  );
+  $rows[] = array(t('When this provider were created?'), $repository->created_at);
+  $rows[] = array(t('When this provider were updated?'), $repository->updated_at);
+  $rows[] = array(t('The last time the provider was validated'), $repository->last_validated);
+  $rows[] = array(
+    t('Latest end date of a successfull selective harvest'),
+    $repository->last_harvest_end_time,
+  );
+  $rows[] = array(
+    t('Earliest start date of a successfull selective harvest'),
+    $repository->earliest_start_date_harvested,
+  );
+  $rows[] = array(
+    t('Last date when this provider were harvested'),
+    $repository->last_harvest_date,
+  );
+  $rows[] = array(
+    t('Which OAI-PMH protocol does the provider support?'),
+    $repository->protocol_version,
+  );
+  $rows[] = array(
+    t('The finest harvesting granularity supported by the repository'),
+    $repository->granularity,
+  );
+  $rows[] = array(
+    t('The manner in which the repository supports the notion of deleted records'),
+    $repository->deleted_record,
+  );
+  if (isset($repository->oai_identifier) && !empty($repository->oai_identifier)) {
+    $rows[] = array(t('OAI identifier\'s scheme'), $repository->oai_identifier['scheme']);
+    $rows[] = array(t('Repository identifier'), $repository->oai_identifier['repositoryIdentifier']);
+    $rows[] = array(t('OAI identifier\'s delimiter character'), $repository->oai_identifier['delimiter']);
+    $rows[] = array(t('A sample identifier'), $repository->oai_identifier['sampleIdentifier']);
+    $rows[] = array(
+      t('Identifier prefix (this is useful only for Metadata Services Toolkit server records)'),
+      $repository->oai_identifier['identifierPrefix'],
+    );
+  }
+  $rows[] = array(
+    t('Was the Identify verb request successful?'),
+    $repository->has_identify ? t('Yes') : t('No'),
+  );
+  $rows[] = array(
+    t('Was the ListMetadataFormats verb request successful?'),
+    $repository->has_list_metadata_formats ? t('Yes') : t('No'),
+  );
+  $rows[] = array(
+    t('Was the ListSets verb request successfull?'),
+    $repository->has_list_sets ? t('Yes') : t('No'),
+  );
+  $rows[] = array(
+    t('Schedules using this repository'),
+    join(', ', $schedules),
+  );
+
+  return theme('table', array('header' => $headers, 'rows' => $rows));
+}
+
+/**
+ * Validate the OAI repository and stores it basic values: the identifier data,
+ * supported sets and metadata formats.
+ * @param $repository The class representing the repository in DB
+ * @return unknown_type
+ */
+function oaiharvester_repository_validate($provider_id, $redirect = TRUE) {
+  require_once 'lib/OAIHarvester.php';
+
+  $repository = oaiharvester_repository_load($provider_id);
+
+  // TODO: call harvester's
+  xc_log_info('oaiharvester', 'Validate repository id: "%id"', array('%id' => $repository->provider_id));
+  xc_log_info('oaiharvester', 'provider url: %id', array('%id' => $repository->oai_provider_url));
+  $start = _microtime_float();
+
+  if (($repository->type == OAIHARVESTER_PROVIDERTYPE_SERVER)) {
+    // get and save Identify
+    try {
+      $oai = new OAIHarvester('Identify', $repository->oai_provider_url, array());
+      $identify = $oai->getIdentify();
+    }
+    catch (Exception $e) {
+      xc_log_error('oaiharvester', $e->getMessage());
+      drupal_set_message(t('Caught exception when retrieving Identify: %msg', array('%msg' => $e->getMessage())), 'error');
+    }
+
+    $repository->has_identify = 0;
+    if (!empty($identify)) {
+      $repository->has_identify     = 1;
+      $repository->server_name      = $identify['repositoryName'];
+      $repository->admin_email      = implode(', ', $identify['adminEmail']);
+      $repository->protocol_version = $identify['protocolVersion'];
+      $repository->granularity      = $identify['granularity'];
+      $repository->deleted_record   = $identify['deletedRecord'];
+
+      // descriptions are optional in the OAI spec, so the next line prevents an error if the description is not provided by the OAI server
+      $descriptions = (isset($identify['description'])) ? $identify['description'] : array();
+
+      foreach ($descriptions as $description) {
+        if (preg_match('{^http://www.openarchives.org/OAI/2.0/oai_dc\/?$}', $description['namespaceURI'])) {
+          $repository->description = implode(' ', $description['childNode']['description']);
+        }
+        elseif (preg_match('{^http://www.openarchives.org/OAI/2.0}', $description['namespaceURI'])
+                && $description['childNode']->nodeName == 'oai-identifier') {
+          $node = $description['childNode'];
+          $repository->oai_identifier = serialize(array(
+            'scheme' => $node->getElementsByTagName('scheme')->item(0)->nodeValue,
+            'repositoryIdentifier' => $node->getElementsByTagName('repositoryIdentifier')->item(0)->nodeValue,
+            'delimiter' => $node->getElementsByTagName('delimiter')->item(0)->nodeValue,
+            'sampleIdentifier' => $node->getElementsByTagName('sampleIdentifier')->item(0)->nodeValue,
+            'identifierPrefix' => preg_replace('/\d+$/', '', $node->getElementsByTagName('sampleIdentifier')->item(0)->nodeValue),
+          ));
+        }
+      }
+    }
+    // update provider
+    $repository->updated_at = format_date(time(), 'custom', 'Y-m-d H:i:s');
+    drupal_write_record('oaiharvester_providers', $repository, 'provider_id');
+
+    // -> ListMetadataFormats
+    $repository->has_list_metadata_formats = 0;
+    try {
+      $oai = new OAIHarvester('ListMetadataFormats', $repository->oai_provider_url, array());
+      _oaiharvester_update_metadata_formats($oai->getMetadataFormats(), $repository);
+    }
+    catch (Exception $e) {
+      xc_log_error('oaiharvester', $e->getMessage());
+      drupal_set_message(t('Caught exception when retrieving ListMetadataFormats: %msg', array('%msg' => $e->getMessage())), 'error');
+    }
+
+    $repository->updated_at = format_date(time(), 'custom', 'Y-m-d H:i:s');
+    drupal_write_record('oaiharvester_providers', $repository, 'provider_id');
+    // END of list metadata formats
+
+    // -> ListSets
+    $repository->has_list_sets = 0;
+    try {
+      $oai = new OAIHarvester('ListSets', $repository->oai_provider_url, array());
+      _oaiharvester_update_list_sets($oai->getSets(), $repository);
+    }
+    catch (Exception $e) {
+      xc_log_error('oaiharvester', $e->getMessage());
+      drupal_set_message(t('Caught exception when retrieving ListSets: %msg', array('%msg' => $e->getMessage())), 'error');
+    }
+
+    // update provider
+    $repository->updated_at     = format_date(time(), 'custom', 'Y-m-d H:i:s');
+    $repository->last_validated = format_date(time(), 'custom', 'Y-m-d H:i:s');
+    // END of list sets
+  }
+
+  $repository->is_service_ready = 0;
+  if ($repository->type == OAIHARVESTER_PROVIDERTYPE_SERVER) {
+    if ($repository->has_identify == 1
+        && $repository->has_list_metadata_formats == 1) { // && $repository->has_list_sets == 1
+      $repository->is_service_ready = 1;
+    }
+  }
+  elseif ($repository->type == OAIHARVESTER_PROVIDERTYPE_CACHE) {
+    // dir is readable?
+    if (!file_exists($repository->oai_provider_url)) {
+      drupal_set_message(t('The directory %dir does not exist', array('%dir' => $repository->oai_provider_url)), 'error');
+    }
+    else {
+      if (!is_dir($repository->oai_provider_url)) {
+        drupal_set_message(t('%dir is not a directory.', array('%dir' => $repository->oai_provider_url)), 'error');
+      }
+      else {
+        if (!file_exists($repository->oai_provider_url . '/' . 'initial.xml')) {
+          drupal_set_message(t('%dir should contains initial.xml.', array('%dir' => $repository->oai_provider_url)), 'error');
+        }
+        else {
+          $repository->is_service_ready = 1;
+        }
+      }
+    }
+  }
+  $repository->updated_at     = format_date(time(), 'custom', 'Y-m-d H:i:s');
+  $repository->last_validated = format_date(time(), 'custom', 'Y-m-d H:i:s');
+  drupal_write_record('oaiharvester_providers', $repository, 'provider_id');
+  $msg = t('%name validated', array('%name' => $repository->name));
+  // drupal_set_message($msg);
+  xc_log_info('oaiharvester', $msg);
+
+  if ($redirect == TRUE) {
+    $url = 'admin/xc/harvester/repository/' . $repository->provider_id;
+    xc_log_info('harvester', 'redirecting to ' . $url);
+    drupal_goto($url);
+  }
+  else {
+    xc_log_info('harvester', 'no redirecting after validating repository');
+  }
+}
+
+/**
+ * Insert or update metadata formats supported by a given repository
+ * @param $oai The OAI-PMH response for ListMetadataFormats verb
+ * @param $provider
+ * @return unknown_type
+ */
+function _oaiharvester_update_metadata_formats($formats, &$provider) {
+
+  if (!isset($formats) || empty($formats)) {
+    xc_log_info('oaiharvester', 'No response for ListMetadataFormats');
+    drupal_set_message(t('No response for ListMetadataFormats.'), 'error');
+    return;
+  }
+
+  /*
+   * $sql = 'SELECT * FROM {oaiharvester_formats} '
+         . " WHERE name = :name"
+         .   " AND namespace = :namespace"
+         .   " AND schema_location = :location";
+    $result = db_query($sql, array(':name' => $format->name,
+                                     ':namespace' => $format->namespace,
+                                     ':location' => $format->schema_location));
+   */
+  $provider->has_list_metadata_formats = 1;
+  foreach ($formats as $format) {
+    // select to see is there such a format
+    $query = db_select('oaiharvester_formats', 'of');
+
+    $query->fields('of')
+          ->condition(db_and()->condition('name', $format->name)
+                              ->condition('namespace', $format->namespace)
+                              ->condition('schema_location', $format->schema_location));
+
+    $result = $query->execute();
+
+    if ($result->rowCount() == 0) {
+      drupal_write_record('oaiharvester_formats', $format);
+    }
+    else {
+      $format = $result->fetchObject();
+    }
+    // is there a connector record?
+    $query = db_select('oaiharvester_formats_to_providers', 'oftp');
+    $query->fields('oftp')
+          ->condition(db_and()->condition('format_id', $format->format_id)
+                              ->condition('provider_id', $provider->provider_id));
+
+    $format2provider = $query->execute();
+    if ($format2provider->rowCount() == 0) {
+      // create the connector record
+      $connector = new stdClass();
+      $connector->format_id   = $format->format_id;
+      $connector->provider_id = $provider->provider_id;
+      drupal_write_record('oaiharvester_formats_to_providers', $connector);
+      xc_log_info('oaiharvester', 'Connect a format (%prefix) and a provider (%name)', array(
+        '%prefix' => $format->name,
+        '%name' => $provider->name,
+      ));
+    } // no registered format-provider pair
+  } // foreach ($formats
+}
+
+/**
+ * Update sets according to the ListSets verb response.
+ * @param $oai The OAI response
+ * @param $provider The class representing the provider DB table
+ * @return unknown_type
+ */
+function _oaiharvester_update_list_sets($sets, &$provider) {
+  if (!isset($sets) || empty($sets)) {
+    xc_log_info('oaiharvester', 'No response for ListSets');
+    drupal_set_message(t('No response for ListSets. This is an optional OAI-PMH functionality, without this you can still use the harvester. If you sure, that server should support sets, please contact the OAI-PMH server\'s administrator (see the "Email of server administrator" propery below).'), 'warning');
+    return;
+  }
+
+  $provider->has_list_sets = 1;
+  foreach ($sets as $set) {
+    // select to see is there such a set
+    $query = db_select('oaiharvester_sets', 'os');
+    $query->fields('os')
+          ->condition(db_and()->condition('set_spec', $set->set_spec)
+                              ->condition('display_name', $set->display_name)
+                              ->condition('description', $set->description));
+
+    $result = $query->execute();
+
+    if ($result->rowCount() == 0) {
+      drupal_write_record('oaiharvester_sets', $set);
+    }
+    else {
+      $set = $result->fetchObject();
+    }
+
+    // is there a connector record?
+    $query = db_select('oaiharvester_sets_to_providers', 'ostp');
+    $query->fields('ostp')
+          ->condition(db_and()->condition('set_id', $set->set_id)
+                              ->condition('provider_id', $provider->provider_id));
+
+    $set2provider = $query->execute();
+
+    if ($set2provider->rowCount() == 0) {
+      // create the connector record
+      $connector = new stdClass();
+      $connector->set_id = $set->set_id;
+      $connector->provider_id = $provider->provider_id;
+      drupal_write_record('oaiharvester_sets_to_providers', $connector);
+    } // no registered format-provider pair
+  } // for each sets
+}
+
+/**
+ * Delete a repository from the database. It deletes the corresponding
+ * formats, sets and schedules
+ * @param $repository
+ * @return unknown_type
+ */
+function oaiharvester_repository_delete($provider_id) {
+  $repository = oaiharvester_repository_load($provider_id);
+  
+  db_delete('oaiharvester_providers')->condition('provider_id', $repository->provider_id)->execute();
+
+  db_delete('oaiharvester_formats_to_providers')->condition('provider_id', $repository->provider_id)->execute();
+
+  db_delete('oaiharvester_harvester_schedules')->condition('provider_id', $repository->provider_id)->execute();
+
+  db_delete('oaiharvester_sets_to_providers')->condition('provider_id', $repository->provider_id)->execute();
+
+  drupal_goto('admin/xc/harvester/repository/list');
+}
+
+/**
+ * Get the page displaying the list of set connected to a repository
+ * @param $id The id of repository
+ * @return string The full page with data
+ */
+function oaiharvester_repository_sets($provider_id) {
+  $repository = oaiharvester_repository_load($provider_id);
+
+  $header  = array(t('Set'), t('Name'), t('Description'));
+  $rows    = array();
+
+  // select data for table
+  $result = _oaiharvester_sets_get_by_provider($repository->provider_id);
+  foreach ($result as $data) {
+    $rows[] = array(
+      'data' => array(
+        check_plain($data->set_spec),
+        check_plain($data->display_name),
+        check_plain($data->description),
+      ),
+      'valign' => 'top',
+    );
+  }
+  return theme('table', array('header' => $header, 'rows' => $rows));
+}
+
+/**
+ * Show metadata formats connected to a given repository
+ * @param $id The id of a repository
+ * @return text The full rendered page
+ */
+function oaiharvester_repository_formats($provider_id) {
+  $repository = oaiharvester_repository_load($provider_id);
+  $header = array(t('Name'), t('Namespace'), t('Schema location'));
+  $rows   = array();
+
+  // select data for table
+  // TODO: check this
+  $result = _oaiharvester_metadataformats_get_by_provider($repository->provider_id);
+  foreach ($result as $data) {
+    $rows[] = array(
+      'data' => array(
+        check_plain($data->name),
+        check_plain($data->namespace),
+        check_plain($data->schema_location),
+      ),
+      'valign' => 'top',
+    );
+  }
+  return theme('table', array('header' => $header, 'rows' => $rows));
+}
+
+/**
+ * List all harvestable sets for all repository
+ * @return String The table of lists
+ */
+function oaiharvester_set_list() {
+  // set title of table
+  $header = array(t('Name'), t('Setspec'), t('Description'), t('Supporting providers'));
+  $rows = array();
+
+  // select data for table
+  $sql = 'SELECT * FROM {oaiharvester_sets}';
+  $result = db_query($sql);
+  foreach ($result as $data) {
+    $rows[] = array(
+      check_plain($data->display_name),
+      check_plain($data->set_spec),
+      check_plain($data->description),
+      join('<br />', _oaiharvester_providers_get_by_set($data->set_id)),
+    );
+  }
+  return theme('table', array('header' => $header, 'rows' => $rows));
+}
+
+/**
+ * Show the properties of a given set
+ * @param $set_id The set ID
+ * @return The table of properties
+ */
+function oaiharvester_set_view($set) {
+  $header = array(t('Name'), t('setspec'), t('Description'));
+  $rows = array();
+
+  drupal_set_title($set->display_name);
+
+  $rows[] = array(
+    check_plain($set->display_name),
+    check_plain($set->set_spec),
+    check_plain($set->description),
+  );
+
+  return theme('table', array('header' => $header, 'rows' => $rows));
+}
+
+/**
+ * Get the set object by its identifier
+ * @param $set_id The id of the set
+ * @return set object
+ */
+function oaiharvester_set_load($set_id) {
+
+  $query = db_select('oaiharvester_sets', 'os');
+
+  return $set = $query->fields('os')
+                      ->condition('set_id', $set_id)
+                      ->execute()
+                      ->fetchObject();
+}
+
+/**
+ * Get the title of a set object
+ * @param $set
+ * @return unknown_type
+ */
+function oaiharvester_set_title($set) {
+  return $set->display_name;
+}
+
+/**
+ * Show the list of metadata formats
+ * @return unknown_type
+ */
+function oaiharvester_format_list() {
+  $header = array(t('Name'), t('Namespace'), t('Schema location'), t('Supporting providers'));
+  $rows = array();
+
+  // select data for table
+  $sql = 'SELECT * FROM {oaiharvester_formats}';
+  $result = db_query($sql);
+  foreach ($result as $data) {
+    $rows[] = array(
+      check_plain($data->name),
+      check_plain($data->namespace),
+      check_plain($data->schema_location),
+      join('<br />', _oaiharvester_providers_get_by_format($data->format_id)),
+    );
+  }
+  return theme('table', array('header' => $header, 'rows' => $rows));
+}
+
+/**
+ * Show the properties of a given metadata format
+ * @param $format_id
+ * @return unknown_type
+ */
+function oaiharvester_format_view($format) {
+  $header = array(t('Name'), t('Namespace'), t('Schema location'));
+  $rows = array();
+
+  // select data for table
+  $rows[] = array(
+    check_plain($format->name),
+    check_plain($format->namespace),
+    check_plain($format->schema_location)
+  );
+  return theme('table', array('header' => $header, 'rows' => $rows));
+}
+
+/**
+ * @todo Please document this function.
+ * @see http://drupal.org/node/1354
+ */
+function oaiharvester_format_load($format_id) {
+  $query = db_select('oaiharvester_formats', 'of');
+
+  return $format = $query->fields('of')
+                         ->condition('format_id', $format_id)
+                         ->execute()
+                         ->fetchObject();
+}
+
+/**
+ * @todo Please document this function.
+ * @see http://drupal.org/node/1354
+ */
+function oaiharvester_format_title($format) {
+  return $format->name;
+}
+
+function xc_time_estimation($start, $percent) {
+  $time_elapsed  = (int) ((microtime(TRUE) - (float) $start));
+  $time_remained = (int) ($time_elapsed / $percent) - $time_elapsed;
+  return t('Elapsed time: %el, remained approx. %re, total approx.: %ato.<br />',
+    array(
+      '%el' => oaiharvester_sec_to_time($time_elapsed),
+      '%re' => oaiharvester_sec_to_time($time_remained),
+      '%ato' => oaiharvester_sec_to_time($time_elapsed + $time_remained),
+  ));
+}
+/**
+ * Lists all schedules in a formatted table
+ *
+ * @return (string)
+ *   A formatted HTML table of all schedules
+ */
+function oaiharvester_schedule_list() {
+  $solr_check = FALSE;
+  $cells = array();
+
+  if (function_exists('xc_source_get_locations')
+      && function_exists('_schedule_id_to_source_id')
+      && module_exists('xc_solr')) {
+    $solr_check = TRUE;
+  }
+
+  $header = array(t('Name'), t('Repository name'), t('Recurrence'), t('Is runnable by cron?'), t('Status'));
+  if ($solr_check) {
+    $header[] = t('Is Solr running?');
+  }
+  $rows = array();
+
+  $curdate = (db_driver() == 'pgsql') ?  'current_date' : 'CURDATE()';
+  $sql = 'SELECT *, (DATE(end_date) >= ' . $curdate . ') AS active FROM {oaiharvester_harvester_schedules}';
+  $result = db_query($sql);
+  $ping_cache = array();
+  foreach ($result as $schedule) {
+    $name = check_plain($schedule->schedule_name);
+    if (!isset($name) || trim($name) == '') {
+      $name = 'unnamed schedule (#' . $schedule->harvest_schedule_id . ')';
+    }
+    $repository = oaiharvester_repository_load($schedule->provider_id);
+    /*
+    $status = '';
+    $saved_batch = oaiharvester_saved_batch_get_last_by_schedule_id($schedule->harvest_schedule_id);
+    if ($saved_batch) {
+      $status = @unserialize($saved_batch->status);
+      if ($status) {
+        $sets = unserialize($saved_batch->sets);
+        $status_msg = 'step ' . ($status->operation_id + 1) . ' / ' . count($sets) . ' ' . $status->status;
+      }
+    }
+    */
+
+    $repo_name = !empty($repository) ? $repository->name : t('[deleted repository]');
+    $cells = array(
+      l($name, 'admin/xc/harvester/schedule/' . $schedule->harvest_schedule_id),
+      l($repo_name, 'admin/xc/harvester/repository/' . $schedule->provider_id),
+      $schedule->recurrence,
+      array(
+        'data' => ($schedule->active ? t('active') : t('inactive')),
+        'style' => ($schedule->active ? NULL : 'color:red'),
+      ),
+      ($schedule->status == OAIHARVESTER_STATUS_ACTIVE ? t('running') : t('not running')),
+    );
+
+    if ($solr_check) {
+      $ping_report = array();
+      $locations = xc_source_get_locations(_schedule_id_to_source_id($schedule->harvest_schedule_id));
+      $locations_hash = md5(serialize($locations));
+      if (!isset($ping_cache[$locations_hash])) {
+        $ping_cache[$locations_hash] = xc_solr_ping($locations);
+      }
+      $ping = $ping_cache[$locations_hash];
+      if (empty($ping)) {
+        $ids = array();
+        foreach ($locations as $location) {
+          $ids[] = $location->location_id;
+        }
+        $ping_report[] = array(
+          'data' => t('No Solr instance defined to locations: %ids',
+            array('%ids' => join(', ', $ids))),
+          'style' => array('color:red'),
+        );
+      }
+      foreach ($ping as $ping_result) {
+        $state = $ping_result['running'] == TRUE ? t('running') : t('stopped');
+        $style = $ping_result['running'] == TRUE ? NULL : 'color:red';
+        $ping_report[] = array(
+          'data' => $ping_result['url'] . ' ' . $state,
+          'style' => array($style),
+        );
+      }
+      $cells[] = theme('item_list', array('items' => $ping_report));
+    }
+    $rows[] = $cells;
+  }
+
+  if (empty($rows)) {
+    drupal_set_message(t('No scheduled harvester created on this system. Please !add a schedule.',
+      array('!add' => l(t('add'), 'admin/xc/harvester/schedule/step1'))), 'warning');
+    $output = '';
+  }
+  else {
+    $output = theme('table', array('header' => $header, 'rows' => $rows));
+  }
+
+  $queue_count = _oaiharvester_queue_count();
+  $output .= '<p>' . t('Currently there are %count items in queue.', array('%count' => $queue_count));
+  if ($queue_count > 0) {
+    $output .= ' ' . t('To empty the queue click !here.', array('!here' => l(t('here'), 'admin/xc/harvester/schedule/emptyqueue')));
+  }
+  $output .= '</p>';
+
+  $processing_cron = variable_get('oaiharvester_processing_cron', 'NOT_RUNNING');
+  $output .= '<p>';
+  $output .= t("The 'oaiharvester_processing_cron' variable status is '%processing_cron'.", array('%processing_cron' => $processing_cron));
+  if ($processing_cron != 'NOT_RUNNING') {
+    $output .=  ' ' . t('If you are sure, that all scheduled harvest has been finished, but status is not NOT_RUNNING it could be a blocker for next harvests. We suggest you to unlock it by setting it to default !here.',
+      array('!here' => l(t('here'), 'admin/xc/harvester/schedule/unlock')));
+  }
+  $output .= '</p>';
+
+  return $output;
+}
+
+/**
+ * Shows the properties of a schedule
+ *
+ * @param $schedule (object)
+ *   The schedule object
+ *
+ * @return (string)
+ *   An HTML table of a schedule's properties
+ */
+function oaiharvester_schedule_view($schedule_id) {
+  $schedule = oaiharvester_schedule_load($schedule_id, TRUE);
+
+  $headers = array(t('Property'), t('Value'));
+  $steps = _oaiharvester_schedule_steps_get($schedule->harvest_schedule_id);
+  $saved_batches = oaiharvester_saved_batch_get_by_schedule_id($schedule->harvest_schedule_id);
+  $saved_batches = array_reverse($saved_batches);
+  $batches_list = array();
+  foreach ($saved_batches as $batch) {
+    $status = @unserialize($batch->status);
+    if ($status) {
+      $sets = unserialize($batch->sets);
+      $status_msg = 'Step ' . ($status->operation_id + 1) . '/' . count($sets) . ': ' . $status->status;
+    }
+    else {
+      // the legacy format. This code is only for historical reasons
+      if (!empty($batch->status)) {
+        list($step, $status_msg, $params) = explode('||', $batch->status);
+      }
+    }
+    if (!isset($status_msg) || empty($status_msg)) {
+      $status_msg = 'FINISHED';
+    }
+
+    $url = 'admin/xc/harvester/schedule/' . $schedule_id . '/batch/' . $batch->id;
+    $link = l($status_msg . ' (started at ' . format_date($batch->timestamp, 'custom', 'Y-m-d H:i') . ')', $url);
+    // TODO: revisit this
+    // start over harvest link
+    if ($status_msg != 'FINISHED') {
+      $link .= ' ' . l(t('Start over!'), $url);
+    }
+
+    $batches_list[] = $link;
+  }
+
+  $dispayed_sets = array();
+  $dispayed_formats = array();
+  $urls = array();
+  foreach ($steps as $step) {
+    // list of sets
+    if (!empty($step->set_id)) {
+      $link = l($step->display_name, 'admin/xc/harvester/set/' . $step->set_id);
+      if (!in_array($link, $dispayed_sets)) {
+        $dispayed_sets[] = $link;
+      }
+    }
+    // list of formats
+    $link = l($step->name, 'admin/xc/harvester/format/' . $step->format_id);
+    if (!in_array($link, $dispayed_formats)) {
+      $dispayed_formats[] = $link;
+    }
+
+    // list of URLs
+    $url = $schedule->oai_provider_url . '?verb=ListRecords';
+    if (strpos($url, 'http') === FALSE) {
+      $url = 'http://' . $url;
+    }
+    $title = '';
+    if (isset($step->name) && $step->name != '') {
+      $url .= '&metadataPrefix=' . $step->name;
+      $title = '<em>' . $step->name . '</em> (format)';
+    }
+    if (!empty($step->set_spec)) {
+      $url .= '&set=' . $step->set_spec;
+      $title .= ' and <em>' . $step->display_name . '</em> (set)';
+    }
+    $url = l($title, $url, array('html' => TRUE));
+    $url .= ' (' . ($step->last_ran != NULL ? $step->last_ran : t('never')) . ')';
+
+    if (!in_array($url, $urls)) {
+      $urls[] = $url;
+    }
+  }
+  // get cache
+  $has_cached_files = FALSE;
+  $caches = array('oaiharvester_http_cache', 'oaiharvester_sql_cache');
+  foreach ($caches as $cache) {
+    $cache_dir = 'public://' . $cache . '/' . $schedule->harvest_schedule_id;
+    if (file_prepare_directory($cache_dir)) {
+      $files = scandir($cache_dir);
+      if (($cached_file_count = count($files)) > 2) {
+        $has_cached_files = TRUE;
+        break;
+      }
+    }
+  }
+
+  $rows = array();
+  $rows[] = array(t('Repository'), l($schedule->repository_name,
+    'admin/xc/harvester/repository/' . $schedule->provider_id));
+  $rows[] = array(t('Set(s)'), join('<br />', $dispayed_sets));
+  $rows[] = array(t('Format(s)'), join('<br />', $dispayed_formats));
+  $rows[] = array(t('Starting URL(s) (last ran)'), join('<br />', $urls));
+  $rows[] = array(t('Recurrence'), $schedule->recurrence);
+  $rows[] = array(t('Minute'), $schedule->minute);
+  $rows[] = array(t('Hour'), $schedule->hour);
+  $rows[] = array(t('Day of week'), $schedule->day_of_week);
+  $rows[] = array(t('Start date'), $schedule->start_date);
+  $rows[] = array(t('End date'), $schedule->end_date
+    . ($schedule->active ? '' : ' (' . t('inactive!') . ')'));
+  $rows[] = array(t('Parsing mode'), $schedule->parsing_mode);
+  $rows[] = array(
+    t('Do harvester cache responses?'),
+    (isset($schedule->is_cacheable)
+       ? ($schedule->is_cacheable ? t('Yes') : t('No'))
+       : t('No')),
+  );
+  $rows[] = array(
+    t('The maximum number of OAI-PMH request'),
+    ($schedule->max_request > 0) ? $schedule->max_request : t('unlimited'),
+  );
+  $rows[] = array(t('Skip main task, and run only additional steps (if any)'), ($schedule->skip_main_task ?  t('Yes') : t('No')));
+  $rows[] = array(
+    t('Has cached responses?'),
+    ($has_cached_files)
+      ? t('Yes, %number files', array('%number' => $cached_file_count))
+        . ' ' . l(t('List'),
+                 'admin/xc/harvester/schedule/' . $schedule->harvest_schedule_id . '/list_http_cache')
+        . ' ' . l(t('Remove chached responses'),
+                 'admin/xc/harvester/schedule/' . $schedule->harvest_schedule_id . '/clear_cache')
+      : t('No'),
+  );
+  $rows[] = array(t('Contact email'), $schedule->notify_email_address);
+  $rows[] = array(t('Created by'), $schedule->created_by);
+  $rows[] = array(t('Created date'), $schedule->created_date);
+  $rows[] = array(t('Status'), ($schedule->status == OAIHARVESTER_STATUS_ACTIVE ? t('running') : t('not running')));
+  $rows[] = array(
+    'data' => array(t('Harvest results'), theme('item_list', array('items' => $batches_list))),
+    'valign' => 'top',
+  );
+
+  // the results come from hook_oaiharvester_schedule_view()
+  $rows = array_merge_recursive($rows, module_invoke_all('oaiharvester_schedule_view', $schedule->harvest_schedule_id));
+
+  $content = theme('table', array('header' => $headers, 'rows' => $rows));
+  return $content;
+}
+
+/**
+ * Displays the harvest report.
+ *
+ * @param $schedule_id (int)
+ *   The schedule identifier
+ * @param $saved_batch (object)
+ *   An oaiharvester_batch record
+ *
+ * @return (string)
+ *   A formatted harvest report
+ */
+function oaiharvester_saved_batch_view($schedule_id, $saved_batch) {
+  $schedule = oaiharvester_schedule_load($schedule_id);
+  $output = '<h3>'
+    . (t('Harvest report for schedule @name harvested at @time', array(
+        '@name' => $schedule->schedule_name,
+        '@time' => format_date($saved_batch->timestamp, 'custom', 'Y-m-d H:i:s'))))
+    . '</h3>';
+
+  $reports = unserialize($saved_batch->reports);
+  if (isset($reports['results'])) {
+    $output .= $reports['results'][0];
+  }
+
+  // call hook_oaiharvester_batch_report_view
+  $output .= join('', module_invoke_all('oaiharvester_harvest_report_view', $reports));
+
+  if (isset($reports['oaiharvester_statistics'])) {
+    drupal_add_css(drupal_get_path('module', 'oaiharvester') . '/css/hierarchial_table.css');
+    drupal_add_js(drupal_get_path('module', 'oaiharvester') . '/js/hierarchial_table.js');
+    $output .= theme('oaiharvester_statistics', array('oaiharvester_statistics' => $reports['oaiharvester_statistics']));
+  }
+  elseif (isset($reports['tech_details'])) {
+    drupal_add_css(drupal_get_path('module', 'oaiharvester') . '/css/hierarchial_table.css');
+    drupal_add_js(drupal_get_path('module', 'oaiharvester') . '/js/hierarchial_table.js');
+    $output .= $reports['tech_details'][1];
+  }
+
+  if (isset($reports['actions'])) {
+    $output .= theme('item_list', array('items' => $reports['actions'], 'title' => t('Actions:')));
+  }
+
+  $steps = array();
+  $sets = unserialize($saved_batch->sets);
+  if (!is_array($sets) && function_exists('dpm')) {
+    dpm($sets);
+  }
+  else {
+    foreach ($sets as $operation) {
+      $params = array();
+      for ($i = 0, $max = count($operation[1]); $i < $max; $i++) {
+        $param = $operation[1][$i];
+        if (is_string($param) && !preg_match('/^\d+$/', $param)) {
+          $params[] = '"' . $param . '"';
+        }
+        elseif (is_array($param)) {
+          $params[] = var_export($param, TRUE);
+        }
+        elseif (is_null($param)) {
+          $params[] = 'NULL';
+        }
+        else {
+          $params[] = $param;
+        }
+      }
+      $steps[] = $operation[0] . '(' . join(', ', $params) . ')';
+    }
+    $output .= theme('item_list', array('items' => $steps, 'title' => t('Operations:')));
+  }
+
+  $status = @unserialize($saved_batch->status);
+  if ($status) {
+    $status_info = array();
+    foreach ($status as $key => $value) {
+      if ($key == 'context') {
+        $context = unserialize($value);
+        $status_info[] = 'progress: ' . sprintf('%.2f%%', $context['finished'] * 100);
+        $status_info[] = t('Status message:') . '<br />' . $context['message'];
+
+        foreach (array('sandbox', 'results') as $type) {
+          $items = array();
+          foreach ($context[$type] as $key => $value) {
+            if (is_object($value) || is_array($value)) {
+              $value = var_export($value, TRUE);
+            }
+            $items[] = '<em>' . $key . ':</em> ' . $value;
+          }
+          $status_info[] = $type . ': ' . theme('item_list', array('items' => $items));
+        }
+      }
+      else {
+        $status_info[] = $key . ': ' . $value;
+      }
+    }
+    $output .= theme('item_list', array('items' => $status_info, 'title' => t('Last operation:')));
+  }
+
+  // TODO: timestamp, status, schedule_id
+  return $output;
+}
+
+/**
+ * Loads the schedule object. If you choose an extended (full) version, it will
+ * retrieve some properties of the data provider (the repository_name,
+ * oai_provider_url, oai_identifier and active (boolean)).
+ *
+ * @param $schedule_id (int)
+ *   The identifier of the schedule record
+ * @param $full (boolean)
+ *   Whether or not to retrieve the extended version (default is FALSE). The extended
+ *   version contains some information about the repository:
+ *   - repository_name: the name
+ *   - oai_provider_url: the URL of the repository
+ *   - oai_identifier: the OAI identifier scheme
+ *
+ * @return (Object)
+ *   The schedule object.
+ */
+function oaiharvester_schedule_load($schedule_id, $full = FALSE) {
+  return $full
+    ? _oaiharvester_schedule_get_full($schedule_id)
+    : _oaiharvester_schedule_get($schedule_id);
+}
+
+/**
+ * @todo Please document this function.
+ * @see http://drupal.org/node/1354
+ */
+function oaiharvester_schedule_title($schedule) {
+  return $schedule->schedule_name;
+}
+
+/**
+ * Add a new schedule
+ * @return unknown_type
+ */
+function oaiharvester_schedule_step1() {
+  drupal_set_title(t('Step 1: Select repository and schedules'));
+  $output = drupal_get_form('oaiharvester_schedule_step1_form');
+  return $output;
+}
+
+/**
+ * Copies the schedule's value to the schedule form's first page.
+ *
+ * @param $form (array)
+ *   The FAPI form definition
+ * @param $schedule (object)
+ *   The schedule object
+ */
+function _oaiharvester_copy_step1_values_to_form(&$form, &$schedule) {
+  if (!empty($schedule)) {
+    $form['schedule_id'] = array(
+      '#type' => 'hidden',
+      '#value' => $schedule->harvest_schedule_id,
+    );
+  }
+
+  $form['provider_id']['#default_value'] = $schedule->provider_id;
+  $form['schedule']['daily']['daily_hour']['#default_value']   = 0;
+  $form['schedule']['weekly']['weekly_hour']['#default_value'] = 0;
+  $form['schedule']['hourly']['minute']['#default_value']      = 0;
+  $form['schedule']['weekly']['day_of_week']['#default_value'] = 1;
+
+  if ($schedule->recurrence == 'Daily') {
+    $form['schedule']['daily']['recurrence']['#default_value']   = $schedule->recurrence;
+    $form['schedule']['daily']['daily_hour']['#default_value']   = $schedule->hour;
+  }
+  elseif ($schedule->recurrence == 'Weekly') {
+    $form['schedule']['weekly']['recurrence']['#default_value']  = $schedule->recurrence;
+    $form['schedule']['weekly']['day_of_week']['#default_value'] = $schedule->day_of_week;
+    $form['schedule']['weekly']['weekly_hour']['#default_value'] = $schedule->hour;
+  }
+  elseif ($schedule->recurrence == 'Hourly') {
+    $form['schedule']['hourly']['recurrence']['#default_value']  = $schedule->recurrence;
+    $form['schedule']['hourly']['minute']['#default_value']      = $schedule->minute;
+  }
+
+  $start_date = explode('-', drupal_substr($schedule->start_date, 0, 10));
+  $form['start_date']['#default_value'] = array(
+    'year' => (int) $start_date[0],
+    'month' => (int) $start_date[1],
+    'day' => (int) $start_date[2],
+  );
+
+  $end_date = explode('-', drupal_substr($schedule->end_date, 0, 10));
+  $form['end_date']['#default_value'] = array(
+    'year' => (int) $end_date[0],
+    'month' => (int) $end_date[1],
+    'day' => (int) $end_date[2],
+  );
+
+  $form['delete'] = array(
+    '#type' => 'submit',
+    '#value' => t('Delete'),
+  );
+}
+
+/**
+ * Copies the schedule's value to the schedule form's second page.
+ *
+ * @param $form (array)
+ *   The FAPI form definition
+ * @param $schedule (object)
+ *   The schedule object
+ */
+function _oaiharvester_copy_step2_values_to_form(&$form, &$schedule) {
+  $steps = _oaiharvester_schedule_steps_get_atomic($schedule->harvest_schedule_id);
+
+  $formats_default_values = array();
+  $sets_default_values = array();
+  foreach ($steps as $step) {
+    if (!in_array($step->format_id, $formats_default_values)) {
+      $formats_default_values[] = $step->format_id;
+    }
+    if (!in_array($step->set_id, $sets_default_values)) {
+      $sets_default_values[]    = $step->set_id;
+    }
+  }
+  $form['set_id']['#default_value'] = $sets_default_values;
+  $form['format_id']['#default_value'] = $formats_default_values;
+
+  if (!empty($schedule)) {
+    $form['schedule_id']['#value'] = $schedule->harvest_schedule_id;
+  }
+
+  $form['submit']['#value'] = t('Save');
+  $form['delete'] = array(
+    '#type' => 'submit',
+    '#value' => t('Delete'),
+  );
+}
+
+/**
+ * Copies the form's incoming values to the form's storage
+ *
+ * @param $form_state (array)
+ *   The FAPI form state
+ */
+function _oaiharvester_copy_values_to_storage(&$form_state) {
+  $values = $form_state['values'];
+
+  $form_state['storage']['recurrence'] = $values['recurrence'];
+  $form_state['storage']['provider_id'] = $values['provider_id'];
+  if (isset($values['schedule_id'])) {
+    $form_state['storage']['schedule_id'] = $values['schedule_id'];
+  }
+
+  switch ($values['recurrence']) {
+    case "Daily":
+      $form_state['storage']['hour'] = $values['daily_hour'];
+      break;
+
+    case "Weekly":
+      $form_state['storage']['hour'] = $values['weekly_hour'];
+      break;
+
+    default:
+      $form_state['storage']['hour'] = 0;
+      break;
+  }
+  $form_state['storage']['minute'] = $values['minute'];
+  $form_state['storage']['day_of_week'] = $values['day_of_week'];
+  $d = $values['start_date'];
+  $form_state['storage']['start_date'] = sprintf(OAIHARVESTER_DATE_FORMAT, $d['year'], $d['month'], $d['day']);
+  $d = $values['end_date'];
+  $form_state['storage']['end_date'] = sprintf(OAIHARVESTER_DATE_FORMAT, $d['year'], $d['month'], $d['day']);
+}
+
+/**
+ * Validate the harvester step 1
+ * @param $form
+ * @param $form_state
+ * @return unknown_type
+ */
+function oaiharvester_schedule_step1_form_validate($form, &$form_state) {}
+
+/**
+ * Handle step 1 form submission
+ * @param $form The form
+ * @param $form_state The form's state
+ * @return unknown_type
+ */
+function oaiharvester_schedule_step1_form_submit($form, &$form_state) {
+  global $user;
+
+  $values = $form_state['values'];
+  $repository_id = $values['provider_id'];
+  $record = new stdClass();
+  $record->provider_id  = $values['provider_id'];
+  $record->recurrence   = $values['recurrence'];
+
+  if (($record->recurrence == 'Daily')) {
+    $record->hour       = $values['daily_hour'];
+  }
+  elseif ($record->recurrence == 'Weekly') {
+    $record->hour       = $values['weekly_hour'];
+  }
+  else {
+    $record->hour       = 0;
+  }
+  $record->minute       = $values['minute'];
+  $record->day_of_week  = $values['day_of_week'];
+  $record->created_date = format_date(time(), 'custom', 'Y-m-d H:i:s');
+  $record->created_by   = $user->name;
+
+  $start = $values['start_date'];
+  $record->start_date = sprintf(DATE_FORMAT, $start['year'], $start['month'], $start['day']);
+
+  $end = $values['end_date'];
+  $record->end_date = sprintf(DATE_FORMAT, $end['year'], $end['month'], $end['day']);
+
+  // save values
+  drupal_write_record('oaiharvester_harvester_schedules', $record);
+
+  // go to step 2
+  $form_state['redirect'] = 'admin/xc/harvester/schedule/step2/' . $record->harvest_schedule_id;
+}
+
+/**
+ * Step 2: select set, metadata prefix, provide contant email, give a schedule name
+ * @param $schedule_id The ID of schedule
+ * @return The rendered form for step 2
+ */
+function oaiharvester_schedule_step2($schedule_id) {
+  $schedule = _oaiharvester_schedule_get($schedule_id);
+  $provider = oaiharvester_repository_load($schedule->provider_id);
+
+  drupal_set_title(t('Step 2: Name harvest schedule'));
+
+  return drupal_get_form(
+    'oaiharvester_schedule_step2_form',
+    $schedule->harvest_schedule_id,
+    $schedule->provider_id
+  );
+}
+
+/**
+ * Saves the values given by step 2
+ * @param $form
+ * @param $form_state
+ * @return unknown_type
+ */
+function oaiharvester_schedule_step2_form_submit($form, &$form_state) {
+  $values = $form_state['values'];
+  $schedule_id = $values['schedule_id'];
+  $schedule = _oaiharvester_schedule_get($schedule_id);
+  $schedule->schedule_name        = $values['schedule_name'];
+  $schedule->parsing_mode         = $values['parsing_mode'];
+  $schedule->notify_email_address = $values['notify_email_address'];
+
+  drupal_write_record('oaiharvester_harvester_schedules', $schedule, 'harvest_schedule_id');
+
+  $sets                           = $values['set_id'];
+  $formats                        = $values['format_id'];
+  // TODO: checking that format is not empty!!!!
+  foreach ($formats as $format_id) {
+    if (!empty($sets)) {
+      foreach ($sets as $set_id) {
+        _oaiharvester_add_schedule_step($schedule->harvest_schedule_id, $format_id, $set_id);
+      }
+    }
+    else {
+      _oaiharvester_add_schedule_step($schedule->harvest_schedule_id, $format_id, NULL);
+    }
+  }
+  $form_state['redirect'] = 'admin/xc/harvester/schedule/list';
+}
+
+/**
+ * Creates the form for modificating of a schedule. It puts together the
+ * step #1 and step #2 forms, and populates the default data
+ * @param $form_state Argument array passed by drupal_get_form
+ * @param $schedule The stored schedule object
+ * @return unknown_type
+ */
+function oaiharvester_schedule_edit_form($form, &$form_state, $schedule) {
+  // a notation:
+  // $form_state = array('storage' => NULL, 'submitted' => FALSE, 'post' => array(),))
+
+  return oaiharvester_schedule_multiform($form, $form_state, $schedule);
+}
+
+/**
+ * @todo Please document this function.
+ * @see http://drupal.org/node/1354
+ */
+function oaiharvester_schedule_edit_form_validate($form, &$form_state) {
+  oaiharvester_schedule_multiform_validate($form, $form_state);
+}
+
+/**
+ * @todo Please document this function.
+ * @see http://drupal.org/node/1354
+ */
+function oaiharvester_schedule_edit_form_submit($form, &$form_state) {
+  oaiharvester_schedule_multiform_submit($form, $form_state);
+}
+
+function _oaiharvester_add_schedule_step_object($record) {
+  drupal_write_record('oaiharvester_harvest_schedule_steps', $record);
+}
+
+/**
+ * Creates a schedule step object, and adds it to the schedule
+ *
+ * @param $schedule_id (int)
+ *   The parent schedule ID
+ * @param $format_id (int)
+ *   The format's ID
+ * @param $set_id (int)
+ *   The OAI-PMH metadata set's ID
+ */
+function _oaiharvester_add_schedule_step($harvest_schedule_id, $format_id, $set_id = NULL) {
+  $record = _oaiharvester_create_step($harvest_schedule_id, $format_id, $set_id);
+  _oaiharvester_add_schedule_step_object($record);
+}
+
+/**
+ * Creates a harvesting step object
+ *
+ * @param $schedule_id (int)
+ *   The parent schedule ID
+ * @param $format_id (int)
+ *   The format's ID
+ * @param $set_id (int)
+ *   The OAI-PMH metadata set's ID
+ * @param $last_ran (int)
+ *   The timestamp of last ran
+ *
+ * @return (object)
+ *   A simple object containing the values
+ */
+function _oaiharvester_create_step($schedule_id, $format_id, $set_id = NULL, $last_ran = NULL) {
+  if (empty($set_id)) {
+    $set_id = NULL;
+  }
+
+  if (empty($last_ran)) {
+    $last_ran = NULL;
+  }
+
+  $step = (object) array(
+    'schedule_id' => $schedule_id,
+    'format_id' => $format_id,
+    'set_id' => $set_id,
+    'last_ran' => $last_ran,
+  );
+
+  return $step;
+}
+
+// BEGINNING of common DB queries
+
+/**
+ * Gets the title of the repository
+ *
+ * @param $repository (object)
+ *   The repository object
+ *
+ * @return (string)
+ *   The name of repository
+ */
+function oaiharvester_repository_title($repository) {
+  return $repository->name;
+}
+
+/**
+ * Get repository by its identity
+ * @param $id The ID of the repository
+ * @return stdClass The provider id
+ */
+function oaiharvester_repository_load($provider_id) {
+  $query = db_select('oaiharvester_providers', 'op');
+
+  $data = $query->fields('op')
+                  ->condition('provider_id', $provider_id)
+                  ->execute()
+                  ->fetchObject();
+  if (!empty($data) && !empty($data->oai_identifier)) {
+    $data->oai_identifier = unserialize($data->oai_identifier);
+  }
+  return $data;
+}
+
+/**
+ * Create an object from a Unix timestamp. The object stores the minute, hour, day,
+ * month, day_of_week, and timestamp properties
+ *
+ * @param $timestamp (integer)
+ *   The Unix timestamp
+ *
+ * @return (object)
+ *   An object storing the following properties:
+ *   - minute (int)
+ *   - hour (int)
+ *   - day (int)
+ *   - month (int)
+ *   - day_of_week (int)
+ *   - timestamp (int) - the original Unix timestamp
+ */
+function _parse_date($timestamp = NULL) {
+
+  if (!isset($timestamp) || is_null($timestamp) || !is_numeric($timestamp)) {
+    $timestamp = time();
+  }
+
+  $now = new stdClass();
+  $now->minute      = format_date($timestamp, 'custom', 'i');
+  $now->hour        = format_date($timestamp, 'custom', 'G');
+  $now->day         = format_date($timestamp, 'custom', 'j');
+  $now->month       = format_date($timestamp, 'custom', 'n');
+  $now->day_of_week = format_date($timestamp, 'custom', 'w');
+  $now->timestamp   = $timestamp;
+
+  return $now;
+}
+
+/**
+ * Get timestamp from a data representation like 2009-02-26 08:01:00
+ * @param $date_string The textual date representation
+ * @return int The timestamp
+ */
+function _oaiharvester_get_timestamp($date_string) {
+  $datetime = date_create($date_string);
+  return $datetime->getTimestamp();
+}
+
+/**
+ * unstable funtion to start each steps of the batch in distinct drupal batch
+ * process
+ * @return unknown_type
+ */
+function oaiharvester_batch_runner($operations = NULL) {
+  if (!is_null($operations)) {
+    $steps_total = count($operations);
+    $steps_actual = 1;
+  }
+}
+
+/**
+ * Event handler launched when a OAI harvester step is processed.
+ *
+ * It updates the oaiharvester_harvest_schedule_steps record, and invokes
+ * hook_oaiharvester_step_processed($has_errors, $original_parameters, $start_time).
+ *
+ * @param $has_errors (boolean)
+ *   Whether any errors occured during the process
+ * @param $original_parameters (array)
+ *   The schedule's parameters
+ * @param $start_time (int)
+ *   The time the schedule were started as Unix timestamp
+ */
+function _oaiharvester_step_processed($has_errors, $original_parameters, $start_time) {
+  $launch_type = $original_parameters['launch_type']; // manual or cron
+
+  // if launch_type is 'manual': oaiharvester_harvester_schedules', harvest_schedule_id
+  // if launch_type is 'cron': oaiharvester_harvest_queue's harvest_id
+  $launcher_id = $original_parameters['launcher_id'];
+  $format_name = $original_parameters['metadataPrefix'];
+  $set_name    = $original_parameters['set'];
+
+  if ($launch_type == 'manual') {
+    // oaiharvester_harvest_schedule_steps
+    $schedule = _oaiharvester_schedule_get($launcher_id);
+    $provider = oaiharvester_repository_load($schedule->provider_id);
+    $steps = _oaiharvester_schedule_step_get_atomic($launcher_id, $format_name, $set_name, $provider->type);
+  }
+  // launch type is cron
+  else {
+    // get queue
+    $queue_item = _oaiharvester_queue_get_item_by_id($launcher_id);
+    // delete the queue item since it's done
+    _oaiharvester_queue_delete_item_by_id($launcher_id);
+    // get schedule ID
+    $schedule = _oaiharvester_schedule_get($queue_item->harvest_schedule_id);
+    $provider = oaiharvester_repository_load($schedule->provider_id);
+    // steps
+    $steps = _oaiharvester_schedule_step_get_atomic($queue_item->harvest_schedule_id, $format_name, $set_name, $provider->type);
+  }
+
+  if (count($steps) != 1) {
+    xc_log_error('harvester',
+      t('There are %number pairs of same format and sets for one harvest schedule!',
+      array('%number' => count($steps))));
+  }
+
+  // Saving the last_ran into database
+  if (!$has_errors && (variable_get('oaiharvester_skip_recording_last_ran', FALSE) == FALSE)) {
+    foreach ($steps as $step) {
+      $step->last_ran = format_date($start_time, 'custom', 'Y-m-d H:i:s');
+      xc_log_info('harvester', 'updating last_ran time for harvester step (id: ' . $step->step_id . ') to: ' . $step->last_ran);
+      drupal_write_record('oaiharvester_harvest_schedule_steps', $step, 'step_id');
+    }
+  }
+
+  module_invoke_all('oaiharvester_step_processed', $has_errors, $original_parameters, $start_time);
+  $sets = oaiharvester_saved_batch_load($original_parameters['saved_batch_id'], 'sets');
+  if (count($sets) == ($original_parameters['operation_id'] + 1)) {
+    xc_log_info('metadata', 'harvester@steps: set passive schedule #' . $schedule->harvest_schedule_id);
+    oaiharvester_schedule_set_passive($schedule->harvest_schedule_id);
+  }
+}
+
+/**
+ * Formats an OAI-PMH compatible date string
+ *
+ * @param $date (string)
+ *   A date string to tormat
+ * @param $granularity (string)
+ *   The granularity mask: it can be day or second precision.
+ */
+function _oaiharvester_format_date($date, $granularity = OAIHARVESTER_LONG_GRANULARITY) {
+  if ($date == NULL) {
+    return $date;
+  }
+
+  if ($granularity == OAIHARVESTER_LONG_GRANULARITY) {
+    // The Kyushu Teams' patch to fix the problem caused by the difference between
+    // local time and GMT.
+    $unixTime = strtotime($date);
+    $date = str_replace(' ', 'T', gmdate("Y-m-d H:i:s", $unixTime)) . 'Z';
+  }
+  else {
+    $date = drupal_substr($date, 0, 10);
+  }
+  return $date;
+}
+
+function _oaiharvester_get_elapsed($start = 0) {
+  if ($start == 0) {
+    return 0;
+  }
+  return _microtime_float() - $start;
+}
+
+function _microtime_float() {
+  list($usec, $sec) = explode(' ', microtime());
+  return ((float) $usec + (float) $sec);
+}
+
+function _oaiharvester_array_diff2($array1, $array2) {
+  $diff = array();
+  foreach ($array1 as $obj) {
+    if (!in_array($obj, $array2)) {
+      $diff[] = $obj;
+    }
+  }
+  return $diff;
+}
+
+/**
+ * Return H:i:s format of a timestamp
+ *
+ * @param $timestamp (int/float)
+ *   The unix timestamp with or without microseconds
+ *
+ * @param $minimalist (boolean)
+ *   If TRUE is returns a minimalist string (only the sec, or min and sec). Default is FALSE
+ *
+ * @return (String)
+ *   The date format
+ */
+function oaiharvester_sec_to_time($timestamp, $minimalist = FALSE) {
+  $orig_timestamp = $timestamp;
+  $ms = FALSE;
+  if (strpos($timestamp, '.')) {
+    list($timestamp, $ms) = explode('.', $timestamp);
+  }
+
+  $day = $min = $hour = -1;
+  if ($timestamp >= OAIHARVESTER_DAY) {
+    $day = floor($timestamp / OAIHARVESTER_DAY);
+    $timestamp = $timestamp % ($day * OAIHARVESTER_DAY);
+    $hour = $min = 0;
+  }
+  if ($timestamp >= OAIHARVESTER_HOUR) {
+    $hour = floor($timestamp / OAIHARVESTER_HOUR);
+    $timestamp = $timestamp % ($hour * OAIHARVESTER_HOUR);
+    $min = 0;
+  }
+  if ($timestamp >= OAIHARVESTER_MINUTE) {
+    $min = floor($timestamp / OAIHARVESTER_MINUTE);
+    $timestamp = $timestamp % ($min * OAIHARVESTER_MINUTE);
+  }
+  if ($day == -1) {
+    if ($minimalist) {
+      if ($min == -1) {
+        $time = sprintf("%d", $timestamp);
+      }
+      elseif ($hour == -1) {
+        $time = sprintf("%2d:%02d", $min, $timestamp);
+      }
+      else {
+        $time = sprintf("%02d:%02d:%02d", $hour, $min, $timestamp);
+      }
+    }
+    else {
+      if ($hour == -1) {
+        $hour = 0;
+      }
+      if ($min == -1) {
+        $min = 0;
+      }
+      $time = sprintf("%02d:%02d:%02d", $hour, $min, $timestamp);
+    }
+  }
+  elseif ($day == 1) {
+    $time = sprintf("%d day %02d:%02d:%02d", $day, $hour, $min, $timestamp);
+  }
+  else {
+    $time = sprintf("%d days %02d:%02d:%02d", $day, $hour, $min, $timestamp);
+  }
+  if (isset($ms)) {
+    $time .= '.' . drupal_substr($ms, 0, 3);
+  }
+  return $time;
+}
+
+/**
+ * Confirmation form for clearing schedule cache
+ *
+ * @param $form_state
+ *   The FAPI form state
+ * @param $schedule (Object)
+ *   The schedule object
+ *
+ * @return (Array)
+ *   The form definition
+ */
+function oaiharvester_schedule_clear_cache_form($form, &$form_state, $schedule) {
+  $question = t('Are you sure you want to clear the cache for %name schedule?', array('%name' => $schedule->schedule_name));
+
+  $form['schedule'] = array(
+    '#type' => 'value',
+    '#value' => $schedule,
+  );
+
+  $form['question'] = array(
+    '#type' => 'item',
+    '#markup' => $question,
+  );
+
+  return confirm_form($form,
+    $question,
+    'admin/xc/harvester/schedule/' . $schedule->harvest_schedule_id,
+    '', t('Yes, clear'), t('Cancel')
+  );
+}
+
+/**
+ * Submit handler for schedule cache clear form
+ *
+ * @param $form
+ *   FAPI form
+ * @param $form_state
+ *   FAPI form state
+ */
+function oaiharvester_schedule_clear_cache_form_submit($form, &$form_state) {
+  $schedule = $form_state['values']['schedule'];
+  $report = oaiharvester_schedule_clear_cache($schedule);
+  drupal_set_message($report);
+  $form_state['redirect'] = 'admin/xc/harvester/schedule/' . $schedule->harvest_schedule_id;
+}
+
+// TODO: check this form
+function oaiharvester_schedule_set_passive_form($form, &$form_state, $schedule) {
+  $question = t('Are you sure you want to set the status as passive for %name schedule?', array('%name' => $schedule->schedule_name));
+
+  $form['schedule'] = array(
+    '#type' => 'value',
+    '#value' => $schedule,
+  );
+
+  $form['question'] = array(
+    '#type' => 'item',
+    '#markup' => $question,
+  );
+
+  $processing_cron = variable_get('oaiharvester_processing_cron', 'NOT_RUNNING');
+  $form['delete_processing_cron'] = array(
+    '#type' => 'checkbox',
+    '#title' => t("Set 'oaiharvester_processing_cron' variable to 'NOT_RUNNING'. (Current value is '%processing_cron')", array('%processing_cron' => $processing_cron)),
+  );
+
+  return confirm_form($form,
+    $question,
+    'admin/xc/harvester/schedule/' . $schedule->harvest_schedule_id,
+    '', t('Yes, declare, that the schedule is not running'), t('Cancel')
+  );
+}
+
+/**
+ * Submit handler for schedule cache clear form
+ * TODO: check this function against D7 API
+ *
+ * @param $form
+ *   FAPI form
+ * @param $form_state
+ *   FAPI form state
+ */
+function oaiharvester_schedule_set_passive_form_submit($form, &$form_state) {
+  $schedule = $form_state['values']['schedule'];
+  $delete_processing_cron = $form_state['values']['delete_processing_cron'];
+  $success = oaiharvester_schedule_set_passive($schedule->harvest_schedule_id);
+  if ($success) {
+    $msg = t('The schedule status is "not running", so it can be launched.');
+  }
+  else {
+    $msg = t('The changing of schedule status was not successful.');
+  }
+  drupal_set_message($msg);
+  if ($delete_processing_cron == 1) {
+    variable_set('oaiharvester_processing_cron', 'NOT_RUNNING');
+  }
+  $form_state['redirect'] = 'admin/xc/harvester/schedule/' . $schedule->harvest_schedule_id;
+}
+
+/**
+ * Clears http and sql caches for a given schedule
+ *
+ * @param $schedule (Object)
+ *   The schedule object
+ */
+function oaiharvester_schedule_clear_cache($schedule) {
+  $deletes_files = array(
+    'sql' => array(
+      'passed' => 0,
+      'failed' => 0,
+    ),
+    'http' => array(
+      'passed' => 0,
+      'failed' => 0,
+    ),
+  );
+  $sql_file = $http_file = 0;
+
+  $http_cache = drupal_realpath(file_default_scheme() . ':/' . '/oaiharvester_http_cache/' . $schedule->harvest_schedule_id);
+  if (file_prepare_directory($http_cache, FALSE)) {
+    $files = scandir($http_cache);
+    if (count($files) > 2) {
+      foreach ($files as $file) {
+        if ($file != '.' && $file != '..') {
+          $success = unlink($http_cache . '/' . $file);
+          if ($success) {
+            $deletes_files['http']['passed']++;
+          }
+          else {
+            $deletes_files['http']['failed']++;
+          }
+        }
+      }
+    }
+  }
+
+  $sql_cache = drupal_realpath(file_default_scheme() . '://') . '/oaiharvester_sql_cache/' . $schedule->harvest_schedule_id;
+  if (file_prepare_directory($sql_cache, FALSE)) {
+    $files = scandir($sql_cache);
+    if (count($files) > 2) {
+      foreach ($files as $file) {
+        if ($file != '.' && $file != '..') {
+          $success = unlink($sql_cache . '/' . $file);
+          if ($success) {
+            $deletes_files['sql']['passed']++;
+          }
+          else {
+            $deletes_files['sql']['failed']++;
+          }
+        }
+      }
+    }
+  }
+
+  return t('Removed !http_passed, failed !http_failed files from HTTP cache, and removed !sql_passed, failed !sql_failed files from SQL cache',
+    array(
+      '!http_passed' => $deletes_files['http']['passed'],
+      '!http_failed' => $deletes_files['http']['failed'],
+      '!sql_passed' => $deletes_files['sql']['passed'],
+      '!sql_failed' => $deletes_files['sql']['failed'],
+  ));
+}
+
+/**
+ * Lists the files in the CSV cache
+ *
+ * @param $schedule_id (int)
+ *   The schedule ID
+ *
+ * @return (string)
+ *   The themed list of files
+ */
+function oaiharvester_list_http_cache($schedule_id) {
+  $cache_dir = file_default_scheme() . ':/' . '/oaiharvester_http_cache/' . $schedule_id;
+  return xc_util_list_directory($cache_dir);
+}
+
+/**
+ * Theming statistical data.
+ *
+ * @param $oaiharvester_statistics (array)
+ *   The key is shows a virtual part of execution, the value is a number it takes to execute.
+ */
+function theme_oaiharvester_statistics($variables) {
+  $oaiharvester_statistics = $variables['oaiharvester_statistics'];
+  require_once drupal_get_path('module', 'xc_util') . '/xc_util.timer.inc';
+  $number_of_records = $oaiharvester_statistics['number_of_records'];
+  unset($oaiharvester_statistics['number_of_records']);
+  unset($oaiharvester_statistics['start']);
+  unset($oaiharvester_statistics['end']);
+
+  if (empty($oaiharvester_statistics)) {
+    return FALSE;
+  }
+
+  ksort($oaiharvester_statistics);
+  $rows = array();
+  $subtotal = 0;
+  foreach ($oaiharvester_statistics as $key => $value) {
+    $parts = explode('/', $key);
+    $level_count = count($parts);
+    $indentation = str_repeat(' &nbsp; ', $level_count - 1);
+
+    if ($level_count == 1) {
+      $subtotal = $value;
+    }
+
+    $label = xc_timer_get_description($key);
+    if (($label == $key) && ($level_count > 1) && function_exists('dpm')) {
+      dpm($label, 'label1');
+    }
+    if ($label == '') {
+      $label = xc_timer_get_description(preg_replace('/^\d+ /', '', $parts[$level_count - 1]));
+    }
+    if ($label == '') {
+      $label = preg_replace('/^\d+ /', '', $parts[$level_count - 1]);
+    }
+
+    if (preg_match('/#$/', $key)) {
+      $rows[] = array(sprintf('<tt>%s</tt>%s: %s', $indentation, $label, $value));
+    }
+    else {
+      $cells = array();
+      // label
+      $cells[] = array(
+        'data' => sprintf('<tt>%s</tt><span title="%s">%s</span>', $indentation, $key, $label),
+        'class' => array('label'),
+      );
+      // total time
+      $cells[] = ($value > 60) ? oaiharvester_sec_to_time($value, TRUE) : sprintf("%01.3f", $value);
+      // percent of total
+      $cells[] = ($oaiharvester_statistics['total'] == 0) ? 0 : sprintf("%01.3f", ($value / $oaiharvester_statistics['total']) * 100);
+      // percen of part
+      $cells[] = ($subtotal == 0) ? 0 : sprintf("%01.3f", ($value / $subtotal) * 100);
+      // sec per record
+      $cells[] = sprintf("%01.3f", ($value * 1000 / $number_of_records));
+
+      $rows[] = array('data' => $cells, 'id' => $key);
+    }
+  }
+
+  $header = array(
+    array('data' => t('process'), 'class' => array('label')),
+    t('total time'), t('% of total'), t('% of part'), t('ms/record')
+  );
+
+  $output = theme('table', array(
+    'header' => $header,
+    'rows' => $rows,
+    'attributes' => array('id' => 'time_statistics', 'class' => array('collapsible')),
+    'caption' => t('Statistics of harvesting @n records', array('@n' => $number_of_records)))
+  );
+  $output .= '<p>' . t('* Note for the table. Indentations means hierarchy. If you click on the label of a higher element, the children rows will be collapsed. The second click will uncollapse the children.') . '</p>';
+
+  return $output;
+}

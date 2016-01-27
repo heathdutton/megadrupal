@@ -1,0 +1,370 @@
+<?php
+
+/**
+ * @file
+ * Implements unique URLs for particular products on product displays.
+ * See d.o. issue #1082596: http://drupal.org/node/1082596
+ */
+
+/**
+ * Implements hook_menu().
+ */
+function commerce_product_urls_menu() {
+  $items = array();
+  $items['admin/commerce/config/product_urls'] = array(
+    'title' => 'Product URLs',
+    'description' => 'Manage behavior of unique URLs for particular products on product displays.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('commerce_product_urls_settings_form'),
+    'access arguments' => array('configure store'),
+    'file' => 'commerce_product_urls.admin.inc',
+  );
+  return $items;
+}
+
+/**
+ * Implements hook_commerce_product_reference_default_delta_alter().
+ */
+function commerce_product_urls_commerce_product_reference_default_delta_alter(&$delta, $products) {
+  $delta = _commerce_product_urls_match_product_from_url($delta, $products);
+}
+
+/**
+ * Implements hook_form_alter().
+ *
+ * If there is more than one product assigned to current product display,
+ * we want to add current product's ID to line item's display_path value,
+ * to make sure that cart items link back to correct products.
+ * Code borrowed from commerce_cart_add_to_cart_form().
+ */
+function commerce_product_urls_form_alter(&$form, &$form_state, $form_id) {
+  if (strpos($form_id, 'commerce_cart_add_to_cart_form') !== FALSE) {
+
+    // EXPERIMENTAL CODE: Add JS file adding a new command to Drupal's Ajax
+    // framework for changing the URL when selected value of any of the
+    // attribute fields changes. That JS is using HTML5 history.pushState(),
+    // which obviously is not going to work in all browsers, for the moment
+    // though I don't see any better solution that would allow to update
+    // the URL query parameters without reloading the page.
+    if (variable_get('commerce_product_urls_update_url', FALSE)) {
+      // We want to do it on node (product display) pages only. In any other
+      // case (for example on views listings etc) URL should not be modified.
+      if (!empty(menu_get_object()->nid)) {
+        // Just in case if it was not added before.
+        drupal_add_library('system', 'drupal.ajax');
+        $form['product_id']['#attached'] = array(
+          'js' => array(
+            drupal_get_path('module', 'commerce_product_urls') . '/commerce_product_urls.js',
+          ),
+        );
+
+        $initial_parsed_url = array();
+        if (variable_get('commerce_product_urls_url_key', 'id') == 'sku') {
+          $initial_parsed_url['sku'] = $form_state['default_product']->sku;
+        } else {
+          $initial_parsed_url['id'] = $form_state['default_product']->product_id;
+        }
+
+        // Pass URL update fallback setting to Javascript, so that it knows how to
+        // behave when it detects we deal with an older browser without HTML5 support.
+        $js_settings = array(
+          'commerceProductURLs' => array(
+            'updateURLFallback' => variable_get('commerce_product_urls_update_url_fallback', FALSE),
+            'product_id' => drupal_http_build_query($initial_parsed_url),
+          ),
+        );
+        drupal_add_js($js_settings, 'setting');
+      }
+    }
+
+    // Retrieve the array of product IDs from the line item's context data array,
+    // and add current product's ID to line item's display_path value.
+    $product_ids = _commerce_product_urls_get_product_ids_from_line_item($form_state['line_item']);
+    if (count($product_ids) > 1) {
+      $parsed_url = drupal_parse_url($form_state['build_info']['args'][0]->data['context']['display_path']);
+      if (isset($form_state['default_product']->product_id)) {
+        $parsed_url['query'] = _commerce_product_urls_build_query_string($form_state, FALSE);
+      }
+      $parsed_url['absolute'] = FALSE;
+      $parsed_url['alias'] = TRUE;
+      $parsed_url['language'] = $GLOBALS['language'];
+      // First argument is always a line item object (see commerce_cart_field_attach_view_alter()).
+      $form_state['build_info']['args'][0]->data['context']['display_path'] = ltrim(url($parsed_url['path'], $parsed_url), '/');
+    }
+
+    // Our own submit callback to add better form redirect, going back
+    // to the same product variation that was just added to the cart.
+    $form['#submit'][] = 'commerce_product_urls_commerce_cart_add_to_cart_form_submit';
+  }
+}
+
+/**
+ * Implements hook_commerce_cart_attributes_refresh_alter().
+ * EXPERIMENTAL CODE: see explanation in commerce_product_urls_form_alter().
+ */
+function commerce_product_urls_commerce_cart_attributes_refresh_alter(&$commands, $form, $form_state) {
+  if (variable_get('commerce_product_urls_update_url', FALSE)) {
+    $commands[] = array(
+      'command' => 'commerceProductUrlsUpdateUrl',
+      'data' => drupal_http_build_query(_commerce_product_urls_build_query_string($form_state, TRUE)),
+    );
+  }
+}
+
+/**
+ * Extra form submit handler: replaces commerce_cart's form redirect
+ * to go back to the same product variation that was just added to the cart.
+ */
+function commerce_product_urls_commerce_cart_add_to_cart_form_submit($form, &$form_state) {
+  // Only if we are on node (product display) page.
+  if (!empty(menu_get_object()->nid)) {
+    // Only if there is more that 1 product assigned to current product display.
+    $product_ids = _commerce_product_urls_get_product_ids_from_line_item($form_state['line_item']);
+    if (count($product_ids) > 1) {
+      // Default product data does not exist after form is built.
+      // @see commerce_cart_add_to_cart_form_after_build.
+      $form_state['default_product'] = commerce_product_load($form_state['values']['product_id']);
+      $form_state['redirect'] = array(current_path(), array(
+        'query' => _commerce_product_urls_build_query_string($form_state, TRUE),
+      ));
+    }
+  }
+}
+
+/**
+ * Re-builds URL query string for current product: adds 'id' parameter pointing
+ * to currently selected product, and strips all attribute field parameters
+ * (they are not needed anymore once 'id' param is added).
+ * Keeps all other parameters in the URL intact.
+ */
+function _commerce_product_urls_build_query_string($form_state, $keep_all_query_params = TRUE) {
+  // Retrieve the array of product IDs from the line item's context data array.
+  $product_ids = _commerce_product_urls_get_product_ids_from_line_item($form_state['line_item']);
+  // Load the referenced products.
+  $products = commerce_product_load_multiple($product_ids);
+  // Generate array of possible attribute fields from loaded products.
+  // We will want to remove all of them from the URL query.
+  $attribute_fields = _commerce_product_urls_get_cart_attribute_fields($products);
+  // We also want to remove all old basic parameters.
+  $basic_query_params = drupal_map_assoc(array('id', 'sku'));
+  // Now we know what to remove, so let's remove it.
+  $parsed_url = drupal_parse_url(request_uri());
+  // There might be the case when we don't want to keep any other params in the
+  // URL except those product-related ($basic_query_params + $attribute_fields).
+  if ($keep_all_query_params === FALSE) {
+    $parsed_url['query'] = array();
+  }
+  else {
+    $parsed_url['query'] = array_diff_key($parsed_url['query'], $attribute_fields, $basic_query_params);
+  }
+  // Add back the current product's query string variable.
+ if (variable_get('commerce_product_urls_url_key', 'id') == 'sku') {
+    $parsed_url['query']['sku'] = $form_state['default_product']->sku;
+  }
+  else {
+    $parsed_url['query']['id'] = $form_state['default_product']->product_id;
+  }
+
+  return $parsed_url['query'];
+}
+
+/**
+ * Tries to determine and return a default product from $products array
+ * based on matching against URL query parameters, or, in case of failure
+ * (when no product matches) returns first product from $products array.
+ */
+function _commerce_product_urls_match_product_from_url($default_product_delta, $products = array()) {
+  $matching_product_deltas = array();
+
+  // Do the whole processing thing only if we have
+  // at least one parameter in the URL query string.
+  $parsed_url = drupal_parse_url(request_uri());
+  if (count($parsed_url['query'])) {
+
+    // We'll be checking two types of query parameters here:
+    // - basic - predefined 'id' and 'sku',
+    // - advanced - any product's field enabled to function
+    //   as an attribute field on Add to Cart forms.
+    $basic_query_params = drupal_map_assoc(array('id', 'sku'));
+
+    // If other than basic URL query parameters were received, first we need
+    // to check which product fields are enabled as attribute fields, and then
+    // compare URL parameters against them.
+    $advanced_query_params = array_diff_key($parsed_url['query'], $basic_query_params);
+    if ($advanced_query_params) {
+      $cart_attributes = _commerce_product_urls_get_cart_attribute_fields($products);
+    }
+
+    // Check which products are matching against URL query parameters.
+    foreach ($products as $delta => $product) {
+      $product_wrapper = entity_metadata_wrapper('commerce_product', $product);
+
+      // If the product is disabled, do not attempt to match it.
+      if ($product_wrapper->status->value() == 0) {
+        continue;
+      }
+
+      $match = TRUE;
+      // Check basic URL query parameters ('id' and 'sku').
+      if (isset($parsed_url['query']['id']) && $parsed_url['query']['id'] != $product->product_id) {
+        $match = FALSE;
+      }
+      if (isset($parsed_url['query']['sku']) && $parsed_url['query']['sku'] != $product->sku) {
+        $match = FALSE;
+      }
+      // Check advanced URL query parameters.
+      if ($advanced_query_params) {
+        foreach ($advanced_query_params as $param_name => $param_value) {
+          if (isset($product_wrapper->{'field_' . $param_name})) {
+            $field_value_in_product = $product_wrapper->{'field_' . $param_name}->raw();
+            if (
+              // Parameter name from URL has to exist in defined attribute names
+              // (meaning that for URL query ?color=red there has to exist
+              // a product field named 'field_color' which has been enabled
+              // as an atrtibute fields on 'Add to Cart' forms.
+              !in_array($param_name, array_keys($cart_attributes))
+              // Parameter value from URL has to exist either in defined attribute
+              // names, or in attribute values (meaning that URL queries like
+              // ?color=red and ?color=3 will both work, as long as 3
+              // is tid of the term 'red' (note that this has nothing to do
+              // with product's attribute field values yet).
+              || (!in_array($param_value, array_keys($cart_attributes[$param_name])) && !in_array($param_value, $cart_attributes[$param_name]))
+              // Parameter value from URL has to be the same as relevant field
+              // value in the product (or relevant term value), meaning that
+              // if product's field_color value is 3 (and 3 is tid of term 'red'),
+              // then both ?color=3 and ?color=red will match such product.
+              || $param_value != $field_value_in_product && $param_value != $cart_attributes[$param_name][$field_value_in_product]
+            ) {
+              $match = FALSE;
+            }
+          }
+        }
+      }
+      if ($match) {
+        $matching_product_deltas[] = $delta;
+      }
+    }
+
+  }
+
+  // Return either first matching product,
+  // or first product from original $products array.
+  return ($matching_product_deltas) ? reset($matching_product_deltas) : $default_product_delta;
+}
+
+/**
+ * Returns an array of product fields enabled as an attribute field
+ * for Add to Cart forms from provided products.
+ */
+function _commerce_product_urls_get_cart_attribute_fields($products) {
+  // Start with generating an array of product types received
+  // in $products array to be checked for attribute fields.
+  $product_types = array();
+  foreach ($products as $product) {
+    $product_types[$product->type] = $product->type;
+  }
+
+  // Now let's loop through all product types and generate an array
+  // of all possible attribute fields available in them. Quite a big part
+  // of this code is borrowed from commerce_cart_add_to_cart_form().
+  $cart_attributes = array();
+  foreach ($product_types as $product_type) {
+
+    foreach (field_info_instances('commerce_product', $product_type) as $field_name => $instance) {
+
+      // In URL query parameters we expect to see only the base part
+      // of the field name, without 'field_' prefix, so let's remove it
+      // first here before any further processing.
+      $short_field_name = str_replace('field_', '', $field_name);
+
+      // A field qualifies if it is single value, required and uses a widget
+      // with a definite set of options. For the sake of simplicity, this is
+      // currently restricted to fields defined by the options module.
+      $field = field_info_field($instance['field_name']);
+
+      // Get the array of Cart settings pertaining to this instance.
+      $commerce_cart_settings = commerce_cart_field_instance_attribute_settings($instance);
+
+      // If the instance is of a field type that is eligible to function as
+      // a product attribute field and if its attribute field settings
+      // specify that this functionality is enabled...
+      if (commerce_cart_field_attribute_eligible($field) && $commerce_cart_settings['attribute_field']) {
+
+        // Get the options properties from the options module and store the
+        // options for the instance in select list format in the array of
+        // qualifying fields.
+        $properties = _options_properties('select', FALSE, TRUE, TRUE);
+
+        // Try to fetch localized names.
+        $allowed_values = NULL;
+
+        // Prepare translated options if using the i18n_field module.
+        if (module_exists('i18n_field')) {
+          if (($translate = i18n_field_type_info($field['type'], 'translate_options'))) {
+            $allowed_values = $translate($field);
+            _options_prepare_options($allowed_values, $properties);
+          }
+
+          // Translate the field title if set.
+          if (!empty($instance['label'])) {
+            $instance['label'] = i18n_field_translate_property($instance, 'label');
+          }
+        }
+
+        // Otherwise just use the base language values.
+        if (empty($allowed_values)) {
+          $allowed_values = _options_get_options($field, $instance, $properties, 'commerce_product', reset($products));
+        }
+
+        if (!empty($allowed_values)) {
+          $cart_attributes[$short_field_name] = $allowed_values;
+        }
+
+      }
+    }
+  }
+  return $cart_attributes;
+}
+
+/**
+ * Retrieves the array of product IDs from the line item's context data array.
+ */
+function _commerce_product_urls_get_product_ids_from_line_item($line_item) {
+  $product_ids = array();
+
+  // If the product IDs setting tells us to use entity values...
+  if ($line_item->data['context']['product_ids'] == 'entity' &&
+    is_array($line_item->data['context']['entity'])) {
+    $entity_data = $line_item->data['context']['entity'];
+
+    // Load the specified entity.
+    $entity = entity_load_single($entity_data['entity_type'], $entity_data['entity_id']);
+
+    // Extract the product IDs from the specified product reference field.
+    if (!empty($entity->{$entity_data['product_reference_field_name']})) {
+      $product_ids = entity_metadata_wrapper($entity_data['entity_type'], $entity)->{$entity_data['product_reference_field_name']}->raw();
+    }
+  }
+  elseif (is_array($line_item->data['context']['product_ids'])) {
+    $product_ids = $line_item->data['context']['product_ids'];
+  }
+
+  return $product_ids;
+}
+
+/**
+ * Implements hook_process_HOOK().
+ *
+ * Adds new class on full view modes of "product display" nodes.
+ * This is used by Javascript's Drupal.behaviors.commerce_product_urls() when
+ * a "product display" page is loaded to add product identifier to the URL.
+ */
+function commerce_product_urls_preprocess_node(&$variables) {
+  if (
+    $variables['elements']['#view_mode'] == 'full'
+    && variable_get('commerce_product_urls_update_url', FALSE)
+    && in_array($variables['elements']['#bundle'], array_keys(commerce_product_reference_node_types()))
+  ) {
+    $variables['classes_array'][] = 'commerce-product-url-product-display';
+  }
+}

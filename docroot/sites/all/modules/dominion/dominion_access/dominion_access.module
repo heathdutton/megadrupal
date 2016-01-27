@@ -1,0 +1,505 @@
+<?php
+
+define('DOMINION_ACCESS_PATH_LOGIN', 'login-required-for-subsite');
+
+define('DOMINION_ACCESS_VAR_ROLES', 'dominion_access_roles');
+define('DOMINION_ACCESS_VAR_EXCLUDE', 'dominion_access_exclude');
+define('DOMINION_ACCESS_VAR_EXCLUDE_DEFAULT', "user\nuser/login\nuser/register\nuser/password");
+define('DOMINION_ACCESS_VAR_REDIRECT', 'dominion_access_redirect');
+define('DOMINION_ACCESS_VAR_THEME', 'dominion_access_theme');
+
+function dominion_access_menu() {
+  $menu = array();
+
+  $menu['admin/structure/dominion/settings/access'] = array(
+    'title' => t('Access'),
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('dominion_access_admin_settings'),
+    'access arguments' => array('administer site configuration'),
+    'type' => MENU_LOCAL_TASK,
+    'file' => 'dominion_access.admin.inc',
+    'weight' => 3,
+  );
+
+  $menu[DOMINION_ACCESS_PATH_LOGIN] = array(
+    'title' => t('Login required'),
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('user_login'),
+    'access callback' => 'dominion_is_subsite',
+    'type' => MENU_CALLBACK,
+  );
+
+  return $menu;
+}
+
+/**
+ * Implements hook_dominion_load().
+ */
+function dominion_access_dominion_load(&$subsite) {
+  // Add whitelisted roles
+  $subsite->access_roles = db_select('dominion_access', 'da')
+    ->fields('da', array('rid'))
+    ->condition('da.domain_id', $subsite->domain_id)
+    ->execute()
+    ->fetchCol();
+
+  // Add whitelisted IP ranges
+  $ips = db_select('dominion_access_ip', 'dai')
+    ->fields('dai', array('ip', 'submask'))
+    ->condition('dai.domain_id', $subsite->domain_id)
+    ->execute()
+    ->fetchAll();
+  $subsite->access_ip = array();
+  foreach ($ips as $ip) {
+    $subsite->access_ip[] = $ip->ip . ($ip->submask == 32 ? '' : '/' . $ip->submask);
+  }
+
+  // Add whitelisted users
+  $subsite->access_users = db_select('dominion_access_user', 'dau')
+    ->fields('dau', array('uid'))
+    ->condition('dau.domain_id', $subsite->domain_id)
+    ->execute()
+    ->fetchCol();
+}
+
+/**
+ * Implements hook_dominion_insert().
+ */
+function dominion_access_dominion_insert($domain_id, $form_values = array()) {
+  // Save roles
+  $roles = $form_values['dominion_access_roles'];
+  foreach ($roles as $rid => $enabled) {
+    if ($enabled) {
+      db_insert('dominion_access')->fields(array(
+        'domain_id' => $domain_id,
+        'rid' => $rid,
+      ))->execute();
+    }
+  }
+
+  // Save IP's and users
+  foreach ($form_values as $name => $value) {
+    if (empty($value)) {
+      continue;
+    }
+    // Save IP (range)
+    if (preg_match('/^dominion_access_ip_([0-9]+)$/s', $name)) {
+      if (preg_match('/^([0-9]{1,3})\\.([0-9]{1,3})\\.([0-9]{1,3})\\.([0-9]{1,3})\\/?([0-9]{1,2})?$/s', $value, $match)) {
+        $submask = empty($match[5]) ? 32 : $match[5];
+        $ip = "{$match[1]}.{$match[2]}.{$match[3]}.{$match[4]}";
+        db_insert('dominion_access_ip')->fields(array(
+          'domain_id' => $domain_id,
+          'ip' => $ip,
+          'submask' => $submask,
+        ))->execute();
+      }
+    }
+    if (preg_match('/^dominion_access_user_([0-9]+)$/s', $name)) {
+      $uid = db_select('users', 'u')->fields('u', array('uid'))->condition('u.name', $value)->execute()->fetchField();
+      if ($uid) {
+        db_insert('dominion_access_user')->fields(array(
+          'domain_id' => $domain_id,
+          'uid' => $uid,
+        ))->execute();
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_dominion_update().
+ */
+function dominion_access_dominion_update($domain_id, $form_values = array()) {
+  $transaction = db_transaction();
+  try {
+    dominion_access_dominion_delete(dominion_get_info($domain_id));
+    dominion_access_dominion_insert($domain_id, $form_values);
+  }
+  catch (Exception $e) {
+    $transaction->rollback();
+    throw $e;
+  }
+}
+
+/**
+ * Implements hook_dominion_delete().
+ */
+function dominion_access_dominion_delete($subsite) {
+  db_delete('dominion_access')
+    ->condition('domain_id', $subsite->domain_id)
+    ->execute();
+  db_delete('dominion_access_ip')
+    ->condition('domain_id', $subsite->domain_id)
+    ->execute();
+  db_delete('dominion_access_user')
+    ->condition('domain_id', $subsite->domain_id)
+    ->execute();
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * Add access configuration to dominion form.
+ */
+function dominion_access_form_dominion_form_alter(&$form, &$form_state) {
+  $roles = array(1 => 1, 2 => 2);
+  if (!empty($form['#domain_id'])) {
+    if ($subsite = dominion_get_info($form['#domain_id'])) {
+      $roles = $subsite->access_roles;
+    }
+  }
+
+  $form['dominion_access'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Access permissions'),
+    '#collapsible' => TRUE,
+    '#collapsed' => TRUE,
+    '#description' => t('Define which users may access this subsite. You may specify user roles, IP addresses and individual users. Submask are allowed for IP-addresses (e.g. <em>213.34.43.4</em> or <em>172.0.0.0/8</em>)."'),
+  );
+
+  $options = db_select('role', 'r')
+    ->fields('r', array('rid', 'name'))
+    ->condition('r.rid', array_keys(variable_get(DOMINION_ACCESS_VAR_ROLES, array(1 => 1, 2 => 2))))
+    ->orderBy('r.rid', 'asc')
+    ->execute()
+    ->fetchAllKeyed();
+  $form['dominion_access']['dominion_access_roles'] = array(
+    '#type' => 'checkboxes',
+    '#title' => t('Roles'),
+    '#options' => $options,
+    '#default_value' => $roles,
+    '#description' => t('Check which roles may access this subsite.'),
+  );
+
+  $form['dominion_access']['ips'] = array(
+    '#prefix' => '<div id="dominion-access-ips">',
+    '#suffix' => '</div>',
+  );
+  $ips = array();
+  if (isset($form_state['values'])) {
+    foreach ($form_state['values'] as $name => $value) {
+      if (!preg_match('/^dominion_access_ip_([0-9]+)$/s', $name) || empty($value)) {
+        continue;
+      }
+      $ips[] = $value;
+    }
+  }
+  elseif (isset($subsite->access_ip)) {
+    $ips = $subsite->access_ip;
+  }
+  $num = count($ips) + 2;
+  for ($i = 0; $i < $num; $i++) {
+    $form['dominion_access']['ips']["dominion_access_ip_$i"] = array(
+      '#type' => 'textfield',
+      '#title' => t('IP-address'),
+      '#default_value' => isset($ips[$i]) ? $ips[$i] : '',
+    );
+  }
+  $form['dominion_access']['dominion_access_add_ip'] = array(
+    '#type' => 'submit',
+    '#value' => t('Add another IP'),
+    '#ajax' => array(
+      'callback' => 'dominion_access_form_ips_callback',
+      'wrapper' => 'dominion-access-ips',
+      'method' => 'html',
+      'effect' => 'fade',
+      'progress' => array(
+        'type' => 'throbber',
+        'message' => '',
+      ),
+    ),
+  );
+
+  $form['dominion_access']['users'] = array(
+    '#prefix' => '<div id="dominion-access-users">',
+    '#suffix' => '</div>',
+  );
+  $users = array();
+  if (isset($form_state['values'])) {
+    foreach ($form_state['values'] as $name => $value) {
+      if (!preg_match('/^dominion_access_user_([0-9]+)$/s', $name) || empty($value)) {
+        continue;
+      }
+      $users[] = $value;
+    }
+  }
+  elseif (isset($subsite->access_users)) {
+    $users = $subsite->access_users;
+  }
+  $num = count($users) + 2;
+  for ($i = 0; $i < $num; $i++) {
+    $default_value = '';
+    if (!empty($users[$i])) {
+      $default_value = db_select('users', 'u')
+        ->fields('u', array('name'))
+        ->condition('u.uid', $users[$i])
+        ->execute()
+        ->fetchField();
+    }
+    $form['dominion_access']['users']["dominion_access_user_$i"] = array(
+      '#type' => 'textfield',
+      '#title' => t('User'),
+      '#default_value' => $default_value,
+      '#autocomplete_path' => 'admin/structure/dominion/list/users/autocomplete/username',
+    );
+  }
+  $form['dominion_access']['dominion_access_add_user'] = array(
+    '#type' => 'submit',
+    '#value' => t('Add another user'),
+    '#ajax' => array(
+      'callback' => 'dominion_access_form_users_callback',
+      'wrapper' => 'dominion-access-users',
+      'method' => 'html',
+      'effect' => 'fade',
+      'progress' => array(
+        'type' => 'throbber',
+        'message' => '',
+      ),
+    ),
+  );
+
+  $form['#validate'][] = 'dominion_access_dominion_form_validate';
+}
+
+/**
+ * AJAX callback.
+ */
+function dominion_access_form_ips_callback($form, $form_state) {
+  return $form['dominion_access']['ips'];
+}
+
+/**
+ * AJAX callback.
+ */
+function dominion_access_form_users_callback($form, $form_state) {
+  return $form['dominion_access']['users'];
+}
+
+function dominion_access_dominion_form_validate($form, &$form_state) {
+  $ips = array();
+  foreach ($form_state['values'] as $name => $value) {
+    if (empty($value)) {
+      continue;
+    }
+    if (preg_match('/^dominion_access_ip_([0-9]+)$/s', $name)) {
+      if (!preg_match('/^([0-9]{1,3})\\.([0-9]{1,3})\\.([0-9]{1,3})\\.([0-9]{1,3})\\/?([0-9]{1,2})?$/s', $value, $match)) {
+        form_set_error($name, t('Invalid IP %ip', array('%ip' => $value)));
+      }
+      $ip = "{$match[1]}.{$match[2]}.{$match[3]}.{$match[4]}";
+      if ($match[1] > 255 || $match[2] > 255 || $match[3] > 255 || $match[4] > 255) {
+        form_set_error($name, t('Invalid IP %ip', array('%ip' => $ip)));
+      }
+      if (isset($match[5]) && ($match[5] < 1 || $match[5] > 32)) {
+        form_set_error($name, t('Submask must be between 1 and 32'));
+      }
+      if (in_array($ip, $ips)) {
+        form_set_error($name, t('Duplicate IP %ip', array('%ip' => $ip)));
+      }
+      $ips[] = $ip;
+    }
+    if (preg_match('/^dominion_access_user_([0-9]+)$/s', $name)) {
+      $uid = db_select('users', 'u')->fields('u', array('uid'))->condition('u.name', $value)->execute()->fetchField();
+      if (!$uid) {
+        form_set_error($name, t('Invalid user %name', array('%name' => $value)));
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_init().
+ */
+function dominion_access_init() {
+  global $user, $_dominion_access_theme;
+
+  if (defined('DRUSH_BASE_PATH')) {
+    // Always allow access to Drush.
+    return;
+  }
+
+  if (!$subsite = dominion_get_info()) {
+    // Not on a subsite.
+    return;
+  }
+
+  if (dominion_access_user_is_allowed($subsite, $user)) {
+    // Allow access based on user roles or IP-address.
+    return;
+  }
+
+  // Override theme. This is also done for the whitelisted pages.
+  if ($theme = variable_get(DOMINION_ACCESS_VAR_THEME, '')) {
+    $_dominion_access_theme = $theme;
+  }
+  header('HTTP/1.1 403 Forbidden');
+
+  $redirect = variable_get(DOMINION_ACCESS_VAR_REDIRECT, '');
+
+  $exclude = variable_get(DOMINION_ACCESS_VAR_EXCLUDE, DOMINION_ACCESS_VAR_EXCLUDE_DEFAULT);
+  $exclude_array = array_filter(array_map('trim', explode("\n", $exclude)));
+  // Compare current page with wildcard-path.
+  // Convert the Drupal path to lowercase.
+  $path = drupal_strtolower(drupal_get_path_alias($_GET['q']));
+  // Compare the lowercase internal and lowercase path alias (if any).
+  $page_match = drupal_match_path($path, $exclude);
+  if ($path != $_GET['q']) {
+    $page_match = $page_match || drupal_match_path($_GET['q'], $exclude);
+  }
+  if ($page_match) {
+    // Page is in the whitelist.
+    return;
+  }
+  // Compare current page with exact path.
+  if ((drupal_is_front_page() && in_array('<front>', $exclude_array)) || ($redirect && $_GET['q'] == $redirect) || $_GET['q'] == DOMINION_ACCESS_PATH_LOGIN) {
+    // Special page which doesn't require login.
+    return;
+  }
+
+  if ($redirect) {
+    drupal_goto($redirect == '<login>' ? DOMINION_ACCESS_PATH_LOGIN : $redirect);
+  }
+  else {
+    drupal_access_denied();
+  }
+  module_invoke_all('exit') & exit;
+}
+
+/**
+ * Check if this user has access to this subsite.
+ *
+ * This does not check the current path.
+ *
+ * @param object $subsite Subsite object from dominion_get_info().
+ * @param object $account User object from user_load().
+ */
+function dominion_access_user_is_allowed($subsite, $account = NULL) {
+  global $user;
+
+  $account = $account ? $account : $user;
+
+  if ($account->uid == 1) {
+    // Always allow access to admin.
+    return TRUE;
+  }
+
+  if (empty($subsite->access_roles) && empty($subsite->access_ip) && empty($subsite->access_users)) {
+    // This domain has no access permissions.
+    return TRUE;
+  }
+
+  foreach ($subsite->access_roles as $rid) {
+    if (isset($account->roles[$rid])) {
+      // Allow access by role.
+      return TRUE;
+    }
+  }
+
+  $ip = isset($_SERVER['HTTP_X_FORWARDED_FOR']) ? $_SERVER['HTTP_X_FORWARDED_FOR'] : $_SERVER['REMOTE_ADDR'];
+  if (_dominion_ip_allowed($ip, $subsite->access_ip)) {
+    // Allow access by IP.
+    return TRUE;
+  }
+
+  foreach ($subsite->access_users as $uid) {
+    // Allow access by user.
+    if ($account->uid == $uid) {
+      return TRUE;
+    }
+  }
+
+  return FALSE;
+}
+
+/**
+ * Get the domain id's where this user is not allowed.
+ *
+ * @param object $account User object from user_load().
+ */
+function dominion_access_get_disallowed_domains($account = NULL) {
+  global $user;
+
+  if (is_null($account)) {
+    $account = $user;
+  }
+
+  $disallowed = array();
+
+  if ($account->uid == 1) {
+    // Has always access to anything.
+    return $disallowed;
+  }
+
+  // Retreive subsites with access restrictions and do the roles check in the query to improve performance.
+  $rids = array();
+  $c = 0;
+  foreach ($account->roles as $rid => $role) {
+    $rids[':arg' . (++$c)] = $rid;
+  }
+  $sql = 'SELECT d.domain_id
+  FROM domain d
+  WHERE ( -- subsite has access restrictions
+    EXISTS(SELECT * FROM dominion_access da WHERE da.domain_id = d.domain_id)
+    OR EXISTS(SELECT * FROM dominion_access_ip dai WHERE dai.domain_id = d.domain_id)
+    OR EXISTS(SELECT * FROM dominion_access_user dau WHERE dau.domain_id = d.domain_id)
+  ) AND NOT EXISTS( -- and access is not granted by role
+    SELECT *
+    FROM dominion_access da
+    WHERE da.domain_id = d.domain_id
+    AND da.rid IN (' . implode(', ', array_keys($rids)) . ')
+  )';
+  $res = db_query($sql, $rids);
+  while ($subsite = $res->fetchObject()) {
+    $subsite = dominion_get_info($subsite->domain_id);
+    if (!dominion_access_user_is_allowed($subsite, $account)) {
+      $disallowed[] = $subsite->domain_id;
+    }
+  }
+  return $disallowed;
+}
+
+/**
+ * Check if IP is allowed.
+ *
+ * @param string $ip
+ * @param string $whitelist
+ */
+function _dominion_ip_allowed($ip, $whitelist) {
+  if (!preg_match('/^([0-9]+)\\.([0-9]+)\\.([0-9]+)\\.([0-9]+)$/', $ip, $match)) {
+    return FALSE;
+  }
+  $ip_dec = $match[4];
+  $ip_dec += $match[3] << 8;
+  $ip_dec += $match[2] << 16;
+  $ip_dec += $match[1] << 24;
+
+  foreach ($whitelist as $range) {
+    if (preg_match('/^([0-9]+)\\.([0-9]+)\\.([0-9]+)\\.([0-9]+)$/', $range, $match)) {
+      // Subnet is not given
+      $range .= '/32';
+    }
+    if (!preg_match('/^([0-9]+)\\.([0-9]+)\\.([0-9]+)\\.([0-9]+)\\/([0-9]+)$/', $range, $match)) {
+      continue;
+    }
+    $range_dec = $match[4];
+    $range_dec += $match[3] << 8;
+    $range_dec += $match[2] << 16;
+    $range_dec += $match[1] << 24;
+    $range_mask = $range_dec >> (32 - $match[5]);
+    $ip_mask = $ip_dec >> (32 - $match[5]);
+    if ($range_mask == $ip_mask) {
+      return TRUE;
+    }
+  }
+
+  return FALSE;
+}
+
+/**
+ * Implements hook_custom_theme().
+ */
+function dominion_access_custom_theme() {
+  global $_dominion_access_theme;
+  if (!empty($_dominion_access_theme)) {
+    return $_dominion_access_theme;
+  }
+}
